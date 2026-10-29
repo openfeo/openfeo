@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::lines::Lines;
 use crate::netns::NetNs;
+use crate::qemu::{BASE_CMDLINE, ConsoleMode, Nic, Vm, VmSpec};
 
 /// ISP A's side of the WAN A link (TEST-NET-3).
 pub const ISP0_ADDR: &str = "203.0.113.1/24";
@@ -27,12 +29,19 @@ pub const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
 /// Per-lab scratch directories live under here on the sandbox's private `/run`.
 pub const RUN_ROOT: &str = "/run/openfeo-harness";
 
-/// One lab: namespaces, taps, and (from Task 8) the VM.
+/// Guest RAM for the lab VM (SPEC §4.3: boots and routes in 64 MiB; twice that for headroom).
+pub const VM_MEM_MIB: u32 = 128;
+/// Guest vCPUs for the lab VM.
+pub const VM_CPUS: u32 = 2;
+
+/// One lab: namespaces, taps, and the VM once booted.
 #[derive(Debug)]
 pub struct Lab {
     /// Scratch directory for configs and logs.
     pub run_dir: PathBuf,
     name: String,
+    /// The router VM, after [`Lab::boot`]. Declared first so it dies before its taps.
+    pub vm: Option<Vm>,
     /// Port taps in port order: wan0 (isp0), wan1 (isp1), lan0 (lan0). Dropped before the
     /// namespaces so the namespaces can go.
     taps: Vec<OwnedFd>,
@@ -65,11 +74,75 @@ impl Lab {
         Ok(Self {
             run_dir,
             name: name.to_owned(),
+            vm: None,
             taps,
             isp0,
             isp1,
             lan0,
         })
+    }
+
+    /// Boot the router with the lab's three taps as ports `p0..p2` and the console captured.
+    /// `extra_cmdline` is appended to [`BASE_CMDLINE`].
+    ///
+    /// # Errors
+    ///
+    /// When already booted, the kernel image is missing, or QEMU cannot start.
+    pub fn boot(&mut self, extra_cmdline: &str) -> Result<&Vm> {
+        self.boot_with(extra_cmdline, ConsoleMode::Captured)
+    }
+
+    /// As [`Lab::boot`], with the console on the caller's terminal instead.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lab::boot`].
+    pub fn boot_interactive(&mut self, extra_cmdline: &str) -> Result<&mut Vm> {
+        self.boot_with(extra_cmdline, ConsoleMode::Interactive)?;
+        self.vm.as_mut().context("VM vanished after boot")
+    }
+
+    fn boot_with(&mut self, extra_cmdline: &str, console: ConsoleMode) -> Result<&Vm> {
+        ensure!(self.vm.is_none(), "lab {} already has a VM", self.name);
+        let nics = self
+            .taps
+            .iter()
+            .zip(MACS)
+            .enumerate()
+            .map(|(i, (tap, mac))| {
+                Ok(Nic {
+                    id: format!("p{i}"),
+                    tap: tap.try_clone().context("dup tap")?,
+                    mac: mac.to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cmdline = if extra_cmdline.is_empty() {
+            BASE_CMDLINE.to_owned()
+        } else {
+            format!("{BASE_CMDLINE} {extra_cmdline}")
+        };
+        let vm = Vm::start(&VmSpec {
+            kernel: Self::kernel_path()?,
+            cmdline,
+            mem_mib: VM_MEM_MIB,
+            cpus: VM_CPUS,
+            nics,
+            console,
+        })?;
+        Ok(self.vm.insert(vm))
+    }
+
+    /// The captured serial console of the booted VM.
+    ///
+    /// # Errors
+    ///
+    /// When no VM is booted, or it was booted interactively.
+    pub fn console(&self) -> Result<&Lines> {
+        self.vm
+            .as_ref()
+            .and_then(|vm| vm.console.as_ref())
+            .context("no captured console: VM not booted, or booted interactively")
     }
 
     /// The lab's name.

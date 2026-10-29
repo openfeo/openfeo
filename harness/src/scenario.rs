@@ -68,7 +68,32 @@ pub fn run_all(all: &[Scenario], filter: Option<&str>) -> ExitCode {
 
 fn run_one(scenario: &Scenario) -> anyhow::Result<()> {
     let mut lab = Lab::new("lab").context("create lab")?;
-    (scenario.run)(&mut lab)
+    let result = (scenario.run)(&mut lab);
+    if result.is_err() {
+        dump_diagnostics(&lab);
+    }
+    result
+}
+
+/// On failure: the end of the VM console and of QEMU's stderr, so the cause is in the output.
+fn dump_diagnostics(lab: &Lab) {
+    if let Some(vm) = &lab.vm {
+        if let Some(console) = &vm.console {
+            eprintln!("--- console (last 80 lines) ---");
+            for line in console.tail(80) {
+                eprintln!("{line}");
+            }
+        }
+        if let Some(errors) = &vm.qemu_errors {
+            let tail = errors.tail(20);
+            if !tail.is_empty() {
+                eprintln!("--- qemu stderr ---");
+                for line in tail {
+                    eprintln!("{line}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

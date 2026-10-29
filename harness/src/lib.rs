@@ -9,7 +9,9 @@
 //! serial console ([`scenario`]).
 
 pub mod lab;
+pub mod lines;
 pub mod netns;
+pub mod qemu;
 pub mod sandbox;
 pub mod scenario;
 pub mod tun;
