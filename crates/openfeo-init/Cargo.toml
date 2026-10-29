@@ -1,0 +1,15 @@
+[package]
+name = "openfeo-init"
+description = "OpenFeO PID 1: mounts, reaper, supervisor, watchdog (no async runtime)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

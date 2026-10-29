@@ -1,0 +1,34 @@
+[graph]
+all-features = true
+
+[licenses]
+# SPEC §14: the shipped binary is a GPLv2 work, so only GPL-2.0-compatible licences may be linked.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "LGPL-2.1-or-later",
+    "GPL-2.0-only",
+    "GPL-2.0-or-later",
+    "CC0-1.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

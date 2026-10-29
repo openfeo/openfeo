@@ -1,0 +1,4 @@
+# The harness may spawn processes, so this file deliberately omits the root's disallowed-methods.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+doc-valid-idents = ["OpenFeO", "PPPoE", "DHCPv4", "DHCPv6", "IPv4", "IPv6", "QEMU", ".."]

@@ -1,0 +1,7 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# Proper nouns clippy::doc_markdown would otherwise want in backticks (".." keeps clippy's defaults).
+doc-valid-idents = ["OpenFeO", "PPPoE", "DHCPv4", "DHCPv6", "IPv4", "IPv6", "QEMU", ".."]
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "no shelling out (SPEC §2 Build); only harness/ and image/ may spawn processes" },
+]
