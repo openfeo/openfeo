@@ -8,7 +8,11 @@ BUILD          ?= $(CURDIR)/build
 BUILD_ID       := $(shell git describe --always --dirty 2>/dev/null || echo dev)
 FILTER         ?=
 
-.PHONY: lint test
+BIN := target/$(TARGET)/$(PROFILE)/openfeo
+
+.PHONY: bin lint test
+bin:
+	OPENFEO_BUILD_ID=$(BUILD_ID) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings

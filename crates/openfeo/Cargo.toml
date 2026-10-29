@@ -1,0 +1,22 @@
+[package]
+name = "openfeo"
+description = "OpenFeO: a tiny Linux router; PID 1 and control plane in one static binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Test hooks (`openfeo.chaos=` on the kernel command line). Never enabled in a release image (ADR-0007).
+harness = []
+
+[dependencies]
+openfeo-init = { path = "../openfeo-init" }
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

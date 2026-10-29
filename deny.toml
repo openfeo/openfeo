@@ -28,6 +28,8 @@ yanked = "deny"
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace-internal `path = ".."` dependencies carry no version; that is not a wildcard.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
