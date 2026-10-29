@@ -5,5 +5,12 @@
 //! Blocking std + libc only; no async runtime. `unsafe` is confined to `sys`.
 
 pub mod cmdline;
+pub mod ctl;
 pub mod heartbeat;
+pub mod log;
+pub mod mounts;
 pub mod restart;
+#[allow(unsafe_code)]
+pub mod sys;
+pub mod sysctl;
+pub mod watchdog;
