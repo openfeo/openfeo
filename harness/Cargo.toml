@@ -8,6 +8,16 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+nix.workspace = true
+regex.workspace = true
+
+[[test]]
+name = "m0"
+path = "tests/m0.rs"
+harness = false
 
 [lints]
 workspace = true
