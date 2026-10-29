@@ -7,8 +7,8 @@ use crate::log::Log;
 
 /// `(key under /proc/sys, value)`.
 pub const CORE: &[(&str, &str)] = &[
-    // An appliance: no SysRq, and an oops is a reboot (with panic=10 on the command line).
-    ("kernel/sysrq", "0"),
+    // An appliance: an oops is a reboot (with panic=10 on the command line). SysRq does not
+    // exist on our kernels (MAGIC_SYSRQ is off), so there is no sysctl to disable.
     ("kernel/panic_on_oops", "1"),
     // We are a router.
     ("net/ipv4/ip_forward", "1"),

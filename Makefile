@@ -10,9 +10,16 @@ FILTER         ?=
 
 BIN := target/$(TARGET)/$(PROFILE)/openfeo
 
-.PHONY: bin lint test
+KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
+
+.PHONY: bin kernel-src kernel lint test
 bin:
 	OPENFEO_BUILD_ID=$(BUILD_ID) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
+kernel-src:
+	$(KERNEL_ENV) kernel/build.sh fetch
+kernel: bin kernel-src
+	$(KERNEL_ENV) kernel/build.sh config $(CURDIR)/$(BIN)
+	$(KERNEL_ENV) kernel/build.sh build
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
