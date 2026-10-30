@@ -98,8 +98,7 @@ fn run(
         eprintln!("lab: /state/config.toml from {}", path.display());
     }
     let run_dir = lab.run_dir.clone();
-    let kea = daemons::kea_dhcp4(&lab.isp0, "wan0", &run_dir)?;
-    lab.daemons.push(kea);
+    lab.start_kea()?;
     let http = daemons::http_server(
         &lab.isp0,
         "203.0.113.1",
@@ -110,8 +109,9 @@ fn run(
     lab.daemons.push(http);
     let extra = chaos.map_or_else(String::new, |c| format!("openfeo.chaos={c}"));
     eprintln!(
-        "lab: p0 <-> isp0 wan0 {ISP0_ADDR} (kea-dhcp4, http :8080), p1 <-> isp1 wan1 {ISP1_ADDR}, \
-         p2 <-> lan0; serial console follows, Ctrl-A x quits"
+        "lab: p0 <-> isp0 wan0 {ISP0_ADDR} (kea-dhcp4 60 s leases, http :8080), p1 <-> isp1 wan1 \
+         {ISP1_ADDR}, p2 <-> lan0; --config harness/fixtures/vm-dhcp.toml takes the WAN address \
+         from Kea; serial console follows, Ctrl-A x quits"
     );
     let status = lab.boot_interactive(&extra)?.wait()?;
     Ok(if status.success() {

@@ -32,7 +32,7 @@ kernel: bin kernel-src
 	$(KERNEL_ENV) kernel/build.sh config $(CURDIR)/$(BIN)
 	$(KERNEL_ENV) kernel/build.sh build
 run: kernel
-	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage
+	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage $(if $(CONFIG),--config $(CONFIG),)
 test-harness: kernel
 	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --no-fail-fast --test netlink --test nft --test dhcp4 --test m0 --test m1 -- $(FILTER)
 check-env:
