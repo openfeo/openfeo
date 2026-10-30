@@ -31,3 +31,9 @@ the monitor as an ordinary notification.
   dump is lost.
 - The sandboxed `addr_and_route_primitives` scenario covers the behaviour: an address and a route
   added through the request path must appear in the cache.
+- The monitor is not restarted when its stream ends (a reconnect would need a fresh dump
+  republished onto the existing `watch` sender). Its death is reported to the health tracker as a
+  dead task, which withholds the heartbeat, and the watchdog reboots the box within a minute
+  (SPEC §5.3): the designed response to a control plane that can no longer see the kernel.
+  Revisit with a reconnect-and-redump path if a notification burst (`ENOBUFS` on the
+  multicast socket) ever triggers it in practice.

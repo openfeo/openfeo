@@ -62,6 +62,56 @@ async fn resolve(
     }
 }
 
+/// One best-effort pass: every operation is attempted, tolerated kernel answers (already there,
+/// already gone) count as done, and the first real failure is returned at the end, so one refused
+/// operation never starves the rest of the subsystem (a LAN stays reachable when another LAN's
+/// bridge cannot be created).
+#[derive(Debug, Default)]
+pub(crate) struct Pass {
+    ops: usize,
+    first_error: Option<ApplyError>,
+}
+
+impl Pass {
+    /// Record one operation's outcome. `tolerated` answers are success.
+    pub(crate) fn op(
+        &mut self,
+        op: &str,
+        result: Result<(), openfeo_netlink::Error>,
+        tolerated: impl Fn(&openfeo_netlink::Error) -> bool,
+    ) {
+        match result {
+            Ok(()) => {
+                tracing::info!("{op}");
+                self.ops += 1;
+            }
+            Err(err) if tolerated(&err) => {
+                tracing::info!("{op}");
+                self.ops += 1;
+            }
+            Err(err) => {
+                tracing::warn!("{op}: {err}");
+                self.fail(ApplyError::netlink(op.to_owned(), err));
+            }
+        }
+    }
+
+    /// Record a failure that was not a netlink operation (an interface that cannot be found).
+    pub(crate) fn fail(&mut self, err: ApplyError) {
+        if self.first_error.is_none() {
+            self.first_error = Some(err);
+        }
+    }
+
+    /// The pass's result: the first failure, or the operation count.
+    pub(crate) fn finish(self) -> Result<Report, ApplyError> {
+        match self.first_error {
+            Some(err) => Err(err),
+            None => Ok(Report { ops: self.ops }),
+        }
+    }
+}
+
 /// The interfaces OpenFeO manages, by name: its bridges and its physical ports (SPEC §7).
 #[must_use]
 pub fn is_managed(ifname: &str) -> bool {

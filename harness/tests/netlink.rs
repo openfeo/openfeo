@@ -54,6 +54,14 @@ const SCENARIOS: &[Scenario] = &[
         name: "foreign_state_is_untouched",
         run: foreign_state_is_untouched,
     },
+    Scenario {
+        name: "global_ipv6_address_is_untouched",
+        run: global_ipv6_address_is_untouched,
+    },
+    Scenario {
+        name: "partial_failure_still_applies_the_rest",
+        run: partial_failure_still_applies_the_rest,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -538,6 +546,78 @@ fn foreign_state_is_untouched(_lab: &mut Lab) -> anyhow::Result<()> {
         .await?;
         ensure!(netns::ip(&["-6", "addr", "show", "br-lan0"])?.contains("fe80::1/64"));
         ensure!(netns::ip(&["route", "show", "10.77.0.0/16"])?.contains("proto static"));
+        anyhow::Ok(())
+    })?
+}
+
+/// A global IPv6 address the kernel (SLAAC) or an operator put on a managed interface is not
+/// ours to delete: IPv6 ownership is M2's; until then the appliers own IPv4 only.
+fn global_ipv6_address_is_untouched(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, config) = build_static().await?;
+        netns::ip(&["addr", "add", "2001:db8::1/64", "dev", "br-lan0"])?;
+        wait_until(&mut rig.rx, "2001:db8::1/64 in the cache", |c| {
+            c.addrs
+                .iter()
+                .any(|a| a.net.to_string() == "2001:db8::1/64")
+        })
+        .await?;
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 0), "the pass touched the IPv6 address: {ops:?}");
+        ensure!(netns::ip(&["-6", "addr", "show", "br-lan0"])?.contains("2001:db8::1/64"));
+        anyhow::Ok(())
+    })?
+}
+
+/// One refused operation (a bridge name the kernel rejects as too long) does not stop the rest of
+/// the pass: the other LAN still gets its bridge and its address, and the failure is reported.
+fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let mut config = static_config()?;
+        config.lans.push(openfeo_config::Lan {
+            name: "guest-network".into(), // br-guest-network is 16 bytes: EINVAL from the kernel
+            ports: vec!["p1".into()],
+            ipv4: "192.168.9.1/24".into(),
+        });
+        let mut rig = Rig::connect().await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let world = world_from(&cache, &config);
+        let links = rig
+            .links
+            .apply(&openfeo_reconcile::links::links(&world), &cache, &rig.nl)
+            .await;
+        ensure!(links.is_err(), "the invalid bridge name must be reported");
+        wait_until(&mut rig.rx, "br-lan0 created despite the failure", |c| {
+            c.link_by_name("br-lan0").is_some()
+        })
+        .await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let world = world_from(&cache, &config);
+        let routing = rig
+            .routing
+            .apply(
+                &openfeo_reconcile::routing::routing(&world),
+                &cache,
+                &rig.nl,
+            )
+            .await;
+        ensure!(
+            routing.is_err(),
+            "the missing guest bridge must be reported by routing"
+        );
+        wait_until(
+            &mut rig.rx,
+            "lan0 address applied despite the failure",
+            |c| {
+                c.addrs
+                    .iter()
+                    .any(|a| a.net.to_string() == "192.168.1.1/24")
+            },
+        )
+        .await?;
+        ensure!(netns::ip(&["-4", "addr", "show", "br-lan0"])?.contains("192.168.1.1/24"));
         anyhow::Ok(())
     })?
 }

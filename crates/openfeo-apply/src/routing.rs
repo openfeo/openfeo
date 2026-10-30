@@ -2,19 +2,23 @@
 // Copyright (C) 2026 Andrew Newton
 
 //! The routing applier: addresses on managed interfaces and routes with `RTPROT_OPENFEO`. Adds
-//! what is missing; deletes global-scope addresses on managed interfaces and protocol-200 routes
-//! that are no longer desired; touches nothing else (link-local addresses, connected routes,
-//! anything on other interfaces, routes with other protocols).
+//! what is missing; deletes IPv4 global-scope addresses on managed interfaces and protocol-200
+//! routes that are no longer desired; touches nothing else (IPv6 addresses, whose ownership M2
+//! defines and which the kernel autoconfigures from router advertisements; link-local addresses;
+//! connected routes; anything on other interfaces; routes with other protocols). A pass is
+//! best-effort: a refused operation or a missing interface is reported at the end, after
+//! everything else was attempted.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use ipnet::IpNet;
-use openfeo_netlink::{Cache, Netlink, RTPROT_OPENFEO, Route, SCOPE_UNIVERSE};
+use openfeo_netlink::{
+    Cache, Error as NetlinkError, Netlink, RTPROT_OPENFEO, Route, SCOPE_UNIVERSE,
+};
 use openfeo_reconcile::routing::DesiredRouting;
-use tracing::info;
 
-use crate::{ApplyError, Report, is_managed, resolve};
+use crate::{ApplyError, Pass, Report, is_managed, resolve};
 
 /// Makes the kernel's addresses and routes match [`DesiredRouting`].
 #[derive(Debug, Default)]
@@ -31,66 +35,68 @@ impl RoutingApplier {
     ///
     /// # Errors
     ///
-    /// [`ApplyError::Netlink`] when the kernel refuses an operation, [`ApplyError::Unresolvable`]
-    /// when a desired interface does not exist yet.
+    /// The first failure of the pass, after every other operation was attempted:
+    /// [`ApplyError::Netlink`] when the kernel refused one, [`ApplyError::Unresolvable`] when a
+    /// desired interface does not exist yet.
     pub async fn apply(
         &mut self,
         desired: &DesiredRouting,
         observed: &Cache,
         nl: &Netlink,
     ) -> Result<Report, ApplyError> {
-        let mut ops = 0;
+        let mut pass = Pass::default();
 
         let mut wanted_addrs: BTreeSet<(u32, IpNet)> = BTreeSet::new();
         for addr in &desired.addrs {
-            let index = resolve(observed, nl, &addr.ifname).await?;
+            let index = match resolve(observed, nl, &addr.ifname).await {
+                Ok(index) => index,
+                Err(err) => {
+                    pass.fail(err);
+                    continue;
+                }
+            };
             wanted_addrs.insert((index, addr.net));
             let present = observed
                 .addrs
                 .iter()
                 .any(|a| a.ifindex == index && a.net == addr.net);
             if !present {
-                match nl.addr_add(index, addr.net).await {
-                    Ok(()) => {}
-                    Err(err) if err.is_exist() => {}
-                    Err(err) => {
-                        return Err(ApplyError::netlink(
-                            format!("add addr {} dev {}", addr.net, addr.ifname),
-                            err,
-                        ));
-                    }
-                }
-                info!("add addr {} dev {}", addr.net, addr.ifname);
-                ops += 1;
+                let op = format!("add addr {} dev {}", addr.net, addr.ifname);
+                pass.op(
+                    &op,
+                    nl.addr_add(index, addr.net).await,
+                    NetlinkError::is_exist,
+                );
             }
         }
         for addr in &observed.addrs {
             let Some(link) = observed.links.get(&addr.ifindex) else {
                 continue;
             };
-            if !is_managed(&link.name)
+            if !matches!(addr.net, IpNet::V4(_))
+                || !is_managed(&link.name)
                 || addr.scope != SCOPE_UNIVERSE
                 || wanted_addrs.contains(&(addr.ifindex, addr.net))
             {
                 continue;
             }
-            match nl.addr_del(addr.ifindex, addr.net).await {
-                Ok(()) => {}
-                Err(err) if err.is_absent() => {}
-                Err(err) => {
-                    return Err(ApplyError::netlink(
-                        format!("del addr {} dev {}", addr.net, link.name),
-                        err,
-                    ));
-                }
-            }
-            info!("del addr {} dev {}", addr.net, link.name);
-            ops += 1;
+            let op = format!("del addr {} dev {}", addr.net, link.name);
+            pass.op(
+                &op,
+                nl.addr_del(addr.ifindex, addr.net).await,
+                NetlinkError::is_absent,
+            );
         }
 
         let mut wanted_routes: BTreeSet<Route> = BTreeSet::new();
         for desired_route in &desired.routes {
-            let oif = resolve(observed, nl, &desired_route.ifname).await?;
+            let oif = match resolve(observed, nl, &desired_route.ifname).await {
+                Ok(index) => index,
+                Err(err) => {
+                    pass.fail(err);
+                    continue;
+                }
+            };
             let route = Route {
                 v6: desired_route.gateway.map_or_else(
                     || matches!(desired_route.dst, Some(IpNet::V6(_))),
@@ -103,16 +109,10 @@ impl RoutingApplier {
                 protocol: desired_route.protocol,
                 priority: desired_route.priority,
             };
-            let text = describe(&route, &desired_route.ifname);
             wanted_routes.insert(route.clone());
             if !observed.routes.contains(&route) {
-                match nl.route_add(&route).await {
-                    Ok(()) => {}
-                    Err(err) if err.is_exist() => {}
-                    Err(err) => return Err(ApplyError::netlink(format!("add route {text}"), err)),
-                }
-                info!("add route {text}");
-                ops += 1;
+                let op = format!("add route {}", describe(&route, &desired_route.ifname));
+                pass.op(&op, nl.route_add(&route).await, NetlinkError::is_exist);
             }
         }
         for route in &observed.routes {
@@ -123,17 +123,11 @@ impl RoutingApplier {
                 .oif
                 .and_then(|oif| observed.links.get(&oif))
                 .map_or("?", |link| link.name.as_str());
-            let text = describe(route, ifname);
-            match nl.route_del(route).await {
-                Ok(()) => {}
-                Err(err) if err.is_absent() => {}
-                Err(err) => return Err(ApplyError::netlink(format!("del route {text}"), err)),
-            }
-            info!("del route {text}");
-            ops += 1;
+            let op = format!("del route {}", describe(route, ifname));
+            pass.op(&op, nl.route_del(route).await, NetlinkError::is_absent);
         }
 
-        Ok(Report { ops })
+        pass.finish()
     }
 }
 

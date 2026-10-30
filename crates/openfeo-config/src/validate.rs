@@ -36,6 +36,26 @@ pub enum Code {
     EmptyPorts,
     /// `[[ports]]` disagrees with the live port map.
     PortMapMismatch,
+    /// A WAN or LAN name the kernel could not take as part of an interface name.
+    InvalidName,
+}
+
+/// Longest LAN name: `br-<lan>` must fit the kernel's 15-byte interface name.
+pub const MAX_LAN_NAME: usize = 15 - "br-".len();
+/// Longest WAN name: `ppp-<wan>` (M3) must fit the kernel's 15-byte interface name.
+pub const MAX_WAN_NAME: usize = 15 - "ppp-".len();
+
+/// A logical name the kernel accepts inside an interface name: `[a-z0-9][a-z0-9_-]*`, at most
+/// `max_len` bytes.
+#[must_use]
+pub fn is_valid_name(name: &str, max_len: usize) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    name.len() <= max_len
+        && first.is_ascii_lowercase() | first.is_ascii_digit()
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 impl Code {
@@ -53,6 +73,7 @@ impl Code {
             Code::MissingKind => "missing_kind",
             Code::EmptyPorts => "empty_ports",
             Code::PortMapMismatch => "port_map_mismatch",
+            Code::InvalidName => "invalid_name",
         }
     }
 }
@@ -111,7 +132,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
 
     for (i, wan) in config.wans.iter().enumerate() {
         let path = format!("wans[{i}]");
-        report.name(&mut names, &format!("{path}.name"), &wan.name);
+        report.name(&mut names, &format!("{path}.name"), &wan.name, MAX_WAN_NAME);
         report.port(&mut used_ports, ports, &format!("{path}.port"), &wan.port);
         match &wan.kind {
             None => report.push(
@@ -150,7 +171,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
 
     for (i, lan) in config.lans.iter().enumerate() {
         let path = format!("lans[{i}]");
-        report.name(&mut names, &format!("{path}.name"), &lan.name);
+        report.name(&mut names, &format!("{path}.name"), &lan.name, MAX_LAN_NAME);
         if lan.ports.is_empty() {
             report.push(
                 format!("{path}.ports"),
@@ -194,7 +215,23 @@ impl Report {
         });
     }
 
-    fn name<'c>(&mut self, names: &mut BTreeSet<&'c str>, path: &str, name: &'c str) {
+    fn name<'c>(
+        &mut self,
+        names: &mut BTreeSet<&'c str>,
+        path: &str,
+        name: &'c str,
+        max_len: usize,
+    ) {
+        if !is_valid_name(name, max_len) {
+            self.push(
+                path.to_owned(),
+                Code::InvalidName,
+                format!(
+                    "{name:?} must be 1 to {max_len} characters of [a-z0-9_-] starting with a letter or digit"
+                ),
+            );
+            return;
+        }
         if !names.insert(name) {
             self.push(
                 path.to_owned(),
@@ -455,5 +492,32 @@ mod tests {
             v.to_string(),
             "lans[0].ports[0]: unknown_port: no port named p7"
         );
+    }
+
+    #[test]
+    fn invalid_names_are_rejected() {
+        for (bad, what) in [
+            ("guest-network", "13 chars: br- prefix would exceed 15"),
+            ("Lan0", "uppercase"),
+            ("lan 0", "space"),
+            ("", "empty"),
+            ("-lan", "leading dash"),
+            ("lan/0", "slash"),
+        ] {
+            let mut cfg = base();
+            cfg.lans[0].name = bad.into();
+            let got = found(&cfg);
+            assert!(
+                got.contains(&("lans[0].name".to_owned(), Code::InvalidName)),
+                "{what}: {got:?}"
+            );
+        }
+        let mut cfg = base();
+        cfg.wans[0].name = "wan-too-long".into();
+        assert!(found(&cfg).contains(&("wans[0].name".to_owned(), Code::InvalidName)));
+        let mut cfg = base();
+        cfg.lans[0].name = "guest_lan_12".into();
+        cfg.wans[0].name = "wan_long_11".into();
+        assert_eq!(found(&cfg), vec![]);
     }
 }

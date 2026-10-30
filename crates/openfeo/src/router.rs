@@ -428,7 +428,6 @@ async fn apply_task(
                         backoff.as_secs()
                     );
                     failed = true;
-                    break;
                 }
             }
         }
