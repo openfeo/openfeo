@@ -33,6 +33,7 @@ lint:
 	cargo clippy -p openfeo --all-targets -- -D warnings
 	cargo deny check
 	scripts/check-spdx.sh
+	scripts/check-deps.sh
 test:
 	cargo test --workspace --lib --bins --all-features
 	cargo test -p openfeo

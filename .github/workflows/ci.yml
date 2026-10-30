@@ -15,6 +15,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: install the musl C toolchain (mimalloc) and e2fsprogs (harness unit tests)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools e2fsprogs
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -35,7 +39,7 @@ jobs:
       - name: install kernel build and harness dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 kea-dhcp4-server iproute2 bc flex bison libelf-dev libssl-dev ccache zstd cpio
+          sudo apt-get install -y qemu-system-x86 kea-dhcp4-server iproute2 iputils-ping e2fsprogs musl-tools bc flex bison libelf-dev libssl-dev ccache zstd cpio
       - name: allow KVM and user namespaces for the runner user
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
