@@ -13,6 +13,7 @@ harness = []
 
 [dependencies]
 openfeo-init = { path = "../openfeo-init" }
+openfeo-platform = { path = "../openfeo-platform" }
 anyhow.workspace = true
 
 [dev-dependencies]

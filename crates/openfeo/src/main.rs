@@ -7,7 +7,6 @@
 
 mod chaos;
 mod cli;
-mod ports;
 mod router;
 mod version;
 

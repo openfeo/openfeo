@@ -13,8 +13,9 @@ use openfeo_init::cmdline::{Cmdline, Mode};
 use openfeo_init::ctl::{CtlPipe, HEARTBEAT_INTERVAL, Msg};
 use openfeo_init::log::Log;
 
+use openfeo_platform::ports;
+
 use crate::chaos::{self, Chaos};
-use crate::ports;
 
 const SYSFS_CLASS_NET: &str = "/sys/class/net";
 
