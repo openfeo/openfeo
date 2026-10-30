@@ -471,7 +471,8 @@ openfeo/
   image/                       installer, ESP layout, systemd-boot fetch/build, signing tools
   crates/
     openfeo-init               PID 1: mounts, reaper, supervisor, watchdog, console menu (no tokio)
-    openfeo-world              World, facts, health, event bus, supervisor runtime
+    openfeo-world              World, facts, port naming, health types (pure: no tokio, no clocks; ADR-0009)
+    openfeo-runtime            World publisher, health tracker, task supervisor, log ring (tokio; ADR-0009)
     openfeo-proto-dhcp4        sans-IO client + server cores and wire format
     openfeo-proto-dhcp6        sans-IO client (NA/PD) + stateless server
     openfeo-proto-ndp          sans-IO RA client + RA server

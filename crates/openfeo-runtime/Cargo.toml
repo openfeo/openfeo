@@ -1,0 +1,21 @@
+[package]
+name = "openfeo-runtime"
+description = "OpenFeO runtime glue on tokio: World publisher, health tracker, task supervisor, tracing ring (ADR-0009)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+openfeo-world = { path = "../openfeo-world" }
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+openfeo-config = { path = "../openfeo-config" }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
