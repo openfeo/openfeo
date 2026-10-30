@@ -21,8 +21,9 @@ use openfeo_apply::routing::RoutingApplier;
 use openfeo_apply::sysctl::SysctlApplier;
 use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_harness::lab::Lab;
+use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::scenario::{Scenario, run_all};
-use openfeo_harness::{netns, nftprobe, sandbox};
+use openfeo_harness::{daemons, lanclient, netns, nftprobe, sandbox};
 use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, TABLE_MAIN};
 use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
@@ -80,6 +81,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "sysctl_for_a_missing_interface_is_reported_last",
         run: sysctl_for_a_missing_interface_is_reported_last,
+    },
+    Scenario {
+        name: "http_get_reaches_a_server_in_the_sandbox",
+        run: http_get_reaches_a_server_in_the_sandbox,
     },
 ];
 
@@ -754,5 +759,40 @@ fn sysctl_for_a_missing_interface_is_reported_last(_lab: &mut Lab) -> anyhow::Re
         forwarding? == "1",
         "ip_forward must still have been written"
     );
+    Ok(())
+}
+
+/// The in-namespace HTTP client reaches a server started in the same namespace (here the lab's
+/// ISP namespace on its own address), returns the body, and the server logged the request.
+fn http_get_reaches_a_server_in_the_sandbox(lab: &mut Lab) -> anyhow::Result<()> {
+    let dir = lab.run_dir.join("http-sandbox");
+    std::fs::create_dir_all(&dir)?;
+    let server = daemons::http_server(&lab.isp0, "203.0.113.1", 8081, &dir, "hello from isp0")?;
+    server.log.wait_for(
+        &mut Cursor::default(),
+        &Regex::new(r"Serving HTTP on")?,
+        Duration::from_secs(5),
+    )?;
+    let body = lanclient::http_get(
+        &lab.isp0,
+        "203.0.113.1:8081".parse()?,
+        "/",
+        Duration::from_secs(5),
+    )?;
+    ensure!(body.trim() == "hello from isp0", "unexpected body {body:?}");
+    ensure!(
+        server.log.count(&Regex::new(
+            r#"203\.0\.113\.1 - - .*"GET / HTTP/1\.0" 200"#
+        )?) == 1,
+        "server log lacks the request: {:?}",
+        server.log.tail(5)
+    );
+    let refused = lanclient::http_get(
+        &lab.isp0,
+        "203.0.113.1:8082".parse()?,
+        "/",
+        Duration::from_secs(2),
+    );
+    ensure!(refused.is_err(), "a closed port must be an error");
     Ok(())
 }

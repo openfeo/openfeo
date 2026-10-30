@@ -21,6 +21,16 @@ use crate::statedisk;
 pub const ISP0_ADDR: &str = "203.0.113.1/24";
 /// ISP B's side of the WAN B link (TEST-NET-2).
 pub const ISP1_ADDR: &str = "198.51.100.1/24";
+/// The LAN host's address (the LAN namespace's end of the LAN tap) on the router's LAN subnet.
+pub const LAN_HOST_ADDR: &str = "192.168.1.2/24";
+/// The router's LAN address, the LAN host's gateway.
+pub const LAN_GATEWAY: &str = "192.168.1.1";
+/// The router's static WAN address, as `isp0` sees it.
+pub const WAN_ADDR: &str = "203.0.113.10";
+/// What the ISP-side HTTP target serves.
+pub const ISP_HTTP_BODY: &str = "openfeo isp target";
+/// What the LAN-side HTTP target serves.
+pub const LAN_HTTP_BODY: &str = "openfeo lan target";
 /// The router's port MACs, in port order.
 pub const MACS: [&str; 3] = [
     "52:54:00:fe:00:00",
@@ -92,6 +102,33 @@ impl Lab {
             isp1,
             lan0,
         })
+    }
+
+    /// Make the LAN namespace a LAN host: `lan0` up at [`LAN_HOST_ADDR`] with the router as its
+    /// default gateway.
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn lan_side_host(&self) -> Result<()> {
+        self.lan0.ip(&["link", "set", "lan0", "up"])?;
+        self.lan0
+            .ip(&["addr", "replace", LAN_HOST_ADDR, "dev", "lan0"])?;
+        self.lan0
+            .ip(&["route", "replace", "default", "via", LAN_GATEWAY])?;
+        Ok(())
+    }
+
+    /// Teach the ISP namespace the way to the LAN subnet through the router's WAN address, so
+    /// an ISP-side host can try to reach LAN hosts directly (which the firewall must refuse).
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn isp_route_to_lan(&self) -> Result<()> {
+        self.isp0
+            .ip(&["route", "replace", "192.168.1.0/24", "via", WAN_ADDR])?;
+        Ok(())
     }
 
     /// Boot the router with the lab's three taps as ports `p0..p2` and the console captured.

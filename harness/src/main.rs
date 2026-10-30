@@ -12,7 +12,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use openfeo_harness::lab::{ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
+use openfeo_harness::lab::{ISP_HTTP_BODY, ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
 use openfeo_harness::{daemons, qemu, sandbox};
 use openfeo_harness::{nftprobe, scenario};
 
@@ -100,10 +100,18 @@ fn run(
     let run_dir = lab.run_dir.clone();
     let kea = daemons::kea_dhcp4(&lab.isp0, "wan0", &run_dir)?;
     lab.daemons.push(kea);
+    let http = daemons::http_server(
+        &lab.isp0,
+        "203.0.113.1",
+        8080,
+        &run_dir.join("isp-http"),
+        ISP_HTTP_BODY,
+    )?;
+    lab.daemons.push(http);
     let extra = chaos.map_or_else(String::new, |c| format!("openfeo.chaos={c}"));
     eprintln!(
-        "lab: p0 <-> isp0 wan0 {ISP0_ADDR} (kea-dhcp4), p1 <-> isp1 wan1 {ISP1_ADDR}, p2 <-> lan0; \
-         serial console follows, Ctrl-A x quits"
+        "lab: p0 <-> isp0 wan0 {ISP0_ADDR} (kea-dhcp4, http :8080), p1 <-> isp1 wan1 {ISP1_ADDR}, \
+         p2 <-> lan0; serial console follows, Ctrl-A x quits"
     );
     let status = lab.boot_interactive(&extra)?.wait()?;
     Ok(if status.success() {
