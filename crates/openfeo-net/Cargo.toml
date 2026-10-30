@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-net"
+description = "OpenFeO socket and timer drivers for the sans-IO protocol cores (SPEC §6.3, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
+libc.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

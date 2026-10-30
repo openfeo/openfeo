@@ -2,9 +2,9 @@
   "Dhcp4": {
     "interfaces-config": { "interfaces": [ "{{IFACE}}" ] },
     "lease-database": { "type": "memfile", "persist": false },
-    "valid-lifetime": 600,
-    "renew-timer": 300,
-    "rebind-timer": 450,
+    "valid-lifetime": 60,
+    "renew-timer": 20,
+    "rebind-timer": 40,
     "subnet4": [
       {
         "id": 1,
@@ -12,7 +12,11 @@
         "pools": [ { "pool": "203.0.113.100 - 203.0.113.200" } ],
         "option-data": [
           { "name": "routers", "data": "203.0.113.1" },
-          { "name": "domain-name-servers", "data": "203.0.113.1" }
+          { "name": "domain-name-servers", "data": "203.0.113.1" },
+          { "name": "domain-name", "data": "isp.example" },
+          { "name": "interface-mtu", "data": "1400" },
+          { "name": "ntp-servers", "data": "203.0.113.1" },
+          { "name": "classless-static-route", "data": "0.0.0.0/0 - 203.0.113.1, 198.51.100.0/24 - 203.0.113.1" }
         ]
       }
     ]

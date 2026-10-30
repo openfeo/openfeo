@@ -18,7 +18,7 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 ## Rules
 - Rust stable, edition 2024, musl targets. `clippy -D warnings`, pedantic as warnings. No `unwrap`/`expect`
   outside tests. `thiserror` in libraries, `anyhow` only in `crates/openfeo` and `harness/`.
-- `#![forbid(unsafe_code)]` everywhere except `openfeo-init` (and later `openfeo-nft`), where `unsafe` is
+- `#![forbid(unsafe_code)]` everywhere except `openfeo-init`, `openfeo-nft` and `openfeo-net` (ADR-0013), where `unsafe` is
   confined to `sys.rs` with `// SAFETY:` comments.
 - No shelling out: `std::process::Command` is banned outside `harness/` and `image/` (clippy enforces it).
 - Only `openfeo-netlink`, `openfeo-nft`, `openfeo-net`, `openfeo-platform` and `openfeo-init` may call the kernel;
