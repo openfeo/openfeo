@@ -157,6 +157,17 @@ ipv4 = "192.168.1.1/24"
     }
 
     #[test]
+    fn parses_firewall_section() {
+        let text = "config_version = 1\n\n[firewall]\nwan_ping = true\n\n[[firewall.port_forwards]]\nname = \"lan-http\"\nproto = \"tcp\"\nport = 2222\nto = \"192.168.1.2\"\nto_port = 8080\n";
+        let cfg = parse(text).unwrap();
+        let firewall = cfg.firewall.unwrap();
+        assert!(firewall.wan_ping);
+        assert_eq!(firewall.port_forwards[0].name, "lan-http");
+        assert_eq!(firewall.port_forwards[0].to, "192.168.1.2");
+        assert_eq!(firewall.port_forwards[0].to_port, 8080);
+    }
+
+    #[test]
     fn portmap_file_round_trips() {
         let text = "[[ports]]\nid = \"pci-0000:00:03.0\"\nname = \"p0\"\n\n[[ports]]\nid = \"pci-0000:00:04.0\"\nname = \"p1\"\n";
         let map = parse_portmap(text).unwrap();
