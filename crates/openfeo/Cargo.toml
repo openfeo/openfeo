@@ -21,6 +21,9 @@ openfeo-netlink = { path = "../openfeo-netlink" }
 openfeo-nft = { path = "../openfeo-nft" }
 openfeo-reconcile = { path = "../openfeo-reconcile" }
 openfeo-apply = { path = "../openfeo-apply" }
+openfeo-net = { path = "../openfeo-net" }
+openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
+ipnet.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

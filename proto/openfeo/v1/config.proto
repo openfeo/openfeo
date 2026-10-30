@@ -126,6 +126,9 @@ message Dhcp4Lease {
   uint32 t2_secs = 12;
   // Wall-clock seconds when the ACK arrived; informational.
   uint64 obtained_unix = 13;
+  repeated string ntp = 14;
+  // Option 28; empty = none.
+  string broadcast = 15;
 }
 
 // A LAN is a bridge of one or more ports (SPEC §7.1).

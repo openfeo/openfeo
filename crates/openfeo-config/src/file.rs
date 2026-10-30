@@ -233,6 +233,8 @@ ipv4 = "192.168.1.1/24"
             t1_secs: 20,
             t2_secs: 40,
             obtained_unix: 1_793_491_200,
+            ntp: vec!["203.0.113.1".into()],
+            broadcast: "203.0.113.255".into(),
         };
         let text = render_dhcp4_lease(&lease).unwrap();
         assert!(text.contains("address = \"203.0.113.100/24\""), "{text}");

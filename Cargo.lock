@@ -968,13 +968,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "ipnet",
  "mimalloc",
  "openfeo-apply",
  "openfeo-config",
  "openfeo-init",
+ "openfeo-net",
  "openfeo-netlink",
  "openfeo-nft",
  "openfeo-platform",
+ "openfeo-proto-dhcp4",
  "openfeo-reconcile",
  "openfeo-runtime",
  "openfeo-world",
@@ -1131,6 +1134,7 @@ dependencies = [
 name = "openfeo-world"
 version = "0.1.0"
 dependencies = [
+ "ipnet",
  "openfeo-config",
  "serde",
  "serde_json",
