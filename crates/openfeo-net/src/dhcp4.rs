@@ -193,6 +193,10 @@ impl Driver {
     /// When a socket for a new phase cannot be opened.
     pub fn link(&mut self, up: bool) -> Result<Vec<Event>, DriverError> {
         let now = self.now();
+        if up && matches!(self.transport, Transport::Raw(_)) {
+            // A packet socket whose device went down may have been unbound; take a fresh one.
+            self.transport = Transport::Raw(raw_socket(self.config.ifindex)?);
+        }
         let input = if up { Input::LinkUp } else { Input::LinkDown };
         let outputs = self.client.handle(input, now);
         self.perform(outputs)
@@ -222,10 +226,10 @@ impl Driver {
                     self.use_udp()?;
                     events.push(Event::Bound { lease, renewed });
                 }
-                Output::Rebooting(address) => {
-                    self.use_raw()?;
-                    events.push(Event::Rebooting(address));
-                }
+                // Rebooting keeps the current socket: at start it is the raw one; after a link
+                // flap the address is still configured, the REQUEST goes out over UDP and the
+                // core asks for a unicast reply, so a busy WAN is not copied to userspace.
+                Output::Rebooting(address) => events.push(Event::Rebooting(address)),
                 Output::Unbound(why) => {
                     self.use_raw()?;
                     events.push(Event::Unbound(why));
@@ -321,6 +325,15 @@ fn raw_socket(ifindex: u32) -> Result<AsyncFd<OwnedFd>, DriverError> {
     sys::register(fd).map_err(io_err("register packet socket"))
 }
 
+/// Errors the kernel reports on a socket whose device went down or away: the core's timers and
+/// the next link-up recover from them, so they are logged, not fatal.
+fn is_transient(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::ENETDOWN | libc::ENXIO | libc::ENODEV)
+    )
+}
+
 async fn wait_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -348,16 +361,46 @@ async fn receive(transport: &Transport, buf: &mut [u8]) -> Result<Option<Vec<u8>
                         _ => None,
                     });
                 }
+                Ok(Err(err)) if is_transient(&err) => {
+                    warn!("dhcp4: packet socket: {err}; waiting for the link");
+                    return Ok(None);
+                }
                 Ok(Err(err)) => return Err(io_err("receive on packet socket")(err)),
                 Err(_would_block) => {}
             }
         },
         Transport::Udp(socket) => {
-            let (len, _) = socket
-                .recv_from(buf)
-                .await
-                .map_err(io_err("receive on UDP socket"))?;
+            let (len, _) = match socket.recv_from(buf).await {
+                Ok(received) => received,
+                Err(err) if is_transient(&err) => {
+                    warn!("dhcp4: UDP socket: {err}; waiting for the link");
+                    return Ok(None);
+                }
+                Err(err) => return Err(io_err("receive on UDP socket")(err)),
+            };
             Ok(Some(buf[..len].to_vec()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_errors_are_transient_but_others_are_not() {
+        for errno in [libc::ENETDOWN, libc::ENXIO, libc::ENODEV] {
+            assert!(
+                is_transient(&std::io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        for errno in [libc::EBADF, libc::EINVAL, libc::EPERM] {
+            assert!(
+                !is_transient(&std::io::Error::from_raw_os_error(errno)),
+                "{errno}"
+            );
+        }
+        assert!(!is_transient(&std::io::Error::other("no errno")));
     }
 }

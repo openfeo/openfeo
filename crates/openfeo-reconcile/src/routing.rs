@@ -6,9 +6,9 @@
 //! `RTPROT_OPENFEO` and carrying the WAN's priority as metric.
 
 use std::collections::BTreeSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net};
 use openfeo_config::wan;
 use openfeo_world::World;
 use serde::Serialize;
@@ -95,17 +95,35 @@ pub fn routing(world: &World) -> DesiredRouting {
                     ifname: wan_config.port.clone(),
                     net: IpNet::V4(lease.address),
                 });
-                if lease.routes.is_empty() {
-                    if let Some(gateway) = lease.gateway {
-                        desired.routes.insert(route(None, IpAddr::V4(gateway)));
-                    }
+                // RFC 3442: classless routes replace the router option, and `0.0.0.0/0` among
+                // them is the default route. A gateway outside the leased subnet (a /32 lease,
+                // say) first gets a host route on the port, or the kernel refuses the route
+                // through it.
+                let wanted: Vec<(Option<IpNet>, Ipv4Addr)> = if lease.routes.is_empty() {
+                    lease
+                        .gateway
+                        .map(|gateway| (None, gateway))
+                        .into_iter()
+                        .collect()
                 } else {
-                    // RFC 3442: classless routes replace the router option; `0.0.0.0/0` among
-                    // them is the default route.
-                    for (dst, via) in &lease.routes {
-                        let dst = (dst.prefix_len() > 0).then_some(IpNet::V4(*dst));
-                        desired.routes.insert(route(dst, IpAddr::V4(*via)));
+                    lease
+                        .routes
+                        .iter()
+                        .map(|(dst, via)| ((dst.prefix_len() > 0).then_some(IpNet::V4(*dst)), *via))
+                        .collect()
+                };
+                for (dst, via) in wanted {
+                    if !lease.address.contains(&via) {
+                        desired.routes.insert(DesiredRoute {
+                            ifname: wan_config.port.clone(),
+                            dst: Some(IpNet::V4(Ipv4Net::from(via))),
+                            gateway: None,
+                            table: TABLE_MAIN,
+                            protocol: RTPROT_OPENFEO,
+                            priority: wan_config.priority,
+                        });
                     }
+                    desired.routes.insert(route(dst, IpAddr::V4(via)));
                 }
             }
             None => {}
@@ -224,6 +242,45 @@ mod tests {
         let addrs: Vec<String> = desired.addrs.iter().map(|a| a.ifname.clone()).collect();
         assert_eq!(addrs, ["br-lan0"]);
         assert_eq!(desired.routes, BTreeSet::new());
+    }
+
+    #[test]
+    fn prefix_only_classless_routes_invent_no_default() {
+        let mut world = fixtures::dhcp_world();
+        let mut fact = fixtures::dhcp_fact();
+        fact.routes.retain(|(dst, _)| dst.prefix_len() > 0);
+        fact.gateway = Some("203.0.113.9".parse().unwrap());
+        world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        assert_eq!(
+            routes_of(&routing(&world)),
+            ["198.51.100.0/24 via 203.0.113.1 dev p0 proto 200 metric 10"]
+        );
+    }
+
+    #[test]
+    fn off_link_gateway_gets_a_host_route_first() {
+        let mut world = fixtures::dhcp_world();
+        let mut fact = fixtures::dhcp_fact();
+        fact.address = "203.0.113.100/32".parse().unwrap();
+        fact.routes.clear();
+        fact.gateway = Some("203.0.113.1".parse().unwrap());
+        world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        assert_eq!(
+            routes_of(&routing(&world)),
+            [
+                "default via 203.0.113.1 dev p0 proto 200 metric 10",
+                "203.0.113.1/32 via - dev p0 proto 200 metric 10",
+            ]
+        );
+        let mut fact = fixtures::dhcp_fact();
+        fact.address = "203.0.113.100/32".parse().unwrap();
+        world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        let routes = routes_of(&routing(&world));
+        assert!(
+            routes.contains(&"203.0.113.1/32 via - dev p0 proto 200 metric 10".to_owned()),
+            "{routes:?}"
+        );
+        assert_eq!(routes.len(), 3, "one host route for both classless routes");
     }
 
     #[test]

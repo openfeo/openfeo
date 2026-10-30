@@ -38,6 +38,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "client_without_a_server_retransmits",
         run: client_without_a_server_retransmits,
     },
+    Scenario {
+        name: "client_survives_the_port_going_down_and_up",
+        run: client_survives_the_port_going_down_and_up,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -374,5 +378,31 @@ fn client_without_a_server_retransmits(lab: &mut Lab) -> anyhow::Result<()> {
     ensure!(result.is_err(), "bound without a server: {result:?}");
     ensure!(counters.discovers >= 2, "counters {counters:?}");
     ensure!(state == State::Selecting, "state {state:?}");
+    Ok(())
+}
+
+/// The port goes administratively down and up while the client is unaddressed: the packet
+/// socket's error is not fatal, and a lease still arrives once the link is back.
+fn client_survives_the_port_going_down_and_up(lab: &mut Lab) -> anyhow::Result<()> {
+    let rig = Rig::create(lab, true)?;
+    let events = block_on(async {
+        let mut driver = rig.driver(None)?;
+        netns::ip(&["link", "set", CLIENT_IF, "down"])?;
+        driver.link(false)?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Ok(stepped) = tokio::time::timeout(Duration::from_millis(500), driver.step()).await {
+            stepped.context("a step while the port is down")?;
+        }
+        netns::ip(&["link", "set", CLIENT_IF, "up"])?;
+        driver.link(true)?;
+        run_until(&mut driver, LEASE_TIMEOUT, |event| {
+            matches!(event, Event::Bound { .. })
+        })
+        .await
+    })??;
+    ensure!(
+        bound_lease(&events).is_some(),
+        "no lease after the flap: {events:?}"
+    );
     Ok(())
 }

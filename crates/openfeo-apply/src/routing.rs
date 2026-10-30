@@ -16,7 +16,7 @@ use ipnet::IpNet;
 use openfeo_netlink::{
     Cache, Error as NetlinkError, Netlink, RTPROT_OPENFEO, Route, SCOPE_UNIVERSE,
 };
-use openfeo_reconcile::routing::DesiredRouting;
+use openfeo_reconcile::routing::{DesiredRoute, DesiredRouting};
 
 use crate::{ApplyError, Pass, Report, is_managed, resolve};
 
@@ -89,7 +89,11 @@ impl RoutingApplier {
         }
 
         let mut wanted_routes: BTreeSet<Route> = BTreeSet::new();
-        for desired_route in &desired.routes {
+        // Routes without a gateway (hosts on the port) first: a route through such a host is
+        // refused until it exists.
+        let mut ordered: Vec<&DesiredRoute> = desired.routes.iter().collect();
+        ordered.sort_by_key(|route| route.gateway.is_some());
+        for desired_route in ordered {
             let oif = match resolve(observed, nl, &desired_route.ifname).await {
                 Ok(index) => index,
                 Err(err) => {

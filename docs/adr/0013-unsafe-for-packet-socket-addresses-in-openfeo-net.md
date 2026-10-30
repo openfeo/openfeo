@@ -37,4 +37,6 @@ raw-address constructors are unsafe too.
 - Should nix grow a safe `LinkAddr` constructor, the module goes and this ADR is superseded.
 - The driver receives all IPv4 frames of one WAN port while unaddressed and filters UDP port
   68 in userspace; no BPF filter is attached (that would be another unsafe `setsockopt`), and
-  a WAN without an address carries next to no traffic.
+  a WAN without an address carries next to no traffic. INIT-REBOOT after a link flap, when the
+  address is still configured and traffic may be flowing, stays on the UDP socket and asks for
+  a unicast reply; the packet socket returns only once the lease is gone.

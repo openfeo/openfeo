@@ -872,7 +872,8 @@ mod tests {
         ));
     }
 
-    /// Seeds for `fuzz/corpus/dhcp4_message`; run once with `-- --ignored write_fuzz_corpus`.
+    /// The committed seeds of `fuzz/corpus/dhcp4_message` (SPEC §11); rerun with
+    /// `-- --ignored write_fuzz_corpus` when the encoder changes.
     #[test]
     #[ignore = "writes fuzz/corpus/dhcp4_message; run on demand"]
     fn write_fuzz_corpus() {
@@ -898,7 +899,7 @@ mod tests {
             }]));
         ack.options[0] = DhcpOption::MessageType(MessageType::Ack);
         for (name, m) in [("discover", discover()), ("offer", offer), ("ack", ack)] {
-            std::fs::write(dir.join(format!("{name}.bin")), m.encode()).unwrap();
+            std::fs::write(dir.join(format!("seed-{name}.bin")), m.encode()).unwrap();
         }
     }
 }

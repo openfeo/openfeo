@@ -20,7 +20,9 @@ pub type Timestamp = u64;
 pub const PARAMETERS: [u8; 11] = [1, 3, 6, 15, 28, 26, 121, 249, 42, 58, 59];
 
 const MS: Timestamp = 1000;
-const MAX_MESSAGE_SIZE: u16 = 1500;
+/// Option 57: the DHCP message size we accept. 1500 minus the IPv4 and UDP headers, so a reply
+/// that fills it still fits one Ethernet frame; a fragment would be dropped on the raw path.
+const MAX_MESSAGE_SIZE: u16 = 1472;
 /// Retransmission waits for DISCOVER and REQUEST: 4 s doubling to 64 s, ±1 s (RFC 2131 §4.1).
 const FIRST_BACKOFF: Timestamp = 4 * MS;
 const MAX_BACKOFF: Timestamp = 64 * MS;
@@ -30,6 +32,10 @@ const MIN_RETRANSMIT: Timestamp = 60 * MS;
 /// REQUESTING and REBOOTING give up after this many sends and go back to INIT.
 const MAX_REQUEST_SENDS: u8 = 3;
 const INFINITE: u32 = u32::MAX;
+/// A lease shorter than this is no lease: it would renew, rebind and expire at once.
+const MIN_LEASE_SECS: u32 = 10;
+/// The least wait after a NAK before the next DISCOVER (RFC 2131 §4.4.1); doubles per NAK.
+const NAK_HOLDOFF: Timestamp = 10 * MS;
 /// A lease MTU outside this is ignored.
 const MTU_RANGE: RangeInclusive<u16> = 576..=9216;
 const UNSPEC: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
@@ -95,6 +101,10 @@ pub enum LeaseError {
     NoServer,
     #[error("no lease time")]
     NoLeaseTime,
+    #[error("lease of {0} s is shorter than {MIN_LEASE_SECS} s")]
+    LeaseTooShort(u32),
+    #[error("{0} is not a unicast address")]
+    BadAddress(Ipv4Addr),
 }
 
 impl Lease {
@@ -107,23 +117,35 @@ impl Lease {
         if msg.yiaddr.is_unspecified() {
             return Err(LeaseError::NoAddress);
         }
+        if !is_unicast(msg.yiaddr) {
+            return Err(LeaseError::BadAddress(msg.yiaddr));
+        }
         let Some(DhcpOption::ServerIdentifier(server)) = msg.option(54) else {
             return Err(LeaseError::NoServer);
         };
         let Some(DhcpOption::AddressLeaseTime(lease_secs)) = msg.option(51) else {
             return Err(LeaseError::NoLeaseTime);
         };
+        if *lease_secs < MIN_LEASE_SECS {
+            return Err(LeaseError::LeaseTooShort(*lease_secs));
+        }
         let mask = match msg.option(1) {
             Some(DhcpOption::SubnetMask(mask)) => Some(*mask),
             _ => None,
         };
-        let routes = match (msg.option(121), msg.option(249)) {
+        let routes: Vec<ClasslessRoute> = match (msg.option(121), msg.option(249)) {
             (Some(DhcpOption::ClasslessStaticRoute(routes)), _)
-            | (_, Some(DhcpOption::MsClasslessStaticRoute(routes))) => routes.clone(),
+            | (_, Some(DhcpOption::MsClasslessStaticRoute(routes))) => routes
+                .iter()
+                .filter(|route| is_unicast(route.via))
+                .copied()
+                .collect(),
             _ => Vec::new(),
         };
         let gateway = match msg.option(3) {
-            Some(DhcpOption::Router(list)) if routes.is_empty() => list.first().copied(),
+            Some(DhcpOption::Router(list)) if routes.is_empty() => {
+                list.iter().copied().find(|router| is_unicast(*router))
+            }
             _ => None,
         };
         let t1 = match msg.option(58) {
@@ -188,11 +210,22 @@ impl Lease {
     }
 }
 
-/// The prefix length of a contiguous mask, or the address's class when there is none.
+/// An address a host can hold or send to: not unspecified, "this network", loopback, multicast,
+/// class E or broadcast.
+fn is_unicast(address: Ipv4Addr) -> bool {
+    let first = address.octets()[0];
+    !address.is_unspecified()
+        && first != 0
+        && !address.is_loopback()
+        && !address.is_multicast()
+        && first < 240
+}
+
+/// The prefix length of a contiguous, non-empty mask, or the address's class when there is none.
 fn prefix_of(mask: Option<Ipv4Addr>, address: Ipv4Addr) -> u8 {
     if let Some(mask) = mask {
         let bits = u32::from(mask);
-        if bits.leading_ones() + bits.trailing_zeros() == 32 {
+        if bits != 0 && bits.leading_ones() + bits.trailing_zeros() == 32 {
             return u8::try_from(bits.leading_ones()).unwrap_or(32);
         }
     }
@@ -246,7 +279,7 @@ pub enum Output {
     Bound { lease: Lease, renewed: bool },
     /// Confirming this address with INIT-REBOOT.
     Rebooting(Ipv4Addr),
-    /// The lease is gone.
+    /// The lease, or the address being asked for, is gone.
     Unbound(Unbound),
     /// A DISCOVER went out.
     Discover,
@@ -296,6 +329,11 @@ pub struct Client {
     lease: Option<Lease>,
     /// When the lease was last acknowledged: T1, T2 and expiry count from here.
     bound_at: Timestamp,
+    /// The lease's address is configured on the interface (from `Bound` until it is gone), so a
+    /// REQUEST may ask for a unicast reply.
+    addressed: bool,
+    /// The wait before the next DISCOVER after a NAK; doubles per NAK, reset when bound.
+    nak_wait: Timestamp,
 }
 
 impl Client {
@@ -315,6 +353,8 @@ impl Client {
             offer: None,
             lease: None,
             bound_at: 0,
+            addressed: false,
+            nak_wait: NAK_HOLDOFF,
         }
     }
 
@@ -324,6 +364,7 @@ impl Client {
         match input {
             Input::Start { lease } => {
                 self.carrier = true;
+                self.addressed = false;
                 match lease {
                     Some(lease) => self.reboot(lease, now, &mut out),
                     None => self.discover(now, &mut out),
@@ -367,7 +408,25 @@ impl Client {
         self.backoff = FIRST_BACKOFF;
         self.sends = 0;
         self.offer = None;
+        self.addressed = false;
         self.send_discover(now, out);
+    }
+
+    /// After a NAK: back to SELECTING, with no DISCOVER for at least ten seconds (RFC 2131
+    /// §4.4.1) and longer after repeated refusals, so a server that refuses everything is not
+    /// asked again at network speed.
+    fn hold_off(&mut self, now: Timestamp) {
+        self.state = State::Selecting;
+        self.xid = self.random_xid();
+        self.started = now;
+        self.backoff = FIRST_BACKOFF;
+        self.sends = 0;
+        self.offer = None;
+        self.lease = None;
+        self.addressed = false;
+        let jitter = self.random() % (2 * JITTER + 1);
+        self.timeout = Some(now + (self.nak_wait + jitter).saturating_sub(JITTER));
+        self.nak_wait = (self.nak_wait * 2).min(MAX_BACKOFF);
     }
 
     fn reboot(&mut self, lease: Lease, now: Timestamp, out: &mut Vec<Output>) {
@@ -411,7 +470,7 @@ impl Client {
             return self.discover(now, out);
         };
         let extra = vec![DhcpOption::RequestedIpAddress(address)];
-        let message = self.message(MessageType::Request, now, UNSPEC, true, extra);
+        let message = self.message(MessageType::Request, now, UNSPEC, !self.addressed, extra);
         out.push(Output::Request(address));
         out.push(send(UNSPEC, BROADCAST, &message));
         self.sends += 1;
@@ -544,19 +603,22 @@ impl Client {
                 let renewed = matches!(self.state, State::Renewing | State::Rebinding);
                 self.state = State::Bound;
                 self.bound_at = now;
+                self.addressed = true;
+                self.nak_wait = NAK_HOLDOFF;
                 self.timeout = (!lease.is_infinite()).then(|| self.deadline(lease.t1_secs));
                 self.lease = Some(lease.clone());
                 out.push(Output::Bound { lease, renewed });
             }
-            (State::Requesting, MessageType::Nak) => self.discover(now, out),
-            (State::Rebooting | State::Renewing | State::Rebinding, MessageType::Nak) => {
+            (
+                State::Requesting | State::Rebooting | State::Renewing | State::Rebinding,
+                MessageType::Nak,
+            ) => {
                 let text = match msg.option(56) {
                     Some(DhcpOption::Message(text)) => Some(text.clone()),
                     _ => None,
                 };
                 out.push(Output::Unbound(Unbound::Nak(text)));
-                self.lease = None;
-                self.discover(now, out);
+                self.hold_off(now);
             }
             _ => {}
         }
@@ -665,7 +727,7 @@ fn send(src: Ipv4Addr, dst: Ipv4Addr, message: &Message) -> Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{DhcpOption, FLAG_BROADCAST, Message, MessageType, Op};
+    use crate::wire::{ClasslessRoute, DhcpOption, FLAG_BROADCAST, Message, MessageType, Op};
     use std::net::Ipv4Addr;
 
     const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xfe, 0x00, 0x00];
@@ -794,7 +856,7 @@ mod tests {
             m.option(55),
             Some(&DhcpOption::ParameterRequestList(PARAMETERS.to_vec()))
         );
-        assert_eq!(m.option(57), Some(&DhcpOption::MaxMessageSize(1500)));
+        assert_eq!(m.option(57), Some(&DhcpOption::MaxMessageSize(1472)));
         assert_eq!(
             m.option(12),
             Some(&DhcpOption::HostName("openfeo-lab".to_owned()))
@@ -1115,11 +1177,18 @@ mod tests {
         assert!(out.contains(&Output::Unbound(Unbound::Nak(Some(
             "address not available".to_owned()
         )))));
+        assert!(
+            !has(&out, |o| matches!(o, Output::Send { .. })),
+            "hold off before discovering again: {out:?}"
+        );
+        assert_eq!(c.lease(), None);
+        assert_eq!(c.state(), State::Selecting);
+        let wait = c.next_timeout().unwrap() - 500;
+        assert!((9 * SEC..=11 * SEC).contains(&wait), "{wait}");
+        let out = c.handle(Input::Timeout, 500 + wait);
         assert!(has(&out, |o| matches!(o, Output::Discover)));
         let (_, _, m) = sent(&out);
         assert_eq!(m.message_type(), Some(MessageType::Discover));
-        assert_eq!(c.lease(), None);
-        assert_eq!(c.state(), State::Selecting);
     }
 
     #[test]
@@ -1160,6 +1229,11 @@ mod tests {
         let (src, dst, request) = sent(&out);
         assert_eq!((src, dst), (ANY, ALL));
         assert_eq!(request.ciaddr, ANY);
+        assert_eq!(
+            request.flags & FLAG_BROADCAST,
+            0,
+            "still addressed, so the ACK can be unicast to us"
+        );
         assert_eq!(
             request.option(50),
             Some(&DhcpOption::RequestedIpAddress(OFFERED))
@@ -1326,5 +1400,166 @@ mod tests {
             [Output::Bound { renewed: false, .. }]
         ));
         assert_eq!(c.state(), State::Bound);
+    }
+
+    #[test]
+    fn lease_time_below_the_floor_is_ignored() {
+        let out = client().handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let ack = |secs: u32| {
+            Message::decode(&reply(
+                &discover,
+                MessageType::Ack,
+                vec![DhcpOption::AddressLeaseTime(secs)],
+            ))
+            .unwrap()
+        };
+        assert_eq!(Lease::from_ack(&ack(0)), Err(LeaseError::LeaseTooShort(0)));
+        assert_eq!(Lease::from_ack(&ack(9)), Err(LeaseError::LeaseTooShort(9)));
+        let lease = Lease::from_ack(&ack(10)).unwrap();
+        assert_eq!((lease.t1_secs, lease.t2_secs), (5, 8));
+
+        let mut c = client();
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let zero = vec![DhcpOption::AddressLeaseTime(0)];
+        let out = c.handle(
+            Input::Packet(reply(&discover, MessageType::Offer, zero.clone())),
+            500,
+        );
+        let (_, _, request) = sent(&out);
+        let timer = c.next_timeout();
+        let out = c.handle(Input::Packet(reply(&request, MessageType::Ack, zero)), 600);
+        assert_eq!(out, Vec::new(), "a zero lease is no lease");
+        assert_eq!(c.state(), State::Requesting);
+        assert_eq!(c.next_timeout(), timer);
+    }
+
+    #[test]
+    fn bad_addresses_masks_and_gateways_are_sanitised() {
+        let out = client().handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let ack_with = |yiaddr: Ipv4Addr, options: Vec<DhcpOption>| {
+            let mut m = Message::decode(&reply(&discover, MessageType::Ack, options)).unwrap();
+            m.yiaddr = yiaddr;
+            m
+        };
+        let lease_time = || vec![DhcpOption::AddressLeaseTime(60)];
+        for bad in [
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(240, 1, 1, 1),
+            Ipv4Addr::new(0, 1, 2, 3),
+        ] {
+            assert_eq!(
+                Lease::from_ack(&ack_with(bad, lease_time())),
+                Err(LeaseError::BadAddress(bad)),
+                "{bad}"
+            );
+        }
+        let mut options = lease_time();
+        options.push(DhcpOption::SubnetMask(Ipv4Addr::UNSPECIFIED));
+        options.push(DhcpOption::Router(vec![Ipv4Addr::UNSPECIFIED, SERVER]));
+        let lease = Lease::from_ack(&ack_with(OFFERED, options)).unwrap();
+        assert_eq!(lease.prefix, 24, "a 0.0.0.0 mask is treated as missing");
+        assert_eq!(lease.gateway, Some(SERVER), "the first usable router");
+        let mut options = lease_time();
+        options.push(DhcpOption::ClasslessStaticRoute(vec![
+            ClasslessRoute {
+                dst: Ipv4Addr::UNSPECIFIED,
+                prefix: 0,
+                via: Ipv4Addr::new(224, 0, 0, 1),
+            },
+            ClasslessRoute {
+                dst: Ipv4Addr::new(198, 51, 100, 0),
+                prefix: 24,
+                via: Ipv4Addr::UNSPECIFIED,
+            },
+            ClasslessRoute {
+                dst: Ipv4Addr::new(192, 0, 2, 0),
+                prefix: 24,
+                via: SERVER,
+            },
+        ]));
+        let lease = Lease::from_ack(&ack_with(OFFERED, options)).unwrap();
+        assert_eq!(
+            lease.routes,
+            vec![ClasslessRoute {
+                dst: Ipv4Addr::new(192, 0, 2, 0),
+                prefix: 24,
+                via: SERVER,
+            }],
+            "routes via nowhere are dropped"
+        );
+        assert_eq!(lease.default_gateway(), None);
+    }
+
+    #[test]
+    fn nak_holds_off_at_least_ten_seconds_before_discovering_again() {
+        let mut c = client();
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let out = c.handle(
+            Input::Packet(reply(&discover, MessageType::Offer, lease_options())),
+            500,
+        );
+        let (_, _, request) = sent(&out);
+        let out = c.handle(
+            Input::Packet(reply(&request, MessageType::Nak, Vec::new())),
+            SEC,
+        );
+        assert!(
+            out.contains(&Output::Unbound(Unbound::Nak(None))),
+            "the refusal is reported: {out:?}"
+        );
+        assert!(
+            !has(&out, |o| matches!(o, Output::Send { .. })),
+            "no packet right after a NAK: {out:?}"
+        );
+        assert_eq!(c.state(), State::Selecting);
+        let wait = c.next_timeout().unwrap() - SEC;
+        assert!((9 * SEC..=11 * SEC).contains(&wait), "{wait}");
+        let out = c.handle(Input::Timeout, SEC + wait);
+        let (_, _, m) = sent(&out);
+        assert_eq!(m.message_type(), Some(MessageType::Discover));
+        assert_ne!(m.xid, discover.xid, "a fresh transaction");
+
+        let offered_at = SEC + wait + 100;
+        let out = c.handle(
+            Input::Packet(reply(&m, MessageType::Offer, lease_options())),
+            offered_at,
+        );
+        let (_, _, request) = sent(&out);
+        let naked_at = offered_at + 100;
+        c.handle(
+            Input::Packet(reply(&request, MessageType::Nak, Vec::new())),
+            naked_at,
+        );
+        let wait = c.next_timeout().unwrap() - naked_at;
+        assert!(
+            (19 * SEC..=21 * SEC).contains(&wait),
+            "a second NAK waits longer: {wait}"
+        );
+    }
+
+    #[test]
+    fn prefix_only_classless_routes_invent_no_default() {
+        let out = client().handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let options = vec![
+            DhcpOption::AddressLeaseTime(60),
+            DhcpOption::Router(vec![Ipv4Addr::new(203, 0, 113, 9)]),
+            DhcpOption::ClasslessStaticRoute(vec![ClasslessRoute {
+                dst: Ipv4Addr::new(198, 51, 100, 0),
+                prefix: 24,
+                via: SERVER,
+            }]),
+        ];
+        let ack = Message::decode(&reply(&discover, MessageType::Ack, options)).unwrap();
+        let lease = Lease::from_ack(&ack).unwrap();
+        assert_eq!(lease.gateway, None, "option 3 yields to classless routes");
+        assert_eq!(lease.default_gateway(), None, "no default route invented");
+        assert_eq!(lease.routes.len(), 1);
     }
 }

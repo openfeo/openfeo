@@ -297,11 +297,25 @@ async fn run(
             events = driver.step() => events.map_err(failed)?,
             changed = world_rx.changed() => {
                 changed.map_err(|_| "world publisher gone")?;
-                let up = world_rx
-                    .borrow_and_update()
-                    .links
-                    .get(&task.port)
-                    .is_some_and(|link| link.up && link.carrier);
+                let (up, index) = {
+                    let world = world_rx.borrow_and_update();
+                    let link = world.links.get(&task.port);
+                    (
+                        link.is_some_and(|link| link.up && link.carrier),
+                        link.map(|link| link.index),
+                    )
+                };
+                if let Some(index) = index
+                    && index != ifindex
+                {
+                    // The device was replaced (a USB NIC re-plugged, say): the sockets are bound
+                    // to the old index, so start over.
+                    return Err(format!(
+                        "dhcp4 {}: {} changed index {ifindex} -> {index}; restarting",
+                        task.wan, task.port
+                    )
+                    .into());
+                }
                 if up == carrier {
                     continue;
                 }

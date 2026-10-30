@@ -1,4 +1,7 @@
 target
-corpus
+corpus/*
+!corpus/dhcp4_message/
+corpus/dhcp4_message/*
+!corpus/dhcp4_message/seed-*.bin
 artifacts
 coverage
