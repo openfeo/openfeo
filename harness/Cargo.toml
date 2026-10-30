@@ -17,6 +17,7 @@ regex.workspace = true
 [dev-dependencies]
 openfeo-netlink = { path = "../crates/openfeo-netlink" }
 tokio.workspace = true
+ipnet.workspace = true
 
 [[test]]
 name = "netlink"

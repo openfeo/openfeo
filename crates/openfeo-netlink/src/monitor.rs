@@ -52,10 +52,10 @@ pub(crate) fn request_error(op: impl Into<String>, source: rtnetlink::Error) -> 
     }
 }
 
-/// The connection handle the apply primitives use. Cheap to clone.
+/// The request connection the apply primitives use. Cheap to clone. Deliberately not the
+/// monitor's socket (ADR-0011).
 #[derive(Debug, Clone)]
 pub struct Netlink {
-    #[allow(dead_code)] // read by the apply primitives (`apply.rs`, Task 9)
     pub(crate) handle: Handle,
 }
 
@@ -69,25 +69,30 @@ pub struct Monitor {
 }
 
 impl Netlink {
-    /// Open the connection subscribed to link, address and route notifications, and fill the
-    /// cache from the initial dumps. The returned [`Monitor`] must be driven with
-    /// [`Monitor::run`] for the cache to stay current.
+    /// Open two connections: one subscribed to link, address and route notifications, which
+    /// fills the cache from the initial dumps and keeps it current, and one for requests. They
+    /// must be different sockets: the kernel does not multicast address and route changes back
+    /// to the socket that requested them (ADR-0011), so one socket would never see its own
+    /// applies land in the cache. The returned [`Monitor`] must be driven with [`Monitor::run`].
     ///
     /// # Errors
     ///
-    /// When the socket cannot be opened or a dump fails.
+    /// When a socket cannot be opened or a dump fails.
     pub async fn connect() -> Result<(Netlink, Monitor), Error> {
-        let (connection, handle, notifications) = rtnetlink::new_multicast_connection(&[
-            MulticastGroup::Link,
-            MulticastGroup::Ipv4Ifaddr,
-            MulticastGroup::Ipv6Ifaddr,
-            MulticastGroup::Ipv4Route,
-            MulticastGroup::Ipv6Route,
-        ])?;
-        tokio::spawn(connection);
+        let (monitor_connection, monitor_handle, notifications) =
+            rtnetlink::new_multicast_connection(&[
+                MulticastGroup::Link,
+                MulticastGroup::Ipv4Ifaddr,
+                MulticastGroup::Ipv6Ifaddr,
+                MulticastGroup::Ipv4Route,
+                MulticastGroup::Ipv6Route,
+            ])?;
+        tokio::spawn(monitor_connection);
+        let (request_connection, request_handle, _unsolicited) = rtnetlink::new_connection()?;
+        tokio::spawn(request_connection);
 
         let mut cache = Cache::default();
-        let mut links = handle.link().get().execute();
+        let mut links = monitor_handle.link().get().execute();
         while let Some(msg) = links
             .try_next()
             .await
@@ -95,7 +100,7 @@ impl Netlink {
         {
             apply_link(&mut cache, &msg, true);
         }
-        let mut addrs = handle.address().get().execute();
+        let mut addrs = monitor_handle.address().get().execute();
         while let Some(msg) = addrs
             .try_next()
             .await
@@ -103,7 +108,7 @@ impl Netlink {
         {
             apply_addr(&mut cache, &msg, true);
         }
-        let mut routes4 = handle
+        let mut routes4 = monitor_handle
             .route()
             .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
             .execute();
@@ -114,7 +119,7 @@ impl Netlink {
         {
             apply_route(&mut cache, &msg, true);
         }
-        let mut routes6 = handle
+        let mut routes6 = monitor_handle
             .route()
             .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
             .execute();
@@ -134,7 +139,9 @@ impl Netlink {
 
         let (tx, _rx) = watch::channel(Arc::new(cache.clone()));
         Ok((
-            Netlink { handle },
+            Netlink {
+                handle: request_handle,
+            },
             Monitor {
                 notifications,
                 tx,

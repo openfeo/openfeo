@@ -13,17 +13,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
+use ipnet::IpNet;
 use openfeo_harness::lab::Lab;
 use openfeo_harness::netns;
 use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
-use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, TABLE_MAIN};
+use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, TABLE_MAIN};
 use tokio::sync::watch;
 
-const SCENARIOS: &[Scenario] = &[Scenario {
-    name: "monitor_sees_veth_addr_and_route",
-    run: monitor_sees_veth_addr_and_route,
-}];
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "monitor_sees_veth_addr_and_route",
+        run: monitor_sees_veth_addr_and_route,
+    },
+    Scenario {
+        name: "bridge_with_vlan_filtering_enslave_rename",
+        run: bridge_with_vlan_filtering_enslave_rename,
+    },
+    Scenario {
+        name: "addr_and_route_primitives",
+        run: addr_and_route_primitives,
+    },
+];
 
 fn main() -> ExitCode {
     if let Err(err) = sandbox::enter() {
@@ -56,7 +67,15 @@ async fn wait_until(
         }
         tokio::time::timeout(SETTLE, rx.changed())
             .await
-            .with_context(|| format!("timed out waiting for {what}"))?
+            .with_context(|| {
+                let cache = rx.borrow();
+                format!(
+                    "timed out waiting for {what}; cache has {} links, addrs {:?}, {} routes",
+                    cache.links.len(),
+                    cache.addrs,
+                    cache.routes.len()
+                )
+            })?
             .context("monitor stopped")?;
     }
 }
@@ -119,5 +138,119 @@ fn monitor_sees_veth_addr_and_route(_lab: &mut Lab) -> anyhow::Result<()> {
         anyhow::Ok(())
     });
     let _ = netns::ip(&["link", "del", "nv0"]);
+    result?
+}
+
+/// Bridge creation with VLAN filtering, enslaving and releasing, renaming, setting a MAC,
+/// up/down, deletion: every link primitive the links applier uses.
+fn bridge_with_vlan_filtering_enslave_rename(_lab: &mut Lab) -> anyhow::Result<()> {
+    for name in ["bv0", "br-t0", "bt1"] {
+        let _ = netns::ip(&["link", "del", name]);
+    }
+    netns::ip(&["link", "add", "bv0", "type", "veth", "peer", "name", "bv1"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        nl.link_add_bridge("br-t0", true).await?;
+        wait_until(&mut rx, "br-t0 in the cache", |c| {
+            c.link_by_name("br-t0")
+                .is_some_and(|l| l.kind == Some(LinkKind::Bridge))
+        })
+        .await?;
+        let details = netns::ip(&["-d", "link", "show", "br-t0"])?;
+        ensure!(details.contains("vlan_filtering 1"), "{details}");
+        let br = rx.borrow().link_by_name("br-t0").context("br-t0")?.index;
+        let bv0 = rx.borrow().link_by_name("bv0").context("bv0")?.index;
+        nl.link_set_master(bv0, Some(br)).await?;
+        wait_until(&mut rx, "bv0 enslaved", |c| {
+            c.links.get(&bv0).is_some_and(|l| l.master == Some(br))
+        })
+        .await?;
+        nl.link_set_master(bv0, None).await?;
+        wait_until(&mut rx, "bv0 released", |c| {
+            c.links.get(&bv0).is_some_and(|l| l.master.is_none())
+        })
+        .await?;
+        let bv1 = rx.borrow().link_by_name("bv1").context("bv1")?.index;
+        nl.link_set_name(bv1, "bt1").await?;
+        wait_until(&mut rx, "bv1 renamed to bt1", |c| {
+            c.link_by_name("bt1").is_some_and(|l| l.index == bv1)
+        })
+        .await?;
+        let mac = [0x02, 0x00, 0x00, 0xfe, 0x00, 0x01];
+        nl.link_set_mac(br, mac).await?;
+        wait_until(&mut rx, "bridge mac", |c| {
+            c.links.get(&br).is_some_and(|l| l.mac == Some(mac))
+        })
+        .await?;
+        nl.link_set_up(bv0, true).await?;
+        wait_until(&mut rx, "bv0 up", |c| {
+            c.links.get(&bv0).is_some_and(|l| l.up)
+        })
+        .await?;
+        nl.link_set_up(bv0, false).await?;
+        wait_until(&mut rx, "bv0 down", |c| {
+            c.links.get(&bv0).is_some_and(|l| !l.up)
+        })
+        .await?;
+        nl.link_del(br).await?;
+        wait_until(&mut rx, "br-t0 gone", |c| c.link_by_name("br-t0").is_none()).await?;
+        anyhow::Ok(())
+    });
+    for name in ["bv0", "br-t0", "bt1"] {
+        let _ = netns::ip(&["link", "del", name]);
+    }
+    result?
+}
+
+/// Address and route primitives, including the `EEXIST` a duplicate route add reports.
+fn addr_and_route_primitives(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "rv0"]);
+    netns::ip(&["link", "add", "rv0", "type", "veth", "peer", "name", "rv1"])?;
+    netns::ip(&["link", "set", "rv1", "up"])?;
+    netns::ip(&["link", "set", "rv0", "up"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let rv0 = rx.borrow().link_by_name("rv0").context("rv0")?.index;
+        let net: IpNet = "10.0.1.1/24".parse()?;
+        nl.addr_add(rv0, net).await?;
+        wait_until(&mut rx, "10.0.1.1/24 on rv0", |c| {
+            c.addrs.iter().any(|a| a.ifindex == rv0 && a.net == net)
+        })
+        .await?;
+        ensure!(netns::ip(&["-4", "addr", "show", "rv0"])?.contains("10.0.1.1/24"));
+        let route = Route {
+            v6: false,
+            table: TABLE_MAIN,
+            dst: None,
+            gateway: Some("10.0.1.2".parse()?),
+            oif: Some(rv0),
+            protocol: RTPROT_OPENFEO,
+            priority: 10,
+        };
+        nl.route_add(&route).await?;
+        wait_until(&mut rx, "default route", |c| c.routes.contains(&route)).await?;
+        let shown = netns::ip(&["route", "show", "default"])?;
+        ensure!(
+            shown.contains("default via 10.0.1.2 dev rv0 proto 200 metric 10"),
+            "{shown}"
+        );
+        match nl.route_add(&route).await {
+            Err(err) if err.is_exist() => {}
+            other => anyhow::bail!("duplicate route add should be EEXIST, got {other:?}"),
+        }
+        nl.route_del(&route).await?;
+        wait_until(&mut rx, "route gone", |c| !c.routes.contains(&route)).await?;
+        nl.addr_del(rv0, net).await?;
+        wait_until(&mut rx, "address gone", |c| {
+            !c.addrs.iter().any(|a| a.ifindex == rv0 && a.net == net)
+        })
+        .await?;
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "rv0"]);
     result?
 }
