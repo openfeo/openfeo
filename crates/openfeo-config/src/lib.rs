@@ -7,8 +7,15 @@
 
 #![forbid(unsafe_code)]
 
+mod error;
+pub mod file;
 mod generated;
+pub mod load;
+pub mod migrate;
+mod portmap;
+pub mod validate;
 
+pub use error::ConfigError;
 pub use generated::{Config, DhcpWan, Lan, PortMap, PortMapEntry, StaticWan, System, Wan, wan};
 
 #[cfg(test)]

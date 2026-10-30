@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# Nightly fuzzing of every parser target (SPEC §11). Not part of `make ci`.
+name: fuzz
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: run every target for five minutes
+        run: |
+          cd fuzz
+          for target in $(cargo fuzz list); do
+            cargo fuzz run "$target" -- -max_total_time=300
+          done

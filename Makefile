@@ -7,12 +7,14 @@ FEATURES       ?= harness
 BUILD          ?= $(CURDIR)/build
 BUILD_ID       := $(shell git describe --always --dirty 2>/dev/null || echo dev)
 FILTER         ?=
+FUZZ_TARGET    ?= config_toml
+FUZZ_SECS      ?= 60
 
 BIN := target/$(TARGET)/$(PROFILE)/openfeo
 
 KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
-.PHONY: bin kernel-src kernel run test-harness check-env ci lint test
+.PHONY: bin kernel-src kernel run test-harness check-env ci lint test fuzz
 bin:
 	OPENFEO_BUILD_ID=$(BUILD_ID) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 kernel-src:
@@ -38,3 +40,5 @@ lint:
 test:
 	cargo test --workspace --lib --bins --all-features
 	cargo test -p openfeo
+fuzz:
+	cd fuzz && cargo +nightly fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_SECS)
