@@ -350,11 +350,12 @@ name = "p0"
 name = "wan0"
 port = "p0"
 vlan = 0                   # 0 = untagged
-kind = "pppoe"             # dhcp | static | pppoe
 priority = 10
+# exactly one of [wans.static], [wans.dhcp], [wans.pppoe] is present and selects the WAN type
 [wans.pppoe]
 username = "..."
 password = "..."
+# [wans.static]            # a static WAN instead: address = "203.0.113.10/24", gateway = "203.0.113.1", dns = ["203.0.113.1"]
 [wans.ipv6]
 mode = "auto"              # auto | disabled
 pd_hint = 48
@@ -389,6 +390,8 @@ channel = "stable"
 auto = true
 confirm_after_secs = 300
 ```
+
+The TOML is the pbjson JSON mapping of `Config` spelled in TOML: enum-like choices are `oneof` tables, so a WAN's type is whichever `[wans.<kind>]` table is present, and unknown keys are rejected by name.
 
 ### 8.3 Transport
 

@@ -34,6 +34,7 @@ lint:
 	cargo deny check
 	scripts/check-spdx.sh
 	scripts/check-deps.sh
+	scripts/check-proto.sh
 test:
 	cargo test --workspace --lib --bins --all-features
 	cargo test -p openfeo

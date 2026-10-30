@@ -15,10 +15,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking compares against origin/main
       - name: install the musl C toolchain (mimalloc) and e2fsprogs (harness unit tests)
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools e2fsprogs
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
