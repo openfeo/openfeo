@@ -22,6 +22,8 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - run: make lint
       - run: make test
+      - name: release binary (no test hooks) must build
+        run: make bin FEATURES=
 
   kernel-and-harness:
     runs-on: ubuntu-24.04
@@ -39,6 +41,8 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: unconfine kea-dhcp4 (Ubuntu's profile pins its config to /etc/kea; ADR-0006)
+        run: sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.kea-dhcp4 || true
       - uses: actions/cache@v4
         with:
           path: |

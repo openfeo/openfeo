@@ -30,7 +30,9 @@ ci: lint test kernel test-harness
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo clippy -p openfeo --all-targets -- -D warnings
 	cargo deny check
 	scripts/check-spdx.sh
 test:
 	cargo test --workspace --lib --bins --all-features
+	cargo test -p openfeo

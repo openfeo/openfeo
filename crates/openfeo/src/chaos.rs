@@ -3,18 +3,18 @@
 
 //! Fault injection for the harness (ADR-0007): `openfeo.chaos=child-exit:<secs>` makes the router
 //! child exit with status 3 after that long; `child-hang:<secs>` makes it stop heartbeating.
-//! Without the `harness` feature the command line is never consulted.
+//! Without the `harness` feature the knob parser is not compiled and the command line is never
+//! consulted.
 
 use std::fmt;
 use std::time::Duration;
 
 use openfeo_init::cmdline::Cmdline;
 
-/// The kernel command-line key.
-pub const KEY: &str = "openfeo.chaos";
-
-/// What to break, and when.
+/// What to break, and when. Release builds never construct one: [`from_cmdline`] is a constant
+/// `None` there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "harness"), allow(dead_code))]
 pub enum Chaos {
     /// Exit with status 3.
     ChildExit {
@@ -47,10 +47,16 @@ impl fmt::Display for Chaos {
     }
 }
 
+/// The kernel command-line key.
+#[cfg(feature = "harness")]
+pub const KEY: &str = "openfeo.chaos";
+
 /// A value that is not `child-exit:<secs>` or `child-hang:<secs>`.
+#[cfg(feature = "harness")]
 #[derive(Debug, PartialEq, Eq)]
 pub struct ParseError(String);
 
+#[cfg(feature = "harness")]
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -61,6 +67,7 @@ impl fmt::Display for ParseError {
     }
 }
 
+#[cfg(feature = "harness")]
 impl std::error::Error for ParseError {}
 
 /// Parse a knob value.
@@ -68,6 +75,7 @@ impl std::error::Error for ParseError {}
 /// # Errors
 ///
 /// [`ParseError`] for anything but the two known kinds with a whole number of seconds.
+#[cfg(feature = "harness")]
 pub fn parse(value: &str) -> Result<Chaos, ParseError> {
     let bad = || ParseError(value.to_owned());
     let (kind, secs) = value.split_once(':').ok_or_else(bad)?;
@@ -98,6 +106,7 @@ mod tests {
     use super::*;
     use openfeo_init::cmdline;
 
+    #[cfg(feature = "harness")]
     #[test]
     fn parses_knobs() {
         assert_eq!(
@@ -114,6 +123,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "harness")]
     #[test]
     fn rejects_garbage() {
         assert!(parse("bogus").is_err());

@@ -53,11 +53,14 @@ pub fn run(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Result<()> {
 
 fn log_ports(log: &Log) {
     match ports::enumerate(Path::new(SYSFS_CLASS_NET)) {
-        Ok(list) => {
-            for (i, p) in list.iter().enumerate() {
+        Ok(inventory) => {
+            for (i, p) in inventory.ports.iter().enumerate() {
                 log.info(&format!("port p{i} {} id={} mac={}", p.ifname, p.id, p.mac));
             }
-            log.info(&format!("ports total={}", list.len()));
+            for s in &inventory.skipped {
+                log.info(&format!("port skipped {}: {}", s.ifname, s.reason));
+            }
+            log.info(&format!("ports total={}", inventory.ports.len()));
         }
         Err(err) => log.warn(&format!("ports: cannot read {SYSFS_CLASS_NET}: {err}")),
     }

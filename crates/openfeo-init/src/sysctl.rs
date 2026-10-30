@@ -31,6 +31,8 @@ pub const CORE: &[(&str, &str)] = &[
     ("net/ipv6/conf/default/accept_redirects", "0"),
     // §7.9.
     ("net/ipv4/tcp_mtu_probing", "1"),
+    // Nothing on the box uses io_uring; its attack surface is not wanted (2 = disabled for all).
+    ("kernel/io_uring_disabled", "2"),
 ];
 
 /// Write every entry of [`CORE`]; a refused write is logged and skipped, never fatal.

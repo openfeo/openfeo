@@ -102,6 +102,11 @@ fn check() -> Result<ExitCode> {
         report(bin, on_path(bin), "");
     }
     report(
+        "kea-dhcp4 reads our config",
+        kea_config_check(),
+        " (if MISSING on Ubuntu: unload /etc/apparmor.d/usr.sbin.kea-dhcp4; ADR-0006)",
+    );
+    report(
         "unprivileged user namespaces",
         sandbox_works()?,
         if sandbox::is_inside() {
@@ -119,6 +124,25 @@ fn check() -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// `kea-dhcp4 -t` on a config written outside `/etc/kea`, as the harness does: fails under
+/// Ubuntu's stock AppArmor profile for Kea.
+fn kea_config_check() -> bool {
+    let dir = std::env::temp_dir().join(format!("openfeo-harness-check-{}", std::process::id()));
+    let config = dir.join("kea-dhcp4.json");
+    let ok = std::fs::create_dir_all(&dir).is_ok()
+        && std::fs::write(&config, daemons::render_kea_dhcp4("lo")).is_ok()
+        && Command::new("kea-dhcp4")
+            .arg("-t")
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+    let _ = std::fs::remove_dir_all(&dir);
+    ok
 }
 
 fn on_path(bin: &str) -> bool {

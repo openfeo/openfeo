@@ -14,10 +14,14 @@ mod version;
 use openfeo_init::cmdline;
 
 fn main() -> anyhow::Result<()> {
+    let cli = cli::parse(std::env::args().skip(1));
     if std::process::id() == 1 {
-        openfeo_init::main(&version::version());
+        // The kernel hands init whatever command-line words it did not recognise, so argv may
+        // hold things that are not our flags; only `--mode` matters here.
+        let mode_flag = cli.as_ref().ok().and_then(|cli| cli.mode);
+        openfeo_init::main(&version::version(), mode_flag);
     }
-    let cli = cli::parse(std::env::args().skip(1))?;
+    let cli = cli?;
     if cli.print_version {
         println!("openfeo {}", version::version());
         return Ok(());

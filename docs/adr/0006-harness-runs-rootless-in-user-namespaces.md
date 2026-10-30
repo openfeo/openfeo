@@ -24,6 +24,10 @@ QEMU as inherited file descriptors. No step of a harness run uses `sudo`.
 ## Consequences
 
 Developers and CI never need elevated privileges or a password. Ubuntu 24.04 runners must set
-`kernel.apparmor_restrict_unprivileged_userns=0` before the harness runs. At M3 the host needs a udev
-rule making `/dev/ppp` group-accessible, or that scenario runs privileged. Daemons that insist on
-dropping to another uid may need flags to stay as (namespace) root.
+`kernel.apparmor_restrict_unprivileged_userns=0` before the harness runs, and must unload the
+enforce-mode AppArmor profile Ubuntu's `isc-kea` ships (`apparmor_parser -R
+/etc/apparmor.d/usr.sbin.kea-dhcp4`): it only lets `kea-dhcp4` read configs under `/etc/kea`, while
+the harness writes them under `/run/openfeo-harness`. `make check-env` probes this with
+`kea-dhcp4 -t` on a config outside `/etc/kea`. At M3 the host needs a udev rule making `/dev/ppp`
+group-accessible, or that scenario runs privileged. Daemons that insist on dropping to another uid
+may need flags to stay as (namespace) root.

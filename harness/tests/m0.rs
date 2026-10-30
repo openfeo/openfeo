@@ -51,6 +51,11 @@ fn re(pattern: &str) -> Regex {
 
 const SOON: Duration = Duration::from_secs(10);
 
+/// The hardware watchdog the lab VM must be armed with: QEMU's i6300ESB (not the q35 board's
+/// iTCO, which QEMU does not let reset the machine by default).
+const WATCHDOG_LINE: &str =
+    r#"openfeo-init: watchdog /dev/watchdog0 timeout=60s identity="i6300ESB timer""#;
+
 /// The namespaces and taps exist with the addresses the ISP sides should have.
 fn lab_topology(lab: &mut Lab) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -84,11 +89,7 @@ fn boots_and_logs(lab: &mut Lab) -> anyhow::Result<()> {
         "unexpected version in {:?}",
         m.line
     );
-    c.wait_for(
-        &mut cur,
-        &re(r"openfeo-init: watchdog /dev/watchdog0 timeout=60s"),
-        SOON,
-    )?;
+    c.wait_for(&mut cur, &re(WATCHDOG_LINE), SOON)?;
     c.wait_for(&mut cur, &re(r"openfeo-init: child started pid=\d+"), SOON)?;
     c.wait_for(
         &mut cur,
@@ -152,22 +153,43 @@ fn watchdog_resets_when_heartbeat_stops(lab: &mut Lab) -> anyhow::Result<()> {
     lab.boot("openfeo.chaos=child-hang:3")?;
     let c = lab.console()?;
     let mut cur = Cursor::default();
+    c.wait_for(&mut cur, &re(WATCHDOG_LINE), BOOT_TIMEOUT)?;
     c.wait_for(
         &mut cur,
         &re(r"openfeo: chaos child-hang: heartbeats stopped"),
-        BOOT_TIMEOUT,
+        SOON,
     )?;
     c.wait_for(
         &mut cur,
         &re(r"openfeo-init: heartbeat lost; watchdog no longer petted"),
         Duration::from_secs(30),
     )?;
+    let lost_at = std::time::Instant::now();
     // The second boot banner: the watchdog fired within its 60 s timeout.
     c.wait_for(
         &mut cur,
         &re(r"Linux version 6\.18\.59-openfeo"),
         Duration::from_secs(120),
     )?;
+    // Only the chip can have done it: the last pet was at most one pet interval before the
+    // "heartbeat lost" line, so a real 60 s timeout cannot reset before ~55 s. Anything sooner
+    // is PID 1 panicking (panic=10), the software fallback, or a reboot(2) we did not ask for.
+    let gap = lost_at.elapsed();
+    anyhow::ensure!(
+        gap >= Duration::from_secs(45),
+        "reset came {gap:?} after heartbeat loss: too soon for the i6300ESB"
+    );
+    for forbidden in [
+        r"Kernel panic",
+        r"openfeo-init: software watchdog expired",
+        r"openfeo-init: .*reboot",
+        r"openfeo-init: fatal",
+    ] {
+        anyhow::ensure!(
+            c.count(&re(forbidden)) == 0,
+            "the reset was not the watchdog's: saw /{forbidden}/"
+        );
+    }
     c.wait_for(&mut cur, &re(r"openfeo-init: start version="), BOOT_TIMEOUT)?;
     let banners = c.count(&re(r"Linux version 6\.18\.59-openfeo"));
     anyhow::ensure!(banners == 2, "expected exactly 2 boots, saw {banners}");
