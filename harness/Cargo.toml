@@ -14,6 +14,15 @@ libc.workspace = true
 nix.workspace = true
 regex.workspace = true
 
+[dev-dependencies]
+openfeo-netlink = { path = "../crates/openfeo-netlink" }
+tokio.workspace = true
+
+[[test]]
+name = "netlink"
+path = "tests/netlink.rs"
+harness = false
+
 [[test]]
 name = "m0"
 path = "tests/m0.rs"

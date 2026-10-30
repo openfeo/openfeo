@@ -25,7 +25,7 @@ kernel: bin kernel-src
 run: kernel
 	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage
 test-harness: kernel
-	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --test m0 -- $(FILTER)
+	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --test netlink --test m0 -- $(FILTER)
 check-env:
 	cargo run -q -p openfeo-harness -- check
 ci: lint test kernel test-harness
