@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The C libraries linked into the binary for the firewall backend (SPEC §2, §13; ADR-0003,
+# ADR-0012). Fields: name version url sha256. nft/fetch.sh downloads each tarball once, verifies
+# it against the sum here and nowhere else, and extracts it into $BUILD/nft/src/<name>-<version>/.
+#
+# The netfilter sums are the projects' published .sha256sum files; jansson publishes none, so its
+# sum is the one recorded on 2026-10-30 and pinned here.
+nftables 1.1.7 https://www.netfilter.org/pub/nftables/nftables-1.1.7.tar.xz a6fbf060d8d4fff001517a2b94f356bb4366bfbf0ba366366f9d27cc38caa58f
+libnftnl 1.3.2 https://www.netfilter.org/pub/libnftnl/libnftnl-1.3.2.tar.xz c97abc3409f8fa396b4462b2bb7f147a3a47a4ddc97cfa0b2f18890c9cfde8b0
+libmnl 1.0.5 https://www.netfilter.org/pub/libmnl/libmnl-1.0.5.tar.bz2 274b9b919ef3152bfb3da3a13c950dd60d6e2bcd54230ffeca298d03b40d0525
+jansson 2.15.1 https://github.com/akheron/jansson/releases/download/v2.15.1/jansson-2.15.1.tar.gz 0c7114dc0b2d22a670724a1f95922029d7077c19dbf79a584cb8084d2f267f2f

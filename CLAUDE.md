@@ -12,6 +12,8 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 - `make lint`          fmt, clippy (-D warnings), cargo-deny, SPDX headers
 - `make ci`            everything CI runs, in CI's order
 - `make check-env`     is this machine able to run the harness?
+- `make bin`, `lint` and `test` first run `make kernel-headers nft-src` (kernel UAPI headers, pinned nftables sources;
+  ADR-0012) and export `OPENFEO_NFT_SRC` and `OPENFEO_UAPI_INCLUDE`; a bare `cargo build` needs both set.
 
 ## Rules
 - Rust stable, edition 2024, musl targets. `clippy -D warnings`, pedantic as warnings. No `unwrap`/`expect`

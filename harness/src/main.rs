@@ -122,7 +122,18 @@ fn check() -> Result<ExitCode> {
         .open("/dev/net/tun")
         .is_ok();
     report("/dev/net/tun", tun, "");
-    for bin in ["qemu-system-x86_64", "ip", "kea-dhcp4", "mkfs.ext4", "ping"] {
+    for bin in [
+        "qemu-system-x86_64",
+        "ip",
+        "kea-dhcp4",
+        "mkfs.ext4",
+        "ping",
+        "python3",
+        "musl-gcc",
+        "pkg-config",
+        "bison",
+        "flex",
+    ] {
         report(bin, on_path(bin), "");
     }
     report(

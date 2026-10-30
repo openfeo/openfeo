@@ -7,7 +7,7 @@
 # kernel/x86_64.config; every option they ask for must survive Kconfig's dependency solving or
 # the build stops and names the missing ones.
 #
-# Usage: kernel/build.sh fetch | config <binary> | check | build | all <binary>
+# Usage: kernel/build.sh fetch | headers | config <binary> | check | build | all <binary>
 # Environment: KERNEL_VERSION (6.18.59), BUILD (<repo>/build), JOBS (nproc), SOURCE_DATE_EPOCH
 set -euo pipefail
 
@@ -85,6 +85,14 @@ check() {
   echo "kernel config: every requested option is present"
 }
 
+# Install the UAPI headers of our pinned kernel (not the host's) for the C libraries that
+# openfeo-nft builds (ADR-0012).
+headers() {
+  [ -f "$SRC/Makefile" ] || { echo "kernel: source not found at $SRC (run fetch first)" >&2; exit 1; }
+  make -C "$SRC" O="$OUT" ARCH=x86_64 INSTALL_HDR_PATH="$BUILD/kernel/headers" -j"$JOBS" headers_install >/dev/null
+  echo "kernel: UAPI headers in $BUILD/kernel/headers/include"
+}
+
 build() {
   local epoch
   epoch=${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || date +%s)}
@@ -97,9 +105,10 @@ build() {
 
 case "${1:-}" in
   fetch) fetch ;;
+  headers) headers ;;
   config) config "${2:-}" ;;
   check) check ;;
   build) build ;;
   all) fetch; config "${2:-}"; build ;;
-  *) echo "usage: kernel/build.sh fetch | config <binary> | check | build | all <binary>" >&2; exit 2 ;;
+  *) echo "usage: kernel/build.sh fetch | headers | config <binary> | check | build | all <binary>" >&2; exit 2 ;;
 esac
