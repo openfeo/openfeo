@@ -12,7 +12,7 @@ BIN := target/$(TARGET)/$(PROFILE)/openfeo
 
 KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
-.PHONY: bin kernel-src kernel lint test
+.PHONY: bin kernel-src kernel run test-harness check-env ci lint test
 bin:
 	OPENFEO_BUILD_ID=$(BUILD_ID) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 kernel-src:
@@ -20,6 +20,13 @@ kernel-src:
 kernel: bin kernel-src
 	$(KERNEL_ENV) kernel/build.sh config $(CURDIR)/$(BIN)
 	$(KERNEL_ENV) kernel/build.sh build
+run: kernel
+	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage
+test-harness: kernel
+	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --test m0 -- $(FILTER)
+check-env:
+	cargo run -q -p openfeo-harness -- check
+ci: lint test kernel test-harness
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings

@@ -41,6 +41,8 @@ pub struct Lab {
     /// Scratch directory for configs and logs.
     pub run_dir: PathBuf,
     name: String,
+    /// An explicit kernel image, instead of [`Lab::kernel_path`].
+    kernel: Option<PathBuf>,
     /// The router VM, after [`Lab::boot`]. Declared first so it dies before its taps.
     pub vm: Option<Vm>,
     /// Reference daemons started by scenarios; stopped before the namespaces go.
@@ -77,6 +79,7 @@ impl Lab {
         Ok(Self {
             run_dir,
             name: name.to_owned(),
+            kernel: None,
             vm: None,
             daemons: Vec::new(),
             taps,
@@ -126,8 +129,19 @@ impl Lab {
         } else {
             format!("{BASE_CMDLINE} {extra_cmdline}")
         };
+        let kernel = match &self.kernel {
+            Some(path) => {
+                ensure!(
+                    path.is_file(),
+                    "kernel image not found at {}",
+                    path.display()
+                );
+                path.clone()
+            }
+            None => Self::kernel_path()?,
+        };
         let vm = Vm::start(&VmSpec {
-            kernel: Self::kernel_path()?,
+            kernel,
             cmdline,
             mem_mib: VM_MEM_MIB,
             cpus: VM_CPUS,
@@ -159,6 +173,11 @@ impl Lab {
     #[must_use]
     pub fn taps(&self) -> &[OwnedFd] {
         &self.taps
+    }
+
+    /// Boot this image instead of the default.
+    pub fn set_kernel(&mut self, path: PathBuf) {
+        self.kernel = Some(path);
     }
 
     /// `$OPENFEO_KERNEL`, or `<workspace>/build/bzImage`.
