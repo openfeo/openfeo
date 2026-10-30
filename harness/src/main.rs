@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use openfeo_harness::lab::{ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
 use openfeo_harness::{daemons, qemu, sandbox};
+use openfeo_harness::{nftprobe, scenario};
 
 #[derive(Parser)]
 #[command(
@@ -49,7 +50,14 @@ enum Cmd {
     /// Internal: exit 0 if the sandbox can be entered.
     #[command(hide = true)]
     CheckSandbox,
+    /// Internal: inside the sandbox, exit 0 if the kernel runs the nft ruleset's expressions,
+    /// 3 if it cannot load their modules, 1 on any other error.
+    #[command(hide = true)]
+    ProbeNft,
 }
+
+/// Exit code of `probe-nft` for a kernel that cannot load the nft modules.
+const PROBE_SKIP: u8 = 3;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -62,6 +70,7 @@ fn main() -> ExitCode {
         } => run(kernel, chaos, config, no_config),
         Cmd::Check => check(),
         Cmd::CheckSandbox => sandbox::enter().map(|()| ExitCode::SUCCESS),
+        Cmd::ProbeNft => probe_nft(),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {err:#}");
@@ -150,6 +159,10 @@ fn check() -> Result<ExitCode> {
             ""
         },
     );
+    match nft_expressions_work()? {
+        Ok(()) => report("nft ct/fib/nat expressions", true, ""),
+        Err(detail) => report("nft ct/fib/nat expressions", false, &format!(" ({detail})")),
+    }
     match Lab::kernel_path() {
         Ok(path) => report("kernel image", true, &format!(" ({})", path.display())),
         Err(err) => report("kernel image", false, &format!(" ({err})")),
@@ -183,6 +196,40 @@ fn kea_config_check() -> bool {
 fn on_path(bin: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(bin).is_file()))
+}
+
+/// `probe-nft`: enter the sandbox and ask the kernel.
+fn probe_nft() -> Result<ExitCode> {
+    sandbox::enter()?;
+    match nftprobe::require_expressions() {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(err) if err.downcast_ref::<scenario::Skip>().is_some() => {
+            eprintln!("{err}");
+            Ok(ExitCode::from(PROBE_SKIP))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Re-run ourselves with `probe-nft` (the probe needs the sandbox, see [`sandbox_works`]):
+/// `Ok(Ok(()))` when the kernel runs every expression the ruleset uses, `Ok(Err(reason))` when
+/// it cannot load their modules (the sandboxed nft scenarios will skip), `Err` when the probe
+/// itself broke.
+fn nft_expressions_work() -> Result<Result<(), String>> {
+    let exe = std::env::current_exe().context("current_exe")?;
+    let output = Command::new(exe)
+        .arg("probe-nft")
+        .stdin(Stdio::null())
+        .output()
+        .context("spawn self")?;
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if output.status.success() {
+        Ok(Ok(()))
+    } else if output.status.code() == Some(i32::from(PROBE_SKIP)) {
+        Ok(Err(stderr))
+    } else {
+        anyhow::bail!("nft probe failed: {stderr}")
+    }
 }
 
 /// Re-run ourselves with the hidden subcommand: entering a user namespace needs a

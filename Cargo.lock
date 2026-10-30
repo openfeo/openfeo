@@ -689,6 +689,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
 ]
 
@@ -741,6 +742,7 @@ dependencies = [
  "openfeo-config",
  "openfeo-world",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
