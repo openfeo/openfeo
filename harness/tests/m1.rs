@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-//! M1 part 1 acceptance scenarios (SPEC §12 row M1, the foundations): first-boot defaults, a
+//! M1 acceptance scenarios (SPEC §12 row M1). Part 1, the foundations: first-boot defaults, a
 //! static WAN and a LAN from `config.toml` on the state disk, a router-child restart that changes
-//! nothing, a WAN link flap, and a port map that survives a reset. Run inside the rootless sandbox;
-//! `harness = false`: this binary is its own runner and an optional first argument filters
-//! scenarios by substring.
+//! nothing, a WAN link flap, and a port map that survives a reset. Part 2a, firewall and NAT: a
+//! LAN host fetching HTTP through NAT, a port forward reached from the WAN and by hairpin, a WAN
+//! that is blocked by default, a router-child crash that does not interrupt forwarding, and a
+//! first boot that forwards nothing. Run inside the rootless sandbox; `harness = false`: this
+//! binary is its own runner and an optional first argument filters scenarios by substring.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use openfeo_harness::lab::{BOOT_TIMEOUT, Lab};
+use openfeo_harness::daemons::{self, Daemon};
+use openfeo_harness::lab::{BOOT_TIMEOUT, ISP_HTTP_BODY, LAN_HTTP_BODY, Lab};
+use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::netns::{self, NetNs};
 use openfeo_harness::sandbox;
@@ -37,6 +41,26 @@ const SCENARIOS: &[Scenario] = &[
         name: "portmap_persists_across_reset",
         run: portmap_persists_across_reset,
     },
+    Scenario {
+        name: "lan_fetches_isp_http_through_nat",
+        run: lan_fetches_isp_http_through_nat,
+    },
+    Scenario {
+        name: "port_forward_from_wan_and_hairpin",
+        run: port_forward_from_wan_and_hairpin,
+    },
+    Scenario {
+        name: "wan_is_blocked_by_default",
+        run: wan_is_blocked_by_default,
+    },
+    Scenario {
+        name: "child_crash_does_not_interrupt_forwarding",
+        run: child_crash_does_not_interrupt_forwarding,
+    },
+    Scenario {
+        name: "first_boot_forwards_nothing",
+        run: first_boot_forwards_nothing,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -51,6 +75,16 @@ fn main() -> ExitCode {
 const VM_STATIC: &str = include_str!("../fixtures/vm-static.toml");
 const SOON: Duration = Duration::from_secs(10);
 const READY: &str = r"openfeo: ready generation=\d+";
+/// How long an HTTP fetch that is supposed to work may take.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// The ISP-side HTTP target.
+const ISP_HTTP: &str = "203.0.113.1:8080";
+/// The LAN-side HTTP target, where the fixture's port forward points.
+const LAN_HTTP: &str = "192.168.1.2:8080";
+/// The fixture's port forward as seen from outside: the WAN address, port 2222.
+const WAN_FORWARD: &str = "203.0.113.10:2222";
+/// Operations a converged restart must not log.
+const KERNEL_CHANGES: &str = r"openfeo: (add|del|enslave|release|renamed|set \S+ (up|down|mac)) ";
 
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|err| panic!("bad test regex {pattern:?}: {err}"))
@@ -250,4 +284,182 @@ fn portmap_persists_across_reset(lab: &mut Lab) -> anyhow::Result<()> {
     )?;
     c.wait_for(&mut cur, &re(READY), SOON)?;
     Ok(())
+}
+
+/// An HTTP target in `ns` on `bind:8080` serving `body`, up before this returns.
+fn http_target(lab: &Lab, ns: &NetNs, bind: &str, body: &str) -> anyhow::Result<Daemon> {
+    let server = daemons::http_server(
+        ns,
+        bind,
+        8080,
+        &lab.run_dir.join(format!("http-{bind}")),
+        body,
+    )?;
+    server
+        .log
+        .wait_for(&mut Cursor::default(), &re(r"Serving HTTP on"), SOON)?;
+    Ok(server)
+}
+
+/// Boot the static fixture, wait for `ready`, make the LAN namespace a LAN host.
+fn boot_static_with_lan_host(lab: &mut Lab, extra_cmdline: &str) -> anyhow::Result<Cursor> {
+    lab.with_config(VM_STATIC)?;
+    lab.boot(extra_cmdline)?;
+    let mut cur = Cursor::default();
+    lab.console()?
+        .wait_for(&mut cur, &re(READY), BOOT_TIMEOUT)?;
+    lab.lan_side_host()?;
+    Ok(cur)
+}
+
+/// A LAN host fetches a page from the ISP side through the router: the ISP server sees the WAN
+/// address (masquerade), never the LAN host's.
+fn lan_fetches_isp_http_through_nat(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_static_with_lan_host(lab, "")?;
+    let server = http_target(lab, &lab.isp0, "203.0.113.1", ISP_HTTP_BODY)?;
+    let body = lanclient::http_get(&lab.lan0, ISP_HTTP.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(body == ISP_HTTP_BODY, "unexpected body {body:?}");
+    anyhow::ensure!(
+        server.log.count(&re(r"^203\.0\.113\.10 - - ")) == 1,
+        "the ISP server did not see the WAN address: {:?}",
+        server.log.tail(5)
+    );
+    anyhow::ensure!(
+        server.log.count(&re(r"192\.168\.1\.2")) == 0,
+        "the LAN address leaked to the ISP side: {:?}",
+        server.log.tail(5)
+    );
+    Ok(())
+}
+
+/// The fixture forwards 2222/tcp to the LAN host's port 8080: reached from the ISP side (the
+/// server sees the ISP host) and from the LAN itself through the WAN address (hairpin: the
+/// server sees the router's LAN address).
+fn port_forward_from_wan_and_hairpin(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_static_with_lan_host(lab, "")?;
+    let server = http_target(lab, &lab.lan0, "192.168.1.2", LAN_HTTP_BODY)?;
+    let body = lanclient::http_get(&lab.isp0, WAN_FORWARD.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(
+        body == LAN_HTTP_BODY,
+        "from the WAN: unexpected body {body:?}"
+    );
+    anyhow::ensure!(
+        server.log.count(&re(r"^203\.0\.113\.1 - - ")) == 1,
+        "the LAN server did not see the ISP host: {:?}",
+        server.log.tail(5)
+    );
+    let body = lanclient::http_get(&lab.lan0, WAN_FORWARD.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(body == LAN_HTTP_BODY, "hairpin: unexpected body {body:?}");
+    anyhow::ensure!(
+        server.log.count(&re(r"^192\.168\.1\.1 - - ")) == 1,
+        "the hairpinned request was not SNATed to the router's LAN address: {:?}",
+        server.log.tail(5)
+    );
+    Ok(())
+}
+
+/// Without `wan_ping` the WAN answers nothing it was not asked to: no forwarding into the LAN
+/// even with a route, no ping of the router, while the explicit port forward still works.
+fn wan_is_blocked_by_default(lab: &mut Lab) -> anyhow::Result<()> {
+    let config = VM_STATIC.replace("wan_ping = true", "wan_ping = false");
+    anyhow::ensure!(config != VM_STATIC, "fixture lost its wan_ping line");
+    lab.with_config(&config)?;
+    lab.boot("")?;
+    let mut cur = Cursor::default();
+    lab.console()?
+        .wait_for(&mut cur, &re(READY), BOOT_TIMEOUT)?;
+    lab.lan_side_host()?;
+    lab.isp_route_to_lan()?;
+    let server = http_target(lab, &lab.lan0, "192.168.1.2", LAN_HTTP_BODY)?;
+    let direct = lanclient::http_get(&lab.isp0, LAN_HTTP.parse()?, "/", Duration::from_secs(3));
+    anyhow::ensure!(
+        direct.is_err(),
+        "the ISP side reached a LAN host directly: {direct:?}"
+    );
+    let pings = lanclient::ping_loop(&lab.isp0, "203.0.113.10", 3, Duration::from_millis(200))?;
+    anyhow::ensure!(
+        pings.received == 0,
+        "the WAN answered {} of {} pings with wan_ping off",
+        pings.received,
+        pings.sent
+    );
+    let body = lanclient::http_get(&lab.isp0, WAN_FORWARD.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(
+        body == LAN_HTTP_BODY,
+        "the explicit forward failed: {body:?}"
+    );
+    anyhow::ensure!(
+        server.log.count(&re(r"^203\.0\.113\.1 - - ")) == 1,
+        "server log: {:?}",
+        server.log.tail(5)
+    );
+    Ok(())
+}
+
+/// The kernel forwards while the router child is dead and restarting: a LAN host pinging the ISP
+/// side across the crash loses at most two of 125 echoes, HTTP through NAT works afterwards, and
+/// the restarted child re-applied the ruleset once without touching links or routes.
+fn child_crash_does_not_interrupt_forwarding(lab: &mut Lab) -> anyhow::Result<()> {
+    let mut cur = boot_static_with_lan_host(lab, "openfeo.chaos=child-exit:20")?;
+    let _server = http_target(lab, &lab.isp0, "203.0.113.1", ISP_HTTP_BODY)?;
+    let c = lab.console()?;
+    let (stats, restarted) = std::thread::scope(|scope| -> anyhow::Result<_> {
+        let pinger = scope.spawn(|| {
+            lanclient::ping_loop(&lab.lan0, "203.0.113.1", 125, Duration::from_millis(200))
+        });
+        c.wait_for(
+            &mut cur,
+            &re(r"openfeo: chaos child-exit: exiting with status 3"),
+            Duration::from_secs(30),
+        )?;
+        c.wait_for(&mut cur, &re(r"openfeo-init: child started pid=\d+"), SOON)?;
+        let restarted = cur;
+        c.wait_for(&mut cur, &re(READY), SOON)?;
+        let stats = pinger
+            .join()
+            .map_err(|_| anyhow::anyhow!("ping thread panicked"))??;
+        Ok((stats, restarted))
+    })?;
+    anyhow::ensure!(stats.sent == 125, "ping sent {} of 125", stats.sent);
+    anyhow::ensure!(
+        stats.received + 2 >= stats.sent,
+        "forwarding was interrupted: {} of {} pings answered",
+        stats.received,
+        stats.sent
+    );
+    let body = lanclient::http_get(&lab.lan0, ISP_HTTP.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(body == ISP_HTTP_BODY, "after the restart: {body:?}");
+    anyhow::ensure!(
+        c.count_since(&restarted, &re(r"openfeo: ruleset applied: ")) == 1,
+        "the restarted child must apply the ruleset exactly once"
+    );
+    let changes = c.count_since(&restarted, &re(KERNEL_CHANGES));
+    anyhow::ensure!(
+        changes == 0,
+        "the restarted child changed links or routes ({changes} operations)"
+    );
+    Ok(())
+}
+
+/// No state disk: the ruleset exists (LAN services stay reachable) but forwarding is never
+/// switched on, because there is no WAN.
+fn first_boot_forwards_nothing(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.boot("")?;
+    let c = lab.console()?;
+    let mut cur = Cursor::default();
+    c.wait_for(&mut cur, &re(READY), BOOT_TIMEOUT)?;
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: sysctl net/ipv4/ip_forward=1")) == 0,
+        "first boot switched forwarding on"
+    );
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: ruleset applied: ")) == 1,
+        "the ruleset was not applied exactly once"
+    );
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: apply \S+ failed")) == 0,
+        "an apply failed"
+    );
+    address_lan_side(lab)?;
+    ping(&lab.lan0, "192.168.1.1")
 }
