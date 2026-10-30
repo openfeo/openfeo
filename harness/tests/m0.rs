@@ -21,6 +21,14 @@ const SCENARIOS: &[Scenario] = &[
         name: "boots_and_logs",
         run: boots_and_logs,
     },
+    Scenario {
+        name: "child_restart_after_exit",
+        run: child_restart_after_exit,
+    },
+    Scenario {
+        name: "watchdog_resets_when_heartbeat_stops",
+        run: watchdog_resets_when_heartbeat_stops,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -90,5 +98,72 @@ fn boots_and_logs(lab: &mut Lab) -> anyhow::Result<()> {
         c.count(&re(r"openfeo-init: child exited")) == 0,
         "child exited during boot"
     );
+    Ok(())
+}
+
+/// M0 acceptance: a crashed child is restarted by PID 1 (with the first backoff of 1 s).
+fn child_restart_after_exit(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.boot("openfeo.chaos=child-exit:3")?;
+    let c = lab.console()?;
+    let mut cur = Cursor::default();
+    let first = c
+        .wait_for(
+            &mut cur,
+            &re(r"openfeo-init: child started pid=(\d+)"),
+            BOOT_TIMEOUT,
+        )?
+        .groups[0]
+        .clone();
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo: chaos child-exit: exiting with status 3"),
+        Duration::from_secs(15),
+    )?;
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo-init: child exited status=exit\(3\) restart_in=1s restarts=1"),
+        SOON,
+    )?;
+    let second = c
+        .wait_for(
+            &mut cur,
+            &re(r"openfeo-init: child started pid=(\d+)"),
+            SOON,
+        )?
+        .groups[0]
+        .clone();
+    anyhow::ensure!(
+        first != second,
+        "restarted child must have a new pid (both {first:?})"
+    );
+    c.wait_for(&mut cur, &re(r"openfeo: router mode=vm"), SOON)?;
+    Ok(())
+}
+
+/// M0 acceptance: when the child stops heartbeating, PID 1 stops petting and the i6300esb resets
+/// the machine, which boots again.
+fn watchdog_resets_when_heartbeat_stops(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.boot("openfeo.chaos=child-hang:3")?;
+    let c = lab.console()?;
+    let mut cur = Cursor::default();
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo: chaos child-hang: heartbeats stopped"),
+        BOOT_TIMEOUT,
+    )?;
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo-init: heartbeat lost; watchdog no longer petted"),
+        Duration::from_secs(30),
+    )?;
+    // The second boot banner: the watchdog fired within its 60 s timeout.
+    c.wait_for(
+        &mut cur,
+        &re(r"Linux version 6\.18\.59-openfeo"),
+        Duration::from_secs(120),
+    )?;
+    c.wait_for(&mut cur, &re(r"openfeo-init: start version="), BOOT_TIMEOUT)?;
+    let banners = c.count(&re(r"Linux version 6\.18\.59-openfeo"));
+    anyhow::ensure!(banners == 2, "expected exactly 2 boots, saw {banners}");
     Ok(())
 }
