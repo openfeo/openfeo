@@ -13,14 +13,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use openfeo_apply::ApplyError;
 use openfeo_apply::links::LinksApplier;
+use openfeo_apply::nft::NftApplier;
 use openfeo_apply::routing::RoutingApplier;
+use openfeo_apply::sysctl::SysctlApplier;
 use openfeo_config::load::{self, Source};
 use openfeo_config::{Config, PortMap, file};
 use openfeo_init::cmdline::{Cmdline, Mode};
 use openfeo_init::ctl::CtlPipe;
 use openfeo_netlink::{Cache, Netlink};
+use openfeo_nft::Nft;
 use openfeo_platform::{atomic, kconfig, ports};
+use openfeo_reconcile::nft::DesiredNft;
 use openfeo_runtime::log::{DEFAULT_RING_BYTES, Ring};
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
@@ -45,6 +50,29 @@ const KMSG: &str = "/dev/kmsg";
 const RENAME_SETTLE: Duration = Duration::from_secs(2);
 /// Backoff between failed apply passes: 1 s doubling to this.
 const MAX_APPLY_BACKOFF: Duration = Duration::from_secs(30);
+/// The appliers of one pass, in order: links (bridges), routing (addresses, routes), nft (the
+/// ruleset), sysctl (forwarding, which [`may_run`] gates on the ruleset).
+const APPLY_ORDER: [Subsystem; 4] = [
+    Subsystem::Links,
+    Subsystem::Routing,
+    Subsystem::Nft,
+    Subsystem::Sysctl,
+];
+
+/// Whether `subsystem` runs in a pass where the nft applier has (`nft_ok_this_pass`) or has not
+/// succeeded: forwarding is never switched on without the ruleset (SPEC §5.6, §7.9).
+fn may_run(subsystem: Subsystem, nft_ok_this_pass: bool) -> bool {
+    subsystem != Subsystem::Sysctl || nft_ok_this_pass
+}
+
+/// Whether a pass ends with `ready generation=N` on the console. `converging_ops` are the links
+/// and routing operations of the pass: the cache has yet to show them, so a later pass decides.
+/// `total_ops` includes the nft and sysctl ones, which are complete when they return (a
+/// restarted child applies its ruleset once and is converged right there). `announced` is
+/// whether the last converged pass already said so.
+fn announce_ready(converging_ops: usize, total_ops: usize, announced: bool) -> bool {
+    converging_ops == 0 && (total_ops > 0 || !announced)
+}
 
 /// Run until PID 1 goes away (or a chaos knob fires). Never returns `Ok` in practice.
 ///
@@ -380,46 +408,104 @@ async fn link_facts_task(
     }
 }
 
-/// The reconcile/apply loop (SPEC §6.2): on every World or cache change, links then routing.
+/// The appliers of one child; a restarted child builds fresh ones (and a fresh libnftables
+/// context), so its first pass applies the ruleset once and adopts everything else.
+struct Appliers {
+    links: LinksApplier,
+    routing: RoutingApplier,
+    nft: NftApplier,
+    sysctl: SysctlApplier,
+}
+
+impl Appliers {
+    fn new() -> Result<Self, TaskError> {
+        Ok(Appliers {
+            links: LinksApplier::new(),
+            routing: RoutingApplier::new(),
+            nft: NftApplier::new(
+                Nft::new().map_err(|err| TaskError::from(format!("libnftables context: {err}")))?,
+            ),
+            sysctl: SysctlApplier::new(),
+        })
+    }
+
+    /// One subsystem's pass; the operation count on success.
+    async fn run(
+        &mut self,
+        subsystem: Subsystem,
+        world: &World,
+        cache: &Cache,
+        nl: &Netlink,
+        desired_nft: &DesiredNft,
+    ) -> Result<usize, ApplyError> {
+        let report = match subsystem {
+            Subsystem::Links => {
+                self.links
+                    .apply(&openfeo_reconcile::links::links(world), cache, nl)
+                    .await?
+            }
+            Subsystem::Routing => {
+                self.routing
+                    .apply(&openfeo_reconcile::routing::routing(world), cache, nl)
+                    .await?
+            }
+            Subsystem::Nft => self.nft.apply(desired_nft)?,
+            Subsystem::Sysctl => self.sysctl.apply(&openfeo_reconcile::sysctl::sysctl(
+                world,
+                desired_nft.forwarding,
+            ))?,
+            Subsystem::Netlink | Subsystem::Config | Subsystem::Supervisor => {
+                openfeo_apply::Report::default()
+            }
+        };
+        Ok(report.ops)
+    }
+}
+
+/// The reconcile/apply loop (SPEC §6.2): on every World or cache change, one pass over
+/// [`APPLY_ORDER`]; sysctl only after the ruleset applied in the same pass.
 async fn apply_task(
     mut world_rx: WorldRx,
     mut cache_rx: watch::Receiver<Arc<Cache>>,
     nl: Netlink,
     health: HealthTracker,
 ) -> Result<(), TaskError> {
-    let mut links_applier = LinksApplier::new();
-    let mut routing_applier = RoutingApplier::new();
+    let mut appliers = Appliers::new()?;
     let mut backoff = Duration::from_secs(1);
     let mut announced = false;
     loop {
         let world = world_rx.borrow_and_update().clone();
         let cache = cache_rx.borrow_and_update().clone();
         let generation = world.generation;
+        let desired_nft = openfeo_reconcile::nft::nft(&world);
         let mut total_ops = 0;
+        let mut converging_ops = 0;
         let mut failed = false;
-        for subsystem in [Subsystem::Links, Subsystem::Routing] {
+        let mut nft_ok = false;
+        for subsystem in APPLY_ORDER {
+            if !may_run(subsystem, nft_ok) {
+                debug!("apply {subsystem} skipped: ruleset not applied this pass");
+                continue;
+            }
             let result = {
                 let _in_flight = health.begin(subsystem);
-                match subsystem {
-                    Subsystem::Links => links_applier
-                        .apply(&openfeo_reconcile::links::links(&world), &cache, &nl)
-                        .await
-                        .map(|report| report.ops),
-                    _ => routing_applier
-                        .apply(&openfeo_reconcile::routing::routing(&world), &cache, &nl)
-                        .await
-                        .map(|report| report.ops),
-                }
+                appliers
+                    .run(subsystem, &world, &cache, &nl, &desired_nft)
+                    .await
             };
             match result {
                 Ok(ops) => {
                     health.set(subsystem, Status::Ok);
+                    nft_ok |= subsystem == Subsystem::Nft;
                     if ops > 0 {
                         info!("apply {subsystem} generation={generation} ops={ops}");
                     } else {
                         debug!("apply {subsystem} generation={generation} ops=0");
                     }
                     total_ops += ops;
+                    if matches!(subsystem, Subsystem::Links | Subsystem::Routing) {
+                        converging_ops += ops;
+                    }
                 }
                 Err(err) => {
                     health.set(subsystem, Status::Degraded(err.to_string()));
@@ -437,15 +523,59 @@ async fn apply_task(
             continue;
         }
         backoff = Duration::from_secs(1);
-        if total_ops > 0 {
-            announced = false;
-        } else if !announced {
+        if announce_ready(converging_ops, total_ops, announced) {
             info!("ready generation={generation}");
             announced = true;
+        } else if converging_ops > 0 {
+            announced = false;
         }
         tokio::select! {
             changed = world_rx.changed() => changed.map_err(|_| "world publisher gone")?,
             changed = cache_rx.changed() => changed.map_err(|_| "netlink cache gone")?,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sysctl_waits_for_nft() {
+        assert!(!may_run(Subsystem::Sysctl, false));
+        assert!(may_run(Subsystem::Sysctl, true));
+        for subsystem in [Subsystem::Links, Subsystem::Routing, Subsystem::Nft] {
+            assert!(may_run(subsystem, false), "{subsystem}");
+            assert!(may_run(subsystem, true), "{subsystem}");
+        }
+    }
+
+    #[test]
+    fn ready_follows_converged_passes() {
+        // Nothing happened and ready was already said: silence.
+        assert!(!announce_ready(0, 0, true));
+        // Nothing happened after work in an earlier pass: ready.
+        assert!(announce_ready(0, 0, false));
+        // Only nft/sysctl work (a restarted child applying its ruleset once): the kernel is
+        // converged, nothing more will arrive on the cache, say ready now.
+        assert!(announce_ready(0, 1, true));
+        assert!(announce_ready(0, 3, false));
+        // Links or routing changed: the cache has yet to show it, a later pass decides.
+        assert!(!announce_ready(2, 2, false));
+        assert!(!announce_ready(1, 2, true));
+    }
+
+    #[test]
+    fn apply_order_ends_with_sysctl() {
+        assert_eq!(
+            APPLY_ORDER,
+            [
+                Subsystem::Links,
+                Subsystem::Routing,
+                Subsystem::Nft,
+                Subsystem::Sysctl
+            ]
+        );
+        assert_eq!(APPLY_ORDER.last(), Some(&Subsystem::Sysctl));
     }
 }

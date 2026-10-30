@@ -10,10 +10,8 @@ pub const CORE: &[(&str, &str)] = &[
     // An appliance: an oops is a reboot (with panic=10 on the command line). SysRq does not
     // exist on our kernels (MAGIC_SYSRQ is off), so there is no sysctl to disable.
     ("kernel/panic_on_oops", "1"),
-    // We are a router.
-    ("net/ipv4/ip_forward", "1"),
-    ("net/ipv6/conf/all/forwarding", "1"),
-    ("net/ipv6/conf/default/forwarding", "1"),
+    // Forwarding (ip_forward, IPv6 forwarding) is not here: the router child switches it on only
+    // together with a ruleset (SPEC §5.6, §7.9), so a box never forwards unfiltered.
     // §7.3: the WAN IPv6 client does RA and SLAAC itself; the kernel does neither anywhere.
     ("net/ipv6/conf/all/accept_ra", "0"),
     ("net/ipv6/conf/default/accept_ra", "0"),
@@ -56,6 +54,13 @@ mod tests {
             assert!(!key.starts_with('/'), "{key} must be relative to /proc/sys");
             assert!(seen.insert(key), "{key} listed twice");
         }
-        assert!(CORE.contains(&("net/ipv4/ip_forward", "1")));
+        // Forwarding is the router child's lever, written only together with a ruleset
+        // (SPEC §5.6, §7.9): PID 1 must not switch it on.
+        for key in CORE.iter().map(|(key, _)| *key) {
+            assert!(
+                !key.ends_with("forwarding") && key != "net/ipv4/ip_forward",
+                "{key}"
+            );
+        }
     }
 }
