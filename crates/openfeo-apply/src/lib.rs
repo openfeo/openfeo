@@ -5,13 +5,16 @@
 //! and issue the netlink operations that close the gap. Appliers own only what they tag: bridges
 //! named `br-*`, ports enslaved to them, global-scope addresses on the interfaces OpenFeO manages,
 //! and routes with `RTPROT_OPENFEO`. Kernel-originated state and anything on other interfaces is
-//! never touched. A failed operation ends the pass with an error; the caller retries with backoff
-//! and the next World.
+//! never touched. The nft applier replaces `table inet openfeo` through libnftables; the sysctl
+//! applier writes the forwarding levers. A failed operation is reported at the end of a
+//! best-effort pass; the caller retries with backoff and the next World.
 
 #![forbid(unsafe_code)]
 
 pub mod links;
+pub mod nft;
 pub mod routing;
+pub mod sysctl;
 
 /// What one pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -35,6 +38,18 @@ pub enum ApplyError {
     /// An interface the desired state names does not exist (yet).
     #[error("{0}")]
     Unresolvable(String),
+    /// libnftables refused the ruleset; the text is its error.
+    #[error("nft: {0}")]
+    Nft(String),
+    /// A kernel parameter could not be read or written.
+    #[error("sysctl {path}: {source}")]
+    Io {
+        /// The key under `/proc/sys`.
+        path: String,
+        /// The error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl ApplyError {

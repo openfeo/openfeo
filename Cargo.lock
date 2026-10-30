@@ -647,8 +647,11 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "openfeo-netlink",
+ "openfeo-nft",
+ "openfeo-platform",
  "openfeo-reconcile",
  "openfeo-world",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
@@ -684,6 +687,7 @@ dependencies = [
  "openfeo-config",
  "openfeo-netlink",
  "openfeo-nft",
+ "openfeo-platform",
  "openfeo-reconcile",
  "openfeo-world",
  "regex",

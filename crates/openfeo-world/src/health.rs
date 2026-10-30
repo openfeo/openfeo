@@ -18,6 +18,10 @@ pub enum Subsystem {
     Links,
     /// The routing applier (addresses, routes).
     Routing,
+    /// The nft applier (the firewall and NAT ruleset).
+    Nft,
+    /// The sysctl applier (forwarding levers).
+    Sysctl,
     /// Configuration loading.
     Config,
     /// The task supervisor itself.
@@ -32,6 +36,8 @@ impl Subsystem {
             Subsystem::Netlink => "netlink",
             Subsystem::Links => "links",
             Subsystem::Routing => "routing",
+            Subsystem::Nft => "nft",
+            Subsystem::Sysctl => "sysctl",
             Subsystem::Config => "config",
             Subsystem::Supervisor => "supervisor",
         }
@@ -107,5 +113,7 @@ mod tests {
         assert!(!report.is_healthy());
         assert_eq!(report.reason().unwrap(), "wedged: links");
         assert_eq!(Subsystem::Netlink.to_string(), "netlink");
+        assert_eq!(Subsystem::Nft.to_string(), "nft");
+        assert_eq!(Subsystem::Sysctl.to_string(), "sysctl");
     }
 }
