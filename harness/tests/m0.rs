@@ -7,6 +7,8 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use anyhow::Context;
+use openfeo_harness::daemons;
 use openfeo_harness::lab::{BOOT_TIMEOUT, Lab};
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::sandbox;
@@ -28,6 +30,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "watchdog_resets_when_heartbeat_stops",
         run: watchdog_resets_when_heartbeat_stops,
+    },
+    Scenario {
+        name: "isp_kea_dhcp4_starts",
+        run: isp_kea_dhcp4_starts,
     },
 ];
 
@@ -165,5 +171,18 @@ fn watchdog_resets_when_heartbeat_stops(lab: &mut Lab) -> anyhow::Result<()> {
     c.wait_for(&mut cur, &re(r"openfeo-init: start version="), BOOT_TIMEOUT)?;
     let banners = c.count(&re(r"Linux version 6\.18\.59-openfeo"));
     anyhow::ensure!(banners == 2, "expected exactly 2 boots, saw {banners}");
+    Ok(())
+}
+
+/// The ISP namespace can run a reference daemon: Kea DHCPv4 starts on wan0 and stays up.
+fn isp_kea_dhcp4_starts(lab: &mut Lab) -> anyhow::Result<()> {
+    let run_dir = lab.run_dir.clone();
+    let kea = daemons::kea_dhcp4(&lab.isp0, "wan0", &run_dir)?;
+    lab.daemons.push(kea);
+    let kea = lab.daemons.last_mut().context("just pushed")?;
+    let mut cur = Cursor::default();
+    kea.log
+        .wait_for(&mut cur, &re(r"DHCP4_STARTED"), Duration::from_secs(15))?;
+    anyhow::ensure!(kea.is_running(), "kea-dhcp4 exited after announcing start");
     Ok(())
 }

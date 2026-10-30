@@ -75,8 +75,15 @@ fn run_one(scenario: &Scenario) -> anyhow::Result<()> {
     result
 }
 
-/// On failure: the end of the VM console and of QEMU's stderr, so the cause is in the output.
+/// On failure: the end of the VM console, of QEMU's stderr and of every daemon's log, so the
+/// cause is in the output.
 fn dump_diagnostics(lab: &Lab) {
+    for daemon in &lab.daemons {
+        eprintln!("--- {} (last 20 lines) ---", daemon.name);
+        for line in daemon.log.tail(20) {
+            eprintln!("{line}");
+        }
+    }
     if let Some(vm) = &lab.vm {
         if let Some(console) = &vm.console {
             eprintln!("--- console (last 80 lines) ---");

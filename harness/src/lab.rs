@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::daemons::Daemon;
 use crate::lines::Lines;
 use crate::netns::NetNs;
 use crate::qemu::{BASE_CMDLINE, ConsoleMode, Nic, Vm, VmSpec};
@@ -42,6 +43,8 @@ pub struct Lab {
     name: String,
     /// The router VM, after [`Lab::boot`]. Declared first so it dies before its taps.
     pub vm: Option<Vm>,
+    /// Reference daemons started by scenarios; stopped before the namespaces go.
+    pub daemons: Vec<Daemon>,
     /// Port taps in port order: wan0 (isp0), wan1 (isp1), lan0 (lan0). Dropped before the
     /// namespaces so the namespaces can go.
     taps: Vec<OwnedFd>,
@@ -75,6 +78,7 @@ impl Lab {
             run_dir,
             name: name.to_owned(),
             vm: None,
+            daemons: Vec::new(),
             taps,
             isp0,
             isp1,

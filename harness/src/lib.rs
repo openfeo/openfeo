@@ -8,6 +8,7 @@
 //! router kernel in QEMU with those taps as its ports ([`lab`]), and drives scenarios against the
 //! serial console ([`scenario`]).
 
+pub mod daemons;
 pub mod lab;
 pub mod lines;
 pub mod netns;
