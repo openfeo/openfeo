@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-proto-dhcp4"
+description = "OpenFeO DHCPv4: wire format, IPv4/UDP encapsulation for raw sockets, identifiers and the sans-IO client core (SPEC §7.2, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+# A second, independent DHCP codec as the oracle for ours (SPEC §2 "memory-safe parsers" wants
+# our own; this one is for tests and fuzzing only and reaches no shipped binary).
+dhcproto.workspace = true
+ipnet.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
