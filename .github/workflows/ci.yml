@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# Mirrors `make ci`: lint and unit tests on one runner; kernel build plus the QEMU harness
+# scenarios on another. The harness is rootless (ADR-0006) but Ubuntu 24.04 runners need
+# unprivileged user namespaces re-enabled and /dev/kvm opened up for the runner user.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy, rustfmt
+      - uses: taiki-e/install-action@cargo-deny
+      - run: make lint
+      - run: make test
+
+  kernel-and-harness:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: install kernel build and harness dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 kea-dhcp4-server iproute2 bc flex bison libelf-dev libssl-dev ccache zstd cpio
+      - name: allow KVM and user namespaces for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/kernel/linux-6.18.59.tar.xz
+            ~/.cache/ccache
+          key: kernel-${{ hashFiles('kernel/**') }}
+          restore-keys: kernel-
+      - run: make kernel
+      - run: make check-env
+      - run: make test-harness
