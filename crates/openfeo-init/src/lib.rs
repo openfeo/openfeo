@@ -59,8 +59,11 @@ pub fn main(version: &str, mode_flag: Option<Mode>) -> ! {
         log.warn(&format!("loopback up: {err}"));
     }
     sysctl::apply(&log);
-    match mounts::mount_all(&[mounts::STATE_FALLBACK], &log) {
-        Ok(()) => log.warn("state: volatile tmpfs until persistent storage lands in M5"),
+    match mounts::mount_state(mode) {
+        Ok(spec) if spec.fstype == "tmpfs" => {
+            log.warn("state: volatile tmpfs until persistent storage lands in M5");
+        }
+        Ok(spec) => log.info(&format!("state: {} {}", spec.fstype, spec.source)),
         Err(err) => log.warn(&err.to_string()),
     }
 
