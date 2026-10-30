@@ -13,6 +13,8 @@ pub mod lab;
 pub mod lines;
 pub mod netns;
 pub mod qemu;
+pub mod qmp;
 pub mod sandbox;
 pub mod scenario;
+pub mod statedisk;
 pub mod tun;

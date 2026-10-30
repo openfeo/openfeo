@@ -13,8 +13,10 @@ clap.workspace = true
 libc.workspace = true
 nix.workspace = true
 regex.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 openfeo-apply = { path = "../crates/openfeo-apply" }
 openfeo-config = { path = "../crates/openfeo-config" }
 openfeo-netlink = { path = "../crates/openfeo-netlink" }

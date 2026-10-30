@@ -641,6 +641,8 @@ dependencies = [
  "openfeo-reconcile",
  "openfeo-world",
  "regex",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
