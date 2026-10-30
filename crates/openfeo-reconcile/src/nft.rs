@@ -275,6 +275,11 @@ fn dnat_map(protocol: &str, map: &str) -> Value {
     )])
 }
 
+/// `meta nfproto ipv4`: the rule applies to IPv4 packets only.
+fn ipv4_only() -> Value {
+    eq(meta("nfproto"), json!("ipv4"))
+}
+
 fn accept() -> Value {
     json!({"accept": null})
 }
@@ -426,14 +431,24 @@ fn dstnat_chain() -> Vec<Value> {
 }
 
 /// IPv4 masquerade on WAN zones; hairpinned flows within one LAN are masqueraded to the
-/// router's LAN address so the reply comes back through the router (SPEC §7.5).
+/// router's LAN address so the reply comes back through the router (SPEC §7.5). Every rule
+/// matches `meta nfproto ipv4` first: in an `inet` table a bare `masquerade` would translate
+/// IPv6 too, and §7.5 says no IPv6 NAT.
 fn srcnat_chain() -> Vec<Value> {
     vec![
         chain("srcnat", "nat", "postrouting", 100, "accept"),
-        rule("srcnat", vec![oifname_in("wan_if"), masquerade()]),
         rule(
             "srcnat",
-            vec![iif_oif_pair_in("lan_same"), ct_status_dnat(), masquerade()],
+            vec![ipv4_only(), oifname_in("wan_if"), masquerade()],
+        ),
+        rule(
+            "srcnat",
+            vec![
+                ipv4_only(),
+                iif_oif_pair_in("lan_same"),
+                ct_status_dnat(),
+                masquerade(),
+            ],
         ),
     ]
 }
@@ -537,6 +552,28 @@ mod tests {
             "wan_ping defaults to off"
         );
         insta::assert_yaml_snapshot!(desired);
+    }
+
+    /// SPEC §7.5: IPv4 masquerade per WAN, no IPv6 NAT. In an `inet` table a bare `masquerade`
+    /// translates both families, so every masquerade rule must match `meta nfproto ipv4`.
+    #[test]
+    fn masquerade_is_ipv4_only() {
+        let desired = nft(&fixtures::static_world());
+        let srcnat = rules_of(&desired.ruleset, "srcnat");
+        let masquerades: Vec<&&Value> = srcnat
+            .iter()
+            .filter(|rule| mentions(rule, "\"masquerade\""))
+            .collect();
+        assert_eq!(masquerades.len(), 2, "{srcnat:?}");
+        let ipv4_guard =
+            json!({"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv4"}});
+        for rule in masquerades {
+            let expr = rule["expr"].as_array().unwrap();
+            assert_eq!(
+                expr[0], ipv4_guard,
+                "masquerade without an IPv4 guard: {rule}"
+            );
+        }
     }
 
     #[test]

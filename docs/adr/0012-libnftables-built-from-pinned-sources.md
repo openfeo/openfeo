@@ -30,9 +30,11 @@ this project's own tooling) refuses, so the nftables build takes the same shape 
   `--disable-shared --enable-static` (nftables additionally `--with-json --with-mini-gmp
   --without-cli --without-xtables --disable-man-doc`, SPEC §13), `CC=musl-gcc` and
   `--host=x86_64-linux-musl` for the musl target, `cc` for the host, `PKG_CONFIG_LIBDIR` confined
-  to its own prefix, and installs into `$OUT_DIR/prefix`; a library whose archive is already there
-  is skipped. It links `nftables`, `nftnl`, `mnl` and `jansson` statically. It is the one place
-  outside `harness/` and `image/` allowed to spawn processes, at build time only.
+  to its own prefix, and installs into `$OUT_DIR/prefix`. A stamp per library records the source
+  tree it was built from: a library whose archive and stamp are current is skipped, a changed
+  tree rebuilds that library and every one after it in dependency order. It links `nftables`,
+  `nftnl`, `mnl` and `jansson` statically. It is the one place outside `harness/` and `image/`
+  allowed to spawn processes, at build time only.
 - `make bin`, `make lint` and `make test` depend on `kernel-headers` and `nft-src` and export
   `OPENFEO_NFT_SRC` and `OPENFEO_UAPI_INCLUDE` to cargo; CI runs the same targets and caches the
   tarballs by the hash of the two pin files.
@@ -43,8 +45,9 @@ this project's own tooling) refuses, so the nftables build takes the same shape 
   check-env` lists them. A cold build of the four libraries takes well under a minute per target
   on a workstation and is skipped afterwards.
 - A bare `cargo build` without the two variables fails with a message pointing at `make`.
-- Updating a library is a one-line change to `nft/sources.txt` (the build script finds the tree
-  by name prefix); the CI cache key follows.
+- Updating a library is a one-line change to `nft/sources.txt`: `fetch.sh` fetches the new tree
+  and removes the old one, the build script (which finds the tree by name prefix) rebuilds that
+  library and its dependents, and the CI cache key follows.
 - The shipped binary is a GPLv2 work because libnftables is GPL-2.0-only (SPEC §14, ADR-0002);
   `docs/third-party.md` lists the four libraries, versions and licences.
 - The sandboxed `harness/tests/nft.rs` scenarios run the real library against the host kernel in

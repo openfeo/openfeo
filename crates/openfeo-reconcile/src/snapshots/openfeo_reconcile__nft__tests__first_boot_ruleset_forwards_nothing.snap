@@ -501,6 +501,12 @@ ruleset:
           - match:
               left:
                 meta:
+                  key: nfproto
+              op: "=="
+              right: ipv4
+          - match:
+              left:
+                meta:
                   key: oifname
               op: "=="
               right: "@wan_if"
@@ -511,6 +517,12 @@ ruleset:
       rule:
         chain: srcnat
         expr:
+          - match:
+              left:
+                meta:
+                  key: nfproto
+              op: "=="
+              right: ipv4
           - match:
               left:
                 concat:

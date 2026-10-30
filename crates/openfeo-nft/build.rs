@@ -8,8 +8,10 @@
 //! Inputs, exported by the Makefile: `OPENFEO_NFT_SRC` (the directory holding
 //! `<name>-<version>/` source trees) and `OPENFEO_UAPI_INCLUDE` (the UAPI headers installed from
 //! our pinned kernel, so the libraries never see the host's). Each library is configured
-//! out-of-tree under `$OUT_DIR/build/<name>` and installed into `$OUT_DIR/prefix`; a library whose
-//! archive is already there is skipped, so a rebuild of the Rust code costs nothing.
+//! out-of-tree under `$OUT_DIR/build/<name>` and installed into `$OUT_DIR/prefix`; a stamp per
+//! library records the source tree it was built from, so a library whose archive and stamp are
+//! current is skipped (a rebuild of the Rust code costs nothing) while a bumped pin rebuilds that
+//! library and every one after it in dependency order.
 
 #![allow(clippy::disallowed_methods)] // build-time only: configure and make of the vendored C libraries
 
@@ -51,12 +53,24 @@ fn main() {
     let musl = target.contains("musl");
     let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "1".to_owned());
 
+    let mut rebuild_rest = false;
     for (name, archive, flags) in LIBRARIES {
-        if prefix.join("lib").join(archive).is_file() {
+        let src = source_tree(&sources, name);
+        let tree = src
+            .file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or(name)
+            .to_owned();
+        let stamp = prefix.join(format!(".built-{name}"));
+        let current = prefix.join("lib").join(archive).is_file()
+            && fs::read_to_string(&stamp).is_ok_and(|built| built.trim() == tree);
+        if current && !rebuild_rest {
             continue;
         }
-        let src = source_tree(&sources, name);
+        // A dependency changed, or this tree did: configure afresh, and rebuild what follows.
+        rebuild_rest = true;
         let build = out_dir.join("build").join(name);
+        let _ = fs::remove_dir_all(&build);
         fs::create_dir_all(&build)
             .unwrap_or_else(|err| panic!("create {}: {err}", build.display()));
 
@@ -92,6 +106,8 @@ fn main() {
             .arg(format!("-j{jobs}"))
             .arg("install");
         run(make, &build.join("make.log"), name, "make install");
+        fs::write(&stamp, format!("{tree}\n"))
+            .unwrap_or_else(|err| panic!("write {}: {err}", stamp.display()));
     }
 
     println!(
