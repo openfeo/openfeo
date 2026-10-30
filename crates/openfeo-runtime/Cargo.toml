@@ -11,6 +11,7 @@ publish = false
 openfeo-world = { path = "../openfeo-world" }
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
