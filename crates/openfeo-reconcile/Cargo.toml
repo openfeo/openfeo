@@ -1,0 +1,20 @@
+[package]
+name = "openfeo-reconcile"
+description = "OpenFeO reconcilers: pure World -> Desired for links and routing (no tokio, no kernel, no clocks)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+openfeo-config = { path = "../openfeo-config" }
+openfeo-world = { path = "../openfeo-world" }
+ipnet.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+
+[lints]
+workspace = true

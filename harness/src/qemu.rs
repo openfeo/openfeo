@@ -60,6 +60,10 @@ pub struct VmSpec {
     pub nics: Vec<Nic>,
     /// Console wiring.
     pub console: ConsoleMode,
+    /// A raw ext4 image attached as virtio-blk, PID 1's `/state` (ADR-0010).
+    pub state_disk: Option<PathBuf>,
+    /// Where QEMU listens for QMP (`server=on,wait=off`).
+    pub qmp_socket: Option<PathBuf>,
 }
 
 /// `kvm` when `/dev/kvm` is usable, else `tcg`.
@@ -118,6 +122,18 @@ pub fn build_args(spec: &VmSpec) -> Vec<OsString> {
             &format!("tap,id={},fd={}", nic.id, FIRST_NIC_FD + i),
             "-device",
             &format!("virtio-net-pci,netdev={},mac={}", nic.id, nic.mac),
+        ]);
+    }
+    if let Some(disk) = &spec.state_disk {
+        push(&[
+            "-drive",
+            &format!("file={},if=virtio,format=raw,cache=unsafe", disk.display()),
+        ]);
+    }
+    if let Some(socket) = &spec.qmp_socket {
+        push(&[
+            "-qmp",
+            &format!("unix:{},server=on,wait=off", socket.display()),
         ]);
     }
     args
@@ -242,6 +258,8 @@ mod tests {
                     mac: "52:54:00:fe:00:01".into(),
                 },
             ],
+            state_disk: None,
+            qmp_socket: None,
         };
         let args: Vec<String> = build_args(&spec)
             .iter()
@@ -253,5 +271,33 @@ mod tests {
         assert!(args.contains(&"virtio-net-pci,netdev=p1,mac=52:54:00:fe:00:01".to_string()));
         assert!(args.windows(2).any(|w| w == ["-append", BASE_CMDLINE]));
         assert!(args.windows(2).any(|w| w == ["-serial", "stdio"]));
+        assert!(!args.iter().any(|a| a == "-drive" || a == "-qmp"));
+    }
+
+    #[test]
+    fn args_include_state_drive_and_qmp_socket() {
+        let spec = VmSpec {
+            kernel: "k".into(),
+            cmdline: BASE_CMDLINE.into(),
+            mem_mib: 128,
+            cpus: 2,
+            console: ConsoleMode::Captured,
+            nics: vec![],
+            state_disk: Some("/run/x/state.img".into()),
+            qmp_socket: Some("/run/x/qmp.sock".into()),
+        };
+        let args: Vec<String> = build_args(&spec)
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w
+            == [
+                "-drive",
+                "file=/run/x/state.img,if=virtio,format=raw,cache=unsafe"
+            ]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-qmp", "unix:/run/x/qmp.sock,server=on,wait=off"])
+        );
     }
 }

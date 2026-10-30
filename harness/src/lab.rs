@@ -14,6 +14,8 @@ use crate::daemons::Daemon;
 use crate::lines::Lines;
 use crate::netns::NetNs;
 use crate::qemu::{BASE_CMDLINE, ConsoleMode, Nic, Vm, VmSpec};
+use crate::qmp::Qmp;
+use crate::statedisk;
 
 /// ISP A's side of the WAN A link (TEST-NET-3).
 pub const ISP0_ADDR: &str = "203.0.113.1/24";
@@ -43,6 +45,8 @@ pub struct Lab {
     name: String,
     /// An explicit kernel image, instead of [`Lab::kernel_path`].
     kernel: Option<PathBuf>,
+    /// The `/state` image for the VM, when a scenario supplied one (ADR-0010).
+    state_disk: Option<PathBuf>,
     /// The router VM, after [`Lab::boot`]. Declared first so it dies before its taps.
     pub vm: Option<Vm>,
     /// Reference daemons started by scenarios; stopped before the namespaces go.
@@ -80,6 +84,7 @@ impl Lab {
             run_dir,
             name: name.to_owned(),
             kernel: None,
+            state_disk: None,
             vm: None,
             daemons: Vec::new(),
             taps,
@@ -147,8 +152,46 @@ impl Lab {
             cpus: VM_CPUS,
             nics,
             console,
+            state_disk: self.state_disk.clone(),
+            qmp_socket: Some(self.qmp_socket_path()),
         })?;
         Ok(self.vm.insert(vm))
+    }
+
+    /// Give the VM a `/state` disk holding `files` (`(relative path, contents)`), before boot.
+    ///
+    /// # Errors
+    ///
+    /// When already booted or the image cannot be built.
+    pub fn with_state(&mut self, files: &[(&str, &[u8])]) -> Result<()> {
+        ensure!(self.vm.is_none(), "state disk must be set before boot");
+        let image = self.run_dir.join("state.img");
+        statedisk::create(&image, files)?;
+        self.state_disk = Some(image);
+        Ok(())
+    }
+
+    /// Give the VM a `/state` disk holding just `config.toml`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lab::with_state`].
+    pub fn with_config(&mut self, toml: &str) -> Result<()> {
+        self.with_state(&[("config.toml", toml.as_bytes())])
+    }
+
+    /// A QMP session to the booted VM.
+    ///
+    /// # Errors
+    ///
+    /// When no VM is booted or QEMU's socket cannot be reached.
+    pub fn qmp(&self) -> Result<Qmp> {
+        ensure!(self.vm.is_some(), "no VM booted");
+        Qmp::connect(&self.qmp_socket_path())
+    }
+
+    fn qmp_socket_path(&self) -> PathBuf {
+        self.run_dir.join("qmp.sock")
     }
 
     /// The captured serial console of the booted VM.

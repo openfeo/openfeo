@@ -1,0 +1,19 @@
+[package]
+name = "openfeo-apply"
+description = "OpenFeO appliers: diff desired links and routing against the netlink cache and make the kernel match, owning only tagged state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+openfeo-netlink = { path = "../openfeo-netlink" }
+openfeo-reconcile = { path = "../openfeo-reconcile" }
+openfeo-world = { path = "../openfeo-world" }
+ipnet.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andrew Newton
+
+syntax = "proto3";
+
+package openfeo.v1;
+
+// The whole router configuration (SPEC §8). On disk as `/state/config.toml`, keyed by these field
+// names (the canonical JSON mapping spelled in TOML). Field numbers are never reused; removed
+// fields become `reserved`.
+message Config {
+  // Schema version of the file; `migrate(n -> n+1)` runs at load (SPEC §8.2).
+  uint32 config_version = 1;
+  System system = 2;
+  // Port identity -> kernel name, mirroring `/state/identity/portmap` (SPEC §7.1).
+  repeated PortMapEntry ports = 3;
+  repeated Wan wans = 4;
+  repeated Lan lans = 5;
+}
+
+message System {
+  string hostname = 1;
+  string domain = 2;
+  string timezone = 3;
+  repeated string ntp_servers = 4;
+}
+
+// One physical port: bus-path identity and the sticky kernel name it was given.
+message PortMapEntry {
+  // Bus-path identity, e.g. "pci-0000:02:00.0".
+  string id = 1;
+  // Kernel interface name, e.g. "p0".
+  string name = 2;
+}
+
+// The file format of `/state/identity/portmap`.
+message PortMap {
+  repeated PortMapEntry ports = 1;
+}
+
+// A WAN is one port, optionally VLAN-tagged, with exactly one kind (SPEC §7.2).
+message Wan {
+  string name = 1;
+  string port = 2;
+  // 802.1Q VLAN id on the port; 0 = untagged.
+  uint32 vlan = 3;
+  // Lower wins when several WANs are up (SPEC §7.4).
+  uint32 priority = 4;
+  // Which table is present in the TOML selects the WAN type.
+  oneof kind {
+    StaticWan static = 5;
+    DhcpWan dhcp = 6;
+  }
+}
+
+// Address, gateway and DNS from config (SPEC §7.2 "Static").
+message StaticWan {
+  // "203.0.113.10/24".
+  string address = 1;
+  // "203.0.113.1".
+  string gateway = 2;
+  repeated string dns = 3;
+}
+
+// Options arrive with the DHCPv4 client (M1 part 2).
+message DhcpWan {}
+
+// A LAN is a bridge of one or more ports (SPEC §7.1).
+message Lan {
+  string name = 1;
+  repeated string ports = 2;
+  // The router's address and the LAN subnet, "192.168.1.1/24".
+  string ipv4 = 3;
+}

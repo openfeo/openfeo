@@ -4,7 +4,10 @@
 //! The filesystems PID 1 mounts before anything else runs (SPEC §6.1).
 
 use std::io;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
+use crate::cmdline::Mode;
 use crate::log::Log;
 
 /// One mount.
@@ -105,6 +108,83 @@ pub const STATE_FALLBACK: MountSpec = MountSpec {
     required: true,
 };
 
+/// `/state` in `vm` mode: the harness's virtio-blk ext4 image (ADR-0010), mounted with the
+/// SPEC §5.2 options. Optional: a VM without the disk falls back to the tmpfs.
+pub const STATE_VM: MountSpec = MountSpec {
+    source: "/dev/vda",
+    target: "/state",
+    fstype: "ext4",
+    flags: libc::MS_NOATIME | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_NOEXEC,
+    data: "",
+    required: false,
+};
+
+/// How long `vm` mode waits for `/dev/vda` to show up in devtmpfs before giving up on the disk.
+/// Built-in virtio-blk probes before init runs, so this is a safety net, not the normal path, and
+/// a VM without a disk pays it on every boot.
+pub const STATE_DISK_WAIT: Duration = Duration::from_secs(1);
+
+/// The mounts to try for `/state`, in order, for `mode`.
+#[must_use]
+pub fn state_plan(mode: Mode) -> &'static [MountSpec] {
+    match mode {
+        Mode::Vm => &[STATE_VM, STATE_FALLBACK],
+        _ => &[STATE_FALLBACK],
+    }
+}
+
+/// Try each spec of `plan` in order with `mount`; the first that mounts (or was already mounted)
+/// wins, an optional spec whose source is absent is skipped.
+///
+/// # Errors
+///
+/// The first failure that is neither success nor an optional absence, or the last spec's
+/// failure when every spec was skipped.
+pub fn mount_state_with(
+    plan: &'static [MountSpec],
+    mount: &mut dyn FnMut(&MountSpec) -> io::Result<()>,
+) -> Result<&'static MountSpec, MountError> {
+    let mut last: Option<MountError> = None;
+    for spec in plan {
+        match mount(spec) {
+            Ok(()) => return Ok(spec),
+            Err(err) => match classify(spec, err)? {
+                Outcome::Mounted | Outcome::AlreadyMounted => return Ok(spec),
+                Outcome::Skipped => {
+                    last = Some(MountError::Failed {
+                        target: spec.target,
+                        fstype: spec.fstype,
+                        source: io::Error::from_raw_os_error(libc::ENODEV),
+                    });
+                }
+            },
+        }
+    }
+    Err(last.unwrap_or(MountError::Failed {
+        target: "/state",
+        fstype: "none",
+        source: io::Error::from_raw_os_error(libc::ENODEV),
+    }))
+}
+
+/// Mount `/state` for `mode` (SPEC §6.1). In `vm` mode the disk may appear a moment after PID 1
+/// starts, so its node is awaited for up to [`STATE_DISK_WAIT`].
+///
+/// # Errors
+///
+/// As [`mount_state_with`].
+pub fn mount_state(mode: Mode) -> Result<&'static MountSpec, MountError> {
+    if mode == Mode::Vm {
+        let deadline = Instant::now() + STATE_DISK_WAIT;
+        while !Path::new(STATE_VM.source).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    mount_state_with(state_plan(mode), &mut |spec: &MountSpec| {
+        crate::sys::mount(spec.source, spec.target, spec.fstype, spec.flags, spec.data)
+    })
+}
+
 /// What became of one mount attempt that did not simply succeed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -131,8 +211,8 @@ pub enum MountError {
     },
 }
 
-/// Decide what a mount failure means: `EBUSY` is fine (already mounted); `ENODEV`/`ENOENT` on an
-/// optional mount means the feature is absent; everything else is fatal.
+/// Decide what a mount failure means: `EBUSY` is fine (already mounted); `ENODEV`/`ENOENT`/`ENXIO`
+/// on an optional mount means the feature or device is absent; everything else is fatal.
 ///
 /// # Errors
 ///
@@ -140,7 +220,7 @@ pub enum MountError {
 pub fn classify(spec: &MountSpec, err: io::Error) -> Result<Outcome, MountError> {
     match err.raw_os_error() {
         Some(libc::EBUSY) => Ok(Outcome::AlreadyMounted),
-        Some(libc::ENODEV | libc::ENOENT) if !spec.required => Ok(Outcome::Skipped),
+        Some(libc::ENODEV | libc::ENOENT | libc::ENXIO) if !spec.required => Ok(Outcome::Skipped),
         _ => Err(MountError::Failed {
             target: spec.target,
             fstype: spec.fstype,
@@ -228,5 +308,76 @@ mod tests {
         let targets: Vec<_> = EARLY.iter().map(|m| m.target).collect();
         assert_eq!(&targets[..3], &["/proc", "/sys", "/dev"]);
         assert_eq!(STATE_FALLBACK.target, "/state");
+    }
+
+    fn sources(plan: &[MountSpec]) -> Vec<&'static str> {
+        plan.iter().map(|m| m.source).collect()
+    }
+
+    #[test]
+    fn vm_plan_tries_the_disk_first() {
+        assert_eq!(sources(state_plan(Mode::Vm)), ["/dev/vda", "tmpfs"]);
+        assert_eq!(STATE_VM.fstype, "ext4");
+        assert_eq!(STATE_VM.target, "/state");
+        assert_eq!(
+            STATE_VM.flags,
+            libc::MS_NOATIME | libc::MS_NODEV | libc::MS_NOSUID | libc::MS_NOEXEC
+        );
+    }
+
+    #[test]
+    fn metal_plan_is_fallback_only_until_m5() {
+        for mode in [Mode::Metal, Mode::Container, Mode::Installer, Mode::Rescue] {
+            assert_eq!(sources(state_plan(mode)), ["tmpfs"], "{mode}");
+        }
+    }
+
+    #[test]
+    fn disk_absent_falls_back() {
+        let mut attempts = Vec::new();
+        let chosen = mount_state_with(state_plan(Mode::Vm), &mut |spec: &MountSpec| {
+            attempts.push(spec.source);
+            if spec.source == "/dev/vda" {
+                Err(e(libc::ENXIO))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, ["/dev/vda", "tmpfs"]);
+        assert_eq!(chosen.source, STATE_FALLBACK.source);
+    }
+
+    #[test]
+    fn disk_present_stops_there() {
+        let mut attempts = Vec::new();
+        let chosen = mount_state_with(state_plan(Mode::Vm), &mut |spec: &MountSpec| {
+            attempts.push(spec.source);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, ["/dev/vda"]);
+        assert_eq!(chosen.source, "/dev/vda");
+    }
+
+    #[test]
+    fn disk_error_other_than_absence_is_fatal() {
+        let result = mount_state_with(state_plan(Mode::Vm), &mut |spec: &MountSpec| {
+            if spec.source == "/dev/vda" {
+                Err(e(libc::EIO))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn enoent_and_enxio_on_an_optional_spec_are_skipped() {
+        assert!(matches!(
+            classify(&spec(false), e(libc::ENXIO)),
+            Ok(Outcome::Skipped)
+        ));
+        assert!(classify(&spec(true), e(libc::ENXIO)).is_err());
     }
 }

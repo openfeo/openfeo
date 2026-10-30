@@ -13,10 +13,31 @@ clap.workspace = true
 libc.workspace = true
 nix.workspace = true
 regex.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+openfeo-apply = { path = "../crates/openfeo-apply" }
+openfeo-config = { path = "../crates/openfeo-config" }
+openfeo-netlink = { path = "../crates/openfeo-netlink" }
+openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
+openfeo-world = { path = "../crates/openfeo-world" }
+tokio.workspace = true
+ipnet.workspace = true
+
+[[test]]
+name = "netlink"
+path = "tests/netlink.rs"
+harness = false
 
 [[test]]
 name = "m0"
 path = "tests/m0.rs"
+harness = false
+
+[[test]]
+name = "m1"
+path = "tests/m1.rs"
 harness = false
 
 [lints]

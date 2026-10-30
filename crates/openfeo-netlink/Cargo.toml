@@ -1,0 +1,22 @@
+[package]
+name = "openfeo-netlink"
+description = "OpenFeO rtnetlink monitor cache and apply primitives: links, bridges, addresses, routes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rtnetlink.workspace = true
+netlink-packet-route.workspace = true
+netlink-packet-core.workspace = true
+netlink-sys.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+ipnet.workspace = true
+
+[lints]
+workspace = true

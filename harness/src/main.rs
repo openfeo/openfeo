@@ -12,7 +12,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use openfeo_harness::lab::{ISP0_ADDR, ISP1_ADDR, Lab};
+use openfeo_harness::lab::{ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
 use openfeo_harness::{daemons, qemu, sandbox};
 
 #[derive(Parser)]
@@ -37,6 +37,12 @@ enum Cmd {
         /// Fault to inject, e.g. `child-exit:3` or `child-hang:3` (harness builds only).
         #[arg(long)]
         chaos: Option<String>,
+        /// Configuration for `/state/config.toml` (default: `harness/fixtures/vm-static.toml`).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Boot without a state disk: first-boot defaults (all ports in one LAN).
+        #[arg(long)]
+        no_config: bool,
     },
     /// Report whether this machine can run the harness.
     Check,
@@ -48,7 +54,12 @@ enum Cmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
-        Cmd::Run { kernel, chaos } => run(kernel, chaos),
+        Cmd::Run {
+            kernel,
+            chaos,
+            config,
+            no_config,
+        } => run(kernel, chaos, config, no_config),
         Cmd::Check => check(),
         Cmd::CheckSandbox => sandbox::enter().map(|()| ExitCode::SUCCESS),
     };
@@ -58,11 +69,24 @@ fn main() -> ExitCode {
     })
 }
 
-fn run(kernel: Option<PathBuf>, chaos: Option<String>) -> Result<ExitCode> {
+fn run(
+    kernel: Option<PathBuf>,
+    chaos: Option<String>,
+    config: Option<PathBuf>,
+    no_config: bool,
+) -> Result<ExitCode> {
     sandbox::enter()?;
     let mut lab = Lab::new("run")?;
     if let Some(kernel) = kernel {
         lab.set_kernel(kernel);
+    }
+    if !no_config {
+        let path =
+            config.unwrap_or_else(|| workspace_root().join("harness/fixtures/vm-static.toml"));
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        lab.with_config(&text)?;
+        eprintln!("lab: /state/config.toml from {}", path.display());
     }
     let run_dir = lab.run_dir.clone();
     let kea = daemons::kea_dhcp4(&lab.isp0, "wan0", &run_dir)?;
@@ -98,7 +122,7 @@ fn check() -> Result<ExitCode> {
         .open("/dev/net/tun")
         .is_ok();
     report("/dev/net/tun", tun, "");
-    for bin in ["qemu-system-x86_64", "ip", "kea-dhcp4"] {
+    for bin in ["qemu-system-x86_64", "ip", "kea-dhcp4", "mkfs.ext4", "ping"] {
         report(bin, on_path(bin), "");
     }
     report(

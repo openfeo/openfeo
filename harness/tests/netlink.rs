@@ -1,0 +1,623 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andrew Newton
+
+//! Kernel-backed tests for `openfeo-netlink` (and, from Task 11, `openfeo-apply`) against veth
+//! pairs inside the rootless sandbox: no QEMU, a few milliseconds each. `harness = false`: this
+//! binary is its own runner; an optional first argument filters scenarios by substring. Every
+//! scenario uses interface names of its own and deletes them on the way out, because the sandbox's
+//! network namespace outlives the scenarios.
+
+use std::future::Future;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, ensure};
+use ipnet::IpNet;
+use openfeo_apply::links::LinksApplier;
+use openfeo_apply::routing::RoutingApplier;
+use openfeo_config::{Config, PortMap, PortMapEntry};
+use openfeo_harness::lab::Lab;
+use openfeo_harness::netns;
+use openfeo_harness::sandbox;
+use openfeo_harness::scenario::{Scenario, run_all};
+use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, TABLE_MAIN};
+use openfeo_world::{LinkFact, MacAddr, World};
+use tokio::sync::watch;
+
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "monitor_sees_veth_addr_and_route",
+        run: monitor_sees_veth_addr_and_route,
+    },
+    Scenario {
+        name: "bridge_with_vlan_filtering_enslave_rename",
+        run: bridge_with_vlan_filtering_enslave_rename,
+    },
+    Scenario {
+        name: "addr_and_route_primitives",
+        run: addr_and_route_primitives,
+    },
+    Scenario {
+        name: "apply_builds_bridge_addrs_routes",
+        run: apply_builds_bridge_addrs_routes,
+    },
+    Scenario {
+        name: "reapply_is_a_noop",
+        run: reapply_is_a_noop,
+    },
+    Scenario {
+        name: "config_change_moves_the_lan_address",
+        run: config_change_moves_the_lan_address,
+    },
+    Scenario {
+        name: "foreign_state_is_untouched",
+        run: foreign_state_is_untouched,
+    },
+    Scenario {
+        name: "global_ipv6_address_is_untouched",
+        run: global_ipv6_address_is_untouched,
+    },
+    Scenario {
+        name: "partial_failure_still_applies_the_rest",
+        run: partial_failure_still_applies_the_rest,
+    },
+];
+
+fn main() -> ExitCode {
+    if let Err(err) = sandbox::enter() {
+        eprintln!("{err:#}");
+        return ExitCode::FAILURE;
+    }
+    run_all(SCENARIOS, std::env::args().nth(1).as_deref())
+}
+
+/// How long a kernel notification may take to reach the cache.
+const SETTLE: Duration = Duration::from_secs(2);
+
+fn block_on<F: Future>(future: F) -> anyhow::Result<F::Output> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    Ok(runtime.block_on(future))
+}
+
+/// Wait until `pred` holds for the cache, or fail after [`SETTLE`].
+async fn wait_until(
+    rx: &mut watch::Receiver<Arc<Cache>>,
+    what: &str,
+    pred: impl Fn(&Cache) -> bool,
+) -> anyhow::Result<()> {
+    loop {
+        if pred(&rx.borrow_and_update()) {
+            return Ok(());
+        }
+        tokio::time::timeout(SETTLE, rx.changed())
+            .await
+            .with_context(|| {
+                let cache = rx.borrow();
+                format!(
+                    "timed out waiting for {what}; cache has {} links, addrs {:?}, {} routes",
+                    cache.links.len(),
+                    cache.addrs,
+                    cache.routes.len()
+                )
+            })?
+            .context("monitor stopped")?;
+    }
+}
+
+/// The monitor's initial dump and its notifications for a link, an address and a route.
+fn monitor_sees_veth_addr_and_route(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "nv0"]);
+    netns::ip(&["link", "add", "nv0", "type", "veth", "peer", "name", "nv1"])?;
+    let result = block_on(async {
+        let (_nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let nv0 = {
+            let cache = rx.borrow().clone();
+            let link = cache
+                .link_by_name("nv0")
+                .context("nv0 in the initial dump")?;
+            ensure!(link.kind == Some(LinkKind::Veth), "kind {:?}", link.kind);
+            ensure!(!link.up, "nv0 should start down");
+            link.index
+        };
+        netns::ip(&["link", "set", "nv1", "up"])?;
+        netns::ip(&["link", "set", "nv0", "up"])?;
+        wait_until(&mut rx, "nv0 up", |c| {
+            c.link_by_name("nv0").is_some_and(|l| l.up)
+        })
+        .await?;
+        netns::ip(&["addr", "add", "10.0.0.1/24", "dev", "nv0"])?;
+        wait_until(&mut rx, "10.0.0.1/24 on nv0", |c| {
+            c.addrs
+                .iter()
+                .any(|a| a.ifindex == nv0 && a.net.to_string() == "10.0.0.1/24")
+        })
+        .await?;
+        netns::ip(&[
+            "route",
+            "add",
+            "10.9.0.0/24",
+            "via",
+            "10.0.0.2",
+            "proto",
+            "200",
+        ])?;
+        wait_until(&mut rx, "route 10.9.0.0/24 via 10.0.0.2 proto 200", |c| {
+            c.routes.iter().any(|r| {
+                r.dst.map(|d| d.to_string()) == Some("10.9.0.0/24".to_owned())
+                    && r.gateway.map(|g| g.to_string()) == Some("10.0.0.2".to_owned())
+                    && r.protocol == RTPROT_OPENFEO
+                    && r.table == TABLE_MAIN
+                    && r.oif == Some(nv0)
+                    && !r.v6
+            })
+        })
+        .await?;
+        netns::ip(&["route", "del", "10.9.0.0/24"])?;
+        wait_until(&mut rx, "route gone", |c| {
+            !c.routes.iter().any(|r| r.protocol == RTPROT_OPENFEO)
+        })
+        .await?;
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "nv0"]);
+    result?
+}
+
+/// Bridge creation with VLAN filtering, enslaving and releasing, renaming, setting a MAC,
+/// up/down, deletion: every link primitive the links applier uses.
+fn bridge_with_vlan_filtering_enslave_rename(_lab: &mut Lab) -> anyhow::Result<()> {
+    for name in ["bv0", "br-t0", "bt1"] {
+        let _ = netns::ip(&["link", "del", name]);
+    }
+    netns::ip(&["link", "add", "bv0", "type", "veth", "peer", "name", "bv1"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        nl.link_add_bridge("br-t0", true).await?;
+        wait_until(&mut rx, "br-t0 in the cache", |c| {
+            c.link_by_name("br-t0")
+                .is_some_and(|l| l.kind == Some(LinkKind::Bridge))
+        })
+        .await?;
+        let details = netns::ip(&["-d", "link", "show", "br-t0"])?;
+        ensure!(details.contains("vlan_filtering 1"), "{details}");
+        let br = rx.borrow().link_by_name("br-t0").context("br-t0")?.index;
+        let bv0 = rx.borrow().link_by_name("bv0").context("bv0")?.index;
+        nl.link_set_master(bv0, Some(br)).await?;
+        wait_until(&mut rx, "bv0 enslaved", |c| {
+            c.links.get(&bv0).is_some_and(|l| l.master == Some(br))
+        })
+        .await?;
+        nl.link_set_master(bv0, None).await?;
+        wait_until(&mut rx, "bv0 released", |c| {
+            c.links.get(&bv0).is_some_and(|l| l.master.is_none())
+        })
+        .await?;
+        let bv1 = rx.borrow().link_by_name("bv1").context("bv1")?.index;
+        nl.link_set_name(bv1, "bt1").await?;
+        wait_until(&mut rx, "bv1 renamed to bt1", |c| {
+            c.link_by_name("bt1").is_some_and(|l| l.index == bv1)
+        })
+        .await?;
+        let mac = [0x02, 0x00, 0x00, 0xfe, 0x00, 0x01];
+        nl.link_set_mac(br, mac).await?;
+        wait_until(&mut rx, "bridge mac", |c| {
+            c.links.get(&br).is_some_and(|l| l.mac == Some(mac))
+        })
+        .await?;
+        nl.link_set_up(bv0, true).await?;
+        wait_until(&mut rx, "bv0 up", |c| {
+            c.links.get(&bv0).is_some_and(|l| l.up)
+        })
+        .await?;
+        nl.link_set_up(bv0, false).await?;
+        wait_until(&mut rx, "bv0 down", |c| {
+            c.links.get(&bv0).is_some_and(|l| !l.up)
+        })
+        .await?;
+        nl.link_del(br).await?;
+        wait_until(&mut rx, "br-t0 gone", |c| c.link_by_name("br-t0").is_none()).await?;
+        anyhow::Ok(())
+    });
+    for name in ["bv0", "br-t0", "bt1"] {
+        let _ = netns::ip(&["link", "del", name]);
+    }
+    result?
+}
+
+/// Address and route primitives, including the `EEXIST` a duplicate route add reports.
+fn addr_and_route_primitives(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "rv0"]);
+    netns::ip(&["link", "add", "rv0", "type", "veth", "peer", "name", "rv1"])?;
+    netns::ip(&["link", "set", "rv1", "up"])?;
+    netns::ip(&["link", "set", "rv0", "up"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let rv0 = rx.borrow().link_by_name("rv0").context("rv0")?.index;
+        let net: IpNet = "10.0.1.1/24".parse()?;
+        nl.addr_add(rv0, net).await?;
+        wait_until(&mut rx, "10.0.1.1/24 on rv0", |c| {
+            c.addrs.iter().any(|a| a.ifindex == rv0 && a.net == net)
+        })
+        .await?;
+        ensure!(netns::ip(&["-4", "addr", "show", "rv0"])?.contains("10.0.1.1/24"));
+        let route = Route {
+            v6: false,
+            table: TABLE_MAIN,
+            dst: None,
+            gateway: Some("10.0.1.2".parse()?),
+            oif: Some(rv0),
+            protocol: RTPROT_OPENFEO,
+            priority: 10,
+        };
+        nl.route_add(&route).await?;
+        wait_until(&mut rx, "default route", |c| c.routes.contains(&route)).await?;
+        let shown = netns::ip(&["route", "show", "default"])?;
+        ensure!(
+            shown.contains("default via 10.0.1.2 dev rv0 proto 200 metric 10"),
+            "{shown}"
+        );
+        match nl.route_add(&route).await {
+            Err(err) if err.is_exist() => {}
+            other => anyhow::bail!("duplicate route add should be EEXIST, got {other:?}"),
+        }
+        nl.route_del(&route).await?;
+        wait_until(&mut rx, "route gone", |c| !c.routes.contains(&route)).await?;
+        nl.addr_del(rv0, net).await?;
+        wait_until(&mut rx, "address gone", |c| {
+            !c.addrs.iter().any(|a| a.ifindex == rv0 && a.net == net)
+        })
+        .await?;
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "rv0"]);
+    result?
+}
+
+// ---- openfeo-apply against the lab's port names -------------------------------------------
+
+/// The lab's configuration (`harness/fixtures/vm-static.toml`), parsed.
+fn static_config() -> anyhow::Result<Config> {
+    Ok(openfeo_config::file::parse(include_str!(
+        "../fixtures/vm-static.toml"
+    ))?)
+}
+
+/// Three veth pairs named like the lab's ports (`p0..p2`, peers `h0..h2`); everything the
+/// appliers may have created is removed when the guard drops.
+struct FakePorts;
+
+impl FakePorts {
+    fn create() -> anyhow::Result<Self> {
+        let guard = FakePorts;
+        Self::cleanup();
+        for i in 0..3 {
+            netns::ip(&[
+                "link",
+                "add",
+                &format!("p{i}"),
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &format!("h{i}"),
+            ])?;
+        }
+        Ok(guard)
+    }
+
+    fn cleanup() {
+        for name in ["p0", "p1", "p2", "br-lan0", "br-zz"] {
+            let _ = netns::ip(&["link", "del", name]);
+        }
+    }
+}
+
+impl Drop for FakePorts {
+    fn drop(&mut self) {
+        Self::cleanup();
+    }
+}
+
+/// A World over the cache's link facts, a `p0..p2` port map and `config`.
+fn world_from(cache: &Cache, config: &Config) -> World {
+    let ports = PortMap {
+        ports: (0..3)
+            .map(|i| PortMapEntry {
+                id: format!("pci-0000:00:0{}.0", 3 + i),
+                name: format!("p{i}"),
+            })
+            .collect(),
+    };
+    let links = cache
+        .links
+        .values()
+        .map(|l| {
+            (
+                l.name.clone(),
+                LinkFact {
+                    index: l.index,
+                    name: l.name.clone(),
+                    up: l.up,
+                    carrier: l.carrier,
+                    mac: l.mac.map(MacAddr),
+                    mtu: l.mtu,
+                },
+            )
+        })
+        .collect();
+    World {
+        generation: 1,
+        config: Arc::new(config.clone()),
+        ports: Arc::new(ports),
+        links: Arc::new(links),
+    }
+}
+
+/// Everything a scenario needs to apply configs repeatedly.
+struct Rig {
+    nl: Netlink,
+    rx: watch::Receiver<Arc<Cache>>,
+    links: LinksApplier,
+    routing: RoutingApplier,
+}
+
+impl Rig {
+    async fn connect() -> anyhow::Result<Self> {
+        let (nl, monitor) = Netlink::connect().await?;
+        let rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        Ok(Rig {
+            nl,
+            rx,
+            links: LinksApplier::new(),
+            routing: RoutingApplier::new(),
+        })
+    }
+
+    /// One pass of both appliers over `config`; returns `(links ops, routing ops)`.
+    async fn apply(&mut self, config: &Config) -> anyhow::Result<(usize, usize)> {
+        let cache = self.rx.borrow_and_update().clone();
+        let world = world_from(&cache, config);
+        let links = self
+            .links
+            .apply(&openfeo_reconcile::links::links(&world), &cache, &self.nl)
+            .await?;
+        let cache = self.rx.borrow_and_update().clone();
+        let world = world_from(&cache, config);
+        let routing = self
+            .routing
+            .apply(
+                &openfeo_reconcile::routing::routing(&world),
+                &cache,
+                &self.nl,
+            )
+            .await?;
+        Ok((links.ops, routing.ops))
+    }
+
+    /// Wait until the cache shows the static config fully applied.
+    async fn settled(&mut self, lan: &str) -> anyhow::Result<()> {
+        let lan_net: IpNet = lan.parse()?;
+        wait_until(&mut self.rx, "static config applied", |c| {
+            let Some(br) = c.link_by_name("br-lan0") else {
+                return false;
+            };
+            br.up
+                && br.mac.is_some()
+                && br.mac == c.link_by_name("p2").and_then(|p| p.mac)
+                && c.link_by_name("p2")
+                    .is_some_and(|p| p.master == Some(br.index))
+                && c.link_by_name("p0").is_some_and(|p| p.up)
+                && c.addrs
+                    .iter()
+                    .any(|a| a.ifindex == br.index && a.net == lan_net)
+                && c.routes.iter().any(|r| {
+                    r.protocol == RTPROT_OPENFEO
+                        && r.dst.is_none()
+                        && r.gateway.map(|g| g.to_string()) == Some("203.0.113.1".to_owned())
+                })
+        })
+        .await
+    }
+}
+
+/// Apply the static config onto fresh fake ports and wait for the cache to reflect it.
+async fn build_static() -> anyhow::Result<(Rig, Config)> {
+    let config = static_config()?;
+    let mut rig = Rig::connect().await?;
+    let (links, routing) = rig.apply(&config).await?;
+    ensure!(
+        links > 0 && routing > 0,
+        "first pass did work: {links}/{routing}"
+    );
+    rig.settled("192.168.1.1/24").await?;
+    Ok((rig, config))
+}
+
+/// The static config: bridge with VLAN filtering, p2 enslaved, p0 up, p1 down, bridge MAC from
+/// p2, both addresses and the default route.
+fn apply_builds_bridge_addrs_routes(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (rig, _config) = build_static().await?;
+        let cache = rig.rx.borrow().clone();
+        let details = netns::ip(&["-d", "link", "show", "br-lan0"])?;
+        ensure!(details.contains("vlan_filtering 1"), "{details}");
+        let br = cache.link_by_name("br-lan0").context("br-lan0")?;
+        let p2 = cache.link_by_name("p2").context("p2")?;
+        ensure!(p2.master == Some(br.index), "p2 master {:?}", p2.master);
+        ensure!(
+            br.mac == p2.mac,
+            "bridge mac {:?} vs p2 {:?}",
+            br.mac,
+            p2.mac
+        );
+        ensure!(cache.link_by_name("p0").is_some_and(|p| p.up), "p0 up");
+        ensure!(
+            cache.link_by_name("p1").is_some_and(|p| !p.up),
+            "p1 stays down"
+        );
+        ensure!(netns::ip(&["-4", "addr", "show", "br-lan0"])?.contains("192.168.1.1/24"));
+        ensure!(netns::ip(&["-4", "addr", "show", "p0"])?.contains("203.0.113.10/24"));
+        let route = netns::ip(&["route", "show", "default"])?;
+        ensure!(
+            route.contains("default via 203.0.113.1 dev p0 proto 200 metric 10"),
+            "{route}"
+        );
+        anyhow::Ok(())
+    })?
+}
+
+/// A second pass over the same config issues no operations (a restarted child adopts state).
+fn reapply_is_a_noop(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, config) = build_static().await?;
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 0), "second pass issued {ops:?}");
+        anyhow::Ok(())
+    })?
+}
+
+/// Changing the LAN address removes the old one and adds the new one, nothing else.
+fn config_change_moves_the_lan_address(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, mut config) = build_static().await?;
+        config.lans[0].ipv4 = "192.168.5.1/24".into();
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 2), "address move issued {ops:?}");
+        rig.settled("192.168.5.1/24").await?;
+        let shown = netns::ip(&["-4", "addr", "show", "br-lan0"])?;
+        ensure!(
+            !shown.contains("192.168.1.1/24"),
+            "old address left: {shown}"
+        );
+        ensure!(shown.contains("192.168.5.1/24"), "{shown}");
+        anyhow::Ok(())
+    })?
+}
+
+/// A link-local address and a route with another protocol survive a pass; a stray `br-*`
+/// bridge does not.
+fn foreign_state_is_untouched(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, config) = build_static().await?;
+        netns::ip(&["addr", "add", "fe80::1/64", "dev", "br-lan0"])?;
+        netns::ip(&[
+            "route",
+            "add",
+            "10.77.0.0/16",
+            "via",
+            "203.0.113.1",
+            "dev",
+            "p0",
+            "proto",
+            "static",
+        ])?;
+        netns::ip(&["link", "add", "br-zz", "type", "bridge"])?;
+        wait_until(&mut rig.rx, "foreign state in the cache", |c| {
+            c.link_by_name("br-zz").is_some()
+                && c.addrs.iter().any(|a| a.net.to_string() == "fe80::1/64")
+                && c.routes
+                    .iter()
+                    .any(|r| r.dst.map(|d| d.to_string()) == Some("10.77.0.0/16".to_owned()))
+        })
+        .await?;
+        let ops = rig.apply(&config).await?;
+        ensure!(
+            ops == (1, 0),
+            "expected only the stray bridge to go: {ops:?}"
+        );
+        wait_until(&mut rig.rx, "br-zz gone", |c| {
+            c.link_by_name("br-zz").is_none()
+        })
+        .await?;
+        ensure!(netns::ip(&["-6", "addr", "show", "br-lan0"])?.contains("fe80::1/64"));
+        ensure!(netns::ip(&["route", "show", "10.77.0.0/16"])?.contains("proto static"));
+        anyhow::Ok(())
+    })?
+}
+
+/// A global IPv6 address the kernel (SLAAC) or an operator put on a managed interface is not
+/// ours to delete: IPv6 ownership is M2's; until then the appliers own IPv4 only.
+fn global_ipv6_address_is_untouched(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, config) = build_static().await?;
+        netns::ip(&["addr", "add", "2001:db8::1/64", "dev", "br-lan0"])?;
+        wait_until(&mut rig.rx, "2001:db8::1/64 in the cache", |c| {
+            c.addrs
+                .iter()
+                .any(|a| a.net.to_string() == "2001:db8::1/64")
+        })
+        .await?;
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 0), "the pass touched the IPv6 address: {ops:?}");
+        ensure!(netns::ip(&["-6", "addr", "show", "br-lan0"])?.contains("2001:db8::1/64"));
+        anyhow::Ok(())
+    })?
+}
+
+/// One refused operation (a bridge name the kernel rejects as too long) does not stop the rest of
+/// the pass: the other LAN still gets its bridge and its address, and the failure is reported.
+fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let mut config = static_config()?;
+        config.lans.push(openfeo_config::Lan {
+            name: "guest-network".into(), // br-guest-network is 16 bytes: EINVAL from the kernel
+            ports: vec!["p1".into()],
+            ipv4: "192.168.9.1/24".into(),
+        });
+        let mut rig = Rig::connect().await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let world = world_from(&cache, &config);
+        let links = rig
+            .links
+            .apply(&openfeo_reconcile::links::links(&world), &cache, &rig.nl)
+            .await;
+        ensure!(links.is_err(), "the invalid bridge name must be reported");
+        wait_until(&mut rig.rx, "br-lan0 created despite the failure", |c| {
+            c.link_by_name("br-lan0").is_some()
+        })
+        .await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let world = world_from(&cache, &config);
+        let routing = rig
+            .routing
+            .apply(
+                &openfeo_reconcile::routing::routing(&world),
+                &cache,
+                &rig.nl,
+            )
+            .await;
+        ensure!(
+            routing.is_err(),
+            "the missing guest bridge must be reported by routing"
+        );
+        wait_until(
+            &mut rig.rx,
+            "lan0 address applied despite the failure",
+            |c| {
+                c.addrs
+                    .iter()
+                    .any(|a| a.net.to_string() == "192.168.1.1/24")
+            },
+        )
+        .await?;
+        ensure!(netns::ip(&["-4", "addr", "show", "br-lan0"])?.contains("192.168.1.1/24"));
+        anyhow::Ok(())
+    })?
+}

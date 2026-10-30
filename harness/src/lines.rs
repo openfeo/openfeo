@@ -137,6 +137,17 @@ impl Lines {
             .count()
     }
 
+    /// Lines from `cursor` (as it stood when it was copied) onwards that match `re`.
+    #[must_use]
+    pub fn count_since(&self, cursor: &Cursor, re: &Regex) -> usize {
+        lock(&self.inner.state)
+            .lines
+            .iter()
+            .skip(cursor.0)
+            .filter(|l| re.is_match(l))
+            .count()
+    }
+
     /// The last `n` lines seen so far.
     #[must_use]
     pub fn tail(&self, n: usize) -> Vec<String> {

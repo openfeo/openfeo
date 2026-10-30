@@ -1,0 +1,23 @@
+[package]
+name = "openfeo-config-fuzz"
+description = "cargo-fuzz targets for OpenFeO parsers (SPEC §11); its own workspace, built with nightly"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "GPL-2.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+openfeo-config = { path = "../crates/openfeo-config" }
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

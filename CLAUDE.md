@@ -20,7 +20,8 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
   confined to `sys.rs` with `// SAFETY:` comments.
 - No shelling out: `std::process::Command` is banned outside `harness/` and `image/` (clippy enforces it).
 - Only `openfeo-netlink`, `openfeo-nft`, `openfeo-net`, `openfeo-platform` and `openfeo-init` may call the kernel;
-  `openfeo-proto-*` and `openfeo-reconcile` never depend on tokio, libc, nix or socket2.
+  `openfeo-proto-*`, `openfeo-reconcile` and `openfeo-world` are pure: no tokio, libc, nix or socket2 anywhere in
+  their dependency trees. `scripts/check-deps.sh` (part of `make lint`) enforces both rules.
 - Every parser gets a fuzz target in the PR that adds it.
 - Every source file starts with `SPDX-License-Identifier: GPL-2.0-or-later` and `Copyright (C) 2026 Andrew Newton`.
 - Commits: `git commit -s` (DCO, identity `Andrew Newton <andy@vitri.ltd>`, set repo-locally), subject `<area>: <summary>`.

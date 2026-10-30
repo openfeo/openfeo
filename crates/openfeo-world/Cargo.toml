@@ -1,0 +1,19 @@
+[package]
+name = "openfeo-world"
+description = "OpenFeO World snapshot, facts, port-map assignment and health types (pure: no runtime, no kernel)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+openfeo-config = { path = "../openfeo-config" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

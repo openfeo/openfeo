@@ -5,13 +5,18 @@
 
 #![forbid(unsafe_code)]
 
+mod boot;
 mod chaos;
 mod cli;
-mod ports;
+mod heartbeat;
 mod router;
 mod version;
 
 use openfeo_init::cmdline;
+
+/// mimalloc as the global allocator (SPEC §2 Build): musl's own allocator is slow under async load.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let cli = cli::parse(std::env::args().skip(1));
