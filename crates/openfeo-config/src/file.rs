@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::ConfigError;
-use crate::{Config, PortMap};
+use crate::{Config, Dhcp4Lease, PortMap};
 
 /// Parse a `config.toml` text into a [`Config`]. Syntax, unknown keys and wrong types are
 /// errors; `config_version` and semantics are checked by `load`, not here.
@@ -51,6 +51,24 @@ pub fn render_portmap(map: &PortMap) -> Result<String, ConfigError> {
     to_toml(map)
 }
 
+/// Parse `/state/leases/dhcp4-<wan>.toml`.
+///
+/// # Errors
+///
+/// As [`parse`].
+pub fn parse_dhcp4_lease(text: &str) -> Result<Dhcp4Lease, ConfigError> {
+    from_table(table(text)?)
+}
+
+/// Render `/state/leases/dhcp4-<wan>.toml`.
+///
+/// # Errors
+///
+/// As [`render`].
+pub fn render_dhcp4_lease(lease: &Dhcp4Lease) -> Result<String, ConfigError> {
+    to_toml(lease)
+}
+
 /// The TOML document as a table, the form migrations work on.
 ///
 /// # Errors
@@ -81,7 +99,7 @@ fn to_toml<T: Serialize>(value: &T) -> Result<String, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wan;
+    use crate::{Dhcp4Lease, Dhcp4Route, DhcpWan, wan};
 
     const SPEC_SHAPED: &str = r#"
 config_version = 1
@@ -165,6 +183,61 @@ ipv4 = "192.168.1.1/24"
         assert_eq!(firewall.port_forwards[0].name, "lan-http");
         assert_eq!(firewall.port_forwards[0].to, "192.168.1.2");
         assert_eq!(firewall.port_forwards[0].to_port, 8080);
+    }
+
+    const VM_DHCP: &str = include_str!("../../../harness/fixtures/vm-dhcp.toml");
+
+    #[test]
+    fn parses_a_dhcp_wan_with_options() {
+        let cfg = parse(VM_DHCP).unwrap();
+        match &cfg.wans[0].kind {
+            Some(wan::Kind::Dhcp(dhcp)) => {
+                assert_eq!(dhcp.hostname, "openfeo-lab");
+                assert_eq!(dhcp.vendor_class, "");
+            }
+            other => panic!("expected a DHCP WAN, got {other:?}"),
+        }
+        assert_eq!(cfg.lans[0].ipv4, "192.168.1.1/24");
+        assert!(cfg.firewall.unwrap().wan_ping);
+    }
+
+    #[test]
+    fn empty_dhcp_table_selects_the_kind() {
+        let text = "config_version = 1\n\n[[wans]]\nname = \"wan0\"\nport = \"p0\"\n[wans.dhcp]\n";
+        let cfg = parse(text).unwrap();
+        assert_eq!(cfg.wans[0].kind, Some(wan::Kind::Dhcp(DhcpWan::default())));
+    }
+
+    #[test]
+    fn dhcp4_lease_file_round_trips() {
+        let lease = Dhcp4Lease {
+            wan: "wan0".into(),
+            mac: "52:54:00:fe:00:00".into(),
+            address: "203.0.113.100/24".into(),
+            server: "203.0.113.1".into(),
+            gateway: String::new(),
+            dns: vec!["203.0.113.1".into()],
+            domain: "isp.example".into(),
+            mtu: 1400,
+            routes: vec![
+                Dhcp4Route {
+                    dst: "0.0.0.0/0".into(),
+                    via: "203.0.113.1".into(),
+                },
+                Dhcp4Route {
+                    dst: "198.51.100.0/24".into(),
+                    via: "203.0.113.1".into(),
+                },
+            ],
+            lease_secs: 60,
+            t1_secs: 20,
+            t2_secs: 40,
+            obtained_unix: 1_793_491_200,
+        };
+        let text = render_dhcp4_lease(&lease).unwrap();
+        assert!(text.contains("address = \"203.0.113.100/24\""), "{text}");
+        assert!(text.contains("[[routes]]"), "{text}");
+        assert_eq!(parse_dhcp4_lease(&text).unwrap(), lease);
     }
 
     #[test]

@@ -356,6 +356,7 @@ priority = 10
 username = "..."
 password = "..."
 # [wans.static]            # a static WAN instead: address = "203.0.113.10/24", gateway = "203.0.113.1", dns = ["203.0.113.1"]
+# [wans.dhcp]              # a DHCP WAN instead; optional hostname = "myrouter", vendor_class = "OpenFeO" (sent only when set)
 [wans.ipv6]
 mode = "auto"              # auto | disabled
 pd_hint = 48
