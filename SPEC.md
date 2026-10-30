@@ -514,7 +514,8 @@ Coding rules (repeated in `CLAUDE.md`):
 ## 15. Open items
 
 - [x] Confirm §2: GPL-2.0-or-later, libnftables backend, systemd-boot + watchdog boot design, copyright-notice holder (Andrew Newton). Confirmed 29 October 2026; ADRs 0002–0005.
-- [ ] GitHub organisation, domains and UK IPO trademark search for OpenFeO.
+- [x] GitHub organisation: `openfeo` (github.com/openfeo), created 30 October 2026; repository `openfeo/openfeo`.
+- [ ] Domains and UK IPO trademark search for OpenFeO.
 - [ ] Buy the N100 box (Intel i226-V); note whether it exposes a serial header.
 - [x] Write `CLAUDE.md` and the first ADRs from §2.
 - [ ] Decide release signing-key custody (offline key; CI holds only a dev key) before M5.
