@@ -119,6 +119,21 @@ impl Netlink {
             })
     }
 
+    /// `ip link set <index> mtu <mtu>`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses (`EINVAL` for an MTU the device cannot take).
+    pub async fn link_set_mtu(&self, index: u32, mtu: u32) -> Result<(), Error> {
+        let message = LinkUnspec::new_with_index(index).mtu(mtu).build();
+        self.handle
+            .link()
+            .set(message)
+            .execute()
+            .await
+            .map_err(|e| request_error(format!("set link {index} mtu {mtu}"), e))
+    }
+
     /// `ip link set <index> name <name>`; the link should be down.
     ///
     /// # Errors

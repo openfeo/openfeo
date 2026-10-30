@@ -41,7 +41,24 @@ impl LinksApplier {
         bridge_macs(&mut pass, desired, observed, nl).await;
         membership(&mut pass, desired, observed, nl).await;
         up_down(&mut pass, desired, observed, nl).await;
+        mtus(&mut pass, desired, observed, nl).await;
         pass.finish()
+    }
+}
+
+/// Ports with a desired MTU (a DHCP WAN's lease) that the kernel does not have yet.
+async fn mtus(pass: &mut Pass, desired: &DesiredLinks, observed: &Cache, nl: &Netlink) {
+    for (port_name, port) in &desired.ports {
+        let (Some(mtu), Some(link)) = (port.mtu, observed.link_by_name(port_name)) else {
+            continue;
+        };
+        if link.mtu != mtu {
+            pass.op(
+                &format!("set {port_name} mtu {mtu}"),
+                nl.link_set_mtu(link.index, mtu).await,
+                |_| false,
+            );
+        }
     }
 }
 

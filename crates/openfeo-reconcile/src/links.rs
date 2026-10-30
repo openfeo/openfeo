@@ -36,6 +36,8 @@ pub struct DesiredPort {
     pub up: bool,
     /// The bridge it belongs to, for LAN members.
     pub master: Option<String>,
+    /// A DHCP WAN's lease MTU (SPEC §7.2); `None` leaves the kernel's alone.
+    pub mtu: Option<u32>,
 }
 
 /// Everything the links applier makes true.
@@ -84,6 +86,15 @@ pub fn links(world: &World) -> DesiredLinks {
         .map(|wan| wan.port.as_str())
         .filter(|port| known.contains(port))
         .collect();
+    let lease_mtu: BTreeMap<&str, u32> = world
+        .config
+        .wans
+        .iter()
+        .filter_map(|wan| {
+            let mtu = world.dhcp4.get(&wan.name)?.mtu?;
+            Some((wan.port.as_str(), mtu))
+        })
+        .collect();
     for port in world.ports.names() {
         let master = master_of.get(port).cloned();
         let up = master.is_some() || wan_ports.contains(port);
@@ -93,6 +104,7 @@ pub fn links(world: &World) -> DesiredLinks {
                 name: port.to_owned(),
                 up,
                 master,
+                mtu: lease_mtu.get(port).copied(),
             },
         );
     }
@@ -156,6 +168,22 @@ mod tests {
         assert_eq!(desired.ports["p1"].master, None);
         assert_eq!(desired.ports["p2"].master.as_deref(), Some("br-lan0"));
         insta::assert_yaml_snapshot!(desired);
+    }
+
+    #[test]
+    fn dhcp_wan_port_takes_the_lease_mtu() {
+        let desired = links(&fixtures::dhcp_world());
+        assert_eq!(desired.ports["p0"].mtu, Some(1400));
+        assert_eq!(desired.ports["p1"].mtu, None);
+        assert_eq!(desired.ports["p2"].mtu, None);
+        assert!(desired.ports["p0"].up);
+        let before = links(&fixtures::dhcp_world_without_lease());
+        assert_eq!(before.ports["p0"].mtu, None, "no lease, no MTU to set");
+        let static_world = links(&fixtures::static_world());
+        assert_eq!(
+            static_world.ports["p0"].mtu, None,
+            "static WANs keep theirs"
+        );
     }
 
     #[test]

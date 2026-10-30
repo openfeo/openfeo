@@ -15,11 +15,14 @@ ports:
     name: p0
     up: true
     master: ~
+    mtu: ~
   p1:
     name: p1
     up: false
     master: ~
+    mtu: ~
   p2:
     name: p2
     up: true
     master: br-lan0
+    mtu: ~
