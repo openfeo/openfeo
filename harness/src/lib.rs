@@ -13,6 +13,7 @@ pub mod lab;
 pub mod lanclient;
 pub mod lines;
 pub mod netns;
+pub mod nftlist;
 pub mod nftprobe;
 pub mod qemu;
 pub mod qmp;

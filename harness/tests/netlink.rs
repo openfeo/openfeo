@@ -23,14 +23,13 @@ use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_harness::lab::Lab;
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::scenario::{Scenario, run_all};
-use openfeo_harness::{daemons, lanclient, netns, nftprobe, sandbox};
+use openfeo_harness::{daemons, lanclient, netns, nftlist, nftprobe, sandbox};
 use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, TABLE_MAIN};
 use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
 use openfeo_reconcile::nft::nft;
 use openfeo_reconcile::sysctl::DesiredSysctl;
 use openfeo_world::{LinkFact, MacAddr, World};
-use serde_json::Value;
 use tokio::sync::watch;
 
 const SCENARIOS: &[Scenario] = &[
@@ -651,17 +650,6 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
     })?
 }
 
-/// A rule of `chain` in the listed ruleset mentioning `text` (the JSON rendering).
-fn rule_mentions(ruleset: &Value, chain: &str, text: &str) -> bool {
-    ruleset
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|object| object.get("rule"))
-        .filter(|rule| rule.get("chain").and_then(Value::as_str) == Some(chain))
-        .any(|rule| rule.to_string().contains(text))
-}
-
 fn desired_sysctl(entries: &[(&str, &str)]) -> DesiredSysctl {
     DesiredSysctl {
         entries: entries
@@ -684,9 +672,10 @@ fn nft_applier_applies_once_then_noops(_lab: &mut Lab) -> anyhow::Result<()> {
         ensure!(first.ops == 1, "first apply: {first:?}");
         let again = applier.apply(&nft(&world))?;
         ensure!(again.ops == 0, "unchanged ruleset re-applied: {again:?}");
+        let icmp_type = serde_json::json!({"payload": {"protocol": "icmp", "field": "type"}});
         ensure!(
-            rule_mentions(&lister.list_ruleset()?, "input", "echo-request"),
-            "fixture has wan_ping = true"
+            nftlist::chain_matches(&lister.list_ruleset()?, "input", &icmp_type),
+            "input should match icmp type while wan_ping is on"
         );
         config
             .firewall
@@ -697,8 +686,8 @@ fn nft_applier_applies_once_then_noops(_lab: &mut Lab) -> anyhow::Result<()> {
         let changed = applier.apply(&nft(&world))?;
         ensure!(changed.ops == 1, "changed ruleset: {changed:?}");
         ensure!(
-            !rule_mentions(&lister.list_ruleset()?, "input", "echo-request"),
-            "echo-request rule should be gone"
+            !nftlist::chain_matches(&lister.list_ruleset()?, "input", &icmp_type),
+            "the icmp type rule should be gone with wan_ping off"
         );
         anyhow::Ok(())
     })();
