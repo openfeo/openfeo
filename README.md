@@ -9,9 +9,13 @@ FeO is iron(II) oxide, that is, rust.
 
 ## Status
 
-Pre-alpha. Milestone M0 of [`SPEC.md`](SPEC.md) §12 is done: the kernel boots in QEMU to the
-OpenFeO PID 1, which mounts the system, supervises the router process, and pets the hardware
-watchdog only while that process reports healthy. Nothing routes yet; the IPv4 router is M1.
+Pre-alpha. Milestone M0 of [`SPEC.md`](SPEC.md) §12 is done and the first part of M1 (the IPv4
+router) is in: the kernel boots in QEMU to the OpenFeO PID 1, which supervises the router process
+and pets the hardware watchdog only while it reports healthy; the router process checks the kernel
+against `kernel/required.config`, names the ports by bus path, loads a protobuf-defined
+configuration from `/state/config.toml`, and makes the kernel match it (LAN bridge, static WAN
+address and default route) through a netlink monitor and appliers that own only what they tag.
+Nothing is forwarded yet: the firewall, NAT and the DHCPv4 client come with the next part of M1.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
