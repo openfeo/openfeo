@@ -14,7 +14,17 @@ harness = []
 [dependencies]
 openfeo-init = { path = "../openfeo-init" }
 openfeo-platform = { path = "../openfeo-platform" }
+openfeo-config = { path = "../openfeo-config" }
+openfeo-world = { path = "../openfeo-world" }
+openfeo-runtime = { path = "../openfeo-runtime" }
+openfeo-netlink = { path = "../openfeo-netlink" }
+openfeo-reconcile = { path = "../openfeo-reconcile" }
+openfeo-apply = { path = "../openfeo-apply" }
 anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures.workspace = true
+mimalloc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

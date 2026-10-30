@@ -182,10 +182,10 @@ impl KmsgLayer {
         match &self.kmsg {
             Some(writer) => {
                 let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
-                let _ = writeln!(writer, "{text}");
+                let _ = writer.write_all(format!("{text}\n").as_bytes());
             }
             None => {
-                let _ = writeln!(std::io::stderr(), "{text}");
+                let _ = std::io::stderr().write_all(format!("{text}\n").as_bytes());
             }
         }
     }

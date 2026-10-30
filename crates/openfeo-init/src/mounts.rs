@@ -120,7 +120,9 @@ pub const STATE_VM: MountSpec = MountSpec {
 };
 
 /// How long `vm` mode waits for `/dev/vda` to show up in devtmpfs before giving up on the disk.
-pub const STATE_DISK_WAIT: Duration = Duration::from_secs(3);
+/// Built-in virtio-blk probes before init runs, so this is a safety net, not the normal path, and
+/// a VM without a disk pays it on every boot.
+pub const STATE_DISK_WAIT: Duration = Duration::from_secs(1);
 
 /// The mounts to try for `/state`, in order, for `mode`.
 #[must_use]
