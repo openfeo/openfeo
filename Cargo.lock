@@ -597,6 +597,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfeo-apply"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "openfeo-netlink",
+ "openfeo-reconcile",
+ "openfeo-world",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "openfeo-config"
 version = "0.1.0"
 dependencies = [
@@ -623,7 +635,11 @@ dependencies = [
  "ipnet",
  "libc",
  "nix",
+ "openfeo-apply",
+ "openfeo-config",
  "openfeo-netlink",
+ "openfeo-reconcile",
+ "openfeo-world",
  "regex",
  "tokio",
 ]

@@ -8,6 +8,7 @@
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use futures::TryStreamExt as _;
 use ipnet::IpNet;
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
@@ -287,5 +288,30 @@ fn route_message(route: &Route) -> RouteMessage {
             builder = builder.output_interface(oif);
         }
         builder.build()
+    }
+}
+
+impl Netlink {
+    /// The interface index of `name`, by asking the kernel (a dump filtered by name on the request
+    /// socket), for an interface created so recently that the monitor's cache does not have it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] for anything other than "no such interface", which is `Ok(None)`.
+    pub async fn link_index(&self, name: &str) -> Result<Option<u32>, Error> {
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(name.to_owned())
+            .execute();
+        match links.try_next().await {
+            Ok(Some(message)) => Ok(Some(message.header.index)),
+            Ok(None) => Ok(None),
+            Err(source) => {
+                let err = request_error(format!("look up link {name}"), source);
+                if err.is_absent() { Ok(None) } else { Err(err) }
+            }
+        }
     }
 }

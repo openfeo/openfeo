@@ -14,11 +14,15 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use ipnet::IpNet;
+use openfeo_apply::links::LinksApplier;
+use openfeo_apply::routing::RoutingApplier;
+use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_harness::lab::Lab;
 use openfeo_harness::netns;
 use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
 use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, TABLE_MAIN};
+use openfeo_world::{LinkFact, MacAddr, World};
 use tokio::sync::watch;
 
 const SCENARIOS: &[Scenario] = &[
@@ -33,6 +37,22 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "addr_and_route_primitives",
         run: addr_and_route_primitives,
+    },
+    Scenario {
+        name: "apply_builds_bridge_addrs_routes",
+        run: apply_builds_bridge_addrs_routes,
+    },
+    Scenario {
+        name: "reapply_is_a_noop",
+        run: reapply_is_a_noop,
+    },
+    Scenario {
+        name: "config_change_moves_the_lan_address",
+        run: config_change_moves_the_lan_address,
+    },
+    Scenario {
+        name: "foreign_state_is_untouched",
+        run: foreign_state_is_untouched,
     },
 ];
 
@@ -253,4 +273,271 @@ fn addr_and_route_primitives(_lab: &mut Lab) -> anyhow::Result<()> {
     });
     let _ = netns::ip(&["link", "del", "rv0"]);
     result?
+}
+
+// ---- openfeo-apply against the lab's port names -------------------------------------------
+
+/// The lab's configuration (`harness/fixtures/vm-static.toml`), parsed.
+fn static_config() -> anyhow::Result<Config> {
+    Ok(openfeo_config::file::parse(include_str!(
+        "../fixtures/vm-static.toml"
+    ))?)
+}
+
+/// Three veth pairs named like the lab's ports (`p0..p2`, peers `h0..h2`); everything the
+/// appliers may have created is removed when the guard drops.
+struct FakePorts;
+
+impl FakePorts {
+    fn create() -> anyhow::Result<Self> {
+        let guard = FakePorts;
+        Self::cleanup();
+        for i in 0..3 {
+            netns::ip(&[
+                "link",
+                "add",
+                &format!("p{i}"),
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &format!("h{i}"),
+            ])?;
+        }
+        Ok(guard)
+    }
+
+    fn cleanup() {
+        for name in ["p0", "p1", "p2", "br-lan0", "br-zz"] {
+            let _ = netns::ip(&["link", "del", name]);
+        }
+    }
+}
+
+impl Drop for FakePorts {
+    fn drop(&mut self) {
+        Self::cleanup();
+    }
+}
+
+/// A World over the cache's link facts, a `p0..p2` port map and `config`.
+fn world_from(cache: &Cache, config: &Config) -> World {
+    let ports = PortMap {
+        ports: (0..3)
+            .map(|i| PortMapEntry {
+                id: format!("pci-0000:00:0{}.0", 3 + i),
+                name: format!("p{i}"),
+            })
+            .collect(),
+    };
+    let links = cache
+        .links
+        .values()
+        .map(|l| {
+            (
+                l.name.clone(),
+                LinkFact {
+                    index: l.index,
+                    name: l.name.clone(),
+                    up: l.up,
+                    carrier: l.carrier,
+                    mac: l.mac.map(MacAddr),
+                    mtu: l.mtu,
+                },
+            )
+        })
+        .collect();
+    World {
+        generation: 1,
+        config: Arc::new(config.clone()),
+        ports: Arc::new(ports),
+        links: Arc::new(links),
+    }
+}
+
+/// Everything a scenario needs to apply configs repeatedly.
+struct Rig {
+    nl: Netlink,
+    rx: watch::Receiver<Arc<Cache>>,
+    links: LinksApplier,
+    routing: RoutingApplier,
+}
+
+impl Rig {
+    async fn connect() -> anyhow::Result<Self> {
+        let (nl, monitor) = Netlink::connect().await?;
+        let rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        Ok(Rig {
+            nl,
+            rx,
+            links: LinksApplier::new(),
+            routing: RoutingApplier::new(),
+        })
+    }
+
+    /// One pass of both appliers over `config`; returns `(links ops, routing ops)`.
+    async fn apply(&mut self, config: &Config) -> anyhow::Result<(usize, usize)> {
+        let cache = self.rx.borrow_and_update().clone();
+        let world = world_from(&cache, config);
+        let links = self
+            .links
+            .apply(&openfeo_reconcile::links::links(&world), &cache, &self.nl)
+            .await?;
+        let cache = self.rx.borrow_and_update().clone();
+        let world = world_from(&cache, config);
+        let routing = self
+            .routing
+            .apply(
+                &openfeo_reconcile::routing::routing(&world),
+                &cache,
+                &self.nl,
+            )
+            .await?;
+        Ok((links.ops, routing.ops))
+    }
+
+    /// Wait until the cache shows the static config fully applied.
+    async fn settled(&mut self, lan: &str) -> anyhow::Result<()> {
+        let lan_net: IpNet = lan.parse()?;
+        wait_until(&mut self.rx, "static config applied", |c| {
+            let Some(br) = c.link_by_name("br-lan0") else {
+                return false;
+            };
+            br.up
+                && br.mac.is_some()
+                && br.mac == c.link_by_name("p2").and_then(|p| p.mac)
+                && c.link_by_name("p2")
+                    .is_some_and(|p| p.master == Some(br.index))
+                && c.link_by_name("p0").is_some_and(|p| p.up)
+                && c.addrs
+                    .iter()
+                    .any(|a| a.ifindex == br.index && a.net == lan_net)
+                && c.routes.iter().any(|r| {
+                    r.protocol == RTPROT_OPENFEO
+                        && r.dst.is_none()
+                        && r.gateway.map(|g| g.to_string()) == Some("203.0.113.1".to_owned())
+                })
+        })
+        .await
+    }
+}
+
+/// Apply the static config onto fresh fake ports and wait for the cache to reflect it.
+async fn build_static() -> anyhow::Result<(Rig, Config)> {
+    let config = static_config()?;
+    let mut rig = Rig::connect().await?;
+    let (links, routing) = rig.apply(&config).await?;
+    ensure!(
+        links > 0 && routing > 0,
+        "first pass did work: {links}/{routing}"
+    );
+    rig.settled("192.168.1.1/24").await?;
+    Ok((rig, config))
+}
+
+/// The static config: bridge with VLAN filtering, p2 enslaved, p0 up, p1 down, bridge MAC from
+/// p2, both addresses and the default route.
+fn apply_builds_bridge_addrs_routes(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (rig, _config) = build_static().await?;
+        let cache = rig.rx.borrow().clone();
+        let details = netns::ip(&["-d", "link", "show", "br-lan0"])?;
+        ensure!(details.contains("vlan_filtering 1"), "{details}");
+        let br = cache.link_by_name("br-lan0").context("br-lan0")?;
+        let p2 = cache.link_by_name("p2").context("p2")?;
+        ensure!(p2.master == Some(br.index), "p2 master {:?}", p2.master);
+        ensure!(
+            br.mac == p2.mac,
+            "bridge mac {:?} vs p2 {:?}",
+            br.mac,
+            p2.mac
+        );
+        ensure!(cache.link_by_name("p0").is_some_and(|p| p.up), "p0 up");
+        ensure!(
+            cache.link_by_name("p1").is_some_and(|p| !p.up),
+            "p1 stays down"
+        );
+        ensure!(netns::ip(&["-4", "addr", "show", "br-lan0"])?.contains("192.168.1.1/24"));
+        ensure!(netns::ip(&["-4", "addr", "show", "p0"])?.contains("203.0.113.10/24"));
+        let route = netns::ip(&["route", "show", "default"])?;
+        ensure!(
+            route.contains("default via 203.0.113.1 dev p0 proto 200 metric 10"),
+            "{route}"
+        );
+        anyhow::Ok(())
+    })?
+}
+
+/// A second pass over the same config issues no operations (a restarted child adopts state).
+fn reapply_is_a_noop(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, config) = build_static().await?;
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 0), "second pass issued {ops:?}");
+        anyhow::Ok(())
+    })?
+}
+
+/// Changing the LAN address removes the old one and adds the new one, nothing else.
+fn config_change_moves_the_lan_address(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, mut config) = build_static().await?;
+        config.lans[0].ipv4 = "192.168.5.1/24".into();
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 2), "address move issued {ops:?}");
+        rig.settled("192.168.5.1/24").await?;
+        let shown = netns::ip(&["-4", "addr", "show", "br-lan0"])?;
+        ensure!(
+            !shown.contains("192.168.1.1/24"),
+            "old address left: {shown}"
+        );
+        ensure!(shown.contains("192.168.5.1/24"), "{shown}");
+        anyhow::Ok(())
+    })?
+}
+
+/// A link-local address and a route with another protocol survive a pass; a stray `br-*`
+/// bridge does not.
+fn foreign_state_is_untouched(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, config) = build_static().await?;
+        netns::ip(&["addr", "add", "fe80::1/64", "dev", "br-lan0"])?;
+        netns::ip(&[
+            "route",
+            "add",
+            "10.77.0.0/16",
+            "via",
+            "203.0.113.1",
+            "dev",
+            "p0",
+            "proto",
+            "static",
+        ])?;
+        netns::ip(&["link", "add", "br-zz", "type", "bridge"])?;
+        wait_until(&mut rig.rx, "foreign state in the cache", |c| {
+            c.link_by_name("br-zz").is_some()
+                && c.addrs.iter().any(|a| a.net.to_string() == "fe80::1/64")
+                && c.routes
+                    .iter()
+                    .any(|r| r.dst.map(|d| d.to_string()) == Some("10.77.0.0/16".to_owned()))
+        })
+        .await?;
+        let ops = rig.apply(&config).await?;
+        ensure!(
+            ops == (1, 0),
+            "expected only the stray bridge to go: {ops:?}"
+        );
+        wait_until(&mut rig.rx, "br-zz gone", |c| {
+            c.link_by_name("br-zz").is_none()
+        })
+        .await?;
+        ensure!(netns::ip(&["-6", "addr", "show", "br-lan0"])?.contains("fe80::1/64"));
+        ensure!(netns::ip(&["route", "show", "10.77.0.0/16"])?.contains("proto static"));
+        anyhow::Ok(())
+    })?
 }

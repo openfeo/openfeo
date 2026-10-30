@@ -15,7 +15,11 @@ nix.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
+openfeo-apply = { path = "../crates/openfeo-apply" }
+openfeo-config = { path = "../crates/openfeo-config" }
 openfeo-netlink = { path = "../crates/openfeo-netlink" }
+openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
+openfeo-world = { path = "../crates/openfeo-world" }
 tokio.workspace = true
 ipnet.workspace = true
 
