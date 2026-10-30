@@ -46,6 +46,8 @@ pub enum Code {
     ForwardTargetOutsideLan,
     /// A port forward on a port the router itself serves.
     ReservedPort,
+    /// The same protocol and port forwarded twice.
+    DuplicateForward,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -92,6 +94,7 @@ impl Code {
             Code::InvalidPort => "invalid_port",
             Code::ForwardTargetOutsideLan => "forward_target_outside_lan",
             Code::ReservedPort => "reserved_port",
+            Code::DuplicateForward => "duplicate_forward",
         }
     }
 }
@@ -228,6 +231,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
 /// inside a LAN, target port.
 fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Net]) {
     let mut forward_names: BTreeSet<&str> = BTreeSet::new();
+    let mut forwarded: BTreeSet<(&str, u16)> = BTreeSet::new();
     for (i, forward) in firewall.port_forwards.iter().enumerate() {
         let path = format!("firewall.port_forwards[{i}]");
         report.name(
@@ -250,6 +254,12 @@ fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Ne
                         format!("{path}.port"),
                         Code::ReservedPort,
                         format!("port {port} is one of the router's own services"),
+                    );
+                } else if !forwarded.insert((forward.proto.as_str(), port)) {
+                    report.push(
+                        format!("{path}.port"),
+                        Code::DuplicateForward,
+                        format!("{port}/{} is already forwarded", forward.proto),
                     );
                 }
             }
@@ -698,5 +708,21 @@ mod tests {
         // Forward names are their own namespace: a forward may share a LAN's name.
         let cfg = with_forwards(vec![forward("lan0", "tcp", 2222, "192.168.1.2", 8080)]);
         assert_eq!(found(&cfg), vec![]);
+    }
+
+    #[test]
+    fn same_proto_and_port_forwarded_twice() {
+        let cfg = with_forwards(vec![
+            forward("a", "tcp", 2222, "192.168.1.2", 8080),
+            forward("b", "tcp", 2222, "192.168.1.3", 0),
+            forward("c", "udp", 2222, "192.168.1.3", 0),
+        ]);
+        assert_eq!(
+            found(&cfg),
+            vec![(
+                "firewall.port_forwards[1].port".to_owned(),
+                Code::DuplicateForward
+            )]
+        );
     }
 }
