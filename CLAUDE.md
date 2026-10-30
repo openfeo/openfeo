@@ -12,6 +12,8 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 - `make lint`          fmt, clippy (-D warnings), cargo-deny, SPDX headers
 - `make ci`            everything CI runs, in CI's order
 - `make check-env`     is this machine able to run the harness?
+- `make bin`, `lint` and `test` first run `make kernel-headers nft-src` (kernel UAPI headers, pinned nftables sources;
+  ADR-0012) and export `OPENFEO_NFT_SRC` and `OPENFEO_UAPI_INCLUDE`; a bare `cargo build` needs both set.
 
 ## Rules
 - Rust stable, edition 2024, musl targets. `clippy -D warnings`, pedantic as warnings. No `unwrap`/`expect`
@@ -30,4 +32,7 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 ## Harness
 Rootless: user + mount + net namespaces, no sudo. Needs `/dev/kvm` (falls back to TCG) and `/dev/net/tun`
 readable, and unprivileged user namespaces enabled. Host-side `pppd` (M3) additionally needs `/dev/ppp`
-group-accessible via a udev rule.
+group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4`, `mkfs.ext4`, `ping`, `python3`
+(HTTP targets); building needs `musl-gcc`, `pkg-config`, `bison`, `flex`. The sandboxed nft scenarios need the
+kernel to load the `ct`/`fib`/`nat` nft modules; a host that cannot (upgraded, not rebooted) makes them skip with
+a reason, `make check-env` says so, and CI sets `OPENFEO_NO_SKIP=1` so a skip fails there.

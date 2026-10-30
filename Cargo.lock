@@ -631,6 +631,7 @@ dependencies = [
  "openfeo-config",
  "openfeo-init",
  "openfeo-netlink",
+ "openfeo-nft",
  "openfeo-platform",
  "openfeo-reconcile",
  "openfeo-runtime",
@@ -646,8 +647,11 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "openfeo-netlink",
+ "openfeo-nft",
+ "openfeo-platform",
  "openfeo-reconcile",
  "openfeo-world",
+ "serde_json",
  "thiserror",
  "tracing",
 ]
@@ -682,11 +686,14 @@ dependencies = [
  "openfeo-apply",
  "openfeo-config",
  "openfeo-netlink",
+ "openfeo-nft",
+ "openfeo-platform",
  "openfeo-reconcile",
  "openfeo-world",
  "regex",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
 ]
 
@@ -714,6 +721,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfeo-nft"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "openfeo-platform"
 version = "0.1.0"
 dependencies = [
@@ -731,6 +746,7 @@ dependencies = [
  "openfeo-config",
  "openfeo-world",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

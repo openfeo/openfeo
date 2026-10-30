@@ -379,7 +379,14 @@ ip = "192.168.1.10"
 hostname = "nas"
 
 [firewall]
-# zone policies, port forwards, rules
+wan_ping = false           # answer ICMP echo on WAN zones
+# zone policies stay as §7.5 defines until the panel (M4) exposes them
+[[firewall.port_forwards]]
+name = "nas-ssh"
+proto = "tcp"              # tcp | udp
+port = 2222                # never one of the router's own ports (53, 67, 68, 80, 123, 443)
+to = "192.168.1.10"        # inside a LAN subnet
+to_port = 22               # 0 = same as port
 
 [dns]
 upstreams = []             # empty = learned from the active WAN

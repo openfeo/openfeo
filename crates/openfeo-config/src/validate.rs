@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::Ipv4Net;
 
-use crate::{Config, PortMap, wan};
+use crate::{Config, Firewall, PortMap, wan};
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,7 +38,23 @@ pub enum Code {
     PortMapMismatch,
     /// A WAN or LAN name the kernel could not take as part of an interface name.
     InvalidName,
+    /// A port forward protocol other than `tcp` or `udp`.
+    InvalidProto,
+    /// A port outside 1-65535 (or, for `to_port`, outside 0-65535).
+    InvalidPort,
+    /// A port forward target that is in no LAN subnet.
+    ForwardTargetOutsideLan,
+    /// A port forward on a port the router itself serves.
+    ReservedPort,
+    /// The same protocol and port forwarded twice.
+    DuplicateForward,
 }
+
+/// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
+/// on one of them would silently hijack that service, so it is refused (SPEC §7.5, §9).
+pub const RESERVED_WAN_PORTS: [u16; 6] = [53, 67, 68, 80, 123, 443];
+/// Longest port forward name (logs and API only; not an interface name).
+pub const MAX_FORWARD_NAME: usize = 32;
 
 /// Longest LAN name: `br-<lan>` must fit the kernel's 15-byte interface name.
 pub const MAX_LAN_NAME: usize = 15 - "br-".len();
@@ -74,6 +90,11 @@ impl Code {
             Code::EmptyPorts => "empty_ports",
             Code::PortMapMismatch => "port_map_mismatch",
             Code::InvalidName => "invalid_name",
+            Code::InvalidProto => "invalid_proto",
+            Code::InvalidPort => "invalid_port",
+            Code::ForwardTargetOutsideLan => "forward_target_outside_lan",
+            Code::ReservedPort => "reserved_port",
+            Code::DuplicateForward => "duplicate_forward",
         }
     }
 }
@@ -102,7 +123,8 @@ impl fmt::Display for Violation {
 }
 
 /// Check `config` against the rules and the live port map `ports`. Returns every violation in
-/// document order (`ports`, then `wans`, then `lans`, then subnet overlaps); empty means valid.
+/// document order (`ports`, then `wans`, then `lans`, then `firewall`, then subnet overlaps);
+/// empty means valid.
 /// Where two items conflict (a name or port used twice, two overlapping subnets) the later one in
 /// document order is flagged.
 #[must_use]
@@ -111,6 +133,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     let mut names: BTreeSet<&str> = BTreeSet::new();
     let mut used_ports: BTreeSet<&str> = BTreeSet::new();
     let mut subnets: Vec<(String, Ipv4Net)> = Vec::new();
+    let mut lan_subnets: Vec<Ipv4Net> = Vec::new();
 
     for (i, entry) in config.ports.iter().enumerate() {
         let live_name = ports.name_of(&entry.id);
@@ -184,7 +207,12 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         }
         if let Some(net) = report.cidr(&format!("{path}.ipv4"), &lan.ipv4) {
             subnets.push((format!("{path}.ipv4"), net));
+            lan_subnets.push(net);
         }
+    }
+
+    if let Some(firewall) = &config.firewall {
+        port_forwards(&mut report, firewall, &lan_subnets);
     }
 
     for (k, (path, net)) in subnets.iter().enumerate() {
@@ -197,6 +225,70 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         }
     }
     report.0
+}
+
+/// `firewall.port_forwards[i]`: name, protocol, port (not one of the router's own), target
+/// inside a LAN, target port.
+fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Net]) {
+    let mut forward_names: BTreeSet<&str> = BTreeSet::new();
+    let mut forwarded: BTreeSet<(&str, u16)> = BTreeSet::new();
+    for (i, forward) in firewall.port_forwards.iter().enumerate() {
+        let path = format!("firewall.port_forwards[{i}]");
+        report.name(
+            &mut forward_names,
+            &format!("{path}.name"),
+            &forward.name,
+            MAX_FORWARD_NAME,
+        );
+        if !matches!(forward.proto.as_str(), "tcp" | "udp") {
+            report.push(
+                format!("{path}.proto"),
+                Code::InvalidProto,
+                format!("{:?} is not \"tcp\" or \"udp\"", forward.proto),
+            );
+        }
+        match u16::try_from(forward.port) {
+            Ok(port) if port != 0 => {
+                if RESERVED_WAN_PORTS.contains(&port) {
+                    report.push(
+                        format!("{path}.port"),
+                        Code::ReservedPort,
+                        format!("port {port} is one of the router's own services"),
+                    );
+                } else if !forwarded.insert((forward.proto.as_str(), port)) {
+                    report.push(
+                        format!("{path}.port"),
+                        Code::DuplicateForward,
+                        format!("{port}/{} is already forwarded", forward.proto),
+                    );
+                }
+            }
+            _ => report.push(
+                format!("{path}.port"),
+                Code::InvalidPort,
+                format!("{} is not a port (1-65535)", forward.port),
+            ),
+        }
+        if let Some(to) = report.addr4(&format!("{path}.to"), &forward.to)
+            && !lan_subnets.iter().any(|net| net.contains(&to))
+        {
+            report.push(
+                format!("{path}.to"),
+                Code::ForwardTargetOutsideLan,
+                format!("{to} is inside no LAN subnet"),
+            );
+        }
+        if u16::try_from(forward.to_port).is_err() {
+            report.push(
+                format!("{path}.to_port"),
+                Code::InvalidPort,
+                format!(
+                    "{} is not a port (0 = same as port, or 1-65535)",
+                    forward.to_port
+                ),
+            );
+        }
+    }
 }
 
 fn overlaps(a: Ipv4Net, b: Ipv4Net) -> bool {
@@ -295,7 +387,7 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Lan, PortMap, PortMapEntry, StaticWan, Wan, wan};
+    use crate::{Config, Firewall, Lan, PortForward, PortMap, PortMapEntry, StaticWan, Wan, wan};
 
     fn entry(id: &str, name: &str) -> PortMapEntry {
         PortMapEntry {
@@ -519,5 +611,118 @@ mod tests {
         cfg.lans[0].name = "guest_lan_12".into();
         cfg.wans[0].name = "wan_long_11".into();
         assert_eq!(found(&cfg), vec![]);
+    }
+
+    fn forward(name: &str, proto: &str, port: u32, to: &str, to_port: u32) -> PortForward {
+        PortForward {
+            name: name.into(),
+            proto: proto.into(),
+            port,
+            to: to.into(),
+            to_port,
+        }
+    }
+
+    fn with_forwards(forwards: Vec<PortForward>) -> Config {
+        let mut cfg = base();
+        cfg.firewall = Some(Firewall {
+            port_forwards: forwards,
+            wan_ping: true,
+        });
+        cfg
+    }
+
+    #[test]
+    fn port_forward_valid_passes() {
+        let cfg = with_forwards(vec![forward("lan-http", "tcp", 2222, "192.168.1.2", 8080)]);
+        assert_eq!(found(&cfg), vec![]);
+        let cfg = with_forwards(vec![forward("same-port", "udp", 5000, "192.168.1.3", 0)]);
+        assert_eq!(found(&cfg), vec![]);
+    }
+
+    #[test]
+    fn forward_target_must_be_in_a_lan() {
+        let cfg = with_forwards(vec![forward("nowhere", "tcp", 2222, "10.9.9.9", 8080)]);
+        assert_eq!(
+            found(&cfg),
+            vec![(
+                "firewall.port_forwards[0].to".to_owned(),
+                Code::ForwardTargetOutsideLan
+            )]
+        );
+    }
+
+    #[test]
+    fn reserved_ports_are_rejected() {
+        assert_eq!(RESERVED_WAN_PORTS, [53, 67, 68, 80, 123, 443]);
+        for port in RESERVED_WAN_PORTS {
+            let cfg = with_forwards(vec![forward(
+                "svc",
+                "tcp",
+                u32::from(port),
+                "192.168.1.2",
+                0,
+            )]);
+            assert_eq!(
+                found(&cfg),
+                vec![(
+                    "firewall.port_forwards[0].port".to_owned(),
+                    Code::ReservedPort
+                )],
+                "port {port}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_proto_and_ports() {
+        let cfg = with_forwards(vec![forward("bad", "sctp", 0, "nonsense", 70000)]);
+        let got = found(&cfg);
+        for expected in [
+            ("firewall.port_forwards[0].proto", Code::InvalidProto),
+            ("firewall.port_forwards[0].port", Code::InvalidPort),
+            ("firewall.port_forwards[0].to", Code::InvalidAddress),
+            ("firewall.port_forwards[0].to_port", Code::InvalidPort),
+        ] {
+            assert!(
+                got.contains(&(expected.0.to_owned(), expected.1)),
+                "{expected:?} not in {got:?}"
+            );
+        }
+        assert_eq!(got.len(), 4, "{got:?}");
+    }
+
+    #[test]
+    fn duplicate_forward_names() {
+        let cfg = with_forwards(vec![
+            forward("lan-http", "tcp", 2222, "192.168.1.2", 8080),
+            forward("lan-http", "udp", 2222, "192.168.1.2", 8080),
+        ]);
+        assert_eq!(
+            found(&cfg),
+            vec![(
+                "firewall.port_forwards[1].name".to_owned(),
+                Code::DuplicateName
+            )]
+        );
+        // Forward names are their own namespace: a forward may share a LAN's name.
+        let cfg = with_forwards(vec![forward("lan0", "tcp", 2222, "192.168.1.2", 8080)]);
+        assert_eq!(found(&cfg), vec![]);
+    }
+
+    #[test]
+    fn same_proto_and_port_forwarded_twice() {
+        let cfg = with_forwards(vec![
+            forward("a", "tcp", 2222, "192.168.1.2", 8080),
+            forward("b", "tcp", 2222, "192.168.1.3", 0),
+            forward("c", "udp", 2222, "192.168.1.3", 0),
+        ]);
+        assert_eq!(
+            found(&cfg),
+            vec![(
+                "firewall.port_forwards[1].port".to_owned(),
+                Code::DuplicateForward
+            )]
+        );
     }
 }

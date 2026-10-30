@@ -18,6 +18,7 @@ openfeo-config = { path = "../openfeo-config" }
 openfeo-world = { path = "../openfeo-world" }
 openfeo-runtime = { path = "../openfeo-runtime" }
 openfeo-netlink = { path = "../openfeo-netlink" }
+openfeo-nft = { path = "../openfeo-nft" }
 openfeo-reconcile = { path = "../openfeo-reconcile" }
 openfeo-apply = { path = "../openfeo-apply" }
 anyhow.workspace = true

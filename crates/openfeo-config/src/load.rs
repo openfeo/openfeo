@@ -65,6 +65,7 @@ impl Config {
                 ports: ports.names().map(str::to_owned).collect(),
                 ipv4: FIRST_BOOT_IPV4.to_owned(),
             }],
+            firewall: None,
         }
     }
 }

@@ -12,14 +12,17 @@ anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
 nix.workspace = true
+openfeo-nft = { path = "../crates/openfeo-nft" }
 regex.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 openfeo-apply = { path = "../crates/openfeo-apply" }
 openfeo-config = { path = "../crates/openfeo-config" }
 openfeo-netlink = { path = "../crates/openfeo-netlink" }
+openfeo-platform = { path = "../crates/openfeo-platform" }
 openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
 openfeo-world = { path = "../crates/openfeo-world" }
 tokio.workspace = true
@@ -28,6 +31,11 @@ ipnet.workspace = true
 [[test]]
 name = "netlink"
 path = "tests/netlink.rs"
+harness = false
+
+[[test]]
+name = "nft"
+path = "tests/nft.rs"
 harness = false
 
 [[test]]

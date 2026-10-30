@@ -16,7 +16,9 @@ mod portmap;
 pub mod validate;
 
 pub use error::ConfigError;
-pub use generated::{Config, DhcpWan, Lan, PortMap, PortMapEntry, StaticWan, System, Wan, wan};
+pub use generated::{
+    Config, DhcpWan, Firewall, Lan, PortForward, PortMap, PortMapEntry, StaticWan, System, Wan, wan,
+};
 
 #[cfg(test)]
 mod tests {

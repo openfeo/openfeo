@@ -8,7 +8,9 @@
 #![forbid(unsafe_code)]
 
 pub mod links;
+pub mod nft;
 pub mod routing;
+pub mod sysctl;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
@@ -17,6 +19,8 @@ pub(crate) mod fixtures;
 pub const RTPROT_OPENFEO: u8 = 200;
 /// The main routing table. Mirrors `openfeo_netlink::TABLE_MAIN`.
 pub const TABLE_MAIN: u32 = 254;
+/// The one nftables table OpenFeO owns, `table inet openfeo` (SPEC §7.5).
+pub const TABLE: &str = "openfeo";
 
 /// The kernel name of a LAN's bridge (SPEC §7).
 #[must_use]

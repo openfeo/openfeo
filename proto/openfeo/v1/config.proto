@@ -16,6 +16,30 @@ message Config {
   repeated PortMapEntry ports = 3;
   repeated Wan wans = 4;
   repeated Lan lans = 5;
+  Firewall firewall = 6;
+}
+
+// Firewall settings beyond the zone defaults of SPEC §7.5 (which the panel exposes in M4).
+message Firewall {
+  repeated PortForward port_forwards = 1;
+  // Answer ICMP echo on WAN zones (SPEC §7.5 "optional ping"); off by default.
+  bool wan_ping = 2;
+}
+
+// One DNAT from every WAN address (and, by hairpin, from LAN clients reaching a router address)
+// to a LAN host (SPEC §7.5).
+message PortForward {
+  // Unique among forwards; shows in logs and the API.
+  string name = 1;
+  // "tcp" or "udp".
+  string proto = 2;
+  // Destination port on the router, 1-65535; never one of the router's own services
+  // (53, 67, 68, 80, 123, 443).
+  uint32 port = 3;
+  // IPv4 address inside one of the LANs.
+  string to = 4;
+  // Port on `to`; 0 = same as `port`.
+  uint32 to_port = 5;
 }
 
 message System {

@@ -14,14 +14,21 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 use ipnet::IpNet;
+use openfeo_apply::ApplyError;
 use openfeo_apply::links::LinksApplier;
+use openfeo_apply::nft::NftApplier;
 use openfeo_apply::routing::RoutingApplier;
+use openfeo_apply::sysctl::SysctlApplier;
 use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_harness::lab::Lab;
-use openfeo_harness::netns;
-use openfeo_harness::sandbox;
+use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::scenario::{Scenario, run_all};
+use openfeo_harness::{daemons, lanclient, netns, nftlist, nftprobe, sandbox};
 use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, TABLE_MAIN};
+use openfeo_nft::Nft;
+use openfeo_platform::sysctl;
+use openfeo_reconcile::nft::nft;
+use openfeo_reconcile::sysctl::DesiredSysctl;
 use openfeo_world::{LinkFact, MacAddr, World};
 use tokio::sync::watch;
 
@@ -61,6 +68,22 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "partial_failure_still_applies_the_rest",
         run: partial_failure_still_applies_the_rest,
+    },
+    Scenario {
+        name: "nft_applier_applies_once_then_noops",
+        run: nft_applier_applies_once_then_noops,
+    },
+    Scenario {
+        name: "sysctl_applier_turns_forwarding_on_and_off",
+        run: sysctl_applier_turns_forwarding_on_and_off,
+    },
+    Scenario {
+        name: "sysctl_for_a_missing_interface_is_reported_last",
+        run: sysctl_for_a_missing_interface_is_reported_last,
+    },
+    Scenario {
+        name: "http_get_reaches_a_server_in_the_sandbox",
+        run: http_get_reaches_a_server_in_the_sandbox,
     },
 ];
 
@@ -329,15 +352,20 @@ impl Drop for FakePorts {
 }
 
 /// A World over the cache's link facts, a `p0..p2` port map and `config`.
-fn world_from(cache: &Cache, config: &Config) -> World {
-    let ports = PortMap {
+/// The lab's three ports, as the QEMU VM sees them.
+fn lab_portmap() -> PortMap {
+    PortMap {
         ports: (0..3)
             .map(|i| PortMapEntry {
                 id: format!("pci-0000:00:0{}.0", 3 + i),
                 name: format!("p{i}"),
             })
             .collect(),
-    };
+    }
+}
+
+fn world_from(cache: &Cache, config: &Config) -> World {
+    let ports = lab_portmap();
     let links = cache
         .links
         .values()
@@ -620,4 +648,140 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
         ensure!(netns::ip(&["-4", "addr", "show", "br-lan0"])?.contains("192.168.1.1/24"));
         anyhow::Ok(())
     })?
+}
+
+fn desired_sysctl(entries: &[(&str, &str)]) -> DesiredSysctl {
+    DesiredSysctl {
+        entries: entries
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    }
+}
+
+/// The nft applier applies a ruleset once, is a no-op while it is unchanged, and applies again
+/// when the World changes it (here: `wan_ping` toggles the echo-request rule).
+fn nft_applier_applies_once_then_noops(_lab: &mut Lab) -> anyhow::Result<()> {
+    nftprobe::require_expressions()?;
+    let mut config = static_config()?;
+    let mut applier = NftApplier::new(Nft::new()?);
+    let mut lister = Nft::new()?;
+    let result = (|| {
+        let world = World::new(config.clone(), lab_portmap());
+        let first = applier.apply(&nft(&world))?;
+        ensure!(first.ops == 1, "first apply: {first:?}");
+        let again = applier.apply(&nft(&world))?;
+        ensure!(again.ops == 0, "unchanged ruleset re-applied: {again:?}");
+        let icmp_type = serde_json::json!({"payload": {"protocol": "icmp", "field": "type"}});
+        ensure!(
+            nftlist::chain_matches(&lister.list_ruleset()?, "input", &icmp_type),
+            "input should match icmp type while wan_ping is on"
+        );
+        config
+            .firewall
+            .as_mut()
+            .context("fixture has [firewall]")?
+            .wan_ping = false;
+        let world = World::new(config.clone(), lab_portmap());
+        let changed = applier.apply(&nft(&world))?;
+        ensure!(changed.ops == 1, "changed ruleset: {changed:?}");
+        ensure!(
+            !nftlist::chain_matches(&lister.list_ruleset()?, "input", &icmp_type),
+            "the icmp type rule should be gone with wan_ping off"
+        );
+        anyhow::Ok(())
+    })();
+    let _ = lister
+        .apply(&[serde_json::json!({"delete": {"table": {"family": "inet", "name": "openfeo"}}})]);
+    result
+}
+
+/// Forwarding and per-interface `send_redirects` follow the desired set; unchanged keys cost
+/// nothing; turning forwarding off is one write.
+fn sysctl_applier_turns_forwarding_on_and_off(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (_rig, _config) = build_static().await?;
+        let mut applier = SysctlApplier::new();
+        // A new network namespace inherits the host's values (this host forwards): baseline.
+        applier.apply(&desired_sysctl(&[
+            ("net/ipv4/ip_forward", "0"),
+            ("net/ipv4/conf/br-lan0/send_redirects", "1"),
+        ]))?;
+        ensure!(sysctl::read("net/ipv4/ip_forward")? == "0");
+        let on = desired_sysctl(&[
+            ("net/ipv4/ip_forward", "1"),
+            ("net/ipv4/conf/br-lan0/send_redirects", "0"),
+        ]);
+        let report = applier.apply(&on)?;
+        ensure!(report.ops == 2, "two writes expected: {report:?}");
+        ensure!(sysctl::read("net/ipv4/ip_forward")? == "1");
+        ensure!(sysctl::read("net/ipv4/conf/br-lan0/send_redirects")? == "0");
+        let report = applier.apply(&on)?;
+        ensure!(report.ops == 0, "nothing to write: {report:?}");
+        let report = applier.apply(&desired_sysctl(&[("net/ipv4/ip_forward", "0")]))?;
+        ensure!(report.ops == 1, "one write expected: {report:?}");
+        ensure!(sysctl::read("net/ipv4/ip_forward")? == "0");
+        anyhow::Ok(())
+    })?
+}
+
+/// A key that cannot be written (an interface that does not exist) is reported after every other
+/// key was written.
+fn sysctl_for_a_missing_interface_is_reported_last(_lab: &mut Lab) -> anyhow::Result<()> {
+    let mut applier = SysctlApplier::new();
+    applier.apply(&desired_sysctl(&[("net/ipv4/ip_forward", "0")]))?;
+    let desired = desired_sysctl(&[
+        ("net/ipv4/conf/nosuchif/send_redirects", "0"),
+        ("net/ipv4/ip_forward", "1"),
+    ]);
+    let result = applier.apply(&desired);
+    let forwarding = sysctl::read("net/ipv4/ip_forward");
+    let _ = applier.apply(&desired_sysctl(&[("net/ipv4/ip_forward", "0")]));
+    match result {
+        Err(ApplyError::Io { path, .. }) => {
+            ensure!(path.contains("nosuchif"), "wrong key reported: {path}");
+        }
+        other => anyhow::bail!("expected Io error, got {other:?}"),
+    }
+    ensure!(
+        forwarding? == "1",
+        "ip_forward must still have been written"
+    );
+    Ok(())
+}
+
+/// The in-namespace HTTP client reaches a server started in the same namespace (here the lab's
+/// ISP namespace on its own address), returns the body, and the server logged the request.
+fn http_get_reaches_a_server_in_the_sandbox(lab: &mut Lab) -> anyhow::Result<()> {
+    let dir = lab.run_dir.join("http-sandbox");
+    std::fs::create_dir_all(&dir)?;
+    let server = daemons::http_server(&lab.isp0, "203.0.113.1", 8081, &dir, "hello from isp0")?;
+    server.log.wait_for(
+        &mut Cursor::default(),
+        &Regex::new(r"Serving HTTP on")?,
+        Duration::from_secs(5),
+    )?;
+    let body = lanclient::http_get(
+        &lab.isp0,
+        "203.0.113.1:8081".parse()?,
+        "/",
+        Duration::from_secs(5),
+    )?;
+    ensure!(body.trim() == "hello from isp0", "unexpected body {body:?}");
+    ensure!(
+        server.log.count(&Regex::new(
+            r#"203\.0\.113\.1 - - .*"GET / HTTP/1\.0" 200"#
+        )?) == 1,
+        "server log lacks the request: {:?}",
+        server.log.tail(5)
+    );
+    let refused = lanclient::http_get(
+        &lab.isp0,
+        "203.0.113.1:8082".parse()?,
+        "/",
+        Duration::from_secs(2),
+    );
+    ensure!(refused.is_err(), "a closed port must be an error");
+    Ok(())
 }

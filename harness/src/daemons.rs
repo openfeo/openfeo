@@ -99,6 +99,32 @@ pub fn kea_dhcp4(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     Daemon::spawn("kea-dhcp4", cmd)
 }
 
+/// A static HTTP target in `ns`: `python3 -m http.server <port>` bound to `bind`, serving `dir`
+/// whose `index.html` is `body`. Its log shows one line per request, with the client address
+/// the server saw (`203.0.113.10 - - [...] "GET / HTTP/1.0" 200 -`), which is how scenarios
+/// prove NAT and hairpin SNAT happened. Unbuffered, so `Serving HTTP on` appears at once.
+///
+/// # Errors
+///
+/// When `index.html` cannot be written or python3 cannot be spawned.
+pub fn http_server(ns: &NetNs, bind: &str, port: u16, dir: &Path, body: &str) -> Result<Daemon> {
+    std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let index = dir.join("index.html");
+    std::fs::write(&index, body).with_context(|| format!("write {}", index.display()))?;
+    let mut cmd = ns.command("python3")?;
+    cmd.args([
+        "-u",
+        "-m",
+        "http.server",
+        &port.to_string(),
+        "--bind",
+        bind,
+        "--directory",
+    ])
+    .arg(dir);
+    Daemon::spawn(&format!("http-{}-{port}", ns.name), cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

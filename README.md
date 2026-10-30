@@ -9,13 +9,17 @@ FeO is iron(II) oxide, that is, rust.
 
 ## Status
 
-Pre-alpha. Milestone M0 of [`SPEC.md`](SPEC.md) §12 is done and the first part of M1 (the IPv4
-router) is in: the kernel boots in QEMU to the OpenFeO PID 1, which supervises the router process
-and pets the hardware watchdog only while it reports healthy; the router process checks the kernel
-against `kernel/required.config`, names the ports by bus path, loads a protobuf-defined
-configuration from `/state/config.toml`, and makes the kernel match it (LAN bridge, static WAN
-address and default route) through a netlink monitor and appliers that own only what they tag.
-Nothing is forwarded yet: the firewall, NAT and the DHCPv4 client come with the next part of M1.
+Pre-alpha. Milestone M0 of [`SPEC.md`](SPEC.md) §12 is done and M1 (the IPv4 router) is under
+way: the kernel boots in QEMU to the OpenFeO PID 1, which supervises the router process and pets
+the hardware watchdog only while it reports healthy; the router process checks the kernel against
+`kernel/required.config`, names the ports by bus path, loads a protobuf-defined configuration from
+`/state/config.toml`, and makes the kernel match it through a netlink monitor and appliers that own
+only what they tag: LAN bridge, static WAN address and default route, and one `table inet openfeo`
+ruleset generated from the configuration and applied through libnftables linked in-process (zones
+as named sets, default deny inbound on the WAN, masquerade, port forwards with hairpin,
+reverse-path filtering in nft). Forwarding is switched on only together with that ruleset, and a
+router-process crash does not interrupt traffic. Still to come in M1: the DHCPv4 client, the LAN
+DHCP server, the DNS forwarder and SNTP.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
@@ -32,9 +36,12 @@ decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
 ## Building and running the lab
 
 Needs Rust stable with the `x86_64-unknown-linux-musl` target, a musl C compiler (`musl-gcc`:
-package `musl` on Arch, `musl-tools` on Debian and Ubuntu), `cargo-deny`, `buf`, QEMU
-(`qemu-system-x86_64`), `iproute2`, `ping`, Kea (`kea-dhcp4`), `mkfs.ext4` (e2fsprogs), `ccache`,
-and the usual kernel build dependencies (`bc`, `flex`, `bison`, `libelf`, `libssl`, `zstd`, `cpio`). The lab runs without
+package `musl` on Arch, `musl-tools` on Debian and Ubuntu), `pkg-config`, `cargo-deny`, `buf`, QEMU
+(`qemu-system-x86_64`), `iproute2`, `ping`, `python3`, Kea (`kea-dhcp4`), `mkfs.ext4` (e2fsprogs), `ccache`,
+and the usual kernel build dependencies (`bc`, `flex`, `bison`, `libelf`, `libssl`, `zstd`, `cpio`).
+`make` fetches the pinned sources of nftables, libnftnl, libmnl and jansson (`nft/sources.txt`),
+verifies them and builds them statically for the firewall backend, against the UAPI headers of
+the pinned kernel (ADR-0012). The lab runs without
 root: it wants unprivileged user namespaces, read-write access to `/dev/net/tun`, and `/dev/kvm`
 (falls back to TCG without it). On Ubuntu, Kea's stock AppArmor profile must be unloaded first
 (see ADR-0006).

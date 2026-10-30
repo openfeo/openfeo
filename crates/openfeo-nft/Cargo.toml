@@ -1,0 +1,16 @@
+[package]
+name = "openfeo-nft"
+description = "OpenFeO firewall backend: libnftables linked in-process, driven through its JSON API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+links = "nftables"
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
