@@ -1,0 +1,16 @@
+---
+source: crates/openfeo-reconcile/src/routing.rs
+expression: desired
+---
+addrs:
+  - ifname: br-lan0
+    net: 192.168.1.1/24
+  - ifname: p0
+    net: 203.0.113.10/24
+routes:
+  - ifname: p0
+    dst: ~
+    gateway: 203.0.113.1
+    table: 254
+    protocol: 200
+    priority: 10

@@ -1,0 +1,27 @@
+---
+source: crates/openfeo-reconcile/src/links.rs
+expression: desired
+---
+bridges:
+  br-lan0:
+    name: br-lan0
+    vlan_filtering: true
+    mac: "52:54:00:fe:00:00"
+    members:
+      - p0
+      - p1
+      - p2
+    up: true
+ports:
+  p0:
+    name: p0
+    up: true
+    master: br-lan0
+  p1:
+    name: p1
+    up: true
+    master: br-lan0
+  p2:
+    name: p2
+    up: true
+    master: br-lan0

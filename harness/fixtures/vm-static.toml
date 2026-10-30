@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The lab's static configuration: WAN A on p0 towards isp0 (203.0.113.1), a LAN on p2 towards
+# lan0, p1 unassigned. No [[ports]] section: the live map assigns p0..p2 in PCI order, which is
+# QEMU's device order.
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+
+[[wans]]
+name = "wan0"
+port = "p0"
+priority = 10
+[wans.static]
+address = "203.0.113.10/24"
+gateway = "203.0.113.1"
+dns = ["203.0.113.1"]
+
+[[lans]]
+name = "lan0"
+ports = ["p2"]
+ipv4 = "192.168.1.1/24"
