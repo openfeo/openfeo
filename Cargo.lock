@@ -461,6 +461,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfeo-world"
+version = "0.1.0"
+dependencies = [
+ "openfeo-config",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "pbjson"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
