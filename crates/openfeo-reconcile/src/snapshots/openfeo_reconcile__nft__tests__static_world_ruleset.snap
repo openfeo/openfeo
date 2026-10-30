@@ -1,0 +1,563 @@
+---
+source: crates/openfeo-reconcile/src/nft.rs
+expression: desired
+---
+ruleset:
+  - add:
+      table:
+        family: inet
+        name: openfeo
+  - delete:
+      table:
+        family: inet
+        name: openfeo
+  - add:
+      table:
+        family: inet
+        name: openfeo
+  - add:
+      set:
+        elem:
+          - p0
+        family: inet
+        name: wan_if
+        table: openfeo
+        type: ifname
+  - add:
+      set:
+        elem:
+          - br-lan0
+        family: inet
+        name: lan_if
+        table: openfeo
+        type: ifname
+  - add:
+      set:
+        elem:
+          - concat:
+              - br-lan0
+              - br-lan0
+        family: inet
+        name: lan_same
+        table: openfeo
+        type:
+          - ifname
+          - ifname
+  - add:
+      map:
+        elem:
+          - - 2222
+            - concat:
+                - 192.168.1.2
+                - 8080
+        family: inet
+        map:
+          - ipv4_addr
+          - inet_service
+        name: fwd_tcp
+        table: openfeo
+        type: inet_service
+  - add:
+      map:
+        family: inet
+        map:
+          - ipv4_addr
+          - inet_service
+        name: fwd_udp
+        table: openfeo
+        type: inet_service
+  - add:
+      chain:
+        family: inet
+        hook: prerouting
+        name: rpfilter
+        policy: accept
+        prio: -300
+        table: openfeo
+        type: filter
+  - add:
+      rule:
+        chain: rpfilter
+        expr:
+          - match:
+              left:
+                concat:
+                  - payload:
+                      field: sport
+                      protocol: udp
+                  - payload:
+                      field: dport
+                      protocol: udp
+              op: "=="
+              right:
+                set:
+                  - concat:
+                      - 67
+                      - 68
+                  - concat:
+                      - 68
+                      - 67
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: rpfilter
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_if"
+          - match:
+              left:
+                fib:
+                  flags:
+                    - saddr
+                    - iif
+                  result: oif
+              op: "=="
+              right: false
+          - drop: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: rpfilter
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                fib:
+                  flags:
+                    - saddr
+                  result: oif
+              op: "=="
+              right: false
+          - drop: ~
+        family: inet
+        table: openfeo
+  - add:
+      chain:
+        family: inet
+        hook: input
+        name: input
+        policy: drop
+        prio: 0
+        table: openfeo
+        type: filter
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                ct:
+                  key: state
+              op: in
+              right:
+                - established
+                - related
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                ct:
+                  key: state
+              op: in
+              right: invalid
+          - drop: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iif
+              op: "=="
+              right: lo
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_if"
+          - match:
+              left:
+                payload:
+                  field: dport
+                  protocol: udp
+              op: "=="
+              right:
+                set:
+                  - 53
+                  - 67
+                  - 123
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_if"
+          - match:
+              left:
+                payload:
+                  field: dport
+                  protocol: tcp
+              op: "=="
+              right:
+                set:
+                  - 53
+                  - 80
+                  - 443
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_if"
+          - match:
+              left:
+                meta:
+                  key: l4proto
+              op: "=="
+              right:
+                set:
+                  - icmp
+                  - icmpv6
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: sport
+                  protocol: udp
+              op: "=="
+              right: 67
+          - match:
+              left:
+                payload:
+                  field: dport
+                  protocol: udp
+              op: "=="
+              right: 68
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: type
+                  protocol: icmp
+              op: "=="
+              right: echo-request
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      chain:
+        family: inet
+        hook: forward
+        name: forward
+        policy: drop
+        prio: 0
+        table: openfeo
+        type: filter
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                ct:
+                  key: state
+              op: in
+              right:
+                - established
+                - related
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                ct:
+                  key: state
+              op: in
+              right: invalid
+          - drop: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                ct:
+                  key: status
+              op: in
+              right: dnat
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_if"
+          - match:
+              left:
+                meta:
+                  key: oifname
+              op: "=="
+              right: "@wan_if"
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                concat:
+                  - meta:
+                      key: iifname
+                  - meta:
+                      key: oifname
+              op: "=="
+              right: "@lan_same"
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      chain:
+        family: inet
+        hook: prerouting
+        name: dstnat
+        policy: accept
+        prio: -100
+        table: openfeo
+        type: nat
+  - add:
+      rule:
+        chain: dstnat
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - dnat:
+              addr:
+                map:
+                  data: "@fwd_tcp"
+                  key:
+                    payload:
+                      field: dport
+                      protocol: tcp
+              family: ip
+              type_flags:
+                - concat
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: dstnat
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - dnat:
+              addr:
+                map:
+                  data: "@fwd_udp"
+                  key:
+                    payload:
+                      field: dport
+                      protocol: udp
+              family: ip
+              type_flags:
+                - concat
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: dstnat
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_if"
+          - match:
+              left:
+                fib:
+                  flags:
+                    - daddr
+                  result: type
+              op: "=="
+              right: local
+          - dnat:
+              addr:
+                map:
+                  data: "@fwd_tcp"
+                  key:
+                    payload:
+                      field: dport
+                      protocol: tcp
+              family: ip
+              type_flags:
+                - concat
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: dstnat
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_if"
+          - match:
+              left:
+                fib:
+                  flags:
+                    - daddr
+                  result: type
+              op: "=="
+              right: local
+          - dnat:
+              addr:
+                map:
+                  data: "@fwd_udp"
+                  key:
+                    payload:
+                      field: dport
+                      protocol: udp
+              family: ip
+              type_flags:
+                - concat
+        family: inet
+        table: openfeo
+  - add:
+      chain:
+        family: inet
+        hook: postrouting
+        name: srcnat
+        policy: accept
+        prio: 100
+        table: openfeo
+        type: nat
+  - add:
+      rule:
+        chain: srcnat
+        expr:
+          - match:
+              left:
+                meta:
+                  key: oifname
+              op: "=="
+              right: "@wan_if"
+          - masquerade: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: srcnat
+        expr:
+          - match:
+              left:
+                concat:
+                  - meta:
+                      key: iifname
+                  - meta:
+                      key: oifname
+              op: "=="
+              right: "@lan_same"
+          - match:
+              left:
+                ct:
+                  key: status
+              op: in
+              right: dnat
+          - masquerade: ~
+        family: inet
+        table: openfeo
+forwarding: true
+wan_if:
+  - p0
+lan_if:
+  - br-lan0

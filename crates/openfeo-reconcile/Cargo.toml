@@ -1,6 +1,6 @@
 [package]
 name = "openfeo-reconcile"
-description = "OpenFeO reconcilers: pure World -> Desired for links and routing (no tokio, no kernel, no clocks)"
+description = "OpenFeO reconcilers: pure World -> Desired for links, routing, the nft ruleset and sysctls (no tokio, no kernel, no clocks)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ openfeo-config = { path = "../openfeo-config" }
 openfeo-world = { path = "../openfeo-world" }
 ipnet.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

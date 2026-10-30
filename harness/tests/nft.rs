@@ -9,11 +9,16 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, ensure};
+use openfeo_config::{PortMap, PortMapEntry};
 use openfeo_harness::lab::Lab;
-use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
+use openfeo_harness::{nftprobe, sandbox};
 use openfeo_nft::{Nft, NftError};
+use openfeo_reconcile::nft::nft;
+use openfeo_world::World;
 use serde_json::{Value, json};
+
+const VM_STATIC: &str = include_str!("../fixtures/vm-static.toml");
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
@@ -31,6 +36,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "init_works_without_capabilities_until_used",
         run: init_works_without_capabilities_until_used,
+    },
+    Scenario {
+        name: "generated_ruleset_is_accepted_by_libnftables",
+        run: generated_ruleset_is_accepted_by_libnftables,
     },
 ];
 
@@ -172,6 +181,52 @@ fn init_works_without_capabilities_until_used(_lab: &mut Lab) -> anyhow::Result<
     ensure!(
         raw.contains("\"nftables\""),
         "raw output is the JSON document: {raw}"
+    );
+    Ok(())
+}
+
+/// The lab's three ports, as the QEMU VM sees them.
+fn lab_portmap() -> PortMap {
+    PortMap {
+        ports: (0..3)
+            .map(|i| PortMapEntry {
+                id: format!("pci-0000:00:0{}.0", 3 + i),
+                name: format!("p{i}"),
+            })
+            .collect(),
+    }
+}
+
+/// The real ruleset for the lab's static configuration goes through libnftables into this
+/// kernel, twice (the add/delete/add prologue makes the second apply a replace), and every chain
+/// is there afterwards. Skips on a kernel that cannot load the ct/fib/nat modules.
+fn generated_ruleset_is_accepted_by_libnftables(_lab: &mut Lab) -> anyhow::Result<()> {
+    nftprobe::require_expressions()?;
+    let config = openfeo_config::file::parse(VM_STATIC)?;
+    let world = World::new(config, lab_portmap());
+    let desired = nft(&world);
+    ensure!(desired.forwarding, "the static fixture has a WAN and a LAN");
+    let mut nft = Nft::new()?;
+    let first = nft.apply(&desired.ruleset);
+    let second = nft.apply(&desired.ruleset);
+    let listed_ruleset = nft.list_ruleset();
+    drop_table(&mut nft, "openfeo");
+    first.context("first apply")?;
+    second.context("second apply (replace)")?;
+    let ruleset = listed_ruleset?;
+    ensure!(
+        listed(&ruleset, "table", "openfeo", None).len() == 1,
+        "exactly one table openfeo: {ruleset}"
+    );
+    for chain in ["rpfilter", "input", "forward", "dstnat", "srcnat"] {
+        ensure!(
+            listed(&ruleset, "chain", chain, Some("openfeo")).len() == 1,
+            "chain {chain} missing or duplicated: {ruleset}"
+        );
+    }
+    ensure!(
+        listed(&ruleset, "map", "fwd_tcp", Some("openfeo")).len() == 1,
+        "map fwd_tcp missing: {ruleset}"
     );
     Ok(())
 }

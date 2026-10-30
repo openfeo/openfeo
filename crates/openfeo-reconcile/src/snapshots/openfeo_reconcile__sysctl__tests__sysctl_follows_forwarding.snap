@@ -1,0 +1,9 @@
+---
+source: crates/openfeo-reconcile/src/sysctl.rs
+expression: "on"
+---
+entries:
+  net/ipv4/conf/br-lan0/send_redirects: "0"
+  net/ipv4/conf/p0/send_redirects: "0"
+  net/ipv4/ip_forward: "1"
+  net/ipv6/conf/all/forwarding: "1"
