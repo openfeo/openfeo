@@ -1052,4 +1052,279 @@ mod tests {
         assert_eq!(c.state(), State::Selecting);
         assert_eq!(c.lease(), None);
     }
+
+    /// A client started with `lease` (INIT-REBOOT) and the REQUEST it sent.
+    fn rebooting(lease: &Lease) -> (Client, Message) {
+        let mut c = client();
+        let out = c.handle(
+            Input::Start {
+                lease: Some(lease.clone()),
+            },
+            0,
+        );
+        assert_eq!(c.state(), State::Rebooting);
+        assert!(out.contains(&Output::Rebooting(OFFERED)));
+        assert!(out.contains(&Output::Request(OFFERED)));
+        let (src, dst, request) = sent(&out);
+        assert_eq!((src, dst), (ANY, ALL));
+        assert_eq!(request.message_type(), Some(MessageType::Request));
+        assert_eq!(
+            request.option(50),
+            Some(&DhcpOption::RequestedIpAddress(OFFERED))
+        );
+        assert_eq!(request.option(54), None, "no server in INIT-REBOOT");
+        assert_eq!(request.ciaddr, ANY);
+        assert_eq!(request.flags & FLAG_BROADCAST, FLAG_BROADCAST);
+        assert_eq!(
+            c.lease(),
+            Some(lease),
+            "the lease is reported while confirming it"
+        );
+        (c, request)
+    }
+
+    #[test]
+    fn start_with_a_lease_reboots_and_the_ack_binds_the_same_address() {
+        let (_, lease) = bound();
+        let (mut c, request) = rebooting(&lease);
+        let out = c.handle(
+            Input::Packet(reply(&request, MessageType::Ack, lease_options())),
+            500,
+        );
+        assert_eq!(
+            out,
+            vec![Output::Bound {
+                lease: lease.clone(),
+                renewed: false
+            }]
+        );
+        assert_eq!(c.state(), State::Bound);
+        assert_eq!(c.next_timeout(), Some(500 + 20 * SEC));
+    }
+
+    #[test]
+    fn nak_while_rebooting_withdraws_the_lease_and_discovers() {
+        let (_, lease) = bound();
+        let (mut c, request) = rebooting(&lease);
+        let nak = reply(
+            &request,
+            MessageType::Nak,
+            vec![DhcpOption::Message("address not available".to_owned())],
+        );
+        let out = c.handle(Input::Packet(nak), 500);
+        assert!(out.contains(&Output::Unbound(Unbound::Nak(Some(
+            "address not available".to_owned()
+        )))));
+        assert!(has(&out, |o| matches!(o, Output::Discover)));
+        let (_, _, m) = sent(&out);
+        assert_eq!(m.message_type(), Some(MessageType::Discover));
+        assert_eq!(c.lease(), None);
+        assert_eq!(c.state(), State::Selecting);
+    }
+
+    #[test]
+    fn reboot_times_out_after_three_sends_then_discovers() {
+        let (_, lease) = bound();
+        let (mut c, _) = rebooting(&lease);
+        for _ in 0..2 {
+            let timeout = c.next_timeout().unwrap();
+            let out = c.handle(Input::Timeout, timeout);
+            let (_, _, again) = sent(&out);
+            assert_eq!(again.message_type(), Some(MessageType::Request));
+            assert_eq!(c.state(), State::Rebooting);
+        }
+        let timeout = c.next_timeout().unwrap();
+        let out = c.handle(Input::Timeout, timeout);
+        assert!(out.contains(&Output::Unbound(Unbound::RebootTimedOut)));
+        assert!(has(&out, |o| matches!(o, Output::Discover)));
+        assert_eq!(c.lease(), None);
+        assert_eq!(c.state(), State::Selecting);
+    }
+
+    #[test]
+    fn link_down_stops_timers_and_link_up_reboots_a_bound_lease() {
+        let (mut c, lease) = bound();
+        let out = c.handle(Input::LinkDown, 2 * SEC);
+        assert_eq!(out, Vec::new());
+        assert_eq!(
+            c.next_timeout(),
+            None,
+            "nothing to send while the link is down"
+        );
+        assert_eq!(c.state(), State::Bound);
+        assert_eq!(c.lease(), Some(&lease), "the lease is kept");
+
+        let out = c.handle(Input::LinkUp, 3 * SEC);
+        assert_eq!(c.state(), State::Rebooting);
+        assert!(out.contains(&Output::Rebooting(OFFERED)));
+        let (src, dst, request) = sent(&out);
+        assert_eq!((src, dst), (ANY, ALL));
+        assert_eq!(request.ciaddr, ANY);
+        assert_eq!(
+            request.option(50),
+            Some(&DhcpOption::RequestedIpAddress(OFFERED))
+        );
+        assert_eq!(c.lease(), Some(&lease), "still reported while confirming");
+        let out = c.handle(
+            Input::Packet(reply(&request, MessageType::Ack, lease_options())),
+            3 * SEC + 200,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [Output::Bound { renewed: false, .. }]
+        ));
+        assert_eq!(c.state(), State::Bound);
+
+        let (mut c, _) = bound();
+        c.handle(Input::LinkDown, 2 * SEC);
+        let out = c.handle(Input::LinkUp, 3 * SEC);
+        let (_, _, request) = sent(&out);
+        let out = c.handle(
+            Input::Packet(reply(&request, MessageType::Nak, Vec::new())),
+            3 * SEC + 200,
+        );
+        assert!(out.contains(&Output::Unbound(Unbound::Nak(None))));
+        assert_eq!(c.lease(), None);
+        assert_eq!(c.state(), State::Selecting);
+    }
+
+    #[test]
+    fn link_up_while_selecting_restarts_discovery_at_once() {
+        let mut c = client();
+        c.handle(Input::Start { lease: None }, 0);
+        let first_timeout = c.next_timeout().unwrap();
+        c.handle(Input::Timeout, first_timeout);
+        let second_wait = c.next_timeout().unwrap() - first_timeout;
+        assert!(
+            second_wait >= 7 * SEC,
+            "backoff had grown to ~8 s: {second_wait}"
+        );
+
+        let now = first_timeout + SEC;
+        let out = c.handle(Input::LinkUp, now);
+        assert!(has(&out, |o| matches!(o, Output::Discover)));
+        let (_, _, m) = sent(&out);
+        assert_eq!(m.message_type(), Some(MessageType::Discover));
+        assert_eq!(c.state(), State::Selecting);
+        let next = c.next_timeout().unwrap() - now;
+        assert!((3 * SEC..=5 * SEC).contains(&next), "backoff reset: {next}");
+    }
+
+    #[test]
+    fn replies_for_another_client_are_ignored() {
+        let mut c = client();
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let offer = reply(&discover, MessageType::Offer, lease_options());
+
+        let mut other_xid = offer.clone();
+        other_xid[4] ^= 0xff;
+        assert_eq!(c.handle(Input::Packet(other_xid), 100), Vec::new());
+        let mut other_chaddr = offer.clone();
+        other_chaddr[33] ^= 0xff;
+        assert_eq!(c.handle(Input::Packet(other_chaddr), 100), Vec::new());
+        let mut not_a_reply = offer.clone();
+        not_a_reply[0] = 1;
+        assert_eq!(c.handle(Input::Packet(not_a_reply), 100), Vec::new());
+        let request_kind = reply(&discover, MessageType::Request, lease_options());
+        assert_eq!(c.handle(Input::Packet(request_kind), 100), Vec::new());
+        assert_eq!(c.handle(Input::Packet(vec![1, 2, 3]), 100), Vec::new());
+        assert_eq!(c.state(), State::Selecting);
+
+        let (mut c, lease) = bound();
+        let mut discover_again = Message::decode(&offer).unwrap();
+        discover_again.xid = 0;
+        let unsolicited = reply(&discover_again, MessageType::Offer, lease_options());
+        assert_eq!(c.handle(Input::Packet(unsolicited), 2 * SEC), Vec::new());
+        assert_eq!(c.state(), State::Bound);
+        assert_eq!(c.lease(), Some(&lease));
+    }
+
+    #[test]
+    fn ack_without_lease_time_or_server_id_is_ignored() {
+        let mut c = client();
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let out = c.handle(
+            Input::Packet(reply(&discover, MessageType::Offer, lease_options())),
+            500,
+        );
+        let (_, _, request) = sent(&out);
+        let timer = c.next_timeout();
+
+        let no_lease_time = reply(
+            &request,
+            MessageType::Ack,
+            vec![DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0))],
+        );
+        assert_eq!(c.handle(Input::Packet(no_lease_time), 600), Vec::new());
+        let mut no_server =
+            Message::decode(&reply(&request, MessageType::Ack, lease_options())).unwrap();
+        no_server.options.retain(|option| option.code() != 54);
+        assert_eq!(Lease::from_ack(&no_server), Err(LeaseError::NoServer));
+        assert_eq!(c.handle(Input::Packet(no_server.encode()), 700), Vec::new());
+        let mut no_address =
+            Message::decode(&reply(&request, MessageType::Ack, lease_options())).unwrap();
+        no_address.yiaddr = ANY;
+        assert_eq!(Lease::from_ack(&no_address), Err(LeaseError::NoAddress));
+        assert_eq!(
+            c.handle(Input::Packet(no_address.encode()), 800),
+            Vec::new()
+        );
+        assert_eq!(c.state(), State::Requesting);
+        assert_eq!(
+            c.next_timeout(),
+            timer,
+            "the retransmission timer is untouched"
+        );
+    }
+
+    #[test]
+    fn mtu_outside_sane_range_is_dropped() {
+        let out = client().handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let with_mtu = |mtu: u16| {
+            let bytes = reply(
+                &discover,
+                MessageType::Ack,
+                vec![
+                    DhcpOption::AddressLeaseTime(60),
+                    DhcpOption::InterfaceMtu(mtu),
+                ],
+            );
+            Lease::from_ack(&Message::decode(&bytes).unwrap())
+                .unwrap()
+                .mtu
+        };
+        assert_eq!(with_mtu(100), None);
+        assert_eq!(with_mtu(20000), None);
+        assert_eq!(with_mtu(575), None);
+        assert_eq!(with_mtu(576), Some(576));
+        assert_eq!(with_mtu(1400), Some(1400));
+        assert_eq!(with_mtu(9216), Some(9216));
+        assert_eq!(with_mtu(9217), None);
+    }
+
+    #[test]
+    fn echoed_client_id_in_replies_is_accepted() {
+        let mut c = client();
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let mut options = lease_options();
+        options.push(DhcpOption::ClientIdentifier(CLIENT_ID.to_vec()));
+        let out = c.handle(
+            Input::Packet(reply(&discover, MessageType::Offer, options.clone())),
+            500,
+        );
+        let (_, _, request) = sent(&out);
+        let out = c.handle(
+            Input::Packet(reply(&request, MessageType::Ack, options)),
+            SEC,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [Output::Bound { renewed: false, .. }]
+        ));
+        assert_eq!(c.state(), State::Bound);
+    }
 }
