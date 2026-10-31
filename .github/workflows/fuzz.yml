@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026 Andrew Newton
 #
-# Nightly fuzzing of every parser target (SPEC §11). Not part of `make ci`.
+# Nightly fuzzing of every parser target (SPEC §11). Not part of `make ci`. A run that finds a
+# crash fails and keeps the input as an artifact; a run that fuzzes nothing must fail too (the
+# first version passed with "no such command: `fuzz`", see the step below).
 name: fuzz
 on:
   schedule:
@@ -13,11 +15,26 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      - name: install cargo-fuzz
+        run: cargo +stable install cargo-fuzz --locked
       - name: run every target for five minutes
         run: |
+          set -euo pipefail
           cd fuzz
-          for target in $(cargo fuzz list); do
-            cargo fuzz run "$target" -- -max_total_time=300
+          cargo +nightly fuzz --version
+          # An assignment fails the step when the command does; `for x in $(cmd)` would not.
+          targets=$(cargo +nightly fuzz list)
+          test -n "$targets"
+          echo "targets: $targets"
+          for target in $targets; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=300
           done
+      - name: keep the crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
