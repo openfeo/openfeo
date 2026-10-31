@@ -327,6 +327,11 @@ impl DnsDriver {
                     tokio::spawn(upstream_tcp(upstream, bytes, self.inbox_tx.clone()));
                 }
                 Output::Event(event) => events.push(event),
+                Output::Drop { id } => {
+                    // Nothing will ever answer: forget the client; a TCP client sees its
+                    // connection close.
+                    self.clients.remove(&id);
+                }
             }
         }
         events
