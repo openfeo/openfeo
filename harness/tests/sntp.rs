@@ -292,6 +292,11 @@ fn the_first_valid_answer_steps_the_recording_clock(lab: &mut Lab) -> anyhow::Re
             .any(|e| matches!(e, Event::Step { server, stratum: 2, .. } if *server == SERVER)),
         "{events:?}"
     );
+    ensure!(
+        driver.clock().synced_flags().first() == Some(&true),
+        "the kernel is told the clock is synced: {:?}",
+        driver.clock().synced_flags()
+    );
     ensure!(rig.queries()? >= 1, "the server saw no query");
     Ok(())
 }
