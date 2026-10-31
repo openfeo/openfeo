@@ -169,7 +169,7 @@ fn addrs(texts: &[String]) -> Option<Vec<Ipv4Addr>> {
     texts.iter().map(|text| text.parse().ok()).collect()
 }
 
-fn mac_text(mac: [u8; 6]) -> String {
+pub(crate) fn mac_text(mac: [u8; 6]) -> String {
     let mut out = String::with_capacity(17);
     for (i, byte) in mac.iter().enumerate() {
         if i > 0 {
@@ -330,7 +330,10 @@ async fn run(
 }
 
 /// The port's index and MAC once it is up with carrier.
-async fn wait_for_link(world_rx: &mut WorldRx, port: &str) -> Result<(u32, [u8; 6]), TaskError> {
+pub(crate) async fn wait_for_link(
+    world_rx: &mut WorldRx,
+    port: &str,
+) -> Result<(u32, [u8; 6]), TaskError> {
     loop {
         let ready = world_rx
             .borrow_and_update()
