@@ -93,7 +93,6 @@ pub enum NakReason {
     Reserved,
     InUse,
     WrongAddress,
-    OfferMismatch,
 }
 
 impl fmt::Display for NakReason {
@@ -104,7 +103,6 @@ impl fmt::Display for NakReason {
             NakReason::Reserved => "reserved for another client",
             NakReason::InUse => "in use by another client",
             NakReason::WrongAddress => "not this client's address",
-            NakReason::OfferMismatch => "not what was offered",
         })
     }
 }
@@ -221,7 +219,7 @@ impl Server {
                 Some((msg, MessageType::Request)) => self.request(&msg, now),
                 Some((msg, MessageType::Release)) => self.release(&msg, now),
                 Some((msg, MessageType::Decline)) => self.decline(&msg, now),
-                Some((msg, MessageType::Inform)) => self.inform(&msg, now),
+                Some((msg, MessageType::Inform)) => self.inform(&msg),
                 _ => Vec::new(),
             },
             Input::ProbeReply { address, mac } => self.probe_reply(address, mac, now),
@@ -387,25 +385,218 @@ impl Server {
         outputs
     }
 
-    // Task 2 fills these in.
-    #[expect(clippy::unused_self, reason = "Task 2 fills this in")]
-    fn request(&mut self, _msg: &Message, _now: Timestamp) -> Vec<Output> {
-        Vec::new()
+    /// RFC 2131 §4.3.2: the address the client means depends on its state (SELECTING names
+    /// our offer with option 54, INIT-REBOOT asks for option 50 with no server, RENEWING and
+    /// REBINDING speak from `ciaddr`); then the same verdict for all of them.
+    fn request(&mut self, msg: &Message, now: Timestamp) -> Vec<Output> {
+        let identity = identity_of(msg);
+        let server_id = match msg.option(54) {
+            Some(DhcpOption::ServerIdentifier(id)) => Some(*id),
+            _ => None,
+        };
+        let address = match (server_id, requested_address(msg), msg.ciaddr) {
+            (Some(id), _, _) if id != self.config.server => {
+                // The client chose another server: our offer is void.
+                self.offers.remove(&identity);
+                return Vec::new();
+            }
+            (_, Some(address), _) => address,
+            (None, None, ciaddr) if ciaddr != Ipv4Addr::UNSPECIFIED => ciaddr,
+            _ => return Vec::new(),
+        };
+        match self.refusal(address, &identity, chaddr6(msg)) {
+            Some(reason) => self.nak(msg, address, reason),
+            None => self.ack(msg, address, now),
+        }
     }
 
-    #[expect(clippy::unused_self, reason = "Task 2 fills this in")]
-    fn release(&mut self, _msg: &Message, _now: Timestamp) -> Vec<Output> {
-        Vec::new()
+    /// Why `identity` may not have `address`, if it may not. An authoritative server: an
+    /// unknown client asking for a free pool address is adopted, one asking for anything else
+    /// is refused so it starts over at once.
+    fn refusal(&self, address: Ipv4Addr, identity: &[u8], mac: [u8; 6]) -> Option<NakReason> {
+        if !self.is_host_address(address) {
+            return Some(NakReason::WrongNetwork);
+        }
+        if self.reserved_for_other(address, identity, mac) {
+            return Some(NakReason::Reserved);
+        }
+        let reservation = self
+            .reservation_for(identity, mac)
+            .map(|reservation| reservation.address);
+        if reservation.is_some_and(|reserved| reserved != address) {
+            return Some(NakReason::WrongAddress);
+        }
+        if !self.free_for(address, identity, mac) {
+            return Some(NakReason::InUse);
+        }
+        if !self.in_pool(address) && reservation != Some(address) {
+            return Some(NakReason::OutsidePool);
+        }
+        None
     }
 
-    #[expect(clippy::unused_self, reason = "Task 2 fills this in")]
-    fn decline(&mut self, _msg: &Message, _now: Timestamp) -> Vec<Output> {
-        Vec::new()
+    /// Commit the lease and acknowledge it.
+    fn ack(&mut self, msg: &Message, address: Ipv4Addr, now: Timestamp) -> Vec<Output> {
+        let identity = identity_of(msg);
+        let mac = chaddr6(msg);
+        let reserved_name = self
+            .reservation_for(&identity, mac)
+            .and_then(|reservation| reservation.hostname.clone());
+        let previous_lease = self.lease_of(&identity).cloned();
+        let hostname = reserved_name
+            .clone()
+            .or_else(|| match msg.option(12) {
+                Some(DhcpOption::HostName(name)) => sanitise_hostname(name),
+                _ => None,
+            })
+            .or_else(|| {
+                previous_lease
+                    .as_ref()
+                    .and_then(|lease| lease.hostname.clone())
+            });
+        let previous = previous_lease.map(|lease| lease.address);
+        if let Some(previous) = previous
+            && previous != address
+        {
+            self.leases.remove(&previous);
+            self.history.insert(previous, now);
+        }
+        self.offers.remove(&identity);
+        self.history.remove(&address);
+        let record = LeaseRecord {
+            address,
+            mac,
+            client_id: match msg.option(61) {
+                Some(DhcpOption::ClientIdentifier(id)) if !id.is_empty() => Some(id.clone()),
+                _ => None,
+            },
+            hostname,
+            granted_at: now,
+            expires_at: now + Timestamp::from(self.config.lease_secs),
+        };
+        self.leases.insert(address, record.clone());
+        let reply = self.reply(
+            msg,
+            MessageType::Ack,
+            address,
+            reserved_name.as_deref(),
+            true,
+        );
+        let event = if previous == Some(address) {
+            ServerEvent::Renewed(record)
+        } else {
+            ServerEvent::Granted(record)
+        };
+        vec![
+            Output::Event(event),
+            Output::Send {
+                to: destination(msg, address),
+                payload: reply.encode(),
+            },
+        ]
     }
 
-    #[expect(clippy::unused_self, reason = "Task 2 fills this in")]
-    fn inform(&mut self, _msg: &Message, _now: Timestamp) -> Vec<Output> {
-        Vec::new()
+    /// Refuse, broadcast (RFC 2131 §4.3.2: `giaddr` is zero), with the reason as option 56.
+    fn nak(&self, msg: &Message, address: Ipv4Addr, reason: NakReason) -> Vec<Output> {
+        let mut reply = self.reply(msg, MessageType::Nak, Ipv4Addr::UNSPECIFIED, None, false);
+        reply
+            .options
+            .insert(2, DhcpOption::Message(reason.to_string()));
+        vec![
+            Output::Event(ServerEvent::Nak {
+                address,
+                mac: chaddr6(msg),
+                reason,
+            }),
+            Output::Send {
+                to: Destination::Broadcast,
+                payload: reply.encode(),
+            },
+        ]
+    }
+
+    /// DHCPINFORM (RFC 2131 §4.3.5): the options for an address the client already has, with
+    /// no lease time.
+    fn inform(&self, msg: &Message) -> Vec<Output> {
+        if msg.ciaddr == Ipv4Addr::UNSPECIFIED {
+            return Vec::new();
+        }
+        let mac = chaddr6(msg);
+        let hostname = self
+            .reservation_for(&identity_of(msg), mac)
+            .and_then(|reservation| reservation.hostname.clone());
+        let reply = self.reply(
+            msg,
+            MessageType::Ack,
+            Ipv4Addr::UNSPECIFIED,
+            hostname.as_deref(),
+            false,
+        );
+        vec![
+            Output::Event(ServerEvent::Informed {
+                address: msg.ciaddr,
+                mac,
+            }),
+            Output::Send {
+                to: Destination::Unicast(msg.ciaddr),
+                payload: reply.encode(),
+            },
+        ]
+    }
+
+    /// DHCPRELEASE: the client gives `ciaddr` back.
+    fn release(&mut self, msg: &Message, now: Timestamp) -> Vec<Output> {
+        if !self.addressed_to_us(msg) {
+            return Vec::new();
+        }
+        let identity = identity_of(msg);
+        let ours = self
+            .leases
+            .get(&msg.ciaddr)
+            .is_some_and(|lease| record_identity(lease) == identity);
+        if !ours {
+            return Vec::new();
+        }
+        let Some(lease) = self.leases.remove(&msg.ciaddr) else {
+            return Vec::new();
+        };
+        self.history.insert(lease.address, now);
+        vec![Output::Event(ServerEvent::Released(lease))]
+    }
+
+    /// DHCPDECLINE: the client found option 50 in use; the address rests for `CONFLICT_HOLD`.
+    fn decline(&mut self, msg: &Message, now: Timestamp) -> Vec<Output> {
+        if !self.addressed_to_us(msg) {
+            return Vec::new();
+        }
+        let identity = identity_of(msg);
+        let mac = chaddr6(msg);
+        let Some(address) = requested_address(msg) else {
+            return Vec::new();
+        };
+        let ours = self
+            .leases
+            .get(&address)
+            .is_some_and(|lease| record_identity(lease) == identity)
+            || self
+                .offers
+                .get(&identity)
+                .is_some_and(|offer| offer.address == address);
+        if !ours {
+            return Vec::new();
+        }
+        self.leases.remove(&address);
+        self.offers.remove(&identity);
+        self.abandoned.insert(address, now + CONFLICT_HOLD);
+        vec![Output::Event(ServerEvent::Declined { address, mac })]
+    }
+
+    /// Option 54 is ours, or absent.
+    fn addressed_to_us(&self, msg: &Message) -> bool {
+        match msg.option(54) {
+            Some(DhcpOption::ServerIdentifier(id)) => *id == self.config.server,
+            _ => true,
+        }
     }
 
     /// RFC 2131 §4.3.1's choice for a DISCOVER: the reservation, the current lease, the
@@ -579,10 +770,30 @@ impl Server {
     }
 }
 
-/// A client's hostname as a DNS label, or nothing (SPEC §7.6 "sanitised to DNS labels").
+/// A client's hostname as a DNS label, or nothing (SPEC §7.6 "sanitised to DNS labels"): the
+/// text before the first dot, ASCII lowercase, every run of other characters one hyphen, no
+/// hyphen at either end, at most [`MAX_LABEL`] bytes.
 #[must_use]
-pub fn sanitise_hostname(_raw: &str) -> Option<String> {
-    None // Task 2
+pub fn sanitise_hostname(raw: &str) -> Option<String> {
+    let first = raw.split('.').next().unwrap_or("");
+    let mut label = String::with_capacity(first.len().min(MAX_LABEL));
+    let mut pending_hyphen = false;
+    for c in first.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_hyphen && !label.is_empty() {
+                label.push('-');
+            }
+            pending_hyphen = false;
+            label.push(c.to_ascii_lowercase());
+        } else {
+            pending_hyphen = true;
+        }
+    }
+    label.truncate(MAX_LABEL);
+    while label.ends_with('-') {
+        label.pop();
+    }
+    (!label.is_empty()).then_some(label)
 }
 
 /// The message, if it is a client's request this server handles.
@@ -674,7 +885,7 @@ fn mask(prefix: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{DhcpOption, Message, MessageType, Op};
+    use crate::wire::{DhcpOption, FLAG_BROADCAST, Message, MessageType, Op};
 
     const MAC_A: [u8; 6] = [2, 0, 0, 0, 0, 0x0a];
     const MAC_B: [u8; 6] = [2, 0, 0, 0, 0, 0x0b];
@@ -788,7 +999,6 @@ mod tests {
         .encode()
     }
 
-    #[expect(dead_code, reason = "Task 2's tests use it")]
     fn decline(mac: [u8; 6], xid: u32, address: Ipv4Addr) -> Vec<u8> {
         message(
             MessageType::Decline,
@@ -824,7 +1034,6 @@ mod tests {
     }
 
     /// DISCOVER at `now`, probe timeout, and the offered address.
-    #[expect(dead_code, reason = "Task 2's tests use it")]
     fn offered(s: &mut Server, mac: [u8; 6], now: Timestamp) -> Ipv4Addr {
         s.handle(Input::Packet(discover(mac, 0x7777, vec![])), now);
         let out = s.handle(Input::Timeout, now + PROBE_TIMEOUT);
@@ -1154,6 +1363,314 @@ mod tests {
         reply.op = Op::BootReply;
         assert_eq!(s.handle(Input::Packet(reply.encode()), 0), Vec::new());
         assert_eq!(s.next_timeout(), None, "nothing was remembered");
+    }
+
+    fn our_request(mac: [u8; 6], xid: u32, address: Ipv4Addr) -> Vec<u8> {
+        request(
+            mac,
+            xid,
+            Ipv4Addr::UNSPECIFIED,
+            vec![
+                DhcpOption::ServerIdentifier(ip("192.168.1.1")),
+                DhcpOption::RequestedIpAddress(address),
+            ],
+        )
+    }
+
+    #[test]
+    fn selecting_request_for_our_offer_is_acked_and_granted() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        let out = s.handle(
+            Input::Packet(request(
+                MAC_A,
+                1,
+                Ipv4Addr::UNSPECIFIED,
+                vec![
+                    DhcpOption::ServerIdentifier(ip("192.168.1.1")),
+                    DhcpOption::RequestedIpAddress(addr),
+                    DhcpOption::HostName("Andy's iPhone".into()),
+                ],
+            )),
+            3,
+        );
+        let (to, ack) = sends(&out).remove(0);
+        assert_eq!(
+            to,
+            Destination::Link {
+                ip: addr,
+                mac: MAC_A
+            }
+        );
+        assert_eq!(ack.message_type(), Some(MessageType::Ack));
+        assert_eq!(ack.yiaddr, addr);
+        assert_eq!(ack.option(51), Some(&DhcpOption::AddressLeaseTime(43_200)));
+        let record = LeaseRecord {
+            address: addr,
+            mac: MAC_A,
+            client_id: None,
+            hostname: Some("andy-s-iphone".into()),
+            granted_at: 3,
+            expires_at: 3 + 43_200,
+        };
+        assert_eq!(events(&out), vec![ServerEvent::Granted(record.clone())]);
+        assert_eq!(s.leases(), vec![record]);
+        assert_eq!(s.next_timeout(), Some(3 + 43_200));
+    }
+
+    #[test]
+    fn selecting_request_for_another_server_is_ignored_and_frees_the_offer() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        let out = s.handle(
+            Input::Packet(request(
+                MAC_A,
+                1,
+                Ipv4Addr::UNSPECIFIED,
+                vec![
+                    DhcpOption::ServerIdentifier(ip("192.168.1.254")),
+                    DhcpOption::RequestedIpAddress(addr),
+                ],
+            )),
+            3,
+        );
+        assert_eq!(out, Vec::new());
+        assert_eq!(offered(&mut s, MAC_B, 4), addr, "A's hold is gone");
+    }
+
+    #[test]
+    fn selecting_request_for_a_reserved_address_is_naked_broadcast() {
+        let mut s = Server::new(config(), vec![], 0);
+        let _ = offered(&mut s, MAC_A, 0);
+        let out = s.handle(Input::Packet(our_request(MAC_A, 1, ip("192.168.1.10"))), 3);
+        let (to, nak) = sends(&out).remove(0);
+        assert_eq!(to, Destination::Broadcast);
+        assert_eq!(nak.message_type(), Some(MessageType::Nak));
+        assert_eq!(
+            (nak.yiaddr, nak.ciaddr),
+            (Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED)
+        );
+        assert_eq!(nak.option(51), None);
+        assert_eq!(
+            nak.option(56),
+            Some(&DhcpOption::Message("reserved for another client".into()))
+        );
+        assert_eq!(
+            events(&out),
+            vec![ServerEvent::Nak {
+                address: ip("192.168.1.10"),
+                mac: MAC_A,
+                reason: NakReason::Reserved
+            }]
+        );
+    }
+
+    #[test]
+    fn init_reboot_is_adopted_inside_the_pool_and_naked_outside() {
+        let mut s = Server::new(config(), vec![], 0);
+        let reboot = |mac, xid, addr: &str| {
+            request(
+                mac,
+                xid,
+                Ipv4Addr::UNSPECIFIED,
+                vec![DhcpOption::RequestedIpAddress(ip(addr))],
+            )
+        };
+        let out = s.handle(Input::Packet(reboot(MAC_A, 1, "192.168.1.150")), 0);
+        assert_eq!(sends(&out)[0].1.message_type(), Some(MessageType::Ack));
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Granted(ref r) if r.address == ip("192.168.1.150"))
+        );
+        let out = s.handle(Input::Packet(reboot(MAC_B, 2, "192.168.1.77")), 1);
+        assert_eq!(
+            events(&out),
+            vec![ServerEvent::Nak {
+                address: ip("192.168.1.77"),
+                mac: MAC_B,
+                reason: NakReason::OutsidePool
+            }]
+        );
+        let out = s.handle(Input::Packet(reboot(MAC_B, 3, "10.0.0.5")), 2);
+        assert_eq!(
+            events(&out),
+            vec![ServerEvent::Nak {
+                address: ip("10.0.0.5"),
+                mac: MAC_B,
+                reason: NakReason::WrongNetwork
+            }]
+        );
+        let out = s.handle(Input::Packet(reboot(MAC_B, 4, "192.168.1.150")), 3);
+        assert_eq!(
+            events(&out),
+            vec![ServerEvent::Nak {
+                address: ip("192.168.1.150"),
+                mac: MAC_B,
+                reason: NakReason::InUse
+            }]
+        );
+    }
+
+    #[test]
+    fn reserved_client_requesting_another_address_is_naked_then_offered_its_reservation() {
+        let mut s = Server::new(config(), vec![], 0);
+        let out = s.handle(
+            Input::Packet(request(
+                MAC_NAS,
+                1,
+                Ipv4Addr::UNSPECIFIED,
+                vec![DhcpOption::RequestedIpAddress(ip("192.168.1.150"))],
+            )),
+            0,
+        );
+        assert_eq!(
+            events(&out),
+            vec![ServerEvent::Nak {
+                address: ip("192.168.1.150"),
+                mac: MAC_NAS,
+                reason: NakReason::WrongAddress
+            }]
+        );
+        assert_eq!(offered(&mut s, MAC_NAS, 1), ip("192.168.1.10"));
+    }
+
+    #[test]
+    fn renewing_and_rebinding_are_acked_unicast_to_ciaddr_as_renewals() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
+        let out = s.handle(Input::Packet(request(MAC_A, 2, addr, vec![])), 21_603);
+        let (to, ack) = sends(&out).remove(0);
+        assert_eq!(to, Destination::Unicast(addr));
+        assert_eq!((ack.yiaddr, ack.ciaddr), (addr, addr));
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.expires_at == 21_603 + 43_200 && r.granted_at == 21_603)
+        );
+        let mut broadcast = Message::decode(&request(MAC_A, 3, addr, vec![])).unwrap();
+        broadcast.flags = FLAG_BROADCAST;
+        let out = s.handle(Input::Packet(broadcast.encode()), 40_000);
+        assert_eq!(
+            sends(&out)[0].0,
+            Destination::Unicast(addr),
+            "ciaddr wins over the broadcast flag"
+        );
+    }
+
+    #[test]
+    fn restored_lease_is_renewed_not_granted_after_a_reboot() {
+        let record = LeaseRecord {
+            address: ip("192.168.1.120"),
+            mac: MAC_A,
+            client_id: None,
+            hostname: Some("pc".into()),
+            granted_at: 0,
+            expires_at: 40_000,
+        };
+        let mut s = Server::new(config(), vec![record], 100);
+        let out = s.handle(
+            Input::Packet(request(
+                MAC_A,
+                1,
+                Ipv4Addr::UNSPECIFIED,
+                vec![DhcpOption::RequestedIpAddress(ip("192.168.1.120"))],
+            )),
+            100,
+        );
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.hostname.as_deref() == Some("pc"))
+        );
+    }
+
+    #[test]
+    fn inform_is_acked_with_options_and_no_lease_time() {
+        let mut s = Server::new(config(), vec![], 0);
+        let out = s.handle(Input::Packet(inform(MAC_A, 9, ip("192.168.1.50"))), 0);
+        let (to, ack) = sends(&out).remove(0);
+        assert_eq!(to, Destination::Unicast(ip("192.168.1.50")));
+        assert_eq!(
+            (ack.yiaddr, ack.ciaddr),
+            (Ipv4Addr::UNSPECIFIED, ip("192.168.1.50"))
+        );
+        assert_eq!(
+            ack.option(6),
+            Some(&DhcpOption::DomainNameServer(vec![ip("192.168.1.1")]))
+        );
+        assert_eq!(ack.option(51), None);
+        assert_eq!(
+            events(&out),
+            vec![ServerEvent::Informed {
+                address: ip("192.168.1.50"),
+                mac: MAC_A
+            }]
+        );
+        assert_eq!(s.leases(), Vec::new());
+    }
+
+    #[test]
+    fn release_frees_and_decline_abandons() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
+        let out = s.handle(Input::Packet(release(MAC_A, 2, addr)), 10);
+        assert!(matches!(events(&out)[0], ServerEvent::Released(ref r) if r.address == addr));
+        assert_eq!(s.leases(), Vec::new());
+        let addr2 = offered(&mut s, MAC_B, 11);
+        assert_ne!(
+            addr2, addr,
+            "a released address rejoins the pool behind the never-leased ones"
+        );
+        let out = s.handle(Input::Packet(decline(MAC_B, 3, addr2)), 12);
+        assert_eq!(
+            events(&out),
+            vec![ServerEvent::Declined {
+                address: addr2,
+                mac: MAC_B
+            }]
+        );
+        let addr3 = offered(&mut s, MAC_C, 13);
+        assert_ne!(addr3, addr2, "a declined address is abandoned");
+    }
+
+    #[test]
+    fn leases_expire_on_timeout() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
+        assert_eq!(s.handle(Input::Timeout, 43_202), Vec::new());
+        let out = s.handle(Input::Timeout, 43_203);
+        assert!(matches!(events(&out)[0], ServerEvent::Expired(ref r) if r.address == addr));
+        assert_eq!(s.leases(), Vec::new());
+    }
+
+    #[test]
+    fn client_identifiers_are_echoed_and_distinguish_clients_with_one_mac() {
+        let mut s = Server::new(config(), vec![], 0);
+        let id1 =
+            DhcpOption::ClientIdentifier(vec![0xff, 1, 2, 3, 4, 0, 3, 0, 1, 1, 2, 3, 4, 5, 6]);
+        let id2 =
+            DhcpOption::ClientIdentifier(vec![0xff, 9, 9, 9, 9, 0, 3, 0, 1, 1, 2, 3, 4, 5, 6]);
+        s.handle(Input::Packet(discover(MAC_A, 1, vec![id1.clone()])), 0);
+        let a = sends(&s.handle(Input::Timeout, 1))[0].1.clone();
+        assert_eq!(a.option(61), Some(&id1));
+        s.handle(Input::Packet(discover(MAC_A, 2, vec![id2])), 2);
+        let b = sends(&s.handle(Input::Timeout, 3))[0].1.clone();
+        assert_ne!(a.yiaddr, b.yiaddr);
+    }
+
+    #[test]
+    fn hostnames_are_sanitised_to_labels() {
+        assert_eq!(
+            sanitise_hostname("Andy's iPhone"),
+            Some("andy-s-iphone".into())
+        );
+        assert_eq!(sanitise_hostname("nas.local"), Some("nas".into()));
+        assert_eq!(sanitise_hostname("  "), None);
+        assert_eq!(sanitise_hostname("--x--"), Some("x".into()));
+        assert_eq!(sanitise_hostname("Ünïcödé"), Some("n-c-d".into()));
+        assert_eq!(sanitise_hostname(&"a".repeat(70)), Some("a".repeat(63)));
+        assert_eq!(
+            sanitise_hostname(&format!("{}-", "a".repeat(62))),
+            Some("a".repeat(62))
+        );
     }
 
     /// Seeds for `fuzz/fuzz_targets/dhcp4_server.rs`; run with `--ignored` to refresh them.
