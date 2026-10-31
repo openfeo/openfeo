@@ -22,8 +22,10 @@ router-process crash does not interrupt traffic. A WAN configured `[wans.dhcp]` 
 address, routes, MTU and DNS from the ISP's DHCPv4 server through an in-house sans-IO client,
 driven over a packet socket until it is bound and over UDP after; it renews the lease, confirms
 it again after a link flap and after a reboot (INIT-REBOOT from the lease kept under
-`/state/leases`), and never holds the LAN back when no server answers. Still to come in M1: the
-LAN DHCP server, the DNS forwarder and SNTP.
+`/state/leases`), and never holds the LAN back when no server answers. Each `[lans.dhcp]` LAN runs a
+DHCPv4 server with a pool, static reservations, DHCPINFORM, an ARP probe before every offer,
+authoritative NAKs and a lease database under `/state/leases`, published as facts. Still to come in
+M1: the DNS forwarder and SNTP.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
