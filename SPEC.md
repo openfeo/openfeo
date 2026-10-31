@@ -531,7 +531,7 @@ Coding rules (repeated in `CLAUDE.md`):
 - [ ] Buy the N100 box (Intel i226-V); note whether it exposes a serial header.
 - [x] Write `CLAUDE.md` and the first ADRs from §2.
 - [ ] Decide release signing-key custody (offline key; CI holds only a dev key) before M5.
-- [ ] M1: `hickory-proto` vs in-tree DNS parser (ADR).
+- [x] M1: `hickory-proto` vs in-tree DNS parser: in-tree, hickory-proto as the test oracle (ADR-0015, 31 October 2026).
 - [ ] M3: record a sanitised AAISP PPPoE session pcap for fixtures (credentials stripped).
 - [ ] M7: RB5009 boot/update ADR after studying OpenWrt's mvebu MikroTik sysupgrade path.
 - [ ] Harness: confirm Kea or odhcpd for DHCPv6-PD over PPP.
