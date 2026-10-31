@@ -1,0 +1,12 @@
+---
+source: crates/openfeo-reconcile/src/time.rs
+expression: d
+---
+servers:
+  - 0.pool.ntp.org
+  - 1.pool.ntp.org
+learned:
+  - 203.0.113.1
+learned_from: wan0
+listeners:
+  - br-lan0

@@ -187,6 +187,7 @@ fn check() -> Result<ExitCode> {
         "busybox",
         "dnsmasq",
         "dig",
+        "ntpdate",
         "mkfs.ext4",
         "ping",
         "python3",

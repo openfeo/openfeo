@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 libc.workspace = true
+openfeo-proto-sntp = { path = "../openfeo-proto-sntp" }
 thiserror.workspace = true
 
 [lints]

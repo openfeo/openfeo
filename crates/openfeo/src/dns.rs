@@ -61,6 +61,7 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
         .collect();
     let mut driver = DnsDriver::new(DnsDriverConfig {
         listeners: listeners.clone(),
+        loopback: true,
         forwarder: config,
         seed: seed(SEED_SALT),
     })

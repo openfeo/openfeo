@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap};
 
-use crate::{Dhcp4Fact, LeaseFact, MacAddr};
+use crate::{Dhcp4Fact, LeaseFact, MacAddr, TimeFact};
 
 /// What the netlink monitor knows about one interface (SPEC §7.1: link state is a fact).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +44,8 @@ pub struct World {
     /// The leases each LAN's DHCPv4 server has granted, keyed by LAN name, ascending by
     /// address (SPEC §7.6).
     pub leases: Arc<BTreeMap<String, Vec<LeaseFact>>>,
+    /// The clock's state (SPEC §7.10).
+    pub time: TimeFact,
 }
 
 impl World {
@@ -57,6 +59,7 @@ impl World {
             links: Arc::new(BTreeMap::new()),
             dhcp4: Arc::new(BTreeMap::new()),
             leases: Arc::new(BTreeMap::new()),
+            time: TimeFact::default(),
         }
     }
 

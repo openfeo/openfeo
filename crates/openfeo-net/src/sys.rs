@@ -52,6 +52,48 @@ pub fn link_addr(ifindex: u32, protocol: u16, dest: Option<[u8; 6]>) -> Option<L
     unsafe { LinkAddr::from_raw(ptr, Some(len)) }
 }
 
+/// `adjtimex(2)` with `ADJ_SETOFFSET | ADJ_NANO`: step the clock by `ns` nanoseconds.
+///
+/// # Errors
+///
+/// When the kernel refuses: no `CAP_SYS_TIME` (a container), or an offset it cannot take.
+pub fn adjtimex_step(ns: i64) -> std::io::Result<()> {
+    // SAFETY: `timex` is a plain C struct of integers; all zero is a valid value, and the
+    // kernel reads only the fields whose mode bits are set.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    tx.modes = libc::ADJ_SETOFFSET | libc::ADJ_NANO;
+    // Under ADJ_NANO the kernel wants the sub-second part in nanoseconds, non-negative.
+    tx.time.tv_sec = libc::time_t::try_from(ns.div_euclid(1_000_000_000))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    tx.time.tv_usec = libc::suseconds_t::try_from(ns.rem_euclid(1_000_000_000))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    adjtimex(&mut tx)
+}
+
+/// `adjtimex(2)` with `ADJ_OFFSET_SINGLESHOT`: slew the clock `ns` nanoseconds, within the
+/// kernel's bound of half a second either way.
+///
+/// # Errors
+///
+/// When the kernel refuses: no `CAP_SYS_TIME`.
+pub fn adjtimex_slew(ns: i64) -> std::io::Result<()> {
+    // SAFETY: as in `adjtimex_step`.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    tx.modes = libc::ADJ_OFFSET_SINGLESHOT;
+    tx.offset = libc::c_long::try_from((ns / 1000).clamp(-500_000, 500_000))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    adjtimex(&mut tx)
+}
+
+fn adjtimex(tx: &mut libc::timex) -> std::io::Result<()> {
+    // SAFETY: `tx` is a valid, writable `timex` for the duration of the call; the kernel reads
+    // the fields its modes name and writes the rest back.
+    if unsafe { libc::adjtimex(std::ptr::from_mut(tx)) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

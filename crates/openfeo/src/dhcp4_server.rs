@@ -382,6 +382,7 @@ mod tests {
             pool: (ip("192.168.1.100"), ip("192.168.1.200")),
             lease_secs: 43_200,
             dns: vec![],
+            ntp: vec![],
             domain: Some("home.arpa".into()),
             reservations: vec![Reservation {
                 mac: MAC,

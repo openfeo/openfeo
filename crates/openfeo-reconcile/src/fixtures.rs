@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap, PortMapEntry};
-use openfeo_world::{Dhcp4Fact, LeaseFact, LinkFact, MacAddr, World};
+use openfeo_world::{Dhcp4Fact, LeaseFact, LinkFact, MacAddr, TimeFact, World};
 
 pub const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
 pub const VM_DHCP: &str = include_str!("../../../harness/fixtures/vm-dhcp.toml");
@@ -55,6 +55,7 @@ fn world(config: Config) -> World {
         links: Arc::new(link_facts()),
         dhcp4: Arc::new(BTreeMap::new()),
         leases: Arc::new(BTreeMap::new()),
+        time: TimeFact::default(),
     }
 }
 
@@ -110,6 +111,7 @@ pub fn dhcp_fact() -> Dhcp4Fact {
             ("198.51.100.0/24".parse().expect("fixture"), server),
         ],
         dns: vec![server],
+        ntp: vec![server],
         domain: Some("isp.example".to_owned()),
         mtu: Some(1400),
     }

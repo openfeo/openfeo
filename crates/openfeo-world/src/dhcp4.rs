@@ -21,6 +21,8 @@ pub struct Dhcp4Fact {
     pub routes: Vec<(Ipv4Net, Ipv4Addr)>,
     /// DNS servers, for the forwarder.
     pub dns: Vec<Ipv4Addr>,
+    /// NTP servers (option 42), for the time task.
+    pub ntp: Vec<Ipv4Addr>,
     /// The domain name the ISP gave.
     pub domain: Option<String>,
     /// Interface MTU, already checked to be sane; `None` leaves the port's alone.

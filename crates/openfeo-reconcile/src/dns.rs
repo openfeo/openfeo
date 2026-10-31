@@ -184,7 +184,7 @@ pub fn forwarder_config(desired: &DesiredDns) -> Config {
 }
 
 /// The configured WAN with the lowest priority whose port the map knows.
-fn active_wan(world: &World) -> Option<&Wan> {
+pub(crate) fn active_wan(world: &World) -> Option<&Wan> {
     world
         .config
         .wans

@@ -166,6 +166,8 @@ message LanDhcp {
   repeated StaticLease static = 3;
   // DNS servers handed out; empty means the router.
   repeated string dns = 4;
+  // NTP servers handed out (option 42); empty means the router, which serves SNTP (SPEC §7.10).
+  repeated string ntp = 5;
 }
 
 // A static lease: the client with this MAC (or client identifier) always gets `ip` and

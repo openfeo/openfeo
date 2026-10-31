@@ -62,6 +62,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "without_upstreams_local_names_still_resolve",
         run: without_upstreams_local_names_still_resolve,
     },
+    Scenario {
+        name: "the_box_can_use_its_own_resolver_on_loopback",
+        run: the_box_can_use_its_own_resolver_on_loopback,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -181,6 +185,7 @@ impl Rig {
         rt.block_on(async {
             DnsDriver::new(DnsDriverConfig {
                 listeners: vec![LAN_IF.to_owned()],
+                loopback: true,
                 forwarder: config,
                 seed: 0x5eed,
             })
@@ -556,6 +561,55 @@ fn without_upstreams_local_names_still_resolve(lab: &mut Lab) -> anyhow::Result<
     ensure!(
         !events.contains(&Event::NoUpstreams),
         "no upstreams was announced again: {events:?}"
+    );
+    Ok(())
+}
+
+/// The forwarder also answers on loopback, for the box's own lookups (time server names, later
+/// TLS and updates): `dig @127.0.0.1` from the router's own namespace, and the resolver stub the
+/// time task uses.
+fn the_box_can_use_its_own_resolver_on_loopback(lab: &mut Lab) -> anyhow::Result<()> {
+    let rig = Rig::create(lab)?;
+    let rt = runtime()?;
+    let mut driver = Rig::driver(&rt, Rig::config()?)?;
+    let (_, answer) = serve_while(&rt, &mut driver, || {
+        let output = std::process::Command::new("dig")
+            .args([
+                "@127.0.0.1",
+                "+time=2",
+                "+tries=1",
+                "+noall",
+                "+comments",
+                "+answer",
+                "www.isp.example",
+                "A",
+            ])
+            .output()
+            .context("run dig")?;
+        lanclient::parse_dig(&String::from_utf8_lossy(&output.stdout))
+    })?;
+    expect_a(&answer, "www.isp.example via 127.0.0.1", "198.51.100.10")?;
+    let (_, addrs) = serve_while(&rt, &mut driver, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let name: openfeo_proto_dns::Name = "www.isp.example".parse()?;
+        runtime
+            .block_on(openfeo_net::resolve::lookup_a(
+                &name,
+                openfeo_net::resolve::LOCAL_RESOLVER,
+                7,
+            ))
+            .context("lookup_a through the loopback listener")
+    })?;
+    ensure!(
+        addrs == vec![Ipv4Addr::new(198, 51, 100, 10)],
+        "lookup_a answered {addrs:?}"
+    );
+    ensure!(
+        rig.upstream_queries(r"auth\[A\] www\.isp\.example")? == 1,
+        "the second lookup went upstream: {:?}",
+        rig.dnsmasq.log.tail(5)
     );
     Ok(())
 }

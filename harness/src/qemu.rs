@@ -64,6 +64,8 @@ pub struct VmSpec {
     pub state_disk: Option<PathBuf>,
     /// Where QEMU listens for QMP (`server=on,wait=off`).
     pub qmp_socket: Option<PathBuf>,
+    /// The guest's clock at power-on (`-rtc base=<iso>`); QEMU's default is the host's time.
+    pub rtc_base: Option<String>,
 }
 
 /// `kvm` when `/dev/kvm` is usable, else `tcg`.
@@ -104,6 +106,9 @@ pub fn build_args(spec: &VmSpec) -> Vec<OsString> {
     args.push(spec.kernel.clone().into_os_string());
     let mut push = |items: &[&str]| args.extend(items.iter().map(OsString::from));
     push(&["-append", &spec.cmdline]);
+    if let Some(base) = &spec.rtc_base {
+        push(&["-rtc", &format!("base={base}")]);
+    }
     match spec.console {
         ConsoleMode::Captured => push(&["-serial", "stdio", "-monitor", "none"]),
         ConsoleMode::Interactive => push(&["-serial", "mon:stdio"]),
@@ -260,6 +265,7 @@ mod tests {
             ],
             state_disk: None,
             qmp_socket: None,
+            rtc_base: None,
         };
         let args: Vec<String> = build_args(&spec)
             .iter()
@@ -285,6 +291,7 @@ mod tests {
             nics: vec![],
             state_disk: Some("/run/x/state.img".into()),
             qmp_socket: Some("/run/x/qmp.sock".into()),
+            rtc_base: None,
         };
         let args: Vec<String> = build_args(&spec)
             .iter()

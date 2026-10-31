@@ -4,6 +4,7 @@
 //! PID 1 for OpenFeO (SPEC §6.1): mounts, reaper, supervisor, watchdog.
 //! Blocking std + libc only; no async runtime. `unsafe` is confined to `sys`.
 
+pub mod clock;
 pub mod cmdline;
 pub mod ctl;
 pub mod heartbeat;
@@ -25,7 +26,7 @@ use watchdog::Watchdog;
 /// Everything PID 1 does, in order (SPEC §6.1), ending in the supervisor loop. `mode_flag` is
 /// `--mode` from argv; `--mode container` skips every hardware duty (no mounts, sysctls or
 /// watchdog: those belong to the host) and only supervises the child.
-pub fn main(version: &str, mode_flag: Option<Mode>) -> ! {
+pub fn main(version: &str, mode_flag: Option<Mode>, build_epoch: u64) -> ! {
     let mut log = Log::new("openfeo-init");
     if mode_flag == Some(Mode::Container) {
         log.info(&format!("start version={version} mode=container slot=none"));
@@ -58,6 +59,7 @@ pub fn main(version: &str, mode_flag: Option<Mode>) -> ! {
     if let Err(err) = sys::loopback_up() {
         log.warn(&format!("loopback up: {err}"));
     }
+    clock::floor(build_epoch, &log);
     sysctl::apply(&log);
     match mounts::mount_state(mode) {
         Ok(spec) if spec.fstype == "tmpfs" => {

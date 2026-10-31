@@ -13,6 +13,7 @@ pub mod links;
 pub mod nft;
 pub mod routing;
 pub mod sysctl;
+pub mod time;
 
 #[cfg(test)]
 pub(crate) mod fixtures;

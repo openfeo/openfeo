@@ -28,6 +28,7 @@ use openfeo_net::dhcp4::{Driver, DriverConfig, Event};
 use openfeo_proto_dhcp4::identity::{client_id, duid_ll, iaid};
 use openfeo_proto_dhcp4::wire::{CLIENT_PORT, DhcpOption, Message, MessageType, Op, SERVER_PORT};
 use openfeo_proto_dhcp4::{ClientConfig, Lease, Unbound};
+use openfeo_proto_sntp::{NtpTimestamp, Packet};
 use serde_json::{Value, json};
 
 use crate::netns::{self, NetNs};
@@ -637,6 +638,118 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<std::process
         .with_context(|| format!("collect {rendered}"))
 }
 
+/// What a reference SNTP client (`ntpdate -q`) reported about one server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NtpReply {
+    pub server: Ipv4Addr,
+    /// The server's clock minus the client's, in seconds.
+    pub offset_s: f64,
+    /// The round trip, when the client prints one (ntp.org's does, ntpsec's does not).
+    pub delay_s: Option<f64>,
+    pub stratum: u8,
+}
+
+/// `ntpdate -q <server>` inside `ns`: query only, never set the clock. Both implementations
+/// are served, ntp.org's (`ntp` on Arch) and ntpsec's wrapper around `ntpdig`
+/// (`ntpsec-ntpdate` on Debian and Ubuntu); each prints the server, its stratum and the offset,
+/// and refuses an unsynchronised server (`no server suitable for synchronization found`),
+/// which is an error here.
+///
+/// # Errors
+///
+/// When ntpdate cannot be run, outlives `timeout`, or prints no reply it accepted.
+pub fn ntpdate_query(ns: &NetNs, server: Ipv4Addr, timeout: Duration) -> Result<NtpReply> {
+    let mut cmd = ns.command("ntpdate")?;
+    cmd.args(["-q", &server.to_string()]);
+    let output = run_with_timeout(&mut cmd, timeout)?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_ntpdate(&text)
+        .with_context(|| format!("ntpdate -q {server}: no reply parsed from: {}", text.trim()))
+}
+
+/// The reply line of either `ntpdate`: ntp.org's `server 192.168.1.1, stratum 3, offset
+/// +7200.000003, delay 0.02567`, or ntpsec's (and `sntp`'s) `2026-10-31 23:29:30.681928 (+0000)
+/// +7200.000020 +/- 0.000079 192.168.1.1 s3 no-leap`.
+#[must_use]
+pub fn parse_ntpdate(output: &str) -> Option<NtpReply> {
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("server ") {
+            let mut parts = rest.split(',').map(str::trim);
+            let server = parts.next()?.parse().ok()?;
+            let (mut stratum, mut offset, mut delay) = (None, None, None);
+            for part in parts {
+                if let Some(value) = part.strip_prefix("stratum ") {
+                    stratum = value.parse().ok();
+                } else if let Some(value) = part.strip_prefix("offset ") {
+                    offset = value.parse().ok();
+                } else if let Some(value) = part.strip_prefix("delay ") {
+                    delay = value.parse().ok();
+                }
+            }
+            return Some(NtpReply {
+                server,
+                offset_s: offset?,
+                delay_s: delay,
+                stratum: stratum?,
+            });
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let Some(pos) = tokens.iter().position(|token| *token == "+/-")
+            && pos >= 1
+        {
+            let offset_s = tokens[pos - 1].parse().ok()?;
+            let server = tokens.get(pos + 2)?.parse().ok()?;
+            let stratum = tokens.get(pos + 3)?.strip_prefix('s')?.parse().ok()?;
+            return Some(NtpReply {
+                server,
+                offset_s,
+                delay_s: None,
+                stratum,
+            });
+        }
+    }
+    None
+}
+
+/// One raw SNTP request to `server` from inside `ns`, the reply decoded: the exact leap, stratum
+/// and timestamps a client sees, which busybox hides.
+///
+/// # Errors
+///
+/// When the namespace cannot be entered, nothing comes back within `timeout`, or the reply is
+/// not a packet.
+pub fn sntp_query(ns: &NetNs, server: Ipv4Addr, timeout: Duration) -> Result<Packet> {
+    let ns_file = File::open(ns.path()).with_context(|| format!("open {}", ns.path().display()))?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> Result<Packet> {
+                setns(&ns_file, CloneFlags::CLONE_NEWNET).context("setns")?;
+                let socket = UdpSocket::bind("0.0.0.0:0").context("bind")?;
+                socket.set_read_timeout(Some(timeout))?;
+                let request = Packet {
+                    version: 4,
+                    mode: 3,
+                    transmit: NtpTimestamp(0x0102_0304_0506_0708),
+                    ..Packet::default()
+                };
+                socket
+                    .send_to(&request.encode(), SocketAddrV4::new(server, 123))
+                    .context("send request")?;
+                let mut buf = [0u8; 512];
+                let (len, _) = socket
+                    .recv_from(&mut buf)
+                    .with_context(|| format!("no SNTP reply from {server}"))?;
+                Packet::decode(&buf[..len]).context("decode reply")
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("sntp thread panicked"))?
+    })
+}
+
 /// What `dig` reported: the status, the header flags, and the answer section as
 /// `(name, ttl, type, rdata)` rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -833,6 +946,37 @@ mod dns_client_tests {
         assert_eq!(parsed.flags, vec!["qr", "rd", "ra"]);
         assert_eq!(parsed.answers.len(), 2);
         assert_eq!(parsed.answers[0].3, "\"aaa\" \"bbb\"");
+    }
+
+    #[test]
+    fn ntpdate_output_parses_both_the_classic_and_the_ntpsec_lines() {
+        let classic = "server 192.168.1.1, stratum 3, offset +7200.000003, delay 0.02567\n31 Oct 21:30:43 ntpdate[1394612]: step time server 192.168.1.1 offset +7200.000003 sec\n";
+        assert_eq!(
+            parse_ntpdate(classic),
+            Some(NtpReply {
+                server: "192.168.1.1".parse().unwrap(),
+                offset_s: 7_200.000_003,
+                delay_s: Some(0.025_67),
+                stratum: 3,
+            })
+        );
+        let ntpsec =
+            "2026-10-31 23:29:30.681928 (+0000) +7200.000020 +/- 0.000079 192.168.1.1 s3 no-leap\n";
+        assert_eq!(
+            parse_ntpdate(ntpsec),
+            Some(NtpReply {
+                server: "192.168.1.1".parse().unwrap(),
+                offset_s: 7_200.000_02,
+                delay_s: None,
+                stratum: 3,
+            })
+        );
+        assert_eq!(
+            parse_ntpdate(
+                "31 Oct 21:30:46 ntpdate[1394649]: no server suitable for synchronization found\n"
+            ),
+            None
+        );
     }
 
     /// dig pads short owner names with a second tab.

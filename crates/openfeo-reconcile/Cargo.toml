@@ -11,6 +11,7 @@ publish = false
 openfeo-config = { path = "../openfeo-config" }
 openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
 openfeo-proto-dns = { path = "../openfeo-proto-dns" }
+openfeo-proto-sntp = { path = "../openfeo-proto-sntp" }
 openfeo-world = { path = "../openfeo-world" }
 ipnet.workspace = true
 serde.workspace = true

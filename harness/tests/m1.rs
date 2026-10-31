@@ -13,7 +13,10 @@
 //! `nas` reservation, the lease database across a reset, and a lease from another router refused with a NAK.
 //! Part 3b, the DNS forwarder: a LAN host resolves `nas.home.arpa` from the router, ISP names
 //! through the upstream the WAN lease named, a rebinding answer refused, and local names with no
-//! WAN at all.
+//! WAN at all. Part 3c, time: the router steps to the ISP's time at boot and serves it to the
+//! LAN, a box whose clock starts in 1990 begins at the build timestamp, a server before the build
+//! is refused, a DHCP WAN's lease names the time server, and the leases point LAN hosts at the
+//! router for time.
 //! Run inside the rootless sandbox; `harness = false`: this binary is its own runner and an
 //! optional first argument filters scenarios by substring.
 
@@ -120,6 +123,22 @@ const SCENARIOS: &[Scenario] = &[
         name: "rebinding_answers_are_refused",
         run: rebinding_answers_are_refused,
     },
+    Scenario {
+        name: "router_steps_to_the_isp_time_at_boot",
+        run: router_steps_to_the_isp_time_at_boot,
+    },
+    Scenario {
+        name: "a_box_without_a_clock_starts_at_the_build_floor",
+        run: a_box_without_a_clock_starts_at_the_build_floor,
+    },
+    Scenario {
+        name: "a_time_before_the_build_is_refused",
+        run: a_time_before_the_build_is_refused,
+    },
+    Scenario {
+        name: "dhcp_wan_learns_the_isp_time_server",
+        run: dhcp_wan_learns_the_isp_time_server,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -170,6 +189,16 @@ const ROUTER_DNS: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
 const DIG_TIMEOUT: Duration = Duration::from_secs(6);
 /// The upstreams line once the WAN's `203.0.113.1` is in use.
 const UPSTREAMS_LEARNED: &str = r"openfeo: dns upstreams 203\.0\.113\.1 \(learned from wan0\)";
+/// PID 1 raised a clock that started in 1990 to the build timestamp.
+const BUILD_FLOOR: &str =
+    r"openfeo-init: time floor 20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ \(build\); clock was 1990-";
+/// The router stepped about two hours to the lab's time server.
+const STEPPED: &str = r"openfeo: time step \+7[12]\d\d\.\d{3}s from 203\.0\.113\.1 stratum 2";
+/// The router is synced to the lab's time server.
+const SYNCED: &str = r"openfeo: time synced offset=[+-]\d+\.\d{3}s delay=\d+\.\d{3}s source=203\.0\.113\.1 stratum=2";
+/// How long the first sync may take after boot: the first poll resolves the server's name through
+/// the forwarder, which needs the WAN.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `dig <name> <qtype>` at the router from the LAN host.
 fn dig_lan(lab: &Lab, name: &str, qtype: &str) -> anyhow::Result<DigAnswer> {
@@ -844,6 +873,7 @@ fn lan_client_gets_a_lease_from_the_router(lab: &mut Lab) -> anyhow::Result<()> 
     for (key, expected) in [
         ("router", "192.168.1.1"),
         ("dns", "192.168.1.1"),
+        ("ntpsrv", "192.168.1.1"),
         ("domain", "home.arpa"),
         ("lease", "43200"),
         ("subnet", "255.255.255.0"),
@@ -1072,5 +1102,97 @@ fn rebinding_answers_are_refused(lab: &mut Lab) -> anyhow::Result<()> {
         &re(r"openfeo: dns rebind dropped evil\.isp\.example -> 192\.168\.1\.5 for 192\.168\.1\.2"),
         SOON,
     )?;
+    Ok(())
+}
+
+/// SPEC §7.10: the box takes its time from the configured server (a name resolved through its
+/// own forwarder), stepping once at boot, and serves it to the LAN one stratum below, which a
+/// reference client (`ntpdate -q`) confirms.
+fn router_steps_to_the_isp_time_at_boot(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.start_dnsmasq()?;
+    lab.start_sntp(7_200)?;
+    boot_static_with_lan_host(lab, "")?;
+    let c = lab.console()?;
+    c.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: time servers ntp\.isp\.example \(configured\)"),
+        SOON,
+    )?;
+    c.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: time serving on br-lan0"),
+        SOON,
+    )?;
+    c.wait_for(&mut Cursor::default(), &re(STEPPED), SYNC_TIMEOUT)?;
+    c.wait_for(&mut Cursor::default(), &re(SYNCED), SOON)?;
+    let reply = lanclient::ntpdate_query(&lab.lan0, ROUTER_DNS, DIG_TIMEOUT)?;
+    anyhow::ensure!(reply.stratum == 3, "stratum {} in {reply:?}", reply.stratum);
+    anyhow::ensure!(
+        (reply.offset_s - 7_200.0).abs() < 2.0,
+        "the LAN host sees offset {}: {reply:?}",
+        reply.offset_s
+    );
+    Ok(())
+}
+
+/// A box with no working RTC powers on in 1990: PID 1 raises the clock to the build timestamp
+/// before anything runs, and the time task then steps to the ISP's time.
+fn a_box_without_a_clock_starts_at_the_build_floor(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.set_rtc_base("1990-01-01T00:00:00");
+    lab.start_dnsmasq()?;
+    lab.start_sntp(0)?;
+    boot_static_with_lan_host(lab, "")?;
+    let c = lab.console()?;
+    c.wait_for(&mut Cursor::default(), &re(BUILD_FLOOR), SOON)?;
+    c.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: time step \+\d+\.\d{3}s from 203\.0\.113\.1 stratum 2"),
+        SYNC_TIMEOUT,
+    )?;
+    c.wait_for(&mut Cursor::default(), &re(SYNCED), SOON)?;
+    Ok(())
+}
+
+/// A server stuck in 2014 (400 million seconds behind) is refused: the clock stays where the build floor put it, the LAN is
+/// told the router is unsynchronised, and nothing claims a sync.
+fn a_time_before_the_build_is_refused(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.start_dnsmasq()?;
+    lab.start_sntp(-400_000_000)?;
+    boot_static_with_lan_host(lab, "")?;
+    let c = lab.console()?;
+    c.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: time refused 201\d-\S+ from 203\.0\.113\.1: before the build floor 20\d\d-\S+"),
+        SYNC_TIMEOUT,
+    )?;
+    let reply = lanclient::sntp_query(&lab.lan0, ROUTER_DNS, DIG_TIMEOUT)?;
+    anyhow::ensure!(
+        reply.leap == 3 && reply.stratum == 16,
+        "the LAN was told {reply:?}"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    anyhow::ensure!(
+        c.count(&re(SYNCED)) == 0,
+        "synced to a server before the build"
+    );
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: time step ")) == 0,
+        "stepped towards a server before the build"
+    );
+    Ok(())
+}
+
+/// A WAN leased from Kea names 203.0.113.1 as its time server; the time task takes it up after
+/// the configured names (which the lab cannot resolve) and syncs through it.
+fn dhcp_wan_learns_the_isp_time_server(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.start_sntp(0)?;
+    let (mut cur, _) = boot_dhcp(lab)?;
+    let c = lab.console()?;
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo: time servers 0\.pool\.ntp\.org 1\.pool\.ntp\.org 203\.0\.113\.1 \(configured, learned from wan0\)"),
+        SOON,
+    )?;
+    c.wait_for(&mut Cursor::default(), &re(SYNCED), SYNC_TIMEOUT)?;
     Ok(())
 }

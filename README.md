@@ -28,7 +28,9 @@ authoritative NAKs and a lease database under `/state/leases`, published as fact
 answers DNS on each LAN: `<hostname>.home.arpa` and reverse names from the leases and
 reservations, everything else through upstreams typed in or learned from the WAN, with a TTL
 cache, negative caching, EDNS0, TCP, and rebinding protection; block lists are the next thing to
-slot in. Still to come in M1: SNTP.
+slot in. The router keeps its clock from SNTP servers (configured, `pool.ntp.org` by default,
+plus the ones the WAN lease names), never earlier than its own build, publishes whether it is
+synced, and serves time to the LAN, which the leases point at. That completes M1.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
@@ -49,7 +51,8 @@ package `musl` on Arch, `musl-tools` on Debian and Ubuntu), `pkg-config`, `cargo
 (`qemu-system-x86_64`), `iproute2`, `ping`, `python3`, Kea (`kea-dhcp4`), busybox (`busybox` on Arch,
 `busybox-static` on Debian and Ubuntu; its `udhcpc` is the lab's reference DHCP client), `dnsmasq`
 (`dnsmasq-base` on Debian and Ubuntu; the lab's upstream resolver), `dig` (`bind` on Arch,
-`bind9-dnsutils` on Debian and Ubuntu; the lab's DNS client), `mkfs.ext4`
+`bind9-dnsutils` on Debian and Ubuntu; the lab's DNS client), `ntpdate` (`ntp` on Arch,
+`ntpsec-ntpdate` on Debian and Ubuntu; the lab's reference time client), `mkfs.ext4`
 (e2fsprogs), `ccache`, and the usual kernel build dependencies (`bc`, `flex`, `bison`, `libelf`, `libssl`, `zstd`, `cpio`).
 `make` fetches the pinned sources of nftables, libnftnl, libmnl and jansson (`nft/sources.txt`),
 verifies them and builds them statically for the firewall backend, against the UAPI headers of

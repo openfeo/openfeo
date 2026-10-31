@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-proto-sntp"
+description = "OpenFeO SNTP without sockets or clocks: the 48-byte packet, the client core, the clock-steering decision and the LAN-side responder (SPEC §7.10, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+openfeo-proto-dns = { path = "../openfeo-proto-dns" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

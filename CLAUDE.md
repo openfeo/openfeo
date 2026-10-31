@@ -34,7 +34,8 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 Rootless: user + mount + net namespaces, no sudo. Needs `/dev/kvm` (falls back to TCG) and `/dev/net/tun`
 readable, and unprivileged user namespaces enabled. Host-side `pppd` (M3) additionally needs `/dev/ppp`
 group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4`, `busybox` (`udhcpc`, the reference
-DHCP client), `dnsmasq` (the upstream resolver), `dig` (the DNS client), `mkfs.ext4`, `ping`, `python3` (HTTP targets);
+DHCP client), `dnsmasq` (the upstream resolver), `dig` (the DNS client), `ntpdate` (the reference time client), `mkfs.ext4`,
+`ping`, `python3` (HTTP targets and the lab's SNTP server);
 building needs `musl-gcc`, `pkg-config`, `bison`, `flex`. The sandboxed nft scenarios need the
 kernel to load the `ct`/`fib`/`nat` nft modules; a host that cannot (upgraded, not rebooted) makes them skip with
 a reason, `make check-env` says so, and CI sets `OPENFEO_NO_SKIP=1` so a skip fails there. The `dhcp4` sandbox
@@ -43,7 +44,12 @@ DHCPv4 server driver against the LAN-side clients (our own as the hidden `openfe
 subcommand, busybox `udhcpc` as the reference; `OPENFEO_TRACE=1` shows their and the driver's account of a
 run); the `dns` suite runs the forwarder driver between a LAN host running `dig` and dnsmasq in
 authoritative mode for `isp.example` (the same dnsmasq serves as the upstream on isp0 in the QEMU
-scenarios); Kea's one template serves 60-second leases
+scenarios); the `sntp` suite runs the time driver on a recording clock between a LAN host (`ntpdate -q`
+and raw queries) and the lab's Python SNTP server (`harness/fixtures/sntp-server.py`), whose
+clock offset each scenario dials (the same server sits on isp0 at 203.0.113.1 in the QEMU
+scenarios, and `Lab::set_rtc_base` starts the VM with a wrong clock); `make bin` bakes
+`OPENFEO_BUILD_EPOCH` (the commit's time, or `SOURCE_DATE_EPOCH`) into the binary as its clock
+floor; Kea's one template serves 60-second leases
 renewing at 20 s to every lab run, so a renewal is observable within a scenario. CI runs Ubuntu 24.04's Kea
 2.4.1, so the template uses only what that version accepts (option 121 is given by code as RFC 3442 bytes);
 `make check-env` tests the template against the installed Kea and prints Kea's own error when it refuses.

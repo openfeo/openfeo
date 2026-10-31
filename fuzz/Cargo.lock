@@ -629,6 +629,7 @@ dependencies = [
  "openfeo-config",
  "openfeo-proto-dhcp4",
  "openfeo-proto-dns",
+ "openfeo-proto-sntp",
 ]
 
 [[package]]
@@ -651,6 +652,13 @@ name = "openfeo-proto-dns"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "thiserror",
+]
+
+[[package]]
+name = "openfeo-proto-sntp"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 
