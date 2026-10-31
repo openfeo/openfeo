@@ -15,9 +15,11 @@ pub mod leases;
 pub mod mac;
 pub mod portmap;
 pub mod rename;
+pub mod time;
 pub mod world;
 
 pub use dhcp4::Dhcp4Fact;
 pub use leases::LeaseFact;
 pub use mac::MacAddr;
+pub use time::TimeFact;
 pub use world::{LinkFact, World};

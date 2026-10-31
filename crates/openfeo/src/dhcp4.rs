@@ -82,6 +82,7 @@ pub fn fact_from(lease: &Lease) -> Dhcp4Fact {
             .map(|route| (net(route.dst, route.prefix).trunc(), route.via))
             .collect(),
         dns: lease.dns.clone(),
+        ntp: lease.ntp.clone(),
         domain: lease.domain.clone(),
         mtu: lease.mtu.map(u32::from),
     }

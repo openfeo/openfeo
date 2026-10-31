@@ -1150,6 +1150,7 @@ dependencies = [
  "openfeo-config",
  "openfeo-proto-dhcp4",
  "openfeo-proto-dns",
+ "openfeo-proto-sntp",
  "openfeo-world",
  "serde",
  "serde_json",

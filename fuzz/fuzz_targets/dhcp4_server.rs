@@ -22,6 +22,7 @@ fn config() -> ServerConfig {
         pool: (POOL_START, Ipv4Addr::new(192, 168, 1, 200)),
         lease_secs: 43_200,
         dns: vec![],
+        ntp: vec![],
         domain: Some("home.arpa".to_owned()),
         reservations: vec![Reservation {
             mac: [0x52, 0x54, 0, 0xfe, 0x10, 0x10],

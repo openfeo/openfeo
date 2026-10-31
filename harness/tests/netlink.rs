@@ -31,7 +31,7 @@ use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
 use openfeo_reconcile::nft::nft;
 use openfeo_reconcile::sysctl::DesiredSysctl;
-use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, World};
+use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, TimeFact, World};
 use tokio::sync::watch;
 
 const SCENARIOS: &[Scenario] = &[
@@ -404,6 +404,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         links: Arc::new(links),
         dhcp4: Arc::new(BTreeMap::new()),
         leases: Arc::new(BTreeMap::new()),
+        time: TimeFact::default(),
     }
 }
 
@@ -841,6 +842,7 @@ fn links_applier_sets_a_dhcp_wan_mtu(_lab: &mut Lab) -> anyhow::Result<()> {
             routes: Vec::new(),
             dns: Vec::new(),
             domain: None,
+            ntp: vec![],
             mtu: Some(1400),
         };
         let mut rig = Rig::connect().await?;
@@ -882,6 +884,7 @@ fn routing_applier_adds_a_host_route_before_an_off_link_default(
             routes: Vec::new(),
             dns: Vec::new(),
             domain: None,
+            ntp: vec![],
             mtu: None,
         };
         let mut rig = Rig::connect().await?;

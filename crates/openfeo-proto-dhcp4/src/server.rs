@@ -51,6 +51,8 @@ pub struct ServerConfig {
     pub lease_secs: u32,
     /// Empty means `[server]`.
     pub dns: Vec<Ipv4Addr>,
+    /// Option 42; empty means `[server]`, which serves SNTP (SPEC §7.10).
+    pub ntp: Vec<Ipv4Addr>,
     pub domain: Option<String>,
     pub reservations: Vec<Reservation>,
 }
@@ -756,6 +758,11 @@ impl Server {
                     self.config.dns.clone()
                 },
             ));
+            options.push(DhcpOption::NtpServers(if self.config.ntp.is_empty() {
+                vec![self.config.server]
+            } else {
+                self.config.ntp.clone()
+            }));
             if let Some(domain) = &self.config.domain {
                 options.push(DhcpOption::DomainName(domain.clone()));
             }
@@ -937,6 +944,7 @@ mod tests {
             pool: (first, last),
             lease_secs: 43_200,
             dns: vec![],
+            ntp: vec![],
             domain: Some("home.arpa".into()),
             reservations: vec![Reservation {
                 mac: MAC_NAS,
@@ -1066,6 +1074,27 @@ mod tests {
         let sent = sends(&out);
         assert_eq!(sent.len(), 1, "one OFFER expected, got {out:?}");
         sent[0].1.yiaddr
+    }
+
+    /// SPEC §7.6: the leases name an NTP server, the router itself unless configured.
+    #[test]
+    fn offers_carry_the_ntp_servers_the_router_by_default() {
+        let offer_with = |cfg: ServerConfig| -> Message {
+            let mut s = Server::new(cfg, vec![], 0);
+            s.handle(Input::Packet(discover([2, 0, 0, 0, 0, 1], 1, vec![])), 0);
+            sends(&s.handle(Input::Timeout, PROBE_TIMEOUT)).remove(0).1
+        };
+        assert_eq!(
+            offer_with(config()).option(42),
+            Some(&DhcpOption::NtpServers(vec![ip("192.168.1.1")])),
+            "ntp empty: the router"
+        );
+        let mut with_ntp = config();
+        with_ntp.ntp = vec![ip("203.0.113.1")];
+        assert_eq!(
+            offer_with(with_ntp).option(42),
+            Some(&DhcpOption::NtpServers(vec![ip("203.0.113.1")]))
+        );
     }
 
     #[test]

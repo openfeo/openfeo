@@ -328,6 +328,15 @@ fn system(report: &mut Report, system: &System) {
             ),
         );
     }
+    for (i, server) in system.ntp_servers.iter().enumerate() {
+        if server.parse::<Ipv4Addr>().is_err() && !is_valid_hostname(server) {
+            report.push(
+                format!("system.ntp_servers[{i}]"),
+                Code::InvalidHostname,
+                format!("{server:?} is neither an IPv4 address nor a host name"),
+            );
+        }
+    }
 }
 
 /// The `[wans.dhcp]` options: a host name and a vendor class, each checked only when set.
@@ -387,6 +396,15 @@ fn lan_dhcp(report: &mut Report, path: &str, net: Ipv4Net, dhcp: &LanDhcp) {
                 format!("{path}.dns[{k}]"),
                 Code::InvalidAddress,
                 format!("{dns:?} is not an IPv4 address"),
+            );
+        }
+    }
+    for (k, ntp) in dhcp.ntp.iter().enumerate() {
+        if ntp.parse::<Ipv4Addr>().is_err() {
+            report.push(
+                format!("{path}.ntp[{k}]"),
+                Code::InvalidAddress,
+                format!("{ntp:?} is not an IPv4 address"),
             );
         }
     }
@@ -1258,6 +1276,25 @@ mod lan_dhcp_tests {
                 &live()
             )),
             vec![("lans[0].dhcp.dns[1]".to_owned(), Code::InvalidAddress)]
+        );
+    }
+
+    #[test]
+    fn lan_ntp_entries_must_be_addresses_and_system_ntp_servers_addresses_or_names() {
+        assert_eq!(
+            codes(&validate(
+                &with_dhcp(&format!("{RANGE}ntp = [\"192.168.1.1\", \"time.example\"]")),
+                &live()
+            )),
+            vec![("lans[0].dhcp.ntp[1]".to_owned(), Code::InvalidAddress)]
+        );
+        let bad = crate::file::parse(
+            "config_version = 1\n[system]\nntp_servers = [\"0.pool.ntp.org\", \"203.0.113.1\", \"-bad\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codes(&validate(&bad, &live())),
+            vec![("system.ntp_servers[2]".to_owned(), Code::InvalidHostname)]
         );
     }
 

@@ -42,6 +42,8 @@ pub struct DesiredDhcpServer {
     pub lease_secs: u32,
     /// Never empty: the router when nothing is configured.
     pub dns: Vec<Ipv4Addr>,
+    /// Never empty: the router, which serves SNTP, when nothing is configured.
+    pub ntp: Vec<Ipv4Addr>,
     /// `[system] domain`, else `home.arpa`.
     pub domain: Option<String>,
     pub reservations: Vec<DesiredReservation>,
@@ -79,7 +81,8 @@ pub fn servers(world: &World) -> BTreeMap<String, DesiredDhcpServer> {
                 prefix: net.prefix_len(),
                 pool,
                 lease_secs: lease_secs(dhcp),
-                dns: dns_of(dhcp, net.addr()),
+                dns: addrs_or_router(&dhcp.dns, net.addr()),
+                ntp: addrs_or_router(&dhcp.ntp, net.addr()),
                 domain: Some(domain.clone()),
                 reservations: dhcp.r#static.iter().filter_map(reservation).collect(),
             },
@@ -97,6 +100,7 @@ pub fn server_config(desired: &DesiredDhcpServer) -> ServerConfig {
         pool: desired.pool,
         lease_secs: desired.lease_secs,
         dns: desired.dns.clone(),
+        ntp: desired.ntp.clone(),
         domain: desired.domain.clone(),
         reservations: desired
             .reservations
@@ -126,13 +130,17 @@ fn lease_secs(dhcp: &LanDhcp) -> u32 {
     }
 }
 
-fn dns_of(dhcp: &LanDhcp, server: Ipv4Addr) -> Vec<Ipv4Addr> {
-    let dns: Vec<Ipv4Addr> = dhcp
-        .dns
+/// The configured addresses, or the router's when none are (or none parse).
+fn addrs_or_router(configured: &[String], server: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let addrs: Vec<Ipv4Addr> = configured
         .iter()
         .filter_map(|text| text.parse().ok())
         .collect();
-    if dns.is_empty() { vec![server] } else { dns }
+    if addrs.is_empty() {
+        vec![server]
+    } else {
+        addrs
+    }
 }
 
 fn reservation(lease: &StaticLease) -> Option<DesiredReservation> {
@@ -210,6 +218,26 @@ mod tests {
             )
         );
         assert_eq!(desired["lan0"].lease_secs, 43_200);
+    }
+
+    #[test]
+    fn ntp_handed_out_is_the_router_unless_configured() {
+        let desired = servers(&fixtures::static_world());
+        assert_eq!(desired["lan0"].ntp, vec![Ipv4Addr::new(192, 168, 1, 1)]);
+        let mut world = fixtures::static_world();
+        Arc::make_mut(&mut world.config).lans[0]
+            .dhcp
+            .as_mut()
+            .unwrap()
+            .ntp = vec!["203.0.113.1".into()];
+        assert_eq!(
+            servers(&world)["lan0"].ntp,
+            vec![Ipv4Addr::new(203, 0, 113, 1)]
+        );
+        assert_eq!(
+            server_config(&servers(&world)["lan0"]).ntp,
+            vec![Ipv4Addr::new(203, 0, 113, 1)]
+        );
     }
 
     #[test]
