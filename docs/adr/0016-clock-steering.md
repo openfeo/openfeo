@@ -32,9 +32,10 @@ some of the target boards carry) would plug in: it must not know where an offset
   kept because it is the standard) steps and anything smaller slews; once synced, an offset
   below half a second (our clamp, see Context) slews and anything from half a second steps. An
   offset of zero holds.
-- The driver tells the kernel what it decided about the clock as a whole: every sync clears
-  `STA_UNSYNC` (`adjtimex(ADJ_STATUS)`, with the kernel's error estimates reset so it does not
-  raise the flag again by itself), and a lost sync sets it.
+- The driver tells the kernel what it decided about the clock as a whole: every adopted sample,
+  step or slew, clears `STA_UNSYNC` (`adjtimex(ADJ_STATUS)`, with the kernel's error estimates
+  reset, since the kernel grows them by itself and would raise the flag again within hours), and
+  a lost sync sets it.
 - Every step is announced on the console (`time step +7200.012s from 203.0.113.1 stratum 2`);
   slews are logged at debug.
 - The build timestamp is the floor: PID 1 raises a clock that starts before it, and the client

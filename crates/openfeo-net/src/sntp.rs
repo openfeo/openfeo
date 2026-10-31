@@ -375,7 +375,9 @@ impl<C: Clock> SntpDriver<C> {
                 Output::Slew(ns) => self.move_clock("slew", ns, C::slew),
                 Output::Event(event) => {
                     match event {
-                        Event::Synced { .. } => self.mark_synced(true),
+                        // Every adopted sample, slews included: `Synced` is only the first one
+                        // and the steps, and the kernel forgets within hours.
+                        Event::Synced { .. } | Event::Slewed { .. } => self.mark_synced(true),
                         Event::LostSync { .. } => self.mark_synced(false),
                         _ => {}
                     }
@@ -397,8 +399,9 @@ impl<C: Clock> SntpDriver<C> {
         }
     }
 
-    /// Tell the kernel the clock is synced (every sync: the kernel forgets within hours) or that
-    /// the sync is lost; a refusal is logged like a refused step.
+    /// Tell the kernel the clock is synced (on every adopted sample: it grows its own error
+    /// estimate and raises `STA_UNSYNC` again within hours) or that the sync is lost; a refusal
+    /// is logged like a refused step.
     fn mark_synced(&mut self, synced: bool) {
         if let Err(err) = self.clock.set_synced(synced) {
             let state = if synced { "synced" } else { "unsynced" };

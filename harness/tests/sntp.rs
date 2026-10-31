@@ -326,6 +326,13 @@ fn small_offsets_slew_after_the_first_sync(lab: &mut Lab) -> anyhow::Result<()> 
         "a second step: {:?}",
         driver.clock().steps()
     );
+    // Every adopted sample tells the kernel the clock is synced, slews included: the kernel
+    // forgets within hours otherwise, and the RTC write-back stops with it.
+    ensure!(
+        driver.clock().synced_flags() == vec![true, true],
+        "the slew did not re-mark the clock synced: {:?}",
+        driver.clock().synced_flags()
+    );
     Ok(())
 }
 
