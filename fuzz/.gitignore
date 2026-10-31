@@ -15,5 +15,8 @@ corpus/dns_message/*
 !corpus/dns_differential/
 corpus/dns_differential/*
 !corpus/dns_differential/seed-*.bin
+!corpus/dns_forwarder/
+corpus/dns_forwarder/*
+!corpus/dns_forwarder/seed-*.bin
 artifacts
 coverage

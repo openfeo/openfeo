@@ -68,4 +68,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "dns_forwarder"
+path = "fuzz_targets/dns_forwarder.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

@@ -747,6 +747,7 @@ dependencies = [
 name = "openfeo-proto-dns"
 version = "0.1.0"
 dependencies = [
+ "ipnet",
  "thiserror",
 ]
 

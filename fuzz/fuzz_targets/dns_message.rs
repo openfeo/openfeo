@@ -15,9 +15,16 @@ fuzz_target!(|data: &[u8]| {
         let again = Message::decode(&message.encode()).expect("our own encoding decodes");
         assert_eq!(again, message);
         let within = message.encode_within(512);
-        assert!(Message::decode(&within).is_ok(), "a truncated encoding decodes");
+        assert!(
+            Message::decode(&within).is_ok(),
+            "a truncated encoding decodes"
+        );
         if message.questions.len() <= 1 {
-            assert!(within.len() <= 512, "{} bytes after truncation", within.len());
+            assert!(
+                within.len() <= 512,
+                "{} bytes after truncation",
+                within.len()
+            );
         }
     }
 });
