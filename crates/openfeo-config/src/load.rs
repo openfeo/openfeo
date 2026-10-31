@@ -72,6 +72,7 @@ impl Config {
                 }),
             }],
             firewall: None,
+            dns: None,
         }
     }
 }

@@ -17,6 +17,21 @@ message Config {
   repeated Wan wans = 4;
   repeated Lan lans = 5;
   Firewall firewall = 6;
+  Dns dns = 7;
+}
+
+// The DNS forwarder (SPEC §7.7; `[dns]` in §8.2).
+message Dns {
+  // Upstream resolvers, in order of preference; empty means the active WAN's learned servers
+  // alone.
+  repeated string upstreams = 1;
+  // Reserved for block lists (post-MVP); must be empty.
+  repeated string blocklists = 2;
+  // Also use the servers the active WAN learned (DHCPv4 now, PPPoE and IPv6 later), after
+  // `upstreams`. Absent means true.
+  optional bool use_wan_dns = 3;
+  // Names whose subdomains may resolve to private addresses (rebinding protection, SPEC §7.7).
+  repeated string rebind_allow = 4;
 }
 
 // Firewall settings beyond the zone defaults of SPEC §7.5 (which the panel exposes in M4).

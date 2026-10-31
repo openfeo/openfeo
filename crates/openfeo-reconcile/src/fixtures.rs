@@ -9,7 +9,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap, PortMapEntry};
-use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, World};
+use openfeo_world::{Dhcp4Fact, LeaseFact, LinkFact, MacAddr, World};
 
 pub const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
 pub const VM_DHCP: &str = include_str!("../../../harness/fixtures/vm-dhcp.toml");
@@ -66,6 +66,35 @@ pub fn first_boot_world() -> World {
 /// `vm-static.toml`: static WAN on p0, LAN on p2, p1 idle.
 pub fn static_world() -> World {
     world(openfeo_config::file::parse(VM_STATIC).expect("fixture parses"))
+}
+
+/// The leases `lan0`'s server has granted: the `nas` reservation taken up, and `pc` from the
+/// pool.
+pub fn lease_facts() -> BTreeMap<String, Vec<LeaseFact>> {
+    BTreeMap::from([(
+        "lan0".to_owned(),
+        vec![
+            LeaseFact {
+                address: Ipv4Addr::new(192, 168, 1, 10),
+                mac: MacAddr([0x52, 0x54, 0x00, 0xfe, 0x10, 0x10]),
+                hostname: Some("nas".to_owned()),
+                expires_unix: 1_800_000_000,
+            },
+            LeaseFact {
+                address: Ipv4Addr::new(192, 168, 1, 120),
+                mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+                hostname: Some("pc".to_owned()),
+                expires_unix: 1_800_000_000,
+            },
+        ],
+    )])
+}
+
+/// [`static_world`] with [`lease_facts`].
+pub fn static_world_with_leases() -> World {
+    let mut world = static_world();
+    world.leases = Arc::new(lease_facts());
+    world
 }
 
 /// The lease the lab's Kea hands out (`harness/fixtures/kea-dhcp4.json.tmpl`), as a fact:

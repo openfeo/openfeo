@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::Ipv4Net;
 
-use crate::{Config, DhcpWan, Firewall, LanDhcp, PortMap, StaticLease, wan};
+use crate::{Config, DhcpWan, Dns, Firewall, LanDhcp, PortMap, StaticLease, wan};
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -68,6 +68,8 @@ pub enum Code {
     DuplicateStatic,
     /// A static lease client identifier that is not hex of 1 to 255 bytes.
     InvalidClientId,
+    /// `[dns] blocklists` is set; block lists arrive after M1 (SPEC §7.7).
+    BlocklistsUnsupported,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -159,6 +161,7 @@ impl Code {
             Code::StaticOutsideSubnet => "static_outside_subnet",
             Code::DuplicateStatic => "duplicate_static",
             Code::InvalidClientId => "invalid_client_id",
+            Code::BlocklistsUnsupported => "blocklists_unsupported",
         }
     }
 }
@@ -187,8 +190,8 @@ impl fmt::Display for Violation {
 }
 
 /// Check `config` against the rules and the live port map `ports`. Returns every violation in
-/// document order (`ports`, then `wans`, then `lans`, then `firewall`, then subnet overlaps);
-/// empty means valid.
+/// document order (`ports`, then `wans`, then `lans`, then `firewall`, then `dns`, then subnet
+/// overlaps); empty means valid.
 /// Where two items conflict (a name or port used twice, two overlapping subnets) the later one in
 /// document order is flagged.
 #[must_use]
@@ -280,6 +283,10 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
 
     if let Some(firewall) = &config.firewall {
         port_forwards(&mut report, firewall, &lan_subnets);
+    }
+
+    if let Some(dns_config) = &config.dns {
+        dns(&mut report, dns_config);
     }
 
     for (k, (path, net)) in subnets.iter().enumerate() {
@@ -561,6 +568,32 @@ fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Ne
                 format!(
                     "{} is not a port (0 = same as port, or 1-65535)",
                     forward.to_port
+                ),
+            );
+        }
+    }
+}
+
+/// `[dns]` (SPEC §7.7): upstreams that are IPv4 addresses, no block lists yet, allow-listed
+/// names that are host names.
+fn dns(report: &mut Report, dns: &Dns) {
+    for (i, upstream) in dns.upstreams.iter().enumerate() {
+        report.addr4(&format!("dns.upstreams[{i}]"), upstream);
+    }
+    if !dns.blocklists.is_empty() {
+        report.push(
+            "dns.blocklists".to_owned(),
+            Code::BlocklistsUnsupported,
+            "block lists are not supported yet; leave the list empty".to_owned(),
+        );
+    }
+    for (i, name) in dns.rebind_allow.iter().enumerate() {
+        if !is_valid_hostname(name) {
+            report.push(
+                format!("dns.rebind_allow[{i}]"),
+                Code::InvalidHostname,
+                format!(
+                    "{name:?} is not a host name: labels of [A-Za-z0-9-] up to 63 bytes, not starting or ending with a hyphen, {MAX_HOSTNAME} bytes in all"
                 ),
             );
         }
@@ -1210,5 +1243,58 @@ mod lan_dhcp_tests {
         );
         assert_eq!(parse_mac("52-54-00-fe-10-10"), None);
         assert_eq!(parse_mac("52:54:00:fe:10"), None);
+    }
+}
+
+#[cfg(test)]
+mod dns_tests {
+    use super::*;
+    use crate::{PortMap, PortMapEntry, file};
+
+    fn live() -> PortMap {
+        PortMap {
+            ports: vec![PortMapEntry {
+                id: "pci-0000:00:03.0".to_owned(),
+                name: "p0".to_owned(),
+            }],
+        }
+    }
+
+    fn codes(violations: &[Violation]) -> Vec<(String, Code)> {
+        violations
+            .iter()
+            .map(|v| (v.path.clone(), v.code))
+            .collect()
+    }
+
+    #[test]
+    fn dns_upstreams_must_be_addresses_blocklists_must_be_empty_and_allow_names_valid() {
+        let config = file::parse(
+            "config_version = 1\n[dns]\nupstreams = [\"9.9.9.9\", \"dns.quad9.net\"]\nblocklists = [\"hagezi\"]\nrebind_allow = [\"plex.direct\", \"-bad\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codes(&validate(&config, &live())),
+            vec![
+                ("dns.upstreams[1]".to_owned(), Code::InvalidAddress),
+                ("dns.blocklists".to_owned(), Code::BlocklistsUnsupported),
+                ("dns.rebind_allow[1]".to_owned(), Code::InvalidHostname),
+            ]
+        );
+        let ok = file::parse(
+            "config_version = 1\n[dns]\nupstreams = [\"9.9.9.9\"]\nuse_wan_dns = false\n",
+        )
+        .unwrap();
+        assert_eq!(validate(&ok, &live()), vec![]);
+        assert_eq!(ok.dns.as_ref().and_then(|d| d.use_wan_dns), Some(false));
+        assert_eq!(
+            file::parse("config_version = 1\n[dns]\nupstreams = [\"9.9.9.9\"]\n")
+                .unwrap()
+                .dns
+                .unwrap()
+                .use_wan_dns,
+            None,
+            "absent means the default, true"
+        );
     }
 }

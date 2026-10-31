@@ -1,0 +1,20 @@
+---
+source: crates/openfeo-reconcile/src/dns.rs
+expression: d
+---
+listeners:
+  - ifname: br-lan0
+    address: 192.168.1.1
+upstreams:
+  - 203.0.113.1
+learned_from: wan0
+domain: home.arpa
+router_name: openfeo.home.arpa
+router_addrs:
+  - 192.168.1.1
+lan_subnets:
+  - 192.168.1.0/24
+local:
+  - name: nas.home.arpa
+    addr: 192.168.1.10
+rebind_allow: []
