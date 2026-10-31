@@ -184,6 +184,30 @@ pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     Daemon::spawn("dnsmasq", cmd)
 }
 
+/// The lab's SNTP server (`harness/fixtures/sntp-server.py`) on `bind:123` inside `ns`: every
+/// mode 3 request is answered with mode 4, stratum `stratum`, reference id `LOCL` and this
+/// host's clock shifted by `offset_secs`; each request is logged as `query from <addr>:<port>`;
+/// ready when it logs `sntp-server listening on <bind>:123`.
+///
+/// # Errors
+///
+/// When python3 cannot be spawned.
+pub fn sntp_server(ns: &NetNs, bind: &str, offset_secs: i64, stratum: u8) -> Result<Daemon> {
+    let script = crate::lab::workspace_root().join("harness/fixtures/sntp-server.py");
+    let mut cmd = ns.command("python3")?;
+    cmd.args(["-I", "-u"]).arg(&script).args([
+        "--bind",
+        bind,
+        "--port",
+        "123",
+        "--offset",
+        &offset_secs.to_string(),
+        "--stratum",
+        &stratum.to_string(),
+    ]);
+    Daemon::spawn(&format!("sntp-{bind}"), cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

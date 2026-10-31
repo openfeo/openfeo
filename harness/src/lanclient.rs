@@ -28,6 +28,7 @@ use openfeo_net::dhcp4::{Driver, DriverConfig, Event};
 use openfeo_proto_dhcp4::identity::{client_id, duid_ll, iaid};
 use openfeo_proto_dhcp4::wire::{CLIENT_PORT, DhcpOption, Message, MessageType, Op, SERVER_PORT};
 use openfeo_proto_dhcp4::{ClientConfig, Lease, Unbound};
+use openfeo_proto_sntp::{NtpTimestamp, Packet};
 use serde_json::{Value, json};
 
 use crate::netns::{self, NetNs};
@@ -637,6 +638,122 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<std::process
         .with_context(|| format!("collect {rendered}"))
 }
 
+/// What busybox `ntpd` reported about one server.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NtpdReply {
+    pub server: Ipv4Addr,
+    /// The server's clock minus the client's, in seconds.
+    pub offset_s: f64,
+    pub delay_s: f64,
+    pub stratum: u8,
+}
+
+/// `busybox ntpd -w -n -d -d -p <server>` inside `ns` (query only, never set the clock) until
+/// its first `reply from` line, then SIGTERM; the line parsed. busybox discards an
+/// unsynchronised answer with a different line, which is an error here.
+///
+/// # Errors
+///
+/// When busybox cannot be run, prints no usable reply within `timeout`, or the reply does not
+/// parse.
+pub fn ntpd_query(ns: &NetNs, server: Ipv4Addr, timeout: Duration) -> Result<NtpdReply> {
+    let mut cmd = ns.command("busybox")?;
+    cmd.args(["ntpd", "-w", "-n", "-d", "-d", "-p", &server.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawn busybox ntpd")?;
+    let stderr = child.stderr.take().context("ntpd stderr")?;
+    let (lines_tx, lines_rx) = mpsc::channel::<String>();
+    let reader = thread::spawn(move || {
+        let mut lines = Vec::new();
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = lines_tx.send(line.clone());
+            lines.push(line);
+        }
+        lines
+    });
+    let deadline = Instant::now() + timeout;
+    let mut replied = false;
+    while !replied && Instant::now() < deadline {
+        match lines_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => replied = line.contains("reply from "),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
+    }
+    let _ = child.wait();
+    let lines = reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ntpd reader thread panicked"))?;
+    let output = lines.join("\n");
+    parse_ntpd(&output)
+        .with_context(|| format!("busybox ntpd @{server}: no reply parsed from: {output}"))
+}
+
+/// busybox 1.36's verbose line, the last one in `output`: `ntpd: reply from 192.168.1.1:
+/// offset:+7200.001234 delay:0.000456 status:0x24 strat:3 refid:0xcb007101 rootdelay:0.001
+/// reach:0x01`.
+#[must_use]
+pub fn parse_ntpd(output: &str) -> Option<NtpdReply> {
+    let line = output.lines().rfind(|line| line.contains("reply from "))?;
+    let rest = line.split("reply from ").nth(1)?;
+    let (server, fields) = rest.split_once(':')?;
+    let server = server.trim().parse().ok()?;
+    let field = |key: &str| -> Option<&str> {
+        fields
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(key))
+    };
+    Some(NtpdReply {
+        server,
+        offset_s: field("offset:")?.parse().ok()?,
+        delay_s: field("delay:")?.parse().ok()?,
+        stratum: field("strat:")?.parse().ok()?,
+    })
+}
+
+/// One raw SNTP request to `server` from inside `ns`, the reply decoded: the exact leap, stratum
+/// and timestamps a client sees, which busybox hides.
+///
+/// # Errors
+///
+/// When the namespace cannot be entered, nothing comes back within `timeout`, or the reply is
+/// not a packet.
+pub fn sntp_query(ns: &NetNs, server: Ipv4Addr, timeout: Duration) -> Result<Packet> {
+    let ns_file = File::open(ns.path()).with_context(|| format!("open {}", ns.path().display()))?;
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> Result<Packet> {
+                setns(&ns_file, CloneFlags::CLONE_NEWNET).context("setns")?;
+                let socket = UdpSocket::bind("0.0.0.0:0").context("bind")?;
+                socket.set_read_timeout(Some(timeout))?;
+                let request = Packet {
+                    version: 4,
+                    mode: 3,
+                    transmit: NtpTimestamp(0x0102_0304_0506_0708),
+                    ..Packet::default()
+                };
+                socket
+                    .send_to(&request.encode(), SocketAddrV4::new(server, 123))
+                    .context("send request")?;
+                let mut buf = [0u8; 512];
+                let (len, _) = socket
+                    .recv_from(&mut buf)
+                    .with_context(|| format!("no SNTP reply from {server}"))?;
+                Packet::decode(&buf[..len]).context("decode reply")
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("sntp thread panicked"))?
+    })
+}
+
 /// What `dig` reported: the status, the header flags, and the answer section as
 /// `(name, ttl, type, rdata)` rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -833,6 +950,21 @@ mod dns_client_tests {
         assert_eq!(parsed.flags, vec!["qr", "rd", "ra"]);
         assert_eq!(parsed.answers.len(), 2);
         assert_eq!(parsed.answers[0].3, "\"aaa\" \"bbb\"");
+    }
+
+    #[test]
+    fn ntpd_output_parses_the_reply_line() {
+        let out = "ntpd: sending query to 192.168.1.1\nntpd: reply from 192.168.1.1: offset:+7200.001234 delay:0.000456 status:0x24 strat:3 refid:0xcb007101 rootdelay:0.001 reach:0x01\n";
+        assert_eq!(
+            parse_ntpd(out),
+            Some(NtpdReply {
+                server: "192.168.1.1".parse().unwrap(),
+                offset_s: 7_200.001_234,
+                delay_s: 0.000_456,
+                stratum: 3,
+            })
+        );
+        assert_eq!(parse_ntpd("ntpd: sending query to 192.168.1.1\n"), None);
     }
 
     /// dig pads short owner names with a second tab.

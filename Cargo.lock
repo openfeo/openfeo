@@ -1050,6 +1050,7 @@ dependencies = [
  "openfeo-platform",
  "openfeo-proto-dhcp4",
  "openfeo-proto-dns",
+ "openfeo-proto-sntp",
  "openfeo-reconcile",
  "openfeo-world",
  "regex",

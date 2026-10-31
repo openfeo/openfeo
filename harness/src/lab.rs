@@ -57,6 +57,8 @@ pub struct Lab {
     kernel: Option<PathBuf>,
     /// The `/state` image for the VM, when a scenario supplied one (ADR-0010).
     state_disk: Option<PathBuf>,
+    /// The guest's clock at power-on (`-rtc base=`), when a scenario set one.
+    rtc_base: Option<String>,
     /// The router VM, after [`Lab::boot`]. Declared first so it dies before its taps.
     pub vm: Option<Vm>,
     /// Reference daemons started by scenarios; stopped before the namespaces go.
@@ -95,6 +97,7 @@ impl Lab {
             name: name.to_owned(),
             kernel: None,
             state_disk: None,
+            rtc_base: None,
             vm: None,
             daemons: Vec::new(),
             taps,
@@ -153,6 +156,30 @@ impl Lab {
         )?;
         self.daemons.push(dnsmasq);
         Ok(())
+    }
+
+    /// Start the lab's SNTP server on ISP A's `wan0` at 203.0.113.1, stratum 2, its clock
+    /// `offset_secs` from the host's (`daemons::sntp_server`); returns once it announces itself.
+    /// The daemon joins [`Lab::daemons`], named `sntp-203.0.113.1`.
+    ///
+    /// # Errors
+    ///
+    /// When the server cannot be started or does not come up within 10 s.
+    pub fn start_sntp(&mut self, offset_secs: i64) -> Result<()> {
+        let server = daemons::sntp_server(&self.isp0, "203.0.113.1", offset_secs, 2)?;
+        server.log.wait_for(
+            &mut Cursor::default(),
+            &Regex::new("sntp-server listening on").context("regex")?,
+            Duration::from_secs(10),
+        )?;
+        self.daemons.push(server);
+        Ok(())
+    }
+
+    /// The guest's clock at power-on, as QEMU's `-rtc base=<iso>` (`2006-06-17T16:01:21`): a
+    /// box whose RTC is wrong or missing. Set before [`Lab::boot`].
+    pub fn set_rtc_base(&mut self, iso: &str) {
+        self.rtc_base = Some(iso.to_owned());
     }
 
     /// Teach the ISP namespace the way to the LAN subnet through the router's WAN address, so
@@ -227,6 +254,7 @@ impl Lab {
             console,
             state_disk: self.state_disk.clone(),
             qmp_socket: Some(self.qmp_socket_path()),
+            rtc_base: self.rtc_base.clone(),
         })?;
         Ok(self.vm.insert(vm))
     }
