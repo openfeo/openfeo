@@ -54,6 +54,7 @@ fn world(config: Config) -> World {
         ports: Arc::new(portmap()),
         links: Arc::new(link_facts()),
         dhcp4: Arc::new(BTreeMap::new()),
+        leases: Arc::new(BTreeMap::new()),
     }
 }
 

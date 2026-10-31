@@ -403,6 +403,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         ports: Arc::new(ports),
         links: Arc::new(links),
         dhcp4: Arc::new(BTreeMap::new()),
+        leases: Arc::new(BTreeMap::new()),
     }
 }
 
