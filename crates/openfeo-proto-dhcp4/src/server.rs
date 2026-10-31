@@ -9,8 +9,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::Ipv4Addr;
 
-pub use crate::client::Timestamp;
 use crate::wire::{DhcpOption, FLAG_BROADCAST, Message, MessageType, Op};
+
+/// Seconds on the driver's monotonic clock (the client core counts milliseconds; a server's
+/// times are lease times, whole seconds on the wire).
+pub type Timestamp = u64;
 
 /// The lease time when the configuration gives none (SPEC §8.2's example).
 pub const DEFAULT_LEASE_SECS: u32 = 43_200;

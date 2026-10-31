@@ -30,7 +30,7 @@ use crate::sys;
 const ETH_P_IP: u16 = 0x0800;
 const BROADCAST_MAC: [u8; 6] = [0xff; 6];
 /// Larger than any DHCP message a server may send us (we advertise 1500).
-const RECEIVE_BUFFER: usize = 4096;
+pub(crate) const RECEIVE_BUFFER: usize = 4096;
 
 /// One WAN port's client: which interface, who we are, what to start from.
 #[derive(Debug, Clone)]
@@ -87,11 +87,11 @@ pub enum DriverError {
     Address(u32),
 }
 
-fn socket_err(what: &'static str) -> impl Fn(nix::Error) -> DriverError {
+pub(crate) fn socket_err(what: &'static str) -> impl Fn(nix::Error) -> DriverError {
     move |source| DriverError::Socket { what, source }
 }
 
-fn io_err(what: &'static str) -> impl Fn(std::io::Error) -> DriverError {
+pub(crate) fn io_err(what: &'static str) -> impl Fn(std::io::Error) -> DriverError {
     move |source| DriverError::Io { what, source }
 }
 
@@ -327,14 +327,14 @@ fn raw_socket(ifindex: u32) -> Result<AsyncFd<OwnedFd>, DriverError> {
 
 /// Errors the kernel reports on a socket whose device went down or away: the core's timers and
 /// the next link-up recover from them, so they are logged, not fatal.
-fn is_transient(err: &std::io::Error) -> bool {
+pub(crate) fn is_transient(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
         Some(libc::ENETDOWN | libc::ENXIO | libc::ENODEV)
     )
 }
 
-async fn wait_until(deadline: Option<Instant>) {
+pub(crate) async fn wait_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
