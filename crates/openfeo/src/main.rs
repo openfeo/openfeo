@@ -10,8 +10,10 @@ mod chaos;
 mod cli;
 mod dhcp4;
 mod dhcp4_server;
+mod dns;
 mod heartbeat;
 mod router;
+mod throttle;
 mod version;
 
 use openfeo_init::cmdline;

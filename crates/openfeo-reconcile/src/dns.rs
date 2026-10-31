@@ -44,6 +44,9 @@ pub struct DesiredDns {
     pub upstreams: Vec<Ipv4Addr>,
     /// The WAN whose servers were appended.
     pub learned_from: Option<String>,
+    /// The servers that WAN learned or was given, before deduplication: an upstream outside
+    /// this list was typed into `[dns]`.
+    pub wan_upstreams: Vec<Ipv4Addr>,
     /// `[system] domain`, else `home.arpa`.
     pub domain: String,
     /// `<hostname>.<domain>`.
@@ -108,14 +111,15 @@ pub fn desired(world: &World) -> DesiredDns {
         push_unique(&mut upstreams, upstream);
     }
     let mut learned_from = None;
+    let mut wan_upstreams = Vec::new();
     if dns.use_wan_dns.unwrap_or(true)
         && let Some(active) = active_wan(world)
     {
-        let learned = wan_dns(world, active);
-        if !learned.is_empty() {
+        wan_upstreams = wan_dns(world, active);
+        if !wan_upstreams.is_empty() {
             learned_from = Some(active.name.clone());
-            for upstream in learned {
-                push_unique(&mut upstreams, upstream);
+            for upstream in &wan_upstreams {
+                push_unique(&mut upstreams, *upstream);
             }
         }
     }
@@ -125,6 +129,7 @@ pub fn desired(world: &World) -> DesiredDns {
         listeners,
         upstreams,
         learned_from,
+        wan_upstreams,
         router_name: format!("{hostname}.{domain}"),
         domain,
         lan_subnets,

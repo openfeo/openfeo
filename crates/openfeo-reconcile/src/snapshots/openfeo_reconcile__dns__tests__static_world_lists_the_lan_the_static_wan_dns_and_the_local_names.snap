@@ -8,6 +8,8 @@ listeners:
 upstreams:
   - 203.0.113.1
 learned_from: wan0
+wan_upstreams:
+  - 203.0.113.1
 domain: home.arpa
 router_name: openfeo.home.arpa
 router_addrs:
