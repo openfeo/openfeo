@@ -10,6 +10,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+ipnet.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

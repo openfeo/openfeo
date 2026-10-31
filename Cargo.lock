@@ -1182,6 +1182,7 @@ name = "openfeo-proto-dns"
 version = "0.1.0"
 dependencies = [
  "hickory-proto 0.25.2",
+ "ipnet",
  "thiserror",
 ]
 

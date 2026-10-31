@@ -313,6 +313,27 @@ impl Message {
         })
     }
 
+    /// A FORMERR for `bytes` whose header decodes but whose body does not: the id, opcode and
+    /// RD it carried, no question. `None` when there is not even a header.
+    #[must_use]
+    pub fn formerr(bytes: &[u8]) -> Option<Message> {
+        if bytes.len() < HEADER_LEN {
+            return None;
+        }
+        let header = Header::decode(bytes);
+        Some(Message {
+            header: Header {
+                id: header.id,
+                response: true,
+                opcode: header.opcode,
+                recursion_desired: header.recursion_desired,
+                rcode: rcode::FORMERR,
+                ..Header::default()
+            },
+            ..Message::default()
+        })
+    }
+
     /// A reply to `query` with `rcode`: id, opcode, RD and CD copied, QR set, the question
     /// copied, nothing else.
     #[must_use]

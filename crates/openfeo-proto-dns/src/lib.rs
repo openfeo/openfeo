@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod forwarder;
 pub mod name;
 pub mod wire;
 
