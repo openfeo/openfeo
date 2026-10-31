@@ -11,6 +11,7 @@
 pub mod client;
 pub mod discipline;
 pub mod packet;
+pub mod responder;
 pub mod timestamp;
 
 pub use packet::Packet;
