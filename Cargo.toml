@@ -13,7 +13,7 @@ rust-version = "1.99"
 libc = "0.2"
 thiserror = "2"
 anyhow = "1"
-nix = { version = "0.30", features = ["sched", "mount", "user", "fs", "process", "signal"] }
+nix = { version = "0.30", features = ["sched", "mount", "user", "fs", "process", "signal", "net"] }
 regex = "1"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
@@ -42,6 +42,8 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 mimalloc = "0.1"
 insta = { version = "1", features = ["yaml"] }
 proptest = "1"
+# M1 part 2b: differential oracle for openfeo-proto-dhcp4's codec; dev-dependency and fuzz only, never shipped
+dhcproto = "0.15"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

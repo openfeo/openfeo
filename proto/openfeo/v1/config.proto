@@ -86,8 +86,50 @@ message StaticWan {
   repeated string dns = 3;
 }
 
-// Options arrive with the DHCPv4 client (M1 part 2).
-message DhcpWan {}
+// A WAN that takes its address from the ISP's DHCPv4 server (SPEC §7.2). Each option is sent
+// only when set.
+message DhcpWan {
+  // Option 12, the host name as DNS labels; empty = not sent.
+  string hostname = 1;
+  // Option 60, the vendor class identifier, printable ASCII up to 255 bytes; empty = not sent.
+  string vendor_class = 2;
+}
+
+// One classless static route of a lease (RFC 3442).
+message Dhcp4Route {
+  // "198.51.100.0/24"; "0.0.0.0/0" is the default route.
+  string dst = 1;
+  // "203.0.113.1".
+  string via = 2;
+}
+
+// The file format of `/state/leases/dhcp4-<wan>.toml`: the last lease a WAN's DHCPv4 client
+// held, confirmed with INIT-REBOOT after a reboot (SPEC §7.2). Ignored when `wan` or `mac` differ
+// from the WAN reading it.
+message Dhcp4Lease {
+  string wan = 1;
+  // The port's hardware address when the lease was taken, "52:54:00:fe:00:00".
+  string mac = 2;
+  // "203.0.113.100/24".
+  string address = 3;
+  // The server to renew with, "203.0.113.1".
+  string server = 4;
+  // Option 3's first router; empty when classless routes are present (RFC 3442).
+  string gateway = 5;
+  repeated string dns = 6;
+  string domain = 7;
+  // 0 = none.
+  uint32 mtu = 8;
+  repeated Dhcp4Route routes = 9;
+  uint32 lease_secs = 10;
+  uint32 t1_secs = 11;
+  uint32 t2_secs = 12;
+  // Wall-clock seconds when the ACK arrived; informational.
+  uint64 obtained_unix = 13;
+  repeated string ntp = 14;
+  // Option 28; empty = none.
+  string broadcast = 15;
+}
 
 // A LAN is a bridge of one or more ports (SPEC §7.1).
 message Lan {

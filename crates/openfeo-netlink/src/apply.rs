@@ -12,7 +12,7 @@ use futures::TryStreamExt as _;
 use ipnet::IpNet;
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
-use netlink_packet_route::route::{RouteMessage, RouteProtocol};
+use netlink_packet_route::route::{RouteMessage, RouteProtocol, RouteScope};
 use rtnetlink::{LinkBridge, LinkUnspec, RouteMessageBuilder};
 
 use crate::monitor::{Error, Netlink, request_error};
@@ -117,6 +117,21 @@ impl Netlink {
                     e,
                 )
             })
+    }
+
+    /// `ip link set <index> mtu <mtu>`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses (`EINVAL` for an MTU the device cannot take).
+    pub async fn link_set_mtu(&self, index: u32, mtu: u32) -> Result<(), Error> {
+        let message = LinkUnspec::new_with_index(index).mtu(mtu).build();
+        self.handle
+            .link()
+            .set(message)
+            .execute()
+            .await
+            .map_err(|e| request_error(format!("set link {index} mtu {mtu}"), e))
     }
 
     /// `ip link set <index> name <name>`; the link should be down.
@@ -256,7 +271,18 @@ pub fn describe(route: &Route) -> String {
     text
 }
 
+/// The message for `route`. A route without a gateway is a host or network on the device and
+/// gets link scope, as `ip route add <dst> dev <if>` does; a gateway route through such a host
+/// is refused unless the host route has that scope.
 fn route_message(route: &Route) -> RouteMessage {
+    let mut message = route_message_builder(route);
+    if route.gateway.is_none() {
+        message.header.scope = RouteScope::Link;
+    }
+    message
+}
+
+fn route_message_builder(route: &Route) -> RouteMessage {
     let protocol = RouteProtocol::from(route.protocol);
     if route.v6 {
         let mut builder = RouteMessageBuilder::<Ipv6Addr>::new()

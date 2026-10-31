@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap};
 
-use crate::MacAddr;
+use crate::{Dhcp4Fact, MacAddr};
 
 /// What the netlink monitor knows about one interface (SPEC §7.1: link state is a fact).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,10 +39,12 @@ pub struct World {
     pub ports: Arc<PortMap>,
     /// Link facts keyed by interface name.
     pub links: Arc<BTreeMap<String, LinkFact>>,
+    /// DHCPv4 leases keyed by WAN name (SPEC §7.2).
+    pub dhcp4: Arc<BTreeMap<String, Dhcp4Fact>>,
 }
 
 impl World {
-    /// Generation 0 with no link facts yet.
+    /// Generation 0 with no facts yet.
     #[must_use]
     pub fn new(config: Config, ports: PortMap) -> Self {
         World {
@@ -50,6 +52,7 @@ impl World {
             config: Arc::new(config),
             ports: Arc::new(ports),
             links: Arc::new(BTreeMap::new()),
+            dhcp4: Arc::new(BTreeMap::new()),
         }
     }
 

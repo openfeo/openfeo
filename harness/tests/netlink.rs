@@ -7,7 +7,9 @@
 //! scenario uses interface names of its own and deletes them on the way out, because the sandbox's
 //! network namespace outlives the scenarios.
 
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::net::Ipv4Addr;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +31,7 @@ use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
 use openfeo_reconcile::nft::nft;
 use openfeo_reconcile::sysctl::DesiredSysctl;
-use openfeo_world::{LinkFact, MacAddr, World};
+use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, World};
 use tokio::sync::watch;
 
 const SCENARIOS: &[Scenario] = &[
@@ -84,6 +86,18 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "http_get_reaches_a_server_in_the_sandbox",
         run: http_get_reaches_a_server_in_the_sandbox,
+    },
+    Scenario {
+        name: "link_set_mtu_shows_in_the_cache",
+        run: link_set_mtu_shows_in_the_cache,
+    },
+    Scenario {
+        name: "links_applier_sets_a_dhcp_wan_mtu",
+        run: links_applier_sets_a_dhcp_wan_mtu,
+    },
+    Scenario {
+        name: "routing_applier_adds_a_host_route_before_an_off_link_default",
+        run: routing_applier_adds_a_host_route_before_an_off_link_default,
     },
 ];
 
@@ -388,6 +402,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         config: Arc::new(config.clone()),
         ports: Arc::new(ports),
         links: Arc::new(links),
+        dhcp4: Arc::new(BTreeMap::new()),
     }
 }
 
@@ -784,4 +799,134 @@ fn http_get_reaches_a_server_in_the_sandbox(lab: &mut Lab) -> anyhow::Result<()>
     );
     ensure!(refused.is_err(), "a closed port must be an error");
     Ok(())
+}
+
+/// `link_set_mtu` and the cache's view of it.
+fn link_set_mtu_shows_in_the_cache(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "mv0"]);
+    netns::ip(&["link", "add", "mv0", "type", "veth", "peer", "name", "mv1"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let (index, mtu) = {
+            let cache = rx.borrow().clone();
+            let link = cache.link_by_name("mv0").context("mv0 in the dump")?;
+            (link.index, link.mtu)
+        };
+        ensure!(mtu == 1500, "a veth starts at 1500, not {mtu}");
+        nl.link_set_mtu(index, 1400).await?;
+        wait_until(&mut rx, "mv0 mtu 1400", |c| {
+            c.link_by_name("mv0").is_some_and(|l| l.mtu == 1400)
+        })
+        .await?;
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "mv0"]);
+    result?
+}
+
+/// A DHCP WAN's lease MTU reaches the port through the links applier, and a second pass with
+/// the same World changes nothing.
+fn links_applier_sets_a_dhcp_wan_mtu(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let config = openfeo_config::file::parse(include_str!("../fixtures/vm-dhcp.toml"))?;
+        let fact = Dhcp4Fact {
+            address: "203.0.113.100/24".parse()?,
+            server: Ipv4Addr::new(203, 0, 113, 1),
+            gateway: None,
+            routes: Vec::new(),
+            dns: Vec::new(),
+            domain: None,
+            mtu: Some(1400),
+        };
+        let mut rig = Rig::connect().await?;
+        let pass = async |rig: &mut Rig| -> anyhow::Result<usize> {
+            let cache = rig.rx.borrow_and_update().clone();
+            let mut world = world_from(&cache, &config);
+            world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact.clone())]));
+            let report = rig
+                .links
+                .apply(&openfeo_reconcile::links::links(&world), &cache, &rig.nl)
+                .await?;
+            Ok(report.ops)
+        };
+        let first = pass(&mut rig).await?;
+        ensure!(first >= 1, "first pass did nothing");
+        wait_until(&mut rig.rx, "p0 mtu 1400", |c| {
+            c.link_by_name("p0").is_some_and(|l| l.mtu == 1400 && l.up)
+        })
+        .await?;
+        let again = pass(&mut rig).await?;
+        ensure!(again == 0, "second pass changed {again} things");
+        anyhow::Ok(())
+    })?
+}
+
+/// A lease whose gateway lies outside the leased /32 (cloud and some ISP DHCP): the host route to
+/// the gateway goes in before the default route, so the kernel accepts both in one pass.
+fn routing_applier_adds_a_host_route_before_an_off_link_default(
+    _lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let config = openfeo_config::file::parse(include_str!("../fixtures/vm-dhcp.toml"))?;
+        let gateway = Ipv4Addr::new(203, 0, 113, 1);
+        let fact = Dhcp4Fact {
+            address: "203.0.113.100/32".parse()?,
+            server: gateway,
+            gateway: Some(gateway),
+            routes: Vec::new(),
+            dns: Vec::new(),
+            domain: None,
+            mtu: None,
+        };
+        let mut rig = Rig::connect().await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let mut world = world_from(&cache, &config);
+        world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact.clone())]));
+        rig.links
+            .apply(&openfeo_reconcile::links::links(&world), &cache, &rig.nl)
+            .await?;
+        wait_until(&mut rig.rx, "p0 up", |c| {
+            c.link_by_name("p0").is_some_and(|l| l.up)
+        })
+        .await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let mut world = world_from(&cache, &config);
+        world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        let report = rig
+            .routing
+            .apply(
+                &openfeo_reconcile::routing::routing(&world),
+                &cache,
+                &rig.nl,
+            )
+            .await
+            .context("routing pass with an off-link gateway")?;
+        ensure!(
+            report.ops == 4,
+            "LAN address, WAN address, host route and default: {}",
+            report.ops
+        );
+        wait_until(
+            &mut rig.rx,
+            "default via 203.0.113.1 and 203.0.113.1/32",
+            |c| {
+                let p0 = c.link_by_name("p0").map(|l| l.index);
+                c.routes.iter().any(|r| {
+                    r.dst.is_none()
+                        && r.gateway.map(|g| g.to_string()) == Some("203.0.113.1".to_owned())
+                        && r.oif == p0
+                }) && c.routes.iter().any(|r| {
+                    r.dst.map(|d| d.to_string()) == Some("203.0.113.1/32".to_owned())
+                        && r.gateway.is_none()
+                        && r.protocol == RTPROT_OPENFEO
+                })
+            },
+        )
+        .await?;
+        anyhow::Ok(())
+    })?
 }

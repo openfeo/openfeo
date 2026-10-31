@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::Ipv4Net;
 
-use crate::{Config, Firewall, PortMap, wan};
+use crate::{Config, DhcpWan, Firewall, PortMap, wan};
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -48,6 +48,10 @@ pub enum Code {
     ReservedPort,
     /// The same protocol and port forwarded twice.
     DuplicateForward,
+    /// A `[wans.dhcp]` hostname that is not a DNS host name.
+    InvalidHostname,
+    /// A `[wans.dhcp]` vendor class that is empty, over 255 bytes or not printable ASCII.
+    InvalidVendorClass,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -60,6 +64,36 @@ pub const MAX_FORWARD_NAME: usize = 32;
 pub const MAX_LAN_NAME: usize = 15 - "br-".len();
 /// Longest WAN name: `ppp-<wan>` (M3) must fit the kernel's 15-byte interface name.
 pub const MAX_WAN_NAME: usize = 15 - "ppp-".len();
+
+/// Longest host name sent as DHCP option 12 (RFC 1035 §2.3.4).
+pub const MAX_HOSTNAME: usize = 253;
+/// Longest vendor class sent as DHCP option 60 (one option's payload).
+pub const MAX_VENDOR_CLASS: usize = 255;
+
+/// A DNS host name (RFC 1123 §2.1): dot-separated labels of `[A-Za-z0-9-]`, 1 to 63 bytes each,
+/// never starting or ending with a hyphen, at most [`MAX_HOSTNAME`] bytes in all.
+#[must_use]
+pub fn is_valid_hostname(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HOSTNAME
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+/// A vendor class identifier: 1 to [`MAX_VENDOR_CLASS`] bytes of printable ASCII.
+#[must_use]
+pub fn is_valid_vendor_class(class: &str) -> bool {
+    !class.is_empty()
+        && class.len() <= MAX_VENDOR_CLASS
+        && class.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
 
 /// A logical name the kernel accepts inside an interface name: `[a-z0-9][a-z0-9_-]*`, at most
 /// `max_len` bytes.
@@ -95,6 +129,8 @@ impl Code {
             Code::ForwardTargetOutsideLan => "forward_target_outside_lan",
             Code::ReservedPort => "reserved_port",
             Code::DuplicateForward => "duplicate_forward",
+            Code::InvalidHostname => "invalid_hostname",
+            Code::InvalidVendorClass => "invalid_vendor_class",
         }
     }
 }
@@ -163,7 +199,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
                 Code::MissingKind,
                 "a WAN needs exactly one of [wans.static], [wans.dhcp]".to_owned(),
             ),
-            Some(wan::Kind::Dhcp(_)) => {}
+            Some(wan::Kind::Dhcp(dhcp)) => dhcp_wan(&mut report, &path, dhcp),
             Some(wan::Kind::Static(s)) => {
                 let net = report.cidr(&format!("{path}.static.address"), &s.address);
                 let gateway = report.addr4(&format!("{path}.static.gateway"), &s.gateway);
@@ -225,6 +261,30 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         }
     }
     report.0
+}
+
+/// The `[wans.dhcp]` options: a host name and a vendor class, each checked only when set.
+fn dhcp_wan(report: &mut Report, path: &str, dhcp: &DhcpWan) {
+    if !dhcp.hostname.is_empty() && !is_valid_hostname(&dhcp.hostname) {
+        report.push(
+            format!("{path}.dhcp.hostname"),
+            Code::InvalidHostname,
+            format!(
+                "{:?} is not a host name: labels of [A-Za-z0-9-] up to 63 bytes, not starting or ending with a hyphen, {MAX_HOSTNAME} bytes in all",
+                dhcp.hostname
+            ),
+        );
+    }
+    if !dhcp.vendor_class.is_empty() && !is_valid_vendor_class(&dhcp.vendor_class) {
+        report.push(
+            format!("{path}.dhcp.vendor_class"),
+            Code::InvalidVendorClass,
+            format!(
+                "{:?} must be 1 to {MAX_VENDOR_CLASS} bytes of printable ASCII",
+                dhcp.vendor_class
+            ),
+        );
+    }
 }
 
 /// `firewall.port_forwards[i]`: name, protocol, port (not one of the router's own), target
@@ -387,7 +447,9 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Firewall, Lan, PortForward, PortMap, PortMapEntry, StaticWan, Wan, wan};
+    use crate::{
+        Config, DhcpWan, Firewall, Lan, PortForward, PortMap, PortMapEntry, StaticWan, Wan, wan,
+    };
 
     fn entry(id: &str, name: &str) -> PortMapEntry {
         PortMapEntry {
@@ -416,6 +478,19 @@ mod tests {
                 address: address.into(),
                 gateway: gateway.into(),
                 dns: dns.iter().map(|s| (*s).to_owned()).collect(),
+            })),
+        }
+    }
+
+    fn dhcp_wan(hostname: &str, vendor_class: &str) -> Wan {
+        Wan {
+            name: "wan0".into(),
+            port: "p0".into(),
+            vlan: 0,
+            priority: 10,
+            kind: Some(wan::Kind::Dhcp(DhcpWan {
+                hostname: hostname.into(),
+                vendor_class: vendor_class.into(),
             })),
         }
     }
@@ -451,6 +526,50 @@ mod tests {
     #[test]
     fn valid_config_has_no_violations() {
         assert_eq!(validate(&base(), &live()), vec![]);
+    }
+
+    #[test]
+    fn dhcp_wan_options_are_validated() {
+        let mut cfg = base();
+        cfg.wans = vec![dhcp_wan("openfeo-lab", "OpenFeO/0.1")];
+        assert_eq!(found(&cfg), vec![]);
+        cfg.wans = vec![dhcp_wan("", "")];
+        assert_eq!(found(&cfg), vec![], "empty means the option is not sent");
+        let long_labels = format!("{}.{}", "a".repeat(63), "b".repeat(63));
+        cfg.wans = vec![dhcp_wan(&long_labels, "")];
+        assert_eq!(
+            found(&cfg),
+            vec![],
+            "63-byte labels are the limit, not over it"
+        );
+        for bad in [
+            "-bad",
+            "bad-",
+            "a..b",
+            "under_score",
+            "sp ace",
+            &"a".repeat(64),
+        ] {
+            cfg.wans = vec![dhcp_wan(bad, "")];
+            assert_eq!(
+                found(&cfg),
+                vec![("wans[0].dhcp.hostname".to_owned(), Code::InvalidHostname)],
+                "{bad:?}"
+            );
+        }
+        for bad in [&"x".repeat(256), "tab\there", "ünïcödé"] {
+            cfg.wans = vec![dhcp_wan("", bad)];
+            assert_eq!(
+                found(&cfg),
+                vec![(
+                    "wans[0].dhcp.vendor_class".to_owned(),
+                    Code::InvalidVendorClass
+                )],
+                "{bad:?}"
+            );
+        }
+        cfg.wans = vec![dhcp_wan("", &"x".repeat(255))];
+        assert_eq!(found(&cfg), vec![], "255 bytes is the limit");
     }
 
     #[test]

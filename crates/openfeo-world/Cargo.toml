@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 openfeo-config = { path = "../openfeo-config" }
+ipnet.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

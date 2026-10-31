@@ -18,8 +18,12 @@ only what they tag: LAN bridge, static WAN address and default route, and one `t
 ruleset generated from the configuration and applied through libnftables linked in-process (zones
 as named sets, default deny inbound on the WAN, masquerade, port forwards with hairpin,
 reverse-path filtering in nft). Forwarding is switched on only together with that ruleset, and a
-router-process crash does not interrupt traffic. Still to come in M1: the DHCPv4 client, the LAN
-DHCP server, the DNS forwarder and SNTP.
+router-process crash does not interrupt traffic. A WAN configured `[wans.dhcp]` takes its
+address, routes, MTU and DNS from the ISP's DHCPv4 server through an in-house sans-IO client,
+driven over a packet socket until it is bound and over UDP after; it renews the lease, confirms
+it again after a link flap and after a reboot (INIT-REBOOT from the lease kept under
+`/state/leases`), and never holds the LAN back when no server answers. Still to come in M1: the
+LAN DHCP server, the DNS forwarder and SNTP.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).

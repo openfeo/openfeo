@@ -7,7 +7,8 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 ## Commands
 - `make bin`           static musl binary (`--features harness` by default; `FEATURES=` for a release build)
 - `make kernel`        fetch/verify/build Linux (see `kernel/`) with the binary embedded → `build/bzImage`
-- `make run`           boot the VM in the rootless lab with the serial console on your terminal (Ctrl-A x quits)
+- `make run`           boot the VM in the rootless lab with the serial console on your terminal (Ctrl-A x quits);
+                       `CONFIG=harness/fixtures/vm-dhcp.toml` boots with a DHCP WAN served by the lab's Kea
 - `make test`          unit tests; `make test-harness` runs the QEMU scenarios (`FILTER=name` to pick one)
 - `make lint`          fmt, clippy (-D warnings), cargo-deny, SPDX headers
 - `make ci`            everything CI runs, in CI's order
@@ -18,7 +19,7 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 ## Rules
 - Rust stable, edition 2024, musl targets. `clippy -D warnings`, pedantic as warnings. No `unwrap`/`expect`
   outside tests. `thiserror` in libraries, `anyhow` only in `crates/openfeo` and `harness/`.
-- `#![forbid(unsafe_code)]` everywhere except `openfeo-init` (and later `openfeo-nft`), where `unsafe` is
+- `#![forbid(unsafe_code)]` everywhere except `openfeo-init`, `openfeo-nft` and `openfeo-net` (ADR-0013), where `unsafe` is
   confined to `sys.rs` with `// SAFETY:` comments.
 - No shelling out: `std::process::Command` is banned outside `harness/` and `image/` (clippy enforces it).
 - Only `openfeo-netlink`, `openfeo-nft`, `openfeo-net`, `openfeo-platform` and `openfeo-init` may call the kernel;
@@ -35,4 +36,8 @@ readable, and unprivileged user namespaces enabled. Host-side `pppd` (M3) additi
 group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4`, `mkfs.ext4`, `ping`, `python3`
 (HTTP targets); building needs `musl-gcc`, `pkg-config`, `bison`, `flex`. The sandboxed nft scenarios need the
 kernel to load the `ct`/`fib`/`nat` nft modules; a host that cannot (upgraded, not rebooted) makes them skip with
-a reason, `make check-env` says so, and CI sets `OPENFEO_NO_SKIP=1` so a skip fails there.
+a reason, `make check-env` says so, and CI sets `OPENFEO_NO_SKIP=1` so a skip fails there. The `dhcp4` sandbox
+suite runs the DHCPv4 client against Kea over a veth pair, no QEMU; Kea's one template serves 60-second leases
+renewing at 20 s to every lab run, so a renewal is observable within a scenario. CI runs Ubuntu 24.04's Kea
+2.4.1, so the template uses only what that version accepts (option 121 is given by code as RFC 3442 bytes);
+`make check-env` tests the template against the installed Kea and prints Kea's own error when it refuses.

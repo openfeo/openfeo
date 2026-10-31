@@ -356,6 +356,7 @@ priority = 10
 username = "..."
 password = "..."
 # [wans.static]            # a static WAN instead: address = "203.0.113.10/24", gateway = "203.0.113.1", dns = ["203.0.113.1"]
+# [wans.dhcp]              # a DHCP WAN instead; optional hostname = "myrouter", vendor_class = "OpenFeO" (sent only when set)
 [wans.ipv6]
 mode = "auto"              # auto | disabled
 pd_hint = 48
@@ -434,7 +435,7 @@ Vue 3 + TypeScript, built with Vite, embedded into the binary at build time. Pag
 - Updates: manifest and image signatures verified before anything is written; a verification failure is an event, never a silent retry loop.
 - Backups are encrypted (Argon2id-derived key, XChaCha20-Poly1305, or `age`); the export dialog refuses an empty passphrase.
 - Secrets are never logged; the support bundle redacts them.
-- Memory safety: `#![forbid(unsafe_code)]` in every crate except `openfeo-init` and `openfeo-nft`, where `unsafe` is confined to small modules with `// SAFETY:` comments; every parser is fuzzed in CI.
+- Memory safety: `#![forbid(unsafe_code)]` in every crate except `openfeo-init`, `openfeo-nft` and `openfeo-net` (ADR-0013: AF_PACKET addresses), where `unsafe` is confined to small modules with `// SAFETY:` comments; every parser is fuzzed in CI.
 
 ## 10. Observability and diagnostics
 

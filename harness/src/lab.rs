@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::daemons::Daemon;
-use crate::lines::Lines;
+use crate::daemons::{self, Daemon};
+use crate::lines::{Cursor, Lines, Regex};
 use crate::netns::NetNs;
 use crate::qemu::{BASE_CMDLINE, ConsoleMode, Nic, Vm, VmSpec};
 use crate::qmp::Qmp;
@@ -116,6 +116,24 @@ impl Lab {
             .ip(&["addr", "replace", LAN_HOST_ADDR, "dev", "lan0"])?;
         self.lan0
             .ip(&["route", "replace", "default", "via", LAN_GATEWAY])?;
+        Ok(())
+    }
+
+    /// Start Kea on ISP A's `wan0`, serving `203.0.113.100-200` with the lab's short lifetimes
+    /// and options (`harness/fixtures/kea-dhcp4.json.tmpl`); returns once it announces itself.
+    /// The daemon joins [`Lab::daemons`], named `kea-dhcp4`.
+    ///
+    /// # Errors
+    ///
+    /// When Kea cannot be started or does not come up within 15 s.
+    pub fn start_kea(&mut self) -> Result<()> {
+        let kea = daemons::kea_dhcp4(&self.isp0, "wan0", &self.run_dir)?;
+        kea.log.wait_for(
+            &mut Cursor::default(),
+            &Regex::new("DHCP4_STARTED").context("regex")?,
+            Duration::from_secs(15),
+        )?;
+        self.daemons.push(kea);
         Ok(())
     }
 

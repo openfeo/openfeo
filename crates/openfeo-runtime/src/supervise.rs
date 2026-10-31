@@ -46,12 +46,13 @@ impl Supervisor {
     /// backoff of 1 s doubling to 30 s. A task that returns `Ok` is finished and not restarted.
     /// After [`MAX_RESTARTS`] restarts within [`WINDOW`] the task is dead: reported to health and
     /// left stopped.
-    pub fn spawn<F, Fut>(&self, name: &'static str, factory: F) -> JoinHandle<()>
+    pub fn spawn<F, Fut>(&self, name: impl Into<String>, factory: F) -> JoinHandle<()>
     where
         F: Fn() -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), TaskError>> + Send + 'static,
     {
         let health = self.health.clone();
+        let name = name.into();
         tokio::spawn(async move {
             let mut restarts: VecDeque<Instant> = VecDeque::new();
             let mut backoff = INITIAL_BACKOFF;
@@ -72,7 +73,7 @@ impl Supervisor {
                     restarts.pop_front();
                 }
                 if restarts.len() >= MAX_RESTARTS {
-                    health.task_dead(name);
+                    health.task_dead(&name);
                     error!(
                         "task {name} dead after {MAX_RESTARTS} restarts in {}s; heartbeat withheld",
                         WINDOW.as_secs()
@@ -133,6 +134,17 @@ mod tests {
             "third attempt runs forever"
         );
         assert!(health.is_healthy(std::time::Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_takes_owned_names() {
+        let health = HealthTracker::new();
+        let supervisor = Supervisor::new(health.clone());
+        let (_, factory) = failing_until(usize::MAX);
+        let handle = supervisor.spawn(format!("dhcp4-{}", "wan0"), factory);
+        handle.await.unwrap();
+        let report = health.report(std::time::Instant::now());
+        assert_eq!(report.dead_tasks, vec!["dhcp4-wan0".to_owned()]);
     }
 
     #[tokio::test(start_paused = true)]

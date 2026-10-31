@@ -6,11 +6,16 @@
 //! nothing, a WAN link flap, and a port map that survives a reset. Part 2a, firewall and NAT: a
 //! LAN host fetching HTTP through NAT, a port forward reached from the WAN and by hairpin, a WAN
 //! that is blocked by default, a router-child crash that does not interrupt forwarding, and a
-//! first boot that forwards nothing. Run inside the rootless sandbox; `harness = false`: this
+//! first boot that forwards nothing. Part 2b, the DHCPv4 client: a lease from the ISP's Kea
+//! with NAT on it, a renewal at T1, a link flap that re-acquires, a reset that keeps the
+//! address through INIT-REBOOT, and a WAN without a server that leaves the LAN working. Run
+//! inside the rootless sandbox; `harness = false`: this
 //! binary is its own runner and an optional first argument filters scenarios by substring.
 
 use std::process::ExitCode;
 use std::time::Duration;
+
+use anyhow::Context as _;
 
 use openfeo_harness::daemons::{self, Daemon};
 use openfeo_harness::lab::{BOOT_TIMEOUT, ISP_HTTP_BODY, LAN_HTTP_BODY, Lab};
@@ -61,6 +66,26 @@ const SCENARIOS: &[Scenario] = &[
         name: "first_boot_forwards_nothing",
         run: first_boot_forwards_nothing,
     },
+    Scenario {
+        name: "dhcp_wan_gets_a_lease_and_nats",
+        run: dhcp_wan_gets_a_lease_and_nats,
+    },
+    Scenario {
+        name: "dhcp_lease_renews_at_t1",
+        run: dhcp_lease_renews_at_t1,
+    },
+    Scenario {
+        name: "dhcp_wan_link_flap_reacquires",
+        run: dhcp_wan_link_flap_reacquires,
+    },
+    Scenario {
+        name: "dhcp_lease_survives_reset",
+        run: dhcp_lease_survives_reset,
+    },
+    Scenario {
+        name: "dhcp_without_a_server_keeps_the_lan_working",
+        run: dhcp_without_a_server_keeps_the_lan_working,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -85,6 +110,14 @@ const LAN_HTTP: &str = "192.168.1.2:8080";
 const WAN_FORWARD: &str = "203.0.113.10:2222";
 /// Operations a converged restart must not log.
 const KERNEL_CHANGES: &str = r"openfeo: (add|del|enslave|release|renamed|set \S+ (up|down|mac)) ";
+/// The lab's DHCP configuration: WAN A on p0 takes its address from isp0's Kea, LAN on p2.
+const VM_DHCP: &str = include_str!("../fixtures/vm-dhcp.toml");
+/// An address in Kea's pool, 203.0.113.100-200.
+const DHCP_POOL: &str = r"203\.0\.113\.(?:1\d\d|200)";
+/// The box's DUID: DUID-LL of p0's MAC.
+const DUID_LINE: &str = r"openfeo: identity: duid 00030001525400fe0000";
+/// Kea renews at 20 s; the client's retransmission jitter adds up to a second.
+const RENEW_TIMEOUT: Duration = Duration::from_secs(35);
 
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|err| panic!("bad test regex {pattern:?}: {err}"))
@@ -462,4 +495,212 @@ fn first_boot_forwards_nothing(lab: &mut Lab) -> anyhow::Result<()> {
     );
     address_lan_side(lab)?;
     ping(&lab.lan0, "192.168.1.1")
+}
+
+/// Boot `VM_DHCP` with Kea on the ISP side and wait for the lease: the console cursor just past
+/// the `bound` line, and the leased address.
+fn boot_dhcp(lab: &mut Lab) -> anyhow::Result<(Cursor, String)> {
+    lab.start_kea()?;
+    lab.with_config(VM_DHCP)?;
+    lab.boot("")?;
+    let c = lab.console()?;
+    let mut cur = Cursor::default();
+    let bound = c.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: wan wan0 dhcp bound ({DHCP_POOL})/24 via 203\.0\.113\.1 lease=60s t1=20s t2=40s server=203\.0\.113\.1"
+        )),
+        BOOT_TIMEOUT,
+    )?;
+    let address = bound
+        .groups
+        .first()
+        .cloned()
+        .flatten()
+        .context("no address in the bound line")?;
+    Ok((cur, address))
+}
+
+/// How many lines of Kea's log match `pattern`.
+fn kea_log_count(lab: &Lab, pattern: &str) -> usize {
+    lab.daemons
+        .iter()
+        .filter(|daemon| daemon.name == "kea-dhcp4")
+        .map(|daemon| daemon.log.count(&re(pattern)))
+        .sum()
+}
+
+/// `203.0.113.100` as a regex.
+fn escaped(address: &str) -> String {
+    address.replace('.', r"\.")
+}
+
+/// The box takes its WAN address from Kea: DISCOVER, OFFER, REQUEST, bound; the lease's address,
+/// routes and MTU reach the kernel; a LAN host fetches through NAT on the leased address.
+fn dhcp_wan_gets_a_lease_and_nats(lab: &mut Lab) -> anyhow::Result<()> {
+    let (mut cur, address) = boot_dhcp(lab)?;
+    let server = http_target(lab, &lab.isp0, "203.0.113.1", ISP_HTTP_BODY)?;
+    let c = lab.console()?;
+    let addr = escaped(&address);
+    for expected in [
+        format!(r"{DUID_LINE} \(new\)"),
+        r"openfeo: wan wan0 dhcp discover".to_owned(),
+        format!(r"openfeo: wan wan0 dhcp offer {addr} from 203\.0\.113\.1"),
+        format!(r"openfeo: wan wan0 dhcp request {addr}"),
+        r"openfeo: wan wan0 dhcp options dns=203\.0\.113\.1 domain=isp\.example mtu=1400 routes=2"
+            .to_owned(),
+    ] {
+        anyhow::ensure!(c.count(&re(&expected)) == 1, "missing /{expected}/");
+    }
+    c.wait_for(&mut cur, &re(READY), SOON)?;
+    for expected in [
+        format!(r"openfeo: add addr {addr}/24 dev p0"),
+        r"openfeo: add route default via 203\.0\.113\.1 dev p0 proto 200 metric 10".to_owned(),
+        r"openfeo: add route 198\.51\.100\.0/24 via 203\.0\.113\.1 dev p0 proto 200 metric 10"
+            .to_owned(),
+        r"openfeo: set p0 mtu 1400".to_owned(),
+    ] {
+        anyhow::ensure!(c.count(&re(&expected)) == 1, "missing /{expected}/");
+    }
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: apply \S+ failed")) == 0,
+        "an apply failed"
+    );
+    lab.lan_side_host()?;
+    let body = lanclient::http_get(&lab.lan0, ISP_HTTP.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(body == ISP_HTTP_BODY, "unexpected body {body:?}");
+    anyhow::ensure!(
+        server.log.count(&re(&format!(r"^{addr} - - "))) == 1,
+        "the ISP server did not see the leased address {address}: {:?}",
+        server.log.tail(5)
+    );
+    anyhow::ensure!(
+        server.log.count(&re(r"192\.168\.1\.2")) == 0,
+        "the LAN address leaked to the ISP side: {:?}",
+        server.log.tail(5)
+    );
+    anyhow::ensure!(
+        kea_log_count(lab, "DHCP4_LEASE_ALLOC") >= 1,
+        "Kea did not log the allocation"
+    );
+    Ok(())
+}
+
+/// At T1 (20 s) the client renews by unicast and Kea extends the lease; no second DISCOVER.
+fn dhcp_lease_renews_at_t1(lab: &mut Lab) -> anyhow::Result<()> {
+    let (mut cur, address) = boot_dhcp(lab)?;
+    let after_bound = cur;
+    let c = lab.console()?;
+    c.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: wan wan0 dhcp renewed {}/24 lease=60s",
+            escaped(&address)
+        )),
+        RENEW_TIMEOUT,
+    )?;
+    anyhow::ensure!(
+        c.count_since(&after_bound, &re(r"openfeo: wan wan0 dhcp discover")) == 0,
+        "a renewal must not discover"
+    );
+    anyhow::ensure!(
+        kea_log_count(lab, "DHCP4_LEASE_ALLOC") >= 2,
+        "Kea logged {} allocations, expected the renewal too",
+        kea_log_count(lab, "DHCP4_LEASE_ALLOC")
+    );
+    Ok(())
+}
+
+/// Carrier lost and regained on the WAN port: the client confirms its address with INIT-REBOOT
+/// and is bound to the same address again.
+fn dhcp_wan_link_flap_reacquires(lab: &mut Lab) -> anyhow::Result<()> {
+    let (mut cur, address) = boot_dhcp(lab)?;
+    let c = lab.console()?;
+    c.wait_for(&mut cur, &re(READY), SOON)?;
+    ping(&lab.isp0, &address)?;
+    let mut qmp = lab.qmp()?;
+    qmp.set_link("p0", false)?;
+    c.wait_for(&mut cur, &re(r"openfeo: link p0 down"), SOON)?;
+    qmp.set_link("p0", true)?;
+    c.wait_for(&mut cur, &re(r"openfeo: link p0 up"), SOON)?;
+    let addr = escaped(&address);
+    c.wait_for(
+        &mut cur,
+        &re(&format!(r"openfeo: wan wan0 dhcp init-reboot {addr}")),
+        SOON,
+    )?;
+    c.wait_for(
+        &mut cur,
+        &re(&format!(r"openfeo: wan wan0 dhcp bound {addr}/24")),
+        Duration::from_secs(15),
+    )?;
+    ping(&lab.isp0, &address)?;
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: apply \S+ failed")) == 0,
+        "an apply failed"
+    );
+    Ok(())
+}
+
+/// A reset of the machine: the DUID is read back and the lease file is confirmed with
+/// INIT-REBOOT, so the box comes back with the same address and no DISCOVER.
+fn dhcp_lease_survives_reset(lab: &mut Lab) -> anyhow::Result<()> {
+    let (mut cur, address) = boot_dhcp(lab)?;
+    let c = lab.console()?;
+    c.wait_for(&mut cur, &re(READY), SOON)?;
+    anyhow::ensure!(c.count(&re(&format!(r"{DUID_LINE} \(new\)"))) == 1);
+    lab.qmp()?.system_reset()?;
+    c.wait_for(
+        &mut cur,
+        &re(r"Linux version 6\.18\.59-openfeo"),
+        BOOT_TIMEOUT,
+    )?;
+    let after_reset = cur;
+    c.wait_for(
+        &mut cur,
+        &re(&format!(r"{DUID_LINE} \(known\)")),
+        BOOT_TIMEOUT,
+    )?;
+    let addr = escaped(&address);
+    c.wait_for(
+        &mut cur,
+        &re(&format!(r"openfeo: wan wan0 dhcp init-reboot {addr}")),
+        SOON,
+    )?;
+    c.wait_for(
+        &mut cur,
+        &re(&format!(r"openfeo: wan wan0 dhcp bound {addr}/24")),
+        SOON,
+    )?;
+    c.wait_for(&mut cur, &re(READY), SOON)?;
+    anyhow::ensure!(
+        c.count_since(&after_reset, &re(r"openfeo: wan wan0 dhcp discover")) == 0,
+        "the reboot must reuse the lease, not discover"
+    );
+    Ok(())
+}
+
+/// No DHCP server: the LAN is served and `ready` is announced while the WAN keeps discovering
+/// with backoff; nothing binds.
+fn dhcp_without_a_server_keeps_the_lan_working(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.with_config(VM_DHCP)?;
+    lab.boot("")?;
+    let c = lab.console()?;
+    let mut cur = Cursor::default();
+    c.wait_for(&mut cur, &re(READY), BOOT_TIMEOUT)?;
+    let mut discovers = Cursor::default();
+    let discover = re(r"openfeo: wan wan0 dhcp discover");
+    c.wait_for(&mut discovers, &discover, SOON)?;
+    c.wait_for(&mut discovers, &discover, Duration::from_secs(12))?;
+    lab.lan_side_host()?;
+    ping(&lab.lan0, "192.168.1.1")?;
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: wan wan0 dhcp bound")) == 0,
+        "bound without a server"
+    );
+    anyhow::ensure!(
+        c.count(&re(r"openfeo: apply \S+ failed")) == 0,
+        "an apply failed"
+    );
+    Ok(())
 }

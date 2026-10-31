@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The lab's DHCP configuration: WAN A on p0 takes its address from isp0's Kea (203.0.113.1),
+# a LAN on p2 towards lan0, p1 unassigned; the same LAN and firewall as vm-static.toml. Used by
+# the M1 DHCPv4 scenarios (lease and NAT, renewal, link flap, reset, no server).
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+
+[[wans]]
+name = "wan0"
+port = "p0"
+priority = 10
+[wans.dhcp]
+hostname = "openfeo-lab"
+
+[[lans]]
+name = "lan0"
+ports = ["p2"]
+ipv4 = "192.168.1.1/24"
+
+[firewall]
+wan_ping = true                 # the lab pings the WAN address from the ISP side
+
+[[firewall.port_forwards]]
+name = "lan-http"
+proto = "tcp"
+port = 2222
+to = "192.168.1.2"
+to_port = 8080

@@ -143,6 +143,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             link_facts_task(publisher.clone(), cache_rx.clone())
         });
     }
+    crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
     {
         let health = health.clone();
         supervisor.spawn("apply", move || {

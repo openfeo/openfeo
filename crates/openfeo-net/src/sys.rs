@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andrew Newton
+
+//! The one unsafe module of this crate (ADR-0013): addresses for `AF_PACKET` sockets, and the
+//! registration of an owned descriptor with tokio. nix offers no safe way to build a
+//! `sockaddr_ll`, and a packet socket not bound to its interface would copy every IPv4 frame of
+//! every port to userspace; tokio makes the caller vouch that a registered descriptor stays
+//! open, which an `OwnedFd` guarantees.
+
+use std::mem::size_of;
+use std::os::fd::OwnedFd;
+
+use nix::sys::socket::{LinkAddr, SockaddrLike};
+use tokio::io::unix::AsyncFd;
+
+/// Register `fd` with the tokio reactor for readiness.
+///
+/// # Errors
+///
+/// When the reactor refuses the descriptor (no runtime, or it is not pollable).
+pub fn register(fd: OwnedFd) -> std::io::Result<AsyncFd<OwnedFd>> {
+    // SAFETY: tokio asks the caller to guarantee that the descriptor stays open and is not
+    // closed behind the reactor's back for as long as it is registered. `OwnedFd` owns the
+    // descriptor outright and is moved into the `AsyncFd`, which deregisters it before the
+    // `OwnedFd` drops and closes it; nothing else holds the descriptor.
+    unsafe { AsyncFd::register(fd) }.map_err(std::io::Error::from)
+}
+
+/// A `sockaddr_ll` for interface `ifindex` and Ethernet `protocol` (host order, such as
+/// `ETH_P_IP`), with `dest` as the destination hardware address for `sendto`, or none for
+/// `bind`. `None` only when a value does not fit the kernel's field types.
+#[must_use]
+pub fn link_addr(ifindex: u32, protocol: u16, dest: Option<[u8; 6]>) -> Option<LinkAddr> {
+    let mut sll_addr = [0u8; 8];
+    if let Some(dest) = dest {
+        sll_addr[..6].copy_from_slice(&dest);
+    }
+    let raw = libc::sockaddr_ll {
+        sll_family: u16::try_from(libc::AF_PACKET).ok()?,
+        sll_protocol: protocol.to_be(),
+        sll_ifindex: i32::try_from(ifindex).ok()?,
+        sll_hatype: 0,
+        sll_pkttype: 0,
+        sll_halen: if dest.is_some() { 6 } else { 0 },
+        sll_addr,
+    };
+    let len = libc::socklen_t::try_from(size_of::<libc::sockaddr_ll>()).ok()?;
+    let ptr = std::ptr::from_ref(&raw).cast::<libc::sockaddr>();
+    // SAFETY: `raw` is a fully initialised `sockaddr_ll` that lives for the whole call, its
+    // family is AF_PACKET and `len` is exactly its size; `from_raw` checks both before copying
+    // the bytes into the returned value, which borrows nothing from `raw`.
+    unsafe { LinkAddr::from_raw(ptr, Some(len)) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn link_addr_carries_interface_protocol_and_destination() {
+        let bound = link_addr(7, 0x0800, None).unwrap();
+        assert_eq!(bound.ifindex(), 7);
+        assert_eq!(bound.protocol(), 0x0800u16.to_be());
+        assert_eq!(bound.halen(), 0, "no destination for bind");
+
+        let dest = link_addr(7, 0x0800, Some([0xff; 6])).unwrap();
+        assert_eq!(dest.addr(), Some([0xff; 6]));
+        assert_eq!(dest.halen(), 6);
+    }
+}

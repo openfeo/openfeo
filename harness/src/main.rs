@@ -98,8 +98,7 @@ fn run(
         eprintln!("lab: /state/config.toml from {}", path.display());
     }
     let run_dir = lab.run_dir.clone();
-    let kea = daemons::kea_dhcp4(&lab.isp0, "wan0", &run_dir)?;
-    lab.daemons.push(kea);
+    lab.start_kea()?;
     let http = daemons::http_server(
         &lab.isp0,
         "203.0.113.1",
@@ -110,8 +109,9 @@ fn run(
     lab.daemons.push(http);
     let extra = chaos.map_or_else(String::new, |c| format!("openfeo.chaos={c}"));
     eprintln!(
-        "lab: p0 <-> isp0 wan0 {ISP0_ADDR} (kea-dhcp4, http :8080), p1 <-> isp1 wan1 {ISP1_ADDR}, \
-         p2 <-> lan0; serial console follows, Ctrl-A x quits"
+        "lab: p0 <-> isp0 wan0 {ISP0_ADDR} (kea-dhcp4 60 s leases, http :8080), p1 <-> isp1 wan1 \
+         {ISP1_ADDR}, p2 <-> lan0; --config harness/fixtures/vm-dhcp.toml takes the WAN address \
+         from Kea; serial console follows, Ctrl-A x quits"
     );
     let status = lab.boot_interactive(&extra)?.wait()?;
     Ok(if status.success() {
@@ -153,11 +153,17 @@ fn check() -> Result<ExitCode> {
     ] {
         report(bin, on_path(bin), "");
     }
-    report(
-        "kea-dhcp4 reads our config",
-        kea_config_check(),
-        " (if MISSING on Ubuntu: unload /etc/apparmor.d/usr.sbin.kea-dhcp4; ADR-0006)",
-    );
+    match kea_config_check() {
+        Ok(()) => report("kea-dhcp4 reads our config", true, ""),
+        Err(detail) => report(
+            "kea-dhcp4 reads our config",
+            false,
+            &format!(
+                " ({detail}; if Kea cannot open the file on Ubuntu: unload \
+                 /etc/apparmor.d/usr.sbin.kea-dhcp4, ADR-0006)"
+            ),
+        ),
+    }
     report(
         "unprivileged user namespaces",
         sandbox_works()?,
@@ -182,23 +188,51 @@ fn check() -> Result<ExitCode> {
     })
 }
 
-/// `kea-dhcp4 -t` on a config written outside `/etc/kea`, as the harness does: fails under
-/// Ubuntu's stock AppArmor profile for Kea.
-fn kea_config_check() -> bool {
+/// `kea-dhcp4 -t` on the lab's config written outside `/etc/kea`, as the harness does. Fails
+/// under Ubuntu's stock AppArmor profile for Kea, and on a Kea that rejects something in the
+/// template; the error carries Kea's own message so the cause is on the console.
+fn kea_config_check() -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!("openfeo-harness-check-{}", std::process::id()));
     let config = dir.join("kea-dhcp4.json");
-    let ok = std::fs::create_dir_all(&dir).is_ok()
-        && std::fs::write(&config, daemons::render_kea_dhcp4("lo")).is_ok()
-        && Command::new("kea-dhcp4")
+    let result = (|| {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        std::fs::write(&config, daemons::render_kea_dhcp4("lo"))
+            .map_err(|e| format!("write {}: {e}", config.display()))?;
+        let output = Command::new("kea-dhcp4")
             .arg("-t")
             .arg(&config)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .output()
+            .map_err(|e| format!("run kea-dhcp4: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        Err(kea_error_line(&text))
+    })();
     let _ = std::fs::remove_dir_all(&dir);
-    ok
+    result
+}
+
+/// The message of Kea's first `ERROR` line without its timestamp and logger tag, else the first
+/// non-empty line of the output.
+fn kea_error_line(output: &str) -> String {
+    let Some(line) = output
+        .lines()
+        .find(|line| line.contains(" ERROR "))
+        .or_else(|| output.lines().find(|line| !line.trim().is_empty()))
+    else {
+        return "no output".to_owned();
+    };
+    let message = if line.contains(" ERROR ") {
+        line.find("] ").map_or(line, |end| &line[end + 2..])
+    } else {
+        line
+    };
+    message.trim().to_owned()
 }
 
 fn on_path(bin: &str) -> bool {
@@ -252,4 +286,30 @@ fn sandbox_works() -> Result<bool> {
         .status()
         .context("spawn self")?;
     Ok(status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kea_error_line;
+
+    #[test]
+    fn kea_error_line_keeps_the_message_without_the_log_prefix() {
+        let output = "2026-10-31 06:51:14.457 INFO  [kea-dhcp4.dhcp4/395.140188485249472] DHCP4_CONFIG_RECEIVED\n\
+                      2026-10-31 06:51:14.458 ERROR [kea-dhcp4.dhcp4/395.140188485249472] DHCP4_PARSER_FAIL failed to create or run parser for configuration element subnet4: definition for the option 'dhcp4.classless-static-route' does not exist (/run/kea-dhcp4.json:19:21)\n";
+        assert_eq!(
+            kea_error_line(output),
+            "DHCP4_PARSER_FAIL failed to create or run parser for configuration element subnet4: \
+             definition for the option 'dhcp4.classless-static-route' does not exist \
+             (/run/kea-dhcp4.json:19:21)"
+        );
+    }
+
+    #[test]
+    fn kea_error_line_falls_back_to_the_first_line_of_output() {
+        assert_eq!(
+            kea_error_line("\nkea-dhcp4: Permission denied\n"),
+            "kea-dhcp4: Permission denied"
+        );
+        assert_eq!(kea_error_line(""), "no output");
+    }
 }
