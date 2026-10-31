@@ -138,35 +138,49 @@ pub fn desired(world: &World) -> DesiredDns {
     }
 }
 
-/// The forwarder's configuration for `desired`; `None` when a name does not parse (validation
-/// forbids it).
+/// The forwarder's configuration for `desired`. Validation refuses names that do not parse,
+/// but the forwarder must come up whatever reaches it: a local name or allow-list entry that
+/// does not parse is left out, a domain that does not parse (or is the root, which would make
+/// every name local) falls back to `home.arpa`, and a router name that does not parse falls back
+/// to `openfeo.<domain>`.
 #[must_use]
-pub fn forwarder_config(desired: &DesiredDns) -> Option<Config> {
-    let local = desired
-        .local
-        .iter()
-        .map(|entry| {
-            Some(LocalRecord {
-                name: entry.name.parse().ok()?,
-                addr: entry.addr,
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let rebind_allow = desired
-        .rebind_allow
-        .iter()
-        .map(|name| name.parse::<Name>().ok())
-        .collect::<Option<Vec<_>>>()?;
-    Some(Config {
+pub fn forwarder_config(desired: &DesiredDns) -> Config {
+    let domain = desired
+        .domain
+        .parse::<Name>()
+        .ok()
+        .filter(|name| !name.is_root())
+        .or_else(|| DEFAULT_DOMAIN.parse().ok())
+        .unwrap_or_else(Name::root);
+    let router_name = desired
+        .router_name
+        .parse::<Name>()
+        .ok()
+        .filter(|name| !name.is_root())
+        .or_else(|| format!("{DEFAULT_HOSTNAME}.{domain}").parse().ok());
+    Config {
         upstreams: desired.upstreams.clone(),
-        domain: desired.domain.parse().ok()?,
-        router_name: Some(desired.router_name.parse().ok()?),
+        domain,
+        router_name,
         router_addrs: desired.router_addrs.clone(),
         lan_subnets: desired.lan_subnets.clone(),
-        local,
-        rebind_allow,
+        local: desired
+            .local
+            .iter()
+            .filter_map(|entry| {
+                Some(LocalRecord {
+                    name: entry.name.parse().ok()?,
+                    addr: entry.addr,
+                })
+            })
+            .collect(),
+        rebind_allow: desired
+            .rebind_allow
+            .iter()
+            .filter_map(|name| name.parse().ok())
+            .collect(),
         cache_capacity: DEFAULT_CAPACITY,
-    })
+    }
 }
 
 /// The configured WAN with the lowest priority whose port the map knows.
@@ -245,10 +259,43 @@ mod tests {
                 addr: Ipv4Addr::new(192, 168, 1, 10),
             }]
         );
-        let cfg = forwarder_config(&d).unwrap();
+        let cfg = forwarder_config(&d);
         assert_eq!(
             (cfg.upstreams, cfg.local.len(), cfg.cache_capacity),
             (vec![Ipv4Addr::new(203, 0, 113, 1)], 1, DEFAULT_CAPACITY)
+        );
+    }
+
+    /// Review finding: a name that does not parse must not take the forwarder down; what does
+    /// not parse is skipped, and the domain and router name fall back on the defaults.
+    #[test]
+    fn forwarder_config_skips_what_does_not_parse_and_falls_back_on_the_defaults() {
+        let mut d = desired(&fixtures::static_world());
+        d.domain = ".".into();
+        d.router_name = "bad..name".into();
+        d.local.push(DesiredLocalName {
+            name: format!("{}.home.arpa", "x".repeat(64)),
+            addr: Ipv4Addr::new(192, 168, 1, 77),
+        });
+        d.rebind_allow = vec!["ok.example".into(), "bad..name".into()];
+        let cfg = forwarder_config(&d);
+        assert_eq!(cfg.domain, "home.arpa".parse().unwrap());
+        assert_eq!(cfg.router_name, Some("openfeo.home.arpa".parse().unwrap()));
+        assert_eq!(
+            cfg.local
+                .iter()
+                .map(|record| record.name.to_string())
+                .collect::<Vec<_>>(),
+            vec!["nas.home.arpa."]
+        );
+        assert_eq!(cfg.rebind_allow, vec!["ok.example".parse().unwrap()]);
+        let mut d = desired(&fixtures::static_world());
+        d.domain = "lan.example".into();
+        d.router_name = "bad..name".into();
+        assert_eq!(
+            forwarder_config(&d).router_name,
+            Some("openfeo.lan.example".parse().unwrap()),
+            "the router's fallback name follows the domain"
         );
     }
 

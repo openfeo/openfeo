@@ -23,6 +23,11 @@ pub const MAX_NEGATIVE_TTL: u32 = 3_600;
 pub struct Key {
     pub name: Name,
     pub qtype: u16,
+    /// The client's DO bit: a signed answer and an unsigned one are different answers.
+    pub dnssec_ok: bool,
+    /// The client's CD bit: an answer a validating upstream would otherwise have refused must
+    /// not reach the clients that did not ask for it.
+    pub checking_disabled: bool,
 }
 
 /// One cached answer, as [`Cache::lookup`] hands it back: TTLs already reduced.
@@ -31,6 +36,8 @@ pub struct Entry {
     pub rcode: u8,
     pub answers: Vec<Record>,
     pub authorities: Vec<Record>,
+    /// The upstream's AD bit.
+    pub authentic_data: bool,
     /// When the entry leaves the cache.
     pub expires_at: Timestamp,
 }
@@ -105,6 +112,7 @@ impl Cache {
                         })
                         .collect(),
                     authorities: response.authorities.clone(),
+                    authentic_data: response.header.authentic_data,
                     expires_at: now + Timestamp::from(ttl) * 1000,
                 }
             }
@@ -129,6 +137,7 @@ impl Cache {
                             }
                         })
                         .collect(),
+                    authentic_data: response.header.authentic_data,
                     expires_at: now + Timestamp::from(ttl) * 1000,
                 }
             }
@@ -174,6 +183,7 @@ impl Cache {
             rcode: slot.entry.rcode,
             answers: slot.entry.answers.iter().map(aged).collect(),
             authorities: slot.entry.authorities.iter().map(aged).collect(),
+            authentic_data: slot.entry.authentic_data,
             expires_at: slot.entry.expires_at,
         })
     }
@@ -235,6 +245,8 @@ mod tests {
         Key {
             name: name(text),
             qtype,
+            dnssec_ok: false,
+            checking_disabled: false,
         }
     }
 

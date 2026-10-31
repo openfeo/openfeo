@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::Ipv4Net;
 
-use crate::{Config, DhcpWan, Dns, Firewall, LanDhcp, PortMap, StaticLease, wan};
+use crate::{Config, DhcpWan, Dns, Firewall, LanDhcp, PortMap, StaticLease, System, wan};
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -190,8 +190,8 @@ impl fmt::Display for Violation {
 }
 
 /// Check `config` against the rules and the live port map `ports`. Returns every violation in
-/// document order (`ports`, then `wans`, then `lans`, then `firewall`, then `dns`, then subnet
-/// overlaps); empty means valid.
+/// document order (`system`, then `ports`, then `wans`, then `lans`, then `firewall`, then
+/// `dns`, then subnet overlaps); empty means valid.
 /// Where two items conflict (a name or port used twice, two overlapping subnets) the later one in
 /// document order is flagged.
 #[must_use]
@@ -201,6 +201,10 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     let mut used_ports: BTreeSet<&str> = BTreeSet::new();
     let mut subnets: Vec<(String, Ipv4Net)> = Vec::new();
     let mut lan_subnets: Vec<Ipv4Net> = Vec::new();
+
+    if let Some(system_config) = &config.system {
+        system(&mut report, system_config);
+    }
 
     for (i, entry) in config.ports.iter().enumerate() {
         let live_name = ports.name_of(&entry.id);
@@ -299,6 +303,31 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         }
     }
     report.0
+}
+
+/// `[system]`: the hostname is one DNS label and the domain a host name (together they are the
+/// router's own name and the local DNS zone, SPEC §7.7); empty means the default.
+fn system(report: &mut Report, system: &System) {
+    if !system.hostname.is_empty() && !is_valid_label(&system.hostname) {
+        report.push(
+            "system.hostname".to_owned(),
+            Code::InvalidHostname,
+            format!(
+                "{:?} is not a DNS label: [A-Za-z0-9-] up to {MAX_LABEL} bytes, not starting or ending with a hyphen",
+                system.hostname
+            ),
+        );
+    }
+    if !system.domain.is_empty() && !is_valid_hostname(&system.domain) {
+        report.push(
+            "system.domain".to_owned(),
+            Code::InvalidHostname,
+            format!(
+                "{:?} is not a domain name: labels of [A-Za-z0-9-] up to 63 bytes, not starting or ending with a hyphen, {MAX_HOSTNAME} bytes in all",
+                system.domain
+            ),
+        );
+    }
 }
 
 /// The `[wans.dhcp]` options: a host name and a vendor class, each checked only when set.
@@ -1296,5 +1325,49 @@ mod dns_tests {
             None,
             "absent means the default, true"
         );
+    }
+
+    /// Review finding: `[system]` feeds the DNS local zone, and a name that does not parse
+    /// there took the forwarder down; the hostname is one label, the domain a host name.
+    #[test]
+    fn system_hostname_is_a_label_and_domain_a_host_name() {
+        let bad = file::parse(
+            "config_version = 1\n[system]\nhostname = \"my router\"\ndomain = \".home.arpa\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codes(&validate(&bad, &live())),
+            vec![
+                ("system.hostname".to_owned(), Code::InvalidHostname),
+                ("system.domain".to_owned(), Code::InvalidHostname),
+            ]
+        );
+        for domain in [".", "home..arpa", "-bad.arpa", "a.b."] {
+            let config = file::parse(&format!(
+                "config_version = 1\n[system]\ndomain = \"{domain}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                codes(&validate(&config, &live())),
+                vec![("system.domain".to_owned(), Code::InvalidHostname)],
+                "{domain:?}"
+            );
+        }
+        let dotted = file::parse("config_version = 1\n[system]\nhostname = \"a.b\"\n").unwrap();
+        assert_eq!(
+            codes(&validate(&dotted, &live())),
+            vec![("system.hostname".to_owned(), Code::InvalidHostname)],
+            "a hostname is one label"
+        );
+        for ok in [
+            "config_version = 1\n[system]\nhostname = \"\"\ndomain = \"\"\n",
+            "config_version = 1\n[system]\nhostname = \"Router-2\"\ndomain = \"lan.example\"\n",
+        ] {
+            assert_eq!(
+                validate(&file::parse(ok).unwrap(), &live()),
+                vec![],
+                "{ok:?}"
+            );
+        }
     }
 }

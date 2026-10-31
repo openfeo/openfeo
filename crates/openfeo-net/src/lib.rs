@@ -12,3 +12,4 @@ pub mod dhcp4_server;
 pub mod dns;
 #[allow(unsafe_code)]
 mod sys;
+pub mod throttle;

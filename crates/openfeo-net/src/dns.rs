@@ -28,6 +28,7 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::dhcp4::{DriverError, RECEIVE_BUFFER, io_err, is_transient, socket_err, wait_until};
+use crate::throttle::{NOISY_WINDOW, Throttle};
 
 /// The port we serve and the upstreams listen on.
 pub const DNS_PORT: u16 = 53;
@@ -109,6 +110,9 @@ pub struct DnsDriver {
     start: Instant,
     stats: DnsStats,
     tasks: Vec<JoinHandle<()>>,
+    /// Console lines a send that fails may produce: one per window each.
+    forward_failures: Throttle,
+    reply_failures: Throttle,
 }
 
 impl std::fmt::Debug for DnsDriver {
@@ -169,6 +173,8 @@ impl DnsDriver {
             start: Instant::now(),
             stats: DnsStats::default(),
             tasks,
+            forward_failures: Throttle::new(NOISY_WINDOW),
+            reply_failures: Throttle::new(NOISY_WINDOW),
         })
     }
 
@@ -321,7 +327,13 @@ impl DnsDriver {
                 if let Some(socket) = self.listeners.get(listener)
                     && let Err(err) = socket.try_send_to(&bytes, peer)
                 {
-                    warn!("dns: reply to {peer} failed: {err}");
+                    // A LAN host can provoke this at packet rate (an off-link source address).
+                    let line = format!("dns: reply to {peer} failed: {err}");
+                    if let Some(line) = self.reply_failures.line(Instant::now(), &line) {
+                        warn!("{line}");
+                    } else {
+                        debug!("{line}");
+                    }
                 }
             }
             ClientHandle::Tcp(reply) => {
@@ -343,7 +355,16 @@ impl DnsDriver {
         let to = SocketAddr::V4(SocketAddrV4::new(upstream, DNS_PORT));
         match socket.try_send_to(bytes, to) {
             Ok(_) => self.stats.forwarded += 1,
-            Err(err) => warn!("dns: forward to {upstream} failed: {err}"),
+            Err(err) => {
+                // Every LAN query ends here while the upstreams have no route (before the WAN
+                // lease, during an outage): one line per window, the rest counted.
+                let line = format!("dns: forward to {upstream} failed: {err}");
+                if let Some(line) = self.forward_failures.line(Instant::now(), &line) {
+                    warn!("{line}");
+                } else {
+                    debug!("{line}");
+                }
+            }
         }
     }
 }

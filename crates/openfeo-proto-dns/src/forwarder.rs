@@ -280,12 +280,10 @@ impl Forwarder {
                 encode_reply(id, &msg, blocked, transport),
             ];
         }
-        let key = Key {
-            name: question.name.clone(),
-            qtype: question.qtype,
-        };
+        let key = cache_key(&msg);
         if let Some(entry) = self.cache.lookup(&key, now) {
             let mut reply = Message::reply_to(&msg, entry.rcode);
+            reply.header.authentic_data = entry.authentic_data && wants_ad(&msg);
             reply.answers = entry.answers;
             reply.authorities = entry.authorities;
             return vec![encode_reply(id, &msg, reply, transport)];
@@ -414,12 +412,9 @@ impl Forwarder {
             ));
             return outputs;
         }
-        let key = Key {
-            name: question.name.clone(),
-            qtype: question.qtype,
-        };
-        self.cache.store(key, &msg, now);
+        self.cache.store(cache_key(&pending.query), &msg, now);
         let mut reply = Message::reply_to(&pending.query, msg.header.rcode);
+        reply.header.authentic_data = msg.header.authentic_data && wants_ad(&pending.query);
         reply.header.truncated = msg.header.truncated;
         reply.answers = msg.answers;
         reply.authorities = msg.authorities;
@@ -684,6 +679,23 @@ impl Forwarder {
             },
         }
     }
+}
+
+/// The cache key of a client's query: its question and its DNSSEC bits, since a signed answer
+/// is not an unsigned one and a CD=1 answer is not for everyone (RFC 4035 §3.2.2, §4.6).
+fn cache_key(query: &Message) -> Key {
+    let question = &query.questions[0];
+    Key {
+        name: question.name.clone(),
+        qtype: question.qtype,
+        dnssec_ok: query.edns().is_some_and(|edns| edns.dnssec_ok),
+        checking_disabled: query.header.checking_disabled,
+    }
+}
+
+/// Whether the client asked for the AD bit: DO or AD set in its query (RFC 6840 §5.7).
+fn wants_ad(query: &Message) -> bool {
+    query.header.authentic_data || query.edns().is_some_and(|edns| edns.dnssec_ok)
 }
 
 /// SERVFAIL to the client of a query no upstream answered.
@@ -1110,11 +1122,12 @@ mod tests {
             50,
         ));
         assert!(r.header.truncated && r.edns().map(|e| e.udp_payload) == Some(EDNS_UDP_PAYLOAD));
+        // The same DO bit: the cache keeps signed and unsigned answers apart.
         let out = f.handle(
             client(
                 2,
                 Transport::Tcp,
-                q_edns("big.isp.example", rtype::TXT, 512, false),
+                q_edns("big.isp.example", rtype::TXT, 512, true),
             ),
             60,
         );
@@ -1454,5 +1467,133 @@ mod tests {
         let out = f.handle(Input::Configure(cfg), 1);
         assert_eq!(reply(&out).header.rcode, rcode::SERVFAIL);
         assert_eq!(f.pending(), 0);
+    }
+
+    /// An RRSIG as an opaque record (type 46).
+    fn rrsig(owner: &str, ttl: u32) -> Record {
+        Record {
+            name: name(owner),
+            rtype: 46,
+            class: CLASS_IN,
+            ttl,
+            rdata: RData::Other(vec![0; 18]),
+        }
+    }
+
+    /// A query with the AD bit set and no OPT: a stub asking for the AD bit back.
+    fn q_ad(qname: &str, qtype: u16) -> Vec<u8> {
+        let mut msg = Message::decode(&q(qname, qtype)).unwrap();
+        msg.header.authentic_data = true;
+        msg.encode()
+    }
+
+    /// A query with CD set and no OPT.
+    fn q_cd(qname: &str, qtype: u16) -> Vec<u8> {
+        let mut msg = Message::decode(&q(qname, qtype)).unwrap();
+        msg.header.checking_disabled = true;
+        msg.encode()
+    }
+
+    /// Review finding: the cache must keep DO and CD apart, or a validating stub is served an
+    /// unsigned answer another client cached and a CD=1 client's answer reaches everyone; the
+    /// upstream's AD bit reaches the clients that asked (DO or AD set) and no other.
+    #[test]
+    fn dnssec_bits_partition_the_cache_and_ad_follows_the_upstream() {
+        let mut f = Forwarder::new(config(), 1);
+        let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        let mut unsigned = Message::decode(&upstream_answer(
+            &fwd,
+            &[a("www.isp.example", 60, "198.51.100.10")],
+        ))
+        .unwrap();
+        unsigned.header.authentic_data = true;
+        let plain = reply(&f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport,
+                bytes: unsigned.encode(),
+            },
+            10,
+        ));
+        assert!(
+            !plain.header.authentic_data,
+            "a client that set neither DO nor AD is not told AD"
+        );
+        let out = f.handle(
+            client(
+                2,
+                Transport::Udp,
+                q_edns("www.isp.example", rtype::A, 1232, true),
+            ),
+            20,
+        );
+        assert_eq!(
+            forwards(&out).len(),
+            1,
+            "a DO client must not be served the unsigned answer from the cache: {out:?}"
+        );
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        assert!(fwd.edns().is_some_and(|edns| edns.dnssec_ok));
+        let mut signed = Message::decode(&upstream_answer(
+            &fwd,
+            &[
+                a("www.isp.example", 60, "198.51.100.10"),
+                rrsig("www.isp.example", 60),
+            ],
+        ))
+        .unwrap();
+        signed.header.authentic_data = true;
+        let r = reply(&f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport,
+                bytes: signed.encode(),
+            },
+            30,
+        ));
+        assert_eq!((r.answers.len(), r.header.authentic_data), (2, true));
+        let r = reply(&f.handle(
+            client(
+                3,
+                Transport::Udp,
+                q_edns("www.isp.example", rtype::A, 1232, true),
+            ),
+            40,
+        ));
+        assert_eq!(
+            (r.answers.len(), r.header.authentic_data),
+            (2, true),
+            "the second DO client is served the signed answer from the cache"
+        );
+        let r = reply(&f.handle(
+            client(4, Transport::Udp, q_ad("www.isp.example", rtype::A)),
+            50,
+        ));
+        assert_eq!(
+            (r.answers.len(), r.header.authentic_data),
+            (1, true),
+            "a client that set AD gets the cached plain answer with AD"
+        );
+        let out = f.handle(
+            client(5, Transport::Udp, q_cd("cd.isp.example", rtype::A)),
+            60,
+        );
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        assert!(fwd.header.checking_disabled);
+        reply(&f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport,
+                bytes: upstream_answer(&fwd, &[a("cd.isp.example", 60, "6.6.6.6")]),
+            },
+            70,
+        ));
+        let out = f.handle(client(6, Transport::Udp, q("cd.isp.example", rtype::A)), 80);
+        assert_eq!(
+            forwards(&out).len(),
+            1,
+            "a CD=0 client is not served a CD=1 client's answer: {out:?}"
+        );
     }
 }

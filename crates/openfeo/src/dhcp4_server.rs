@@ -33,8 +33,9 @@ use openfeo_world::{LeaseFact, MacAddr};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
+
 use crate::dhcp4::{LEASES_DIR, mac_text, wait_for_link};
-use crate::throttle::{NOISY_WINDOW, Throttle};
 
 /// The least time between two writes of a lease database (SPEC §5.2).
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -107,13 +108,10 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
                     let line = event_line(lan, &event);
                     if matches!(event, ServerEvent::Exhausted { .. } | ServerEvent::Conflict { .. }) {
                         // A LAN can provoke these at packet rate: one per window on the console.
-                        match noisy.admit(Instant::now()) {
-                            Some(0) => info!("{line}"),
-                            Some(held) => info!(
-                                "{line} (and {held} more such lines in the last {}s)",
-                                NOISY_WINDOW.as_secs()
-                            ),
-                            None => debug!("{line}"),
+                        if let Some(line) = noisy.line(Instant::now(), &line) {
+                            info!("{line}");
+                        } else {
+                            debug!("{line}");
                         }
                     } else {
                         info!("{line}");

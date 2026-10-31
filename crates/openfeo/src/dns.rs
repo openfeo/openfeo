@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use openfeo_net::dhcp4::DriverError;
 use openfeo_net::dns::{DnsDriver, DnsDriverConfig};
+use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_proto_dns::Name;
 use openfeo_proto_dns::forwarder::Event;
 use openfeo_reconcile::dns::{DesiredDns, desired, forwarder_config};
@@ -18,10 +19,9 @@ use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{Publisher, Supervisor};
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::dhcp4::{seed, wait_for_link};
-use crate::throttle::{NOISY_WINDOW, Throttle};
 
 /// The salt of the clock fallback of [`seed`].
 const SEED_SALT: u64 = 0x0044_4e53;
@@ -51,8 +51,8 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
     }
     // The World moved on while the bridges came up: leases, a WAN lease.
     current = desired(&world_rx.borrow_and_update());
-    let config = forwarder_config(&current)
-        .ok_or_else(|| TaskError::from("dns: a configured name does not parse"))?;
+    let config = forwarder_config(&current);
+    let local_names = config.local.len();
     let failed = |err: DriverError| TaskError::from(format!("dns: {err}"));
     let listeners: Vec<String> = current
         .listeners
@@ -67,7 +67,7 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
     .map_err(failed)?;
     info!("dns listening on {}", listeners.join(", "));
     info!("{}", upstreams_line(&current));
-    info!("dns local names {}", current.local.len());
+    info!("dns local names {local_names}");
     let mut rebind = Throttle::new(NOISY_WINDOW);
     loop {
         tokio::select! {
@@ -100,15 +100,13 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
                 if next.listeners != current.listeners {
                     return Err("dns: the LANs changed; restarting".into());
                 }
-                let Some(config) = forwarder_config(&next) else {
-                    warn!("dns: a configured name does not parse; keeping the previous settings");
-                    continue;
-                };
+                let config = forwarder_config(&next);
+                let local_names = config.local.len();
                 for event in driver.configure(config) {
                     log_event(&event, &mut rebind);
                 }
                 info!("{}", upstreams_line(&next));
-                info!("dns local names {}", next.local.len());
+                info!("dns local names {local_names}");
                 current = next;
             }
         }
@@ -121,17 +119,12 @@ fn log_event(event: &Event, rebind: &mut Throttle) {
     let Some(line) = event_line(event) else {
         return;
     };
-    if matches!(event, Event::RebindDropped { .. }) {
-        match rebind.admit(Instant::now()) {
-            Some(0) => info!("{line}"),
-            Some(held) => info!(
-                "{line} (and {held} more such lines in the last {}s)",
-                NOISY_WINDOW.as_secs()
-            ),
-            None => debug!("{line}"),
-        }
-    } else {
+    if !matches!(event, Event::RebindDropped { .. }) {
         info!("{line}");
+    } else if let Some(line) = rebind.line(Instant::now(), &line) {
+        info!("{line}");
+    } else {
+        debug!("{line}");
     }
 }
 
