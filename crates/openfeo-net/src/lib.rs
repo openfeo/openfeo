@@ -9,5 +9,6 @@
 
 pub mod dhcp4;
 pub mod dhcp4_server;
+pub mod dns;
 #[allow(unsafe_code)]
 mod sys;

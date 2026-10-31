@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
+openfeo-proto-dns = { path = "../openfeo-proto-dns" }
 libc.workspace = true
 nix.workspace = true
 thiserror.workspace = true
