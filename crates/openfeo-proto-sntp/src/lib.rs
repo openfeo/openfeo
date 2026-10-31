@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
+pub mod discipline;
 pub mod packet;
 pub mod timestamp;
 
