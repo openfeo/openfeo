@@ -1132,6 +1132,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfeo-proto-sntp"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "openfeo-reconcile"
 version = "0.1.0"
 dependencies = [
