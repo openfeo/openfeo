@@ -132,10 +132,12 @@ impl ServerDriver {
         Ok(self.perform(outputs))
     }
 
-    /// Seconds since the driver started: the core's clock.
+    /// Seconds since the driver started, rounded up: the core's clock. Rounding up means a
+    /// timer the core arms for `now + 1` always waits at least a second, so a probe late in a
+    /// second does not expire almost at once.
     #[must_use]
     pub fn now(&self) -> Timestamp {
-        self.start.elapsed().as_secs()
+        ceil_secs(self.start.elapsed())
     }
 
     /// The active leases, ascending by address.
@@ -284,6 +286,11 @@ async fn receive_arp(fd: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> Result<Option<Inp
     }
 }
 
+/// Whole seconds, rounded up.
+pub(crate) fn ceil_secs(elapsed: Duration) -> Timestamp {
+    elapsed.as_secs() + Timestamp::from(elapsed.subsec_nanos() > 0)
+}
+
 /// An ARP reply, as the core wants to hear about it.
 pub(crate) fn probe_reply(frame: &[u8]) -> Option<Input> {
     match ArpPacket::decode(frame) {
@@ -304,6 +311,16 @@ pub(crate) fn probe_reply(frame: &[u8]) -> Option<Input> {
 mod tests {
     use super::*;
     use openfeo_proto_dhcp4::arp::{self, ArpOp, ArpPacket};
+
+    /// Review finding: the core's clock must round up, or a probe armed late in a second
+    /// waits almost nothing.
+    #[test]
+    fn the_clock_rounds_up_so_every_timer_lasts_its_full_length() {
+        assert_eq!(ceil_secs(Duration::from_millis(5_950)), 6);
+        assert_eq!(ceil_secs(Duration::from_millis(5_001)), 6);
+        assert_eq!(ceil_secs(Duration::from_secs(5)), 5);
+        assert_eq!(ceil_secs(Duration::ZERO), 0);
+    }
 
     #[test]
     fn arp_replies_become_probe_inputs_and_requests_do_not() {

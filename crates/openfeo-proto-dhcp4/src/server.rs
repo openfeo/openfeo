@@ -191,8 +191,9 @@ pub struct Server {
 }
 
 impl Server {
-    /// A server with the leases that still fit: active, inside the subnet, not the server's
-    /// address, not another client's reservation.
+    /// A server with the leases that still fit: active, inside the subnet and the pool (or the
+    /// client's own reservation), not the server's address, not another client's reservation,
+    /// with at most a lease time left.
     #[must_use]
     pub fn new(config: ServerConfig, leases: Vec<LeaseRecord>, now: Timestamp) -> Server {
         let mut server = Server {
@@ -202,13 +203,25 @@ impl Server {
             offers: BTreeMap::new(),
             abandoned: BTreeMap::new(),
         };
+        let lease_secs = Timestamp::from(server.config.lease_secs);
         for lease in leases {
             let identity = record_identity(&lease);
+            let its_reservation = server
+                .reservation_for(&identity, lease.mac)
+                .is_some_and(|reservation| reservation.address == lease.address);
             if lease.expires_at > now
                 && server.is_host_address(lease.address)
                 && !server.reserved_for_other(lease.address, &identity, lease.mac)
+                && (server.in_pool(lease.address) || its_reservation)
             {
-                server.leases.entry(lease.address).or_insert(lease);
+                // A file written or read under a wrong wall clock cannot make a lease outlive
+                // its lease time; a pool shrunk before the reboot drops what fell outside it.
+                let capped = LeaseRecord {
+                    expires_at: lease.expires_at.min(now + lease_secs),
+                    granted_at: lease.granted_at.min(now),
+                    ..lease
+                };
+                server.leases.entry(capped.address).or_insert(capped);
             }
         }
         server
@@ -262,7 +275,9 @@ impl Server {
             }
             offer.discover = msg;
             offer.hold_until = now + OFFER_HOLD;
-            return self.offer_outputs(&identity);
+            // Re-sent, not announced again: a client that keeps discovering is not a console line
+            // per second.
+            return self.offer_outputs(&identity, false);
         }
         let requested = requested_address(&msg);
         let Some(address) = self.candidate(&identity, mac, requested) else {
@@ -281,14 +296,14 @@ impl Server {
         };
         self.offers.insert(identity.clone(), offer);
         if own {
-            self.offer_outputs(&identity)
+            self.offer_outputs(&identity, true)
         } else {
             vec![Output::Probe { address }]
         }
     }
 
-    /// The OFFER for the pending offer of `identity`.
-    fn offer_outputs(&self, identity: &[u8]) -> Vec<Output> {
+    /// The OFFER for the pending offer of `identity`, with an `Offered` event when `announce`.
+    fn offer_outputs(&self, identity: &[u8], announce: bool) -> Vec<Output> {
         let Some(offer) = self.offers.get(identity) else {
             return Vec::new();
         };
@@ -302,16 +317,18 @@ impl Server {
             hostname.as_deref(),
             true,
         );
-        vec![
-            Output::Event(ServerEvent::Offered {
+        let mut outputs = Vec::with_capacity(2);
+        if announce {
+            outputs.push(Output::Event(ServerEvent::Offered {
                 address: offer.address,
                 mac: offer.mac,
-            }),
-            Output::Send {
-                to: destination(&offer.discover, offer.address),
-                payload: message.encode(),
-            },
-        ]
+            }));
+        }
+        outputs.push(Output::Send {
+            to: destination(&offer.discover, offer.address),
+            payload: message.encode(),
+        });
+        outputs
     }
 
     fn probe_reply(&mut self, address: Ipv4Addr, mac: [u8; 6], now: Timestamp) -> Vec<Output> {
@@ -356,7 +373,7 @@ impl Server {
             offer.probing = None;
             offer.hold_until = now + OFFER_HOLD;
         }
-        self.offer_outputs(identity)
+        self.offer_outputs(identity, true)
     }
 
     fn timeout(&mut self, now: Timestamp) -> Vec<Output> {
@@ -1695,6 +1712,79 @@ mod tests {
             sanitise_hostname(&format!("{}-", "a".repeat(62))),
             Some("a".repeat(62))
         );
+    }
+
+    /// Review finding: a lease restored from the file that lies outside the current pool (the
+    /// range was shrunk before the reboot) must be dropped, or the client is offered it on
+    /// DISCOVER and refused it on REQUEST forever; a reservation stays whatever the pool.
+    #[test]
+    fn new_drops_restored_leases_outside_the_pool_unless_reserved() {
+        let lease = |address: &str, mac: [u8; 6]| LeaseRecord {
+            address: ip(address),
+            mac,
+            client_id: None,
+            hostname: None,
+            granted_at: 0,
+            expires_at: 1_000,
+        };
+        let mut s = Server::new(
+            config_with_pool(ip("192.168.1.100"), ip("192.168.1.150")),
+            vec![
+                lease("192.168.1.180", MAC_A),
+                lease("192.168.1.10", MAC_NAS),
+                lease("192.168.1.120", MAC_B),
+            ],
+            0,
+        );
+        assert_eq!(
+            s.leases()
+                .iter()
+                .map(|l| l.address.to_string())
+                .collect::<Vec<_>>(),
+            vec!["192.168.1.10", "192.168.1.120"]
+        );
+        // The client of the dropped lease starts over and gets a pool address, no livelock.
+        s.handle(
+            Input::Packet(discover(
+                MAC_A,
+                1,
+                vec![DhcpOption::RequestedIpAddress(ip("192.168.1.180"))],
+            )),
+            0,
+        );
+        let out = s.handle(Input::Timeout, PROBE_TIMEOUT);
+        assert_eq!(sends(&out)[0].1.yiaddr, ip("192.168.1.100"));
+    }
+
+    /// Review finding: a restored lease's remaining time is capped at the lease time, so a box
+    /// whose wall clock was wrong when the file was written or read (no RTC, 1970 at boot)
+    /// cannot make a lease permanent.
+    #[test]
+    fn new_caps_a_restored_lease_at_the_lease_time() {
+        let record = LeaseRecord {
+            address: ip("192.168.1.120"),
+            mac: MAC_A,
+            client_id: None,
+            hostname: None,
+            granted_at: 0,
+            expires_at: 1_800_000_000,
+        };
+        let s = Server::new(config(), vec![record], 100);
+        assert_eq!(s.leases()[0].expires_at, 100 + 43_200);
+        assert_eq!(s.next_timeout(), Some(100 + 43_200));
+    }
+
+    /// Review finding: a client that repeats DISCOVER forever gets its offer re-sent but must
+    /// not produce an `Offered` event (a console line) each time.
+    #[test]
+    fn repeated_discovers_do_not_repeat_the_offer_event() {
+        let mut s = Server::new(config(), vec![], 0);
+        s.handle(Input::Packet(discover(MAC_A, 1, vec![])), 0);
+        let first = s.handle(Input::Timeout, PROBE_TIMEOUT);
+        assert_eq!(events(&first).len(), 1, "the first offer is announced");
+        let again = s.handle(Input::Packet(discover(MAC_A, 2, vec![])), 2);
+        assert_eq!(sends(&again).len(), 1, "the offer is re-sent");
+        assert_eq!(events(&again), Vec::new(), "but not announced again");
     }
 
     /// Seeds for `fuzz/fuzz_targets/dhcp4_server.rs`; run with `--ignored` to refresh them.

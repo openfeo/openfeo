@@ -40,3 +40,9 @@ ISC dhcpd and Kea send every reply as a frame with their own checksums for this 
   touching offload settings, and would catch a regression at once.
 - The same hazard applies to any future service that must talk to raw-socket peers over
   virtual links; a UDP socket is fine only when the peer's kernel does the verifying.
+- Replies go to the client's `chaddr`, not to the source address of the frame that carried the
+  request (which the UDP receive path does not see): a client whose `chaddr` differs from its
+  link address is not served. Kea uses the source address; ISC lets the kernel resolve
+  `ciaddr`. On a flat LAN the two are the same address.
+- A reply larger than the bridge's MTU is refused by the kernel (the frame carries DF) and
+  logged as a failed send; replies are a few hundred bytes.

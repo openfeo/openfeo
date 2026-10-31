@@ -37,6 +37,54 @@ use crate::dhcp4::{LEASES_DIR, mac_text, wait_for_link};
 
 /// The least time between two writes of a lease database (SPEC §5.2).
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Console lines the LAN can provoke at will (`pool exhausted`, `conflict`) are limited to one
+/// per this window, the rest counted.
+pub const NOISY_WINDOW: Duration = Duration::from_secs(10);
+
+/// The events after which the leases differ, so the facts and the database must follow.
+pub(crate) fn changes_leases(event: &ServerEvent) -> bool {
+    matches!(
+        event,
+        ServerEvent::Granted(_)
+            | ServerEvent::Renewed(_)
+            | ServerEvent::Released(_)
+            | ServerEvent::Expired(_)
+            | ServerEvent::Declined { .. }
+    )
+}
+
+/// One line per window; the lines held back are counted and reported with the next one.
+#[derive(Debug)]
+pub(crate) struct Throttle {
+    window: Duration,
+    last: Option<Instant>,
+    held: u32,
+}
+
+impl Throttle {
+    pub(crate) fn new(window: Duration) -> Self {
+        Throttle {
+            window,
+            last: None,
+            held: 0,
+        }
+    }
+
+    /// `Some(held)` when a line may go out, with the number held back since the last one;
+    /// `None` to hold this one.
+    pub(crate) fn admit(&mut self, now: Instant) -> Option<u32> {
+        match self.last {
+            Some(last) if now < last + self.window => {
+                self.held = self.held.saturating_add(1);
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.held))
+            }
+        }
+    }
+}
 
 /// `/state/leases/dhcp4-server-<lan>.toml`.
 #[must_use]
@@ -86,18 +134,26 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
     publish_facts(lan, &driver, publisher);
     let mut last_save: Option<Instant> = None;
     let mut save_at: Option<Instant> = None;
+    let mut noisy = Throttle::new(NOISY_WINDOW);
     loop {
         tokio::select! {
             events = driver.step() => {
                 for event in events.map_err(failed)? {
-                    info!("{}", event_line(lan, &event));
-                    if matches!(
-                        event,
-                        ServerEvent::Granted(_)
-                            | ServerEvent::Renewed(_)
-                            | ServerEvent::Released(_)
-                            | ServerEvent::Expired(_)
-                    ) {
+                    let line = event_line(lan, &event);
+                    if matches!(event, ServerEvent::Exhausted { .. } | ServerEvent::Conflict { .. }) {
+                        // A LAN can provoke these at packet rate: one per window on the console.
+                        match noisy.admit(Instant::now()) {
+                            Some(0) => info!("{line}"),
+                            Some(held) => info!(
+                                "{line} (and {held} more such lines in the last {}s)",
+                                NOISY_WINDOW.as_secs()
+                            ),
+                            None => debug!("{line}"),
+                        }
+                    } else {
+                        info!("{line}");
+                    }
+                    if changes_leases(&event) {
                         publish_facts(lan, &driver, publisher);
                         if save_at.is_none() {
                             save_at = Some(next_save(last_save, Instant::now()));
@@ -373,6 +429,71 @@ mod tests {
         }
     }
 
+    /// Review finding: a DECLINE removes the lease in the core, so the facts and the database
+    /// must follow, as for every other lease change.
+    #[test]
+    fn every_event_that_changes_the_leases_republishes_and_saves() {
+        let record = LeaseRecord {
+            address: ip("192.168.1.100"),
+            mac: MAC_A,
+            client_id: None,
+            hostname: None,
+            granted_at: 0,
+            expires_at: 43_200,
+        };
+        for event in [
+            ServerEvent::Granted(record.clone()),
+            ServerEvent::Renewed(record.clone()),
+            ServerEvent::Released(record.clone()),
+            ServerEvent::Expired(record),
+            ServerEvent::Declined {
+                address: ip("192.168.1.100"),
+                mac: MAC_A,
+            },
+        ] {
+            assert!(changes_leases(&event), "{event:?}");
+        }
+        for event in [
+            ServerEvent::Offered {
+                address: ip("192.168.1.100"),
+                mac: MAC_A,
+            },
+            ServerEvent::Nak {
+                address: ip("192.168.1.100"),
+                mac: MAC_A,
+                reason: NakReason::InUse,
+            },
+            ServerEvent::Informed {
+                address: ip("192.168.1.50"),
+                mac: MAC_A,
+            },
+            ServerEvent::Conflict {
+                address: ip("192.168.1.100"),
+                mac: MAC_B,
+            },
+            ServerEvent::Exhausted { mac: MAC_A },
+        ] {
+            assert!(!changes_leases(&event), "{event:?}");
+        }
+    }
+
+    /// Review finding: lines a LAN can provoke at packet rate (`pool exhausted`, `conflict`)
+    /// are throttled: one per window, then a count of what was held back.
+    #[test]
+    fn noisy_lines_are_throttled_to_one_per_window_with_a_count() {
+        let t0 = Instant::now();
+        let mut throttle = Throttle::new(Duration::from_secs(10));
+        assert_eq!(throttle.admit(t0), Some(0), "the first line passes");
+        assert_eq!(throttle.admit(t0 + Duration::from_secs(1)), None);
+        assert_eq!(throttle.admit(t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            throttle.admit(t0 + Duration::from_secs(10)),
+            Some(2),
+            "the window ends: pass, with the two held back"
+        );
+        assert_eq!(throttle.admit(t0 + Duration::from_secs(25)), Some(0));
+    }
+
     #[test]
     fn lease_file_round_trips_through_records_with_wall_clock_conversion() {
         let records = vec![LeaseRecord {
@@ -420,7 +541,7 @@ mod tests {
                 lease("52:54:00:fe:10:10", "192.168.1.10", 1_800_000_000),
                 lease("52:54:00:fe:10:11", "10.0.0.5", 1_800_009_000),
                 lease("nope", "192.168.1.12", 1_800_009_000),
-                lease("52:54:00:fe:10:13", "192.168.1.13", 1_800_009_000),
+                lease("52:54:00:fe:10:13", "192.168.1.113", 1_800_009_000),
             ],
         };
         let records = records_from_file(&file, "lan0", 50, 1_800_000_100);
@@ -429,8 +550,8 @@ mod tests {
                 .iter()
                 .map(|r| r.address.to_string())
                 .collect::<Vec<_>>(),
-            vec!["10.0.0.5", "192.168.1.13"],
-            "the file keeps what parses and has not expired; the subnet check is Server::new's"
+            vec!["10.0.0.5", "192.168.1.113"],
+            "the file keeps what parses and has not expired; the subnet and pool checks are Server::new's"
         );
         assert_eq!(
             Server::new(config(), records, 50).leases().len(),
