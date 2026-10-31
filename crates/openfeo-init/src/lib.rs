@@ -13,7 +13,7 @@ pub mod mounts;
 pub mod restart;
 pub mod supervisor;
 #[allow(unsafe_code)]
-pub mod sys;
+pub(crate) mod sys;
 pub mod sysctl;
 pub mod watchdog;
 
@@ -93,13 +93,13 @@ pub fn pid1_mode(flag: Option<Mode>, cmdline: Option<Mode>) -> (Mode, Option<&'s
 
 fn read_cmdline(log: &Log) -> Cmdline {
     match std::fs::read_to_string("/proc/cmdline") {
-        Ok(text) => match cmdline::parse(&text) {
-            Ok(cmdline) => cmdline,
-            Err(err) => {
-                log.warn(&format!("cmdline: {err}; using defaults"));
-                Cmdline::default()
+        Ok(text) => {
+            let cmdline = cmdline::parse(&text);
+            for warning in &cmdline.warnings {
+                log.warn(&format!("cmdline: {warning}; ignoring it"));
             }
-        },
+            cmdline
+        }
         Err(err) => {
             log.warn(&format!(
                 "cmdline: cannot read /proc/cmdline: {err}; using defaults"

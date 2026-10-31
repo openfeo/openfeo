@@ -110,10 +110,13 @@ pub enum Error {
 /// A parsed kernel command line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cmdline {
-    /// `openfeo.mode=`, if present.
+    /// `openfeo.mode=`, if present and known.
     pub mode: Option<Mode>,
-    /// `openfeo.slot=`, if present.
+    /// `openfeo.slot=`, if present and known.
     pub slot: Option<Slot>,
+    /// One line per `openfeo.*` value this build does not know, for the console: the field it
+    /// would have filled stays `None` and the rest of the line still counts.
+    pub warnings: Vec<String>,
     params: Vec<(String, Option<String>)>,
 }
 
@@ -132,12 +135,11 @@ impl Cmdline {
 /// Parse a kernel command line.
 ///
 /// Tokens are separated by ASCII whitespace; a double-quoted value may contain whitespace and the
-/// quotes are dropped. The last occurrence of a key wins.
-///
-/// # Errors
-///
-/// Returns [`Error`] when `openfeo.mode` or `openfeo.slot` carries a value this build does not know.
-pub fn parse(s: &str) -> Result<Cmdline, Error> {
+/// quotes are dropped. The last occurrence of a key wins. An `openfeo.mode` or `openfeo.slot`
+/// value this build does not know leaves that field `None` and adds a line to `warnings`, so a
+/// typo in one does not take the other with it.
+#[must_use]
+pub fn parse(s: &str) -> Cmdline {
     let mut cmdline = Cmdline::default();
     for token in tokens(s) {
         let param = match token.split_once('=') {
@@ -146,9 +148,17 @@ pub fn parse(s: &str) -> Result<Cmdline, Error> {
         };
         cmdline.params.push(param);
     }
-    cmdline.mode = cmdline.get("openfeo.mode").map(str::parse).transpose()?;
-    cmdline.slot = cmdline.get("openfeo.slot").map(str::parse).transpose()?;
-    Ok(cmdline)
+    match cmdline.get("openfeo.mode").map(str::parse::<Mode>) {
+        Some(Ok(mode)) => cmdline.mode = Some(mode),
+        Some(Err(err)) => cmdline.warnings.push(err.to_string()),
+        None => {}
+    }
+    match cmdline.get("openfeo.slot").map(str::parse::<Slot>) {
+        Some(Ok(slot)) => cmdline.slot = Some(slot),
+        Some(Err(err)) => cmdline.warnings.push(err.to_string()),
+        None => {}
+    }
+    cmdline
 }
 
 /// Split on ASCII whitespace outside double quotes, dropping the quotes.
@@ -179,7 +189,8 @@ mod tests {
 
     #[test]
     fn parses_mode_and_slot() {
-        let c = parse("console=ttyS0,115200 openfeo.mode=vm openfeo.slot=a panic=10").unwrap();
+        let c = parse("console=ttyS0,115200 openfeo.mode=vm openfeo.slot=a panic=10");
+        assert_eq!(c.warnings, Vec::<String>::new());
         assert_eq!(c.mode, Some(Mode::Vm));
         assert_eq!(c.slot, Some(Slot::A));
         assert_eq!(c.get("panic"), Some("10"));
@@ -187,32 +198,45 @@ mod tests {
 
     #[test]
     fn missing_mode_is_none_and_defaults_to_metal() {
-        let c = parse("console=ttyS0").unwrap();
+        let c = parse("console=ttyS0");
         assert_eq!(c.mode, None);
         assert_eq!(c.mode.unwrap_or_default(), Mode::Metal);
     }
 
     #[test]
-    fn unknown_mode_is_an_error() {
-        assert!(matches!(parse("openfeo.mode=bogus"), Err(Error::UnknownMode(m)) if m == "bogus"));
+    fn an_unknown_mode_is_a_warning_and_the_slot_survives() {
+        let c = parse("openfeo.mode=weird openfeo.slot=b");
+        assert_eq!((c.mode, c.slot), (None, Some(Slot::B)));
+        assert_eq!(
+            c.warnings,
+            vec![
+                "unknown openfeo.mode `weird` (expected metal, vm, container, installer or rescue)"
+                    .to_owned()
+            ]
+        );
     }
 
     #[test]
-    fn unknown_slot_is_an_error() {
-        assert!(matches!(parse("openfeo.slot=c"), Err(Error::UnknownSlot(s)) if s == "c"));
+    fn an_unknown_slot_is_a_warning_and_the_mode_survives() {
+        let c = parse("openfeo.mode=vm openfeo.slot=c");
+        assert_eq!((c.mode, c.slot), (Some(Mode::Vm), None));
+        assert_eq!(
+            c.warnings,
+            vec!["unknown openfeo.slot `c` (expected a or b)".to_owned()]
+        );
     }
 
     #[test]
     fn last_occurrence_wins() {
         assert_eq!(
-            parse("openfeo.mode=vm openfeo.mode=rescue").unwrap().mode,
+            parse("openfeo.mode=vm openfeo.mode=rescue").mode,
             Some(Mode::Rescue)
         );
     }
 
     #[test]
     fn quotes_tabs_and_bare_flags() {
-        let c = parse("quiet\t openfeo.chaos=\"child-exit:3\"   ro").unwrap();
+        let c = parse("quiet\t openfeo.chaos=\"child-exit:3\"   ro");
         assert_eq!(c.get("openfeo.chaos"), Some("child-exit:3"));
         assert_eq!(c.get("quiet"), None);
         assert_eq!(c.get("ro"), None);

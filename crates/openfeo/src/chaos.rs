@@ -134,14 +134,14 @@ mod tests {
     #[cfg(feature = "harness")]
     #[test]
     fn cmdline_knob_is_read_with_feature() {
-        let c = cmdline::parse("openfeo.chaos=child-exit:3").unwrap();
+        let c = cmdline::parse("openfeo.chaos=child-exit:3");
         assert!(from_cmdline(&c).is_some());
     }
 
     #[cfg(not(feature = "harness"))]
     #[test]
     fn cmdline_knob_is_ignored_without_feature() {
-        let c = cmdline::parse("openfeo.chaos=child-exit:3").unwrap();
+        let c = cmdline::parse("openfeo.chaos=child-exit:3");
         assert!(from_cmdline(&c).is_none());
     }
 }
