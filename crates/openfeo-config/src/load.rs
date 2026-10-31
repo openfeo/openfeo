@@ -23,6 +23,8 @@ pub const DEFAULT_DOMAIN: &str = "home.arpa";
 pub const FIRST_BOOT_LAN: &str = "lan0";
 /// Its address and subnet.
 pub const FIRST_BOOT_IPV4: &str = "192.168.1.1/24";
+/// The DHCPv4 pool of that LAN (SPEC §5.6 "DHCP on").
+pub const FIRST_BOOT_POOL: (&str, &str) = ("192.168.1.100", "192.168.1.250");
 /// Permission bits for every file under `/state` (SPEC §5.2).
 pub const STATE_FILE_MODE: u32 = 0o600;
 
@@ -64,6 +66,10 @@ impl Config {
                 name: FIRST_BOOT_LAN.to_owned(),
                 ports: ports.names().map(str::to_owned).collect(),
                 ipv4: FIRST_BOOT_IPV4.to_owned(),
+                dhcp: Some(crate::LanDhcp {
+                    range: vec![FIRST_BOOT_POOL.0.to_owned(), FIRST_BOOT_POOL.1.to_owned()],
+                    ..crate::LanDhcp::default()
+                }),
             }],
             firewall: None,
         }
@@ -257,5 +263,40 @@ mod tests {
         // Loading the rewritten file with the same migrations is now a no-op.
         let again = load_with(&path, &live(), &[set_timezone]).unwrap();
         assert_eq!(again.migrated_from, None);
+    }
+}
+
+#[cfg(test)]
+mod first_boot_dhcp_tests {
+    use super::*;
+    use crate::PortMapEntry;
+    use crate::validate::validate;
+
+    #[test]
+    fn first_boot_serves_dhcp_on_the_temporary_lan() {
+        let ports = PortMap {
+            ports: vec![
+                PortMapEntry {
+                    id: "pci-0000:00:03.0".into(),
+                    name: "p0".into(),
+                },
+                PortMapEntry {
+                    id: "pci-0000:00:04.0".into(),
+                    name: "p1".into(),
+                },
+            ],
+        };
+        let config = Config::first_boot(&ports);
+        let dhcp = config.lans[0]
+            .dhcp
+            .as_ref()
+            .expect("DHCP on at first boot (SPEC §5.6)");
+        assert_eq!(dhcp.range, vec![FIRST_BOOT_POOL.0, FIRST_BOOT_POOL.1]);
+        assert_eq!(dhcp.range, vec!["192.168.1.100", "192.168.1.250"]);
+        assert_eq!(
+            (dhcp.lease_secs, dhcp.r#static.len(), dhcp.dns.len()),
+            (0, 0, 0)
+        );
+        assert_eq!(validate(&config, &ports), vec![]);
     }
 }

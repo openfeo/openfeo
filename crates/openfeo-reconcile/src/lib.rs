@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dhcp;
 pub mod links;
 pub mod nft;
 pub mod routing;

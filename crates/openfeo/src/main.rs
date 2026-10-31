@@ -9,6 +9,7 @@ mod boot;
 mod chaos;
 mod cli;
 mod dhcp4;
+mod dhcp4_server;
 mod heartbeat;
 mod router;
 mod version;

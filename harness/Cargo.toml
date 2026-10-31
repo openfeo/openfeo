@@ -12,22 +12,23 @@ anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
 nix.workspace = true
+openfeo-net = { path = "../crates/openfeo-net" }
 openfeo-nft = { path = "../crates/openfeo-nft" }
+openfeo-proto-dhcp4 = { path = "../crates/openfeo-proto-dhcp4" }
 regex.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 openfeo-apply = { path = "../crates/openfeo-apply" }
 openfeo-config = { path = "../crates/openfeo-config" }
-openfeo-net = { path = "../crates/openfeo-net" }
 openfeo-netlink = { path = "../crates/openfeo-netlink" }
 openfeo-platform = { path = "../crates/openfeo-platform" }
-openfeo-proto-dhcp4 = { path = "../crates/openfeo-proto-dhcp4" }
 openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
 openfeo-world = { path = "../crates/openfeo-world" }
-tokio.workspace = true
 ipnet.workspace = true
 
 [[test]]
@@ -43,6 +44,11 @@ harness = false
 [[test]]
 name = "dhcp4"
 path = "tests/dhcp4.rs"
+harness = false
+
+[[test]]
+name = "dhcp4_server"
+path = "tests/dhcp4_server.rs"
 harness = false
 
 [[test]]

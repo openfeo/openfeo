@@ -144,6 +144,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         });
     }
     crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
+    crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
     {
         let health = health.clone();
         supervisor.spawn("apply", move || {

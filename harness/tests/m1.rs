@@ -8,9 +8,11 @@
 //! that is blocked by default, a router-child crash that does not interrupt forwarding, and a
 //! first boot that forwards nothing. Part 2b, the DHCPv4 client: a lease from the ISP's Kea
 //! with NAT on it, a renewal at T1, a link flap that re-acquires, a reset that keeps the
-//! address through INIT-REBOOT, and a WAN without a server that leaves the LAN working. Run
-//! inside the rootless sandbox; `harness = false`: this
-//! binary is its own runner and an optional first argument filters scenarios by substring.
+//! address through INIT-REBOOT, and a WAN without a server that leaves the LAN working. Part 3a,
+//! the LAN DHCPv4 server: a LAN host leases from the router and fetches through NAT on it, the
+//! `nas` reservation, the lease database across a reset, and a lease from another router refused with a NAK.
+//! Run inside the rootless sandbox; `harness = false`: this binary is its own runner and an
+//! optional first argument filters scenarios by substring.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -86,6 +88,22 @@ const SCENARIOS: &[Scenario] = &[
         name: "dhcp_without_a_server_keeps_the_lan_working",
         run: dhcp_without_a_server_keeps_the_lan_working,
     },
+    Scenario {
+        name: "lan_client_gets_a_lease_from_the_router",
+        run: lan_client_gets_a_lease_from_the_router,
+    },
+    Scenario {
+        name: "reservation_gives_the_nas_its_address",
+        run: reservation_gives_the_nas_its_address,
+    },
+    Scenario {
+        name: "lan_lease_db_survives_reset",
+        run: lan_lease_db_survives_reset,
+    },
+    Scenario {
+        name: "a_foreign_lease_is_naked_on_the_new_router",
+        run: a_foreign_lease_is_naked_on_the_new_router,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -118,6 +136,18 @@ const DHCP_POOL: &str = r"203\.0\.113\.(?:1\d\d|200)";
 const DUID_LINE: &str = r"openfeo: identity: duid 00030001525400fe0000";
 /// Kea renews at 20 s; the client's retransmission jitter adds up to a second.
 const RENEW_TIMEOUT: Duration = Duration::from_secs(35);
+/// An address in the LAN server's pool, 192.168.1.100-200.
+const LAN_POOL: &str = r"192\.168\.1\.(?:1\d\d|200)";
+/// The fixture's `nas` reservation.
+const NAS_MAC: &str = "52:54:00:fe:10:10";
+/// The LAN server announcing the fixture's pool and reservation.
+const SERVING: &str = r"openfeo: lan lan0 dhcp serving 192\.168\.1\.0/24 pool 192\.168\.1\.100-192\.168\.1\.200 statics=1 lease=43200s";
+/// udhcpc's four tries of three seconds, with margin.
+const UDHCPC_TIMEOUT: Duration = Duration::from_secs(20);
+/// Our client holds off for 10 s after a NAK before it discovers again.
+const NAK_TIMEOUT: Duration = Duration::from_secs(30);
+/// The harness binary: `dhcp-client` runs our DHCP client inside the LAN namespace.
+const HARNESS_BIN: &str = env!("CARGO_BIN_EXE_openfeo-harness");
 
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|err| panic!("bad test regex {pattern:?}: {err}"))
@@ -162,6 +192,11 @@ fn first_boot_defaults_bridge_all_ports(lab: &mut Lab) -> anyhow::Result<()> {
     )?;
     c.wait_for(&mut cur, &re(r"openfeo: add bridge br-lan0"), SOON)?;
     c.wait_for(&mut cur, &re(READY), SOON)?;
+    c.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: lan lan0 dhcp serving 192\.168\.1\.0/24 pool 192\.168\.1\.100-192\.168\.1\.250 statics=0 lease=43200s"),
+        SOON,
+    )?;
     let enslaved = c.count(&re(r"openfeo: enslave p[0-2] -> br-lan0"));
     anyhow::ensure!(enslaved == 3, "expected 3 enslave lines, saw {enslaved}");
     anyhow::ensure!(
@@ -702,5 +737,216 @@ fn dhcp_without_a_server_keeps_the_lan_working(lab: &mut Lab) -> anyhow::Result<
         c.count(&re(r"openfeo: apply \S+ failed")) == 0,
         "an apply failed"
     );
+    Ok(())
+}
+
+/// Boot the static fixture, wait for `ready` and the LAN server's announcement, and bring the
+/// LAN host's interface up without an address: the DHCP client gets it one.
+fn boot_static_dhcp_lan(lab: &mut Lab) -> anyhow::Result<Cursor> {
+    lab.with_config(VM_STATIC)?;
+    lab.boot("")?;
+    let mut cur = Cursor::default();
+    let c = lab.console()?;
+    c.wait_for(&mut cur, &re(READY), BOOT_TIMEOUT)?;
+    c.wait_for(&mut Cursor::default(), &re(SERVING), SOON)?;
+    lab.lan0.ip(&["link", "set", "lan0", "up"])?;
+    Ok(cur)
+}
+
+/// The LAN host's MAC, lowercase, as the console prints it.
+fn lan_mac(lab: &Lab) -> anyhow::Result<String> {
+    let (_, mac) = lanclient::link_info_in(&lab.lan0, "lan0")?;
+    Ok(mac
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":"))
+}
+
+/// One variable udhcpc set for its `bound` event.
+fn udhcpc_env<'a>(events: &'a [lanclient::UdhcpcEvent], key: &str) -> anyhow::Result<&'a str> {
+    let bound = events
+        .iter()
+        .find(|event| event.kind == "bound")
+        .with_context(|| format!("udhcpc never bound: {events:?}"))?;
+    bound
+        .env
+        .get(key)
+        .map(String::as_str)
+        .with_context(|| format!("udhcpc bound without {key}: {:?}", bound.env))
+}
+
+/// A LAN host gets a lease from the router with the fixture's options and uses it: a fetch from
+/// the ISP side goes through NAT on the leased address.
+fn lan_client_gets_a_lease_from_the_router(lab: &mut Lab) -> anyhow::Result<()> {
+    let mut cur = boot_static_dhcp_lan(lab)?;
+    let events = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&events, "ip")?.to_owned();
+    anyhow::ensure!(
+        re(&format!("^{LAN_POOL}$")).is_match(&ip),
+        "leased {ip} outside the pool"
+    );
+    for (key, expected) in [
+        ("router", "192.168.1.1"),
+        ("dns", "192.168.1.1"),
+        ("domain", "home.arpa"),
+        ("lease", "43200"),
+        ("subnet", "255.255.255.0"),
+    ] {
+        anyhow::ensure!(
+            udhcpc_env(&events, key)? == expected,
+            "udhcpc {key}={:?}, expected {expected}",
+            udhcpc_env(&events, key)
+        );
+    }
+    let c = lab.console()?;
+    let mac = lan_mac(lab)?;
+    let addr = escaped(&ip);
+    c.wait_for(
+        &mut cur,
+        &re(&format!(r"openfeo: lan lan0 dhcp offer {addr} to {mac}")),
+        SOON,
+    )?;
+    c.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: lan lan0 dhcp lease granted {addr} to {mac} host=- lease=43200s"
+        )),
+        SOON,
+    )?;
+    // The script put the address on the interface; the default route is the host's own doing.
+    lab.lan0
+        .ip(&["route", "replace", "default", "via", "192.168.1.1"])?;
+    let server = http_target(lab, &lab.isp0, "203.0.113.1", ISP_HTTP_BODY)?;
+    let body = lanclient::http_get(&lab.lan0, ISP_HTTP.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(body == ISP_HTTP_BODY, "unexpected body {body:?}");
+    anyhow::ensure!(
+        server.log.count(&re(r"^203\.0\.113\.10 - - ")) == 1,
+        "the ISP server did not see the WAN address: {:?}",
+        server.log.tail(5)
+    );
+    Ok(())
+}
+
+/// The LAN host with the fixture's `nas` MAC gets 192.168.1.10 and the name `nas`.
+fn reservation_gives_the_nas_its_address(lab: &mut Lab) -> anyhow::Result<()> {
+    let mut cur = boot_static_dhcp_lan(lab)?;
+    lab.lan0.ip(&["link", "set", "lan0", "down"])?;
+    lab.lan0.ip(&["link", "set", "lan0", "address", NAS_MAC])?;
+    lab.lan0.ip(&["link", "set", "lan0", "up"])?;
+    let events = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    anyhow::ensure!(
+        udhcpc_env(&events, "ip")? == "192.168.1.10",
+        "ip {:?}",
+        udhcpc_env(&events, "ip")
+    );
+    anyhow::ensure!(
+        udhcpc_env(&events, "hostname")? == "nas",
+        "hostname {:?}",
+        udhcpc_env(&events, "hostname")
+    );
+    lab.console()?.wait_for(
+        &mut cur,
+        &re(r"openfeo: lan lan0 dhcp lease granted 192\.168\.1\.10 to 52:54:00:fe:10:10 host=nas lease=43200s"),
+        SOON,
+    )?;
+    Ok(())
+}
+
+/// The lease database survives a reset: the rebooted router restores it, and when the host asks
+/// for its old address again (udhcpc's `-r` puts it in a DISCOVER) the answer is a renewal of
+/// the restored lease, never a new grant.
+fn lan_lease_db_survives_reset(lab: &mut Lab) -> anyhow::Result<()> {
+    let mut cur = boot_static_dhcp_lan(lab)?;
+    let events = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&events, "ip")?.to_owned();
+    let c = lab.console()?;
+    c.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: lan lan0 dhcp lease granted {}",
+            escaped(&ip)
+        )),
+        SOON,
+    )?;
+    // The first write of the database follows the lease at once; give the disk a moment.
+    std::thread::sleep(Duration::from_secs(2));
+    lab.qmp()?.system_reset()?;
+    c.wait_for(
+        &mut cur,
+        &re(r"Linux version 6\.18\.59-openfeo"),
+        BOOT_TIMEOUT,
+    )?;
+    let after_reset = cur;
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo: lan lan0 dhcp restored 1 leases"),
+        BOOT_TIMEOUT,
+    )?;
+    c.wait_for(&mut cur, &re(READY), BOOT_TIMEOUT)?;
+    let events = lanclient::udhcpc(
+        &lab.lan0,
+        "lan0",
+        &lab.run_dir,
+        &["-r", &ip],
+        UDHCPC_TIMEOUT,
+    )?;
+    anyhow::ensure!(
+        udhcpc_env(&events, "ip")? == ip,
+        "rebooted to {:?}",
+        udhcpc_env(&events, "ip")
+    );
+    c.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: lan lan0 dhcp lease renewed {} to {}",
+            escaped(&ip),
+            lan_mac(lab)?
+        )),
+        SOON,
+    )?;
+    anyhow::ensure!(
+        c.count_since(&after_reset, &re(r"openfeo: lan lan0 dhcp lease granted")) == 0,
+        "the restored lease must be renewed, not granted anew"
+    );
+    Ok(())
+}
+
+/// A lease kept from another router is refused: our client's INIT-REBOOT of 192.168.1.77
+/// (udhcpc has no INIT-REBOOT) gets a NAK, and after its hold-off the host takes a pool address.
+fn a_foreign_lease_is_naked_on_the_new_router(lab: &mut Lab) -> anyhow::Result<()> {
+    let mut cur = boot_static_dhcp_lan(lab)?;
+    let lines = lanclient::dhcp_client(
+        HARNESS_BIN,
+        &lab.lan0,
+        "lan0",
+        &["--request", "192.168.1.77"],
+        NAK_TIMEOUT,
+    )?;
+    let kinds: Vec<&str> = lines
+        .iter()
+        .filter_map(|line| line["event"].as_str())
+        .collect();
+    anyhow::ensure!(
+        kinds.contains(&"nak") && kinds.last() == Some(&"bound"),
+        "client events {kinds:?}"
+    );
+    let bound = lines
+        .iter()
+        .find(|line| line["event"] == "bound")
+        .context("no bound event")?;
+    let ip = bound["address"].as_str().context("bound without address")?;
+    anyhow::ensure!(
+        re(&format!("^{LAN_POOL}$")).is_match(ip),
+        "{ip} outside the pool"
+    );
+    lab.console()?.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: lan lan0 dhcp nak 192\.168\.1\.77 to {} \(outside pool\)",
+            lan_mac(lab)?
+        )),
+        SOON,
+    )?;
     Ok(())
 }

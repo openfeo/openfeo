@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::Ipv4Net;
 
-use crate::{Config, DhcpWan, Firewall, PortMap, wan};
+use crate::{Config, DhcpWan, Firewall, LanDhcp, PortMap, StaticLease, wan};
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,6 +52,22 @@ pub enum Code {
     InvalidHostname,
     /// A `[wans.dhcp]` vendor class that is empty, over 255 bytes or not printable ASCII.
     InvalidVendorClass,
+    /// A `[lans.dhcp]` range that is not two IPv4 addresses with the first not above the last.
+    InvalidRange,
+    /// A `[lans.dhcp]` range end that is not a host address of the LAN subnet.
+    RangeOutsideSubnet,
+    /// A `[lans.dhcp]` range containing the router's own address.
+    RouterInRange,
+    /// A `[lans.dhcp]` lease time under [`MIN_LEASE_SECS`] (0 means the default).
+    LeaseTooShort,
+    /// A static lease MAC that is not `aa:bb:cc:dd:ee:ff`.
+    InvalidMac,
+    /// A static lease address that is not a host address of the LAN subnet, or is the router's.
+    StaticOutsideSubnet,
+    /// A static lease MAC or address used twice within one LAN.
+    DuplicateStatic,
+    /// A static lease client identifier that is not hex of 1 to 255 bytes.
+    InvalidClientId,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -69,6 +85,10 @@ pub const MAX_WAN_NAME: usize = 15 - "ppp-".len();
 pub const MAX_HOSTNAME: usize = 253;
 /// Longest vendor class sent as DHCP option 60 (one option's payload).
 pub const MAX_VENDOR_CLASS: usize = 255;
+/// Longest DNS label (a static lease's hostname).
+pub const MAX_LABEL: usize = 63;
+/// Shortest DHCPv4 lease `[lans.dhcp] lease_secs` may ask for; 0 means the default.
+pub const MIN_LEASE_SECS: u32 = 60;
 
 /// A DNS host name (RFC 1123 §2.1): dot-separated labels of `[A-Za-z0-9-]`, 1 to 63 bytes each,
 /// never starting or ending with a hyphen, at most [`MAX_HOSTNAME`] bytes in all.
@@ -131,6 +151,14 @@ impl Code {
             Code::DuplicateForward => "duplicate_forward",
             Code::InvalidHostname => "invalid_hostname",
             Code::InvalidVendorClass => "invalid_vendor_class",
+            Code::InvalidRange => "invalid_range",
+            Code::RangeOutsideSubnet => "range_outside_subnet",
+            Code::RouterInRange => "router_in_range",
+            Code::LeaseTooShort => "lease_too_short",
+            Code::InvalidMac => "invalid_mac",
+            Code::StaticOutsideSubnet => "static_outside_subnet",
+            Code::DuplicateStatic => "duplicate_static",
+            Code::InvalidClientId => "invalid_client_id",
         }
     }
 }
@@ -244,6 +272,9 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         if let Some(net) = report.cidr(&format!("{path}.ipv4"), &lan.ipv4) {
             subnets.push((format!("{path}.ipv4"), net));
             lan_subnets.push(net);
+            if let Some(dhcp) = &lan.dhcp {
+                lan_dhcp(&mut report, &path, net, dhcp);
+            }
         }
     }
 
@@ -285,6 +316,191 @@ fn dhcp_wan(report: &mut Report, path: &str, dhcp: &DhcpWan) {
             ),
         );
     }
+}
+
+/// `lans[i].dhcp` (SPEC §7.6): a pool of two ordered host addresses of the subnet with the
+/// router outside it, a lease time of at least [`MIN_LEASE_SECS`] (0 for the default), static
+/// leases with a MAC, a host address, a label and an optional client identifier, and DNS
+/// servers that are addresses.
+fn lan_dhcp(report: &mut Report, path: &str, net: Ipv4Net, dhcp: &LanDhcp) {
+    let path = format!("{path}.dhcp");
+    dhcp_range(report, &format!("{path}.range"), net, &dhcp.range);
+    if dhcp.lease_secs != 0 && dhcp.lease_secs < MIN_LEASE_SECS {
+        report.push(
+            format!("{path}.lease_secs"),
+            Code::LeaseTooShort,
+            format!(
+                "{} s; at least {MIN_LEASE_SECS} s, or 0 for the default",
+                dhcp.lease_secs
+            ),
+        );
+    }
+    let mut seen = (BTreeSet::new(), BTreeSet::new());
+    for (j, lease) in dhcp.r#static.iter().enumerate() {
+        static_lease(
+            report,
+            &format!("{path}.static[{j}]"),
+            net,
+            lease,
+            &mut seen,
+        );
+    }
+    for (k, dns) in dhcp.dns.iter().enumerate() {
+        if dns.parse::<Ipv4Addr>().is_err() {
+            report.push(
+                format!("{path}.dns[{k}]"),
+                Code::InvalidAddress,
+                format!("{dns:?} is not an IPv4 address"),
+            );
+        }
+    }
+}
+
+/// A host address of `net`: inside it, neither the network nor the broadcast address.
+fn is_host_address(net: Ipv4Net, addr: Ipv4Addr) -> bool {
+    net.contains(&addr) && addr != net.network() && addr != net.broadcast()
+}
+
+/// `lans[i].dhcp.range`: two ordered host addresses of the subnet, the router outside them.
+fn dhcp_range(report: &mut Report, path: &str, net: Ipv4Net, range: &[String]) {
+    let [first, last] = range else {
+        report.push(
+            path.to_owned(),
+            Code::InvalidRange,
+            format!(
+                "a range is exactly two addresses, first and last, not {}",
+                range.len()
+            ),
+        );
+        return;
+    };
+    let router = net.addr();
+    match (first.parse::<Ipv4Addr>(), last.parse::<Ipv4Addr>()) {
+        (Ok(first), Ok(last)) if first > last => report.push(
+            path.to_owned(),
+            Code::InvalidRange,
+            format!("{first} comes after {last}"),
+        ),
+        (Ok(first), Ok(last)) if !is_host_address(net, first) || !is_host_address(net, last) => {
+            report.push(
+                path.to_owned(),
+                Code::RangeOutsideSubnet,
+                format!("{first}-{last} must be host addresses of {}", net.trunc()),
+            );
+        }
+        (Ok(first), Ok(last)) if (first..=last).contains(&router) => report.push(
+            path.to_owned(),
+            Code::RouterInRange,
+            format!("the router's address {router} lies inside {first}-{last}"),
+        ),
+        (Ok(_), Ok(_)) => {}
+        _ => report.push(
+            path.to_owned(),
+            Code::InvalidRange,
+            format!("{range:?} are not two IPv4 addresses"),
+        ),
+    }
+}
+
+/// `lans[i].dhcp.static[j]`: a MAC and a host address not seen before in this LAN, a label,
+/// an optional hex client identifier.
+fn static_lease(
+    report: &mut Report,
+    path: &str,
+    net: Ipv4Net,
+    lease: &StaticLease,
+    seen: &mut (BTreeSet<[u8; 6]>, BTreeSet<Ipv4Addr>),
+) {
+    match parse_mac(&lease.mac) {
+        None => report.push(
+            format!("{path}.mac"),
+            Code::InvalidMac,
+            format!(
+                "{:?} is not a MAC address like aa:bb:cc:dd:ee:ff",
+                lease.mac
+            ),
+        ),
+        Some(mac) if !seen.0.insert(mac) => report.push(
+            format!("{path}.mac"),
+            Code::DuplicateStatic,
+            format!("{} already has a static lease", lease.mac),
+        ),
+        Some(_) => {}
+    }
+    match lease.ip.parse::<Ipv4Addr>() {
+        Err(_) => report.push(
+            format!("{path}.ip"),
+            Code::InvalidAddress,
+            format!("{:?} is not an IPv4 address", lease.ip),
+        ),
+        Ok(ip) if !is_host_address(net, ip) || ip == net.addr() => report.push(
+            format!("{path}.ip"),
+            Code::StaticOutsideSubnet,
+            format!(
+                "{ip} must be a host address of {} other than the router's",
+                net.trunc()
+            ),
+        ),
+        Ok(ip) if !seen.1.insert(ip) => report.push(
+            format!("{path}.ip"),
+            Code::DuplicateStatic,
+            format!("{ip} already has a static lease"),
+        ),
+        Ok(_) => {}
+    }
+    if !lease.hostname.is_empty() && !is_valid_label(&lease.hostname) {
+        report.push(
+            format!("{path}.hostname"),
+            Code::InvalidHostname,
+            format!(
+                "{:?} is not a DNS label: [A-Za-z0-9-] up to {MAX_LABEL} bytes, not starting or ending with a hyphen",
+                lease.hostname
+            ),
+        );
+    }
+    if !lease.client_id.is_empty() && !is_valid_client_id(&lease.client_id) {
+        report.push(
+            format!("{path}.client_id"),
+            Code::InvalidClientId,
+            format!(
+                "{:?} is not a client identifier: an even number of hex digits, 1 to 255 bytes",
+                lease.client_id
+            ),
+        );
+    }
+}
+
+/// One DNS label: 1 to [`MAX_LABEL`] bytes of `[A-Za-z0-9-]`, not starting or ending with a
+/// hyphen.
+#[must_use]
+pub fn is_valid_label(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_LABEL
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// `aa:bb:cc:dd:ee:ff`, either case.
+#[must_use]
+pub fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut parts = text.split(':');
+    for byte in &mut mac {
+        let part = parts.next()?;
+        if part.len() != 2 {
+            return None;
+        }
+        *byte = u8::from_str_radix(part, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
+/// Lowercase or uppercase hex of 1 to 255 bytes.
+fn is_valid_client_id(text: &str) -> bool {
+    text.len().is_multiple_of(2)
+        && (2..=510).contains(&text.len())
+        && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// `firewall.port_forwards[i]`: name, protocol, port (not one of the router's own), target
@@ -500,6 +716,7 @@ mod tests {
             name: name.into(),
             ports: ports.iter().map(|s| (*s).to_owned()).collect(),
             ipv4: ipv4.into(),
+            dhcp: None,
         }
     }
 
@@ -843,5 +1060,155 @@ mod tests {
                 Code::DuplicateForward
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod lan_dhcp_tests {
+    use super::*;
+    use crate::{PortMap, PortMapEntry};
+
+    const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
+    const VM_DHCP: &str = include_str!("../../../harness/fixtures/vm-dhcp.toml");
+
+    fn live() -> PortMap {
+        PortMap {
+            ports: ["pci-0000:00:03.0", "pci-0000:00:04.0", "pci-0000:00:05.0"]
+                .iter()
+                .enumerate()
+                .map(|(i, id)| PortMapEntry {
+                    id: (*id).to_owned(),
+                    name: format!("p{i}"),
+                })
+                .collect(),
+        }
+    }
+
+    /// A minimal config with one LAN and the given `[lans.dhcp]` body, so the only violations
+    /// are the DHCP block's.
+    fn with_dhcp(fragment: &str) -> Config {
+        crate::file::parse(&format!(
+            "config_version = 1\n[[lans]]\nname = \"lan0\"\nports = [\"p2\"]\nipv4 = \"192.168.1.1/24\"\n[lans.dhcp]\n{fragment}\n"
+        ))
+        .expect("test config parses")
+    }
+
+    fn codes(violations: &[Violation]) -> Vec<(String, Code)> {
+        violations
+            .iter()
+            .map(|v| (v.path.clone(), v.code))
+            .collect()
+    }
+
+    const RANGE: &str = "range = [\"192.168.1.100\", \"192.168.1.200\"]\n";
+
+    #[test]
+    fn fixture_dhcp_sections_are_valid() {
+        for fixture in [VM_STATIC, VM_DHCP] {
+            let config = crate::file::parse(fixture).expect("fixture parses");
+            assert!(config.lans[0].dhcp.is_some(), "fixture has [lans.dhcp]");
+            assert_eq!(validate(&config, &live()), vec![]);
+        }
+    }
+
+    #[test]
+    fn range_must_be_two_ordered_host_addresses_of_the_subnet_without_the_router() {
+        let range = |text: &str| codes(&validate(&with_dhcp(&format!("range = {text}")), &live()));
+        assert_eq!(
+            range(r#"["192.168.1.100"]"#),
+            vec![("lans[0].dhcp.range".to_owned(), Code::InvalidRange)]
+        );
+        assert_eq!(
+            range(r#"["192.168.1.200", "192.168.1.100"]"#),
+            vec![("lans[0].dhcp.range".to_owned(), Code::InvalidRange)]
+        );
+        assert_eq!(
+            range(r#"["192.168.1.0", "192.168.1.255"]"#),
+            vec![("lans[0].dhcp.range".to_owned(), Code::RangeOutsideSubnet)]
+        );
+        assert_eq!(
+            range(r#"["192.168.2.10", "192.168.2.20"]"#),
+            vec![("lans[0].dhcp.range".to_owned(), Code::RangeOutsideSubnet)]
+        );
+        assert_eq!(
+            range(r#"["192.168.1.1", "192.168.1.20"]"#),
+            vec![("lans[0].dhcp.range".to_owned(), Code::RouterInRange)]
+        );
+    }
+
+    #[test]
+    fn lease_secs_zero_is_the_default_and_under_60_is_refused() {
+        assert_eq!(validate(&with_dhcp(RANGE), &live()), vec![]);
+        assert_eq!(
+            codes(&validate(
+                &with_dhcp(&format!("{RANGE}lease_secs = 30")),
+                &live()
+            )),
+            vec![("lans[0].dhcp.lease_secs".to_owned(), Code::LeaseTooShort)]
+        );
+        assert_eq!(
+            validate(&with_dhcp(&format!("{RANGE}lease_secs = 60")), &live()),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn statics_need_a_mac_a_host_address_a_label_and_no_duplicates() {
+        let bad = format!(
+            "{RANGE}[[lans.dhcp.static]]\nmac = \"zz:00\"\nip = \"192.168.1.1\"\nhostname = \"nas.home\"\nclient_id = \"abc\"\n\
+             [[lans.dhcp.static]]\nmac = \"52:54:00:fe:10:10\"\nip = \"192.168.1.10\"\nhostname = \"nas\"\n\
+             [[lans.dhcp.static]]\nmac = \"52:54:00:FE:10:10\"\nip = \"192.168.1.11\"\nhostname = \"nas2\"\n\
+             [[lans.dhcp.static]]\nmac = \"52:54:00:fe:10:11\"\nip = \"192.168.1.10\"\nhostname = \"nas3\"\n"
+        );
+        assert_eq!(
+            codes(&validate(&with_dhcp(&bad), &live())),
+            vec![
+                ("lans[0].dhcp.static[0].mac".to_owned(), Code::InvalidMac),
+                (
+                    "lans[0].dhcp.static[0].ip".to_owned(),
+                    Code::StaticOutsideSubnet
+                ),
+                (
+                    "lans[0].dhcp.static[0].hostname".to_owned(),
+                    Code::InvalidHostname
+                ),
+                (
+                    "lans[0].dhcp.static[0].client_id".to_owned(),
+                    Code::InvalidClientId
+                ),
+                (
+                    "lans[0].dhcp.static[2].mac".to_owned(),
+                    Code::DuplicateStatic
+                ),
+                (
+                    "lans[0].dhcp.static[3].ip".to_owned(),
+                    Code::DuplicateStatic
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_entries_must_be_addresses() {
+        assert_eq!(
+            codes(&validate(
+                &with_dhcp(&format!("{RANGE}dns = [\"1.1.1.1\", \"dns.example\"]")),
+                &live()
+            )),
+            vec![("lans[0].dhcp.dns[1]".to_owned(), Code::InvalidAddress)]
+        );
+    }
+
+    #[test]
+    fn labels_and_macs_parse() {
+        assert!(is_valid_label("nas") && is_valid_label("Nas-2"));
+        assert!(!is_valid_label("-nas") && !is_valid_label("nas.home") && !is_valid_label(""));
+        assert!(!is_valid_label(&"a".repeat(64)) && is_valid_label(&"a".repeat(63)));
+        assert_eq!(
+            parse_mac("52:54:00:FE:10:10"),
+            Some([0x52, 0x54, 0, 0xfe, 0x10, 0x10])
+        );
+        assert_eq!(parse_mac("52-54-00-fe-10-10"), None);
+        assert_eq!(parse_mac("52:54:00:fe:10"), None);
     }
 }
