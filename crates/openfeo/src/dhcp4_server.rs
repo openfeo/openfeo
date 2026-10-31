@@ -15,12 +15,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ipnet::Ipv4Net;
-use openfeo_config::load::STATE_FILE_MODE;
 use openfeo_config::validate::parse_mac;
 use openfeo_config::{Dhcp4ServerLease, Dhcp4ServerLeases, file};
 use openfeo_net::dhcp4::DriverError;
 use openfeo_net::dhcp4_server::{ServerDriver, ServerDriverConfig};
-use openfeo_platform::atomic;
 use openfeo_proto_dhcp4::identity::{from_hex, hex};
 use openfeo_proto_dhcp4::server::Timestamp;
 use openfeo_proto_dhcp4::{LeaseRecord, ServerEvent};
@@ -36,6 +34,7 @@ use tracing::{debug, info, warn};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 
 use crate::dhcp4::{LEASES_DIR, mac_text, wait_for_link};
+use crate::state;
 
 /// The least time between two writes of a lease database (SPEC §5.2).
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -142,7 +141,7 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
                     // The bridge was recreated: the sockets are bound to the old index. A save
                     // still owed is written first; the restart reads it back.
                     if save_at.is_some() {
-                        save_leases(&path, lan, &driver);
+                        save_leases(&path, lan, &driver).await;
                     }
                     return Err(format!(
                         "dhcp4 server {lan}: {bridge} changed index {ifindex} -> {index}; restarting"
@@ -151,7 +150,7 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
                 }
             }
             () = sleep_until(save_at) => {
-                save_leases(&path, lan, &driver);
+                save_leases(&path, lan, &driver).await;
                 last_save = Some(Instant::now());
                 save_at = None;
             }
@@ -301,16 +300,12 @@ fn read_leases(path: &Path, lan: &str, now: Timestamp, unix_now: u64) -> Vec<Lea
     }
 }
 
-fn save_leases(path: &Path, lan: &str, driver: &ServerDriver) {
+async fn save_leases(path: &Path, lan: &str, driver: &ServerDriver) {
     let leases = file_from_records(lan, &driver.leases(), driver.now(), unix_now());
-    let result = file::render_dhcp4_server_leases(&leases)
-        .map_err(|err| io::Error::other(err.to_string()))
-        .and_then(|text| {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            atomic::write(path, text.as_bytes(), STATE_FILE_MODE)
-        });
+    let result = match file::render_dhcp4_server_leases(&leases) {
+        Ok(text) => state::write(path, text).await,
+        Err(err) => Err(io::Error::other(err.to_string())),
+    };
     match result {
         Ok(()) => debug!(
             "lan {lan} dhcp {} leases saved to {}",

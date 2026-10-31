@@ -119,6 +119,8 @@ pub struct Driver {
     stats: Stats,
     /// Events produced before the caller asked for them (by `new` and `link`).
     pending: Vec<Event>,
+    /// The receive buffer, reused across steps.
+    buf: Vec<u8>,
 }
 
 impl std::fmt::Debug for Driver {
@@ -150,6 +152,7 @@ impl Driver {
             start: Instant::now(),
             stats: Stats::default(),
             pending: Vec::new(),
+            buf: vec![0u8; RECEIVE_BUFFER],
         };
         let outputs = driver.client.handle(
             Input::Start {
@@ -176,10 +179,9 @@ impl Driver {
             .client
             .next_timeout()
             .map(|at| self.start + Duration::from_millis(at));
-        let mut buf = vec![0u8; RECEIVE_BUFFER];
         let received = tokio::select! {
             () = wait_until(deadline) => None,
-            packet = receive(&self.transport, &mut buf) => Some(packet?),
+            packet = receive(&self.transport, &mut self.buf) => Some(packet?),
         };
         let now = self.now();
         let outputs = match received {
