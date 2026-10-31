@@ -177,6 +177,7 @@ impl Rig {
                 },
             ],
             rebind_allow: vec!["allowed.isp.example".parse().context("a name")?],
+            wan_addrs: Vec::new(),
             cache_capacity: 64,
         })
     }

@@ -50,6 +50,9 @@ pub struct Config {
     pub router_name: Option<Name>,
     /// The LAN addresses: the router's A records, and never a valid upstream answer.
     pub router_addrs: Vec<Ipv4Addr>,
+    /// The router's other addresses (the WAN's): never a valid upstream answer either, but not
+    /// A records of the router's name.
+    pub wan_addrs: Vec<Ipv4Addr>,
     /// Reverse zones the forwarder is authoritative for, and never a valid upstream answer.
     pub lan_subnets: Vec<Ipv4Net>,
     /// Reservations first, then leases; the first match wins.
@@ -582,6 +585,7 @@ impl Forwarder {
                 .iter()
                 .any(|subnet| subnet.contains(&addr))
             || self.config.router_addrs.contains(&addr)
+            || self.config.wan_addrs.contains(&addr)
     }
 
     /// ULA, link-local, loopback, or an IPv4-mapped address that [`Forwarder::is_internal_v4`]
@@ -804,6 +808,7 @@ mod tests {
             domain: name("home.arpa"),
             router_name: Some(name("openfeo.home.arpa")),
             router_addrs: vec![ip("192.168.1.1")],
+            wan_addrs: Vec::new(),
             lan_subnets: vec!["192.168.1.0/24".parse().unwrap()],
             local: vec![
                 LocalRecord {
@@ -1647,7 +1652,7 @@ mod tests {
         let mut cfg = config();
         // A LAN numbered outside RFC 1918, and the WAN address as the reconciler supplies it.
         cfg.lan_subnets.push("198.18.0.0/15".parse().unwrap());
-        cfg.router_addrs.push(ip("203.0.113.10"));
+        cfg.wan_addrs.push(ip("203.0.113.10"));
         let mut f = Forwarder::new(cfg, 1);
         let cases = [
             ("cgnat.isp.example", "100.64.1.2"),
@@ -1833,6 +1838,27 @@ mod tests {
                 .count(),
             MAX_PENDING,
             "every pending query gets SERVFAIL"
+        );
+    }
+
+    #[test]
+    fn the_routers_name_resolves_to_its_lan_addresses_only() {
+        let mut cfg = config();
+        cfg.wan_addrs.push(ip("203.0.113.10"));
+        let mut f = Forwarder::new(cfg, 1);
+        let r = reply(&f.handle(
+            client(1, Transport::Udp, q("openfeo.home.arpa", rtype::A)),
+            0,
+        ));
+        let addrs: Vec<RData> = r
+            .answers
+            .iter()
+            .map(|record| record.rdata.clone())
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![RData::A(ip("192.168.1.1"))],
+            "the WAN address guards; it is not an A record of the router"
         );
     }
 }
