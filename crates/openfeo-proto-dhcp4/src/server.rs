@@ -77,15 +77,15 @@ pub enum Input {
     Timeout,
 }
 
-/// Where a reply goes (RFC 2131 §4.1).
+/// Where a reply goes (RFC 2131 §4.1): broadcast, or to the client's own hardware address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Destination {
     /// 255.255.255.255:68.
     Broadcast,
-    /// Link-layer unicast to a client that has no address yet.
+    /// Link-layer unicast to the client's hardware address, whether it has no address yet
+    /// (`yiaddr`) or speaks from one (`ciaddr`): a reply never goes through the kernel's IP
+    /// path, whose offloaded checksums a raw-socket client rejects on virtual links (ADR-0014).
     Link { ip: Ipv4Addr, mac: [u8; 6] },
-    /// Plain UDP to a client's configured address.
-    Unicast(Ipv4Addr),
 }
 
 /// Why a REQUEST was refused.
@@ -541,7 +541,10 @@ impl Server {
                 mac,
             }),
             Output::Send {
-                to: Destination::Unicast(msg.ciaddr),
+                to: Destination::Link {
+                    ip: msg.ciaddr,
+                    mac,
+                },
                 payload: reply.encode(),
             },
         ]
@@ -866,7 +869,10 @@ fn requested_address(msg: &Message) -> Option<Ipv4Addr> {
 /// Where the reply to `request` goes (RFC 2131 §4.1, `giaddr` being zero).
 fn destination(request: &Message, yiaddr: Ipv4Addr) -> Destination {
     if request.ciaddr != Ipv4Addr::UNSPECIFIED {
-        Destination::Unicast(request.ciaddr)
+        Destination::Link {
+            ip: request.ciaddr,
+            mac: chaddr6(request),
+        }
     } else if request.flags & FLAG_BROADCAST != 0 {
         Destination::Broadcast
     } else {
@@ -1543,7 +1549,13 @@ mod tests {
         s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
         let out = s.handle(Input::Packet(request(MAC_A, 2, addr, vec![])), 21_603);
         let (to, ack) = sends(&out).remove(0);
-        assert_eq!(to, Destination::Unicast(addr));
+        assert_eq!(
+            to,
+            Destination::Link {
+                ip: addr,
+                mac: MAC_A
+            }
+        );
         assert_eq!((ack.yiaddr, ack.ciaddr), (addr, addr));
         assert!(
             matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.expires_at == 21_603 + 43_200 && r.granted_at == 21_603)
@@ -1553,7 +1565,10 @@ mod tests {
         let out = s.handle(Input::Packet(broadcast.encode()), 40_000);
         assert_eq!(
             sends(&out)[0].0,
-            Destination::Unicast(addr),
+            Destination::Link {
+                ip: addr,
+                mac: MAC_A
+            },
             "ciaddr wins over the broadcast flag"
         );
     }
@@ -1588,7 +1603,13 @@ mod tests {
         let mut s = Server::new(config(), vec![], 0);
         let out = s.handle(Input::Packet(inform(MAC_A, 9, ip("192.168.1.50"))), 0);
         let (to, ack) = sends(&out).remove(0);
-        assert_eq!(to, Destination::Unicast(ip("192.168.1.50")));
+        assert_eq!(
+            to,
+            Destination::Link {
+                ip: ip("192.168.1.50"),
+                mac: MAC_A
+            }
+        );
         assert_eq!(
             (ack.yiaddr, ack.ciaddr),
             (Ipv4Addr::UNSPECIFIED, ip("192.168.1.50"))

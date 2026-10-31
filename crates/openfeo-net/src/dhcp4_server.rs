@@ -3,11 +3,11 @@
 
 //! The DHCPv4 server driver (SPEC §7.6): runs one [`Server`] on one LAN bridge over a UDP
 //! socket bound to the device for the ordinary traffic and a packet socket bound to ARP, which
-//! sends the probes, reads the replies and carries the link-layer unicast replies that a client
-//! without an address needs.
+//! sends the probes, reads the replies and carries every reply as a frame with our own checksums
+//! (ADR-0014).
 
 use std::ffi::OsString;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -162,27 +162,23 @@ impl ServerDriver {
         events
     }
 
-    /// A send that fails is logged, not fatal: the client retransmits.
+    /// A send that fails is logged, not fatal: the client retransmits. Every reply is a frame
+    /// of our own making over the packet socket, checksums included: a UDP socket's broadcast
+    /// over a veth or virtio link carries an offloaded, partial checksum that a raw-socket
+    /// client drops (ADR-0014).
     fn send(&mut self, to: Destination, payload: &[u8]) {
-        let result = match (socket_target(to), to) {
-            (Some(target), _) => self
-                .udp
-                .try_send_to(payload, SocketAddr::V4(target))
-                .map(|_| ())
-                .map_err(|err| err.to_string()),
-            (None, Destination::Link { ip, mac }) => {
-                let frame = udp::encapsulate(
-                    self.config.server.server,
-                    ip,
-                    SERVER_PORT,
-                    CLIENT_PORT,
-                    payload,
-                );
-                self.send_frame(&frame, ETH_P_IP, mac)
-            }
-            (None, _) => Err("no destination".to_owned()),
+        let (ip, mac) = match to {
+            Destination::Broadcast => (Ipv4Addr::BROADCAST, BROADCAST_MAC),
+            Destination::Link { ip, mac } => (ip, mac),
         };
-        match result {
+        let frame = udp::encapsulate(
+            self.config.server.server,
+            ip,
+            SERVER_PORT,
+            CLIENT_PORT,
+            payload,
+        );
+        match self.send_frame(&frame, ETH_P_IP, mac) {
             Ok(()) => {
                 self.stats.sent += 1;
                 debug!(
@@ -220,7 +216,7 @@ impl ServerDriver {
     }
 }
 
-/// The UDP socket: port 67 on the device only, able to broadcast.
+/// The UDP socket: port 67 on the device only; it only receives.
 fn udp_socket(ifname: &str) -> Result<UdpSocket, DriverError> {
     let fd = socket(
         AddressFamily::Inet,
@@ -230,7 +226,6 @@ fn udp_socket(ifname: &str) -> Result<UdpSocket, DriverError> {
     )
     .map_err(socket_err("open UDP socket"))?;
     setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(socket_err("SO_REUSEADDR"))?;
-    setsockopt(&fd, sockopt::Broadcast, &true).map_err(socket_err("SO_BROADCAST"))?;
     setsockopt(&fd, sockopt::BindToDevice, &OsString::from(ifname))
         .map_err(socket_err("SO_BINDTODEVICE"))?;
     bind(fd.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, SERVER_PORT))
@@ -305,15 +300,6 @@ pub(crate) fn probe_reply(frame: &[u8]) -> Option<Input> {
     }
 }
 
-/// Where a UDP reply goes; `None` for a link-layer destination, which the packet socket takes.
-pub(crate) fn socket_target(to: Destination) -> Option<SocketAddrV4> {
-    match to {
-        Destination::Broadcast => Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, CLIENT_PORT)),
-        Destination::Unicast(ip) => Some(SocketAddrV4::new(ip, CLIENT_PORT)),
-        Destination::Link { .. } => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,24 +328,5 @@ mod tests {
         );
         assert_eq!(probe_reply(&request.encode()), None);
         assert_eq!(probe_reply(&[0; 5]), None);
-    }
-
-    #[test]
-    fn destinations_map_to_socket_targets() {
-        assert_eq!(
-            socket_target(Destination::Broadcast),
-            Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 68))
-        );
-        assert_eq!(
-            socket_target(Destination::Unicast("192.168.1.50".parse().unwrap())),
-            Some(SocketAddrV4::new("192.168.1.50".parse().unwrap(), 68))
-        );
-        assert_eq!(
-            socket_target(Destination::Link {
-                ip: Ipv4Addr::UNSPECIFIED,
-                mac: [0; 6]
-            }),
-            None
-        );
     }
 }
