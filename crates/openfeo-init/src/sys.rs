@@ -381,6 +381,47 @@ pub fn file_from_fd(fd: RawFd) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// The wall clock, as seconds and nanoseconds since the Unix epoch.
+///
+/// # Errors
+///
+/// When `clock_gettime(2)` fails, which it does not for `CLOCK_REALTIME`.
+pub fn clock_realtime() -> io::Result<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable `timespec` for the duration of the call; the kernel
+    // fills it and returns 0, or -1 with errno.
+    if unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Duration::new(
+        u64::try_from(ts.tv_sec).unwrap_or(0),
+        u32::try_from(ts.tv_nsec).unwrap_or(0),
+    ))
+}
+
+/// Set the wall clock to `unix_secs` exactly.
+///
+/// # Errors
+///
+/// When `clock_settime(2)` refuses: no `CAP_SYS_TIME` (a container), or a time it cannot
+/// represent.
+pub fn set_clock_realtime(unix_secs: u64) -> io::Result<()> {
+    let ts = libc::timespec {
+        tv_sec: libc::time_t::try_from(unix_secs)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a fully initialised `timespec` that lives for the call; the kernel only
+    // reads it.
+    if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

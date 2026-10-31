@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
         // The kernel hands init whatever command-line words it did not recognise, so argv may
         // hold things that are not our flags; only `--mode` matters here.
         let mode_flag = cli.as_ref().ok().and_then(|cli| cli.mode);
-        openfeo_init::main(&version::version(), mode_flag);
+        openfeo_init::main(&version::version(), mode_flag, version::build_epoch());
     }
     let cli = cli?;
     if cli.print_version {

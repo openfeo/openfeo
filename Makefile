@@ -6,6 +6,9 @@ PROFILE        ?= release
 FEATURES       ?= harness
 BUILD          ?= $(CURDIR)/build
 BUILD_ID       := $(shell git describe --always --dirty 2>/dev/null || echo dev)
+# The build timestamp the binary carries as its clock floor (SPEC §7.10): SOURCE_DATE_EPOCH when
+# set (reproducible builds), else the commit's time, else now.
+BUILD_EPOCH    := $(or $(SOURCE_DATE_EPOCH),$(shell git log -1 --format=%ct 2>/dev/null || date +%s))
 FILTER         ?=
 FUZZ_TARGET    ?= config_toml
 FUZZ_SECS      ?= 60
@@ -21,7 +24,7 @@ KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
 .PHONY: bin kernel-src kernel-headers nft-src kernel run test-harness check-env ci lint test fuzz
 bin: kernel-headers nft-src
-	OPENFEO_BUILD_ID=$(BUILD_ID) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
+	OPENFEO_BUILD_ID=$(BUILD_ID) OPENFEO_BUILD_EPOCH=$(BUILD_EPOCH) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 kernel-src:
 	$(KERNEL_ENV) kernel/build.sh fetch
 kernel-headers: kernel-src
