@@ -147,6 +147,13 @@ pub enum ServerEvent {
     Exhausted {
         mac: [u8; 6],
     },
+    /// The address reserved for `mac` answered the probe from `by`: the client gets no offer
+    /// until the squatter lets go.
+    ReservationInUse {
+        address: Ipv4Addr,
+        mac: [u8; 6],
+        by: [u8; 6],
+    },
 }
 
 /// What the server wants done or known.
@@ -275,7 +282,7 @@ impl Server {
             if offer.probing.is_some() {
                 return Vec::new();
             }
-            offer.discover = msg;
+            offer.discover = slim_for_offer(msg);
             offer.hold_until = now + OFFER_HOLD;
             // Re-sent, not announced again: a client that keeps discovering is not a console line
             // per second.
@@ -291,7 +298,7 @@ impl Server {
         let offer = Offer {
             address,
             mac,
-            discover: msg,
+            discover: slim_for_offer(msg),
             probing: (!own).then_some(now + PROBE_TIMEOUT),
             probes: 1,
             hold_until: now + OFFER_HOLD,
@@ -364,7 +371,18 @@ impl Server {
             outputs.push(Output::Probe { address: next });
         } else {
             self.offers.remove(&identity);
-            outputs.push(Output::Event(ServerEvent::Exhausted { mac: offer_mac }));
+            let reserved = self
+                .reservation_for(&identity, offer_mac)
+                .is_some_and(|reservation| reservation.address == address);
+            outputs.push(Output::Event(if reserved {
+                ServerEvent::ReservationInUse {
+                    address,
+                    mac: offer_mac,
+                    by: mac,
+                }
+            } else {
+                ServerEvent::Exhausted { mac: offer_mac }
+            }));
         }
         outputs
     }
@@ -423,7 +441,9 @@ impl Server {
                 return Vec::new();
             }
             (_, Some(address), _) => address,
-            (None, None, ciaddr) if ciaddr != Ipv4Addr::UNSPECIFIED => ciaddr,
+            // RENEWING or REBINDING: the address is `ciaddr`, whether or not the client names
+            // us as well (some do, against RFC 2131 §4.3.2).
+            (_, None, ciaddr) if ciaddr != Ipv4Addr::UNSPECIFIED => ciaddr,
             _ => return Vec::new(),
         };
         match self.refusal(address, &identity, chaddr6(msg)) {
@@ -773,8 +793,10 @@ impl Server {
                 options.push(DhcpOption::HostName(hostname.to_owned()));
             }
         }
-        if let Some(client_id) = request.option(61) {
-            options.push(client_id.clone());
+        if let Some(DhcpOption::ClientIdentifier(id)) = request.option(61)
+            && !id.is_empty()
+        {
+            options.push(DhcpOption::ClientIdentifier(id.clone()));
         }
         Message {
             op: Op::BootReply,
@@ -798,6 +820,21 @@ impl Server {
             options,
         }
     }
+}
+
+/// What an offer keeps of the DISCOVER it answers: the header fields the OFFER echoes and the
+/// two options read later (50, the requested address; 61, the client identifier). `sname`,
+/// `file` and every other option go, so a pending offer costs a few dozen bytes, not a packet.
+fn slim_for_offer(mut msg: Message) -> Message {
+    msg.options.retain(|option| {
+        matches!(
+            option,
+            DhcpOption::RequestedIpAddress(_) | DhcpOption::ClientIdentifier(_)
+        )
+    });
+    msg.sname = [0; 64];
+    msg.file = [0; 128];
+    msg
 }
 
 /// A client's hostname as a DNS label, or nothing (SPEC §7.6 "sanitised to DNS labels"): the
@@ -1888,5 +1925,109 @@ mod tests {
         );
         assert_eq!(s.leases(), vec![good]);
         assert_eq!(s.next_timeout(), Some(100));
+    }
+
+    #[test]
+    fn a_squatted_reservation_is_reported_as_in_use_not_exhausted() {
+        let mut s = Server::new(config(), vec![], 0);
+        s.handle(Input::Packet(discover(MAC_NAS, 1, vec![])), 0);
+        let mut out = Vec::new();
+        for i in 0..MAX_PROBES {
+            out = s.handle(
+                Input::ProbeReply {
+                    address: ip("192.168.1.10"),
+                    mac: MAC_SQUATTER,
+                },
+                Timestamp::from(i),
+            );
+        }
+        assert!(
+            events(&out).contains(&ServerEvent::ReservationInUse {
+                address: ip("192.168.1.10"),
+                mac: MAC_NAS,
+                by: MAC_SQUATTER,
+            }),
+            "{out:?}"
+        );
+        assert!(
+            !events(&out)
+                .iter()
+                .any(|e| matches!(e, ServerEvent::Exhausted { .. }))
+        );
+    }
+
+    #[test]
+    fn a_renewing_request_with_our_server_id_and_ciaddr_is_acknowledged() {
+        let mut s = Server::new(config(), vec![], 0);
+        let address = offered(&mut s, MAC_A, 0);
+        s.handle(
+            Input::Packet(request(
+                MAC_A,
+                1,
+                Ipv4Addr::UNSPECIFIED,
+                vec![
+                    DhcpOption::ServerIdentifier(ip("192.168.1.1")),
+                    DhcpOption::RequestedIpAddress(address),
+                ],
+            )),
+            2,
+        );
+        let out = s.handle(
+            Input::Packet(request(
+                MAC_A,
+                2,
+                address,
+                vec![DhcpOption::ServerIdentifier(ip("192.168.1.1"))],
+            )),
+            100,
+        );
+        assert_eq!(
+            sends(&out)[0].1.message_type(),
+            Some(MessageType::Ack),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_client_identifier_is_not_echoed() {
+        let mut s = Server::new(config(), vec![], 0);
+        s.handle(
+            Input::Packet(discover(
+                MAC_A,
+                1,
+                vec![DhcpOption::ClientIdentifier(vec![])],
+            )),
+            0,
+        );
+        let out = s.handle(Input::Timeout, PROBE_TIMEOUT);
+        assert_eq!(sends(&out)[0].1.option(61), None, "{out:?}");
+    }
+
+    /// Pin for the slimmed offer: what it must still carry.
+    #[test]
+    fn offers_keep_the_requested_address_and_the_client_identifier() {
+        let mut s = Server::new(config(), vec![], 0);
+        let id = vec![0xff, 1, 2, 3, 4];
+        s.handle(
+            Input::Packet(discover(
+                MAC_A,
+                1,
+                vec![
+                    DhcpOption::ClientIdentifier(id.clone()),
+                    DhcpOption::RequestedIpAddress(ip("192.168.1.150")),
+                    DhcpOption::Unknown {
+                        code: 43,
+                        data: vec![1; 200],
+                    },
+                ],
+            )),
+            0,
+        );
+        let out = s.handle(Input::Timeout, PROBE_TIMEOUT);
+        let offer = &sends(&out)[0].1;
+        assert_eq!(
+            (offer.yiaddr, offer.option(61)),
+            (ip("192.168.1.150"), Some(&DhcpOption::ClientIdentifier(id)))
+        );
     }
 }

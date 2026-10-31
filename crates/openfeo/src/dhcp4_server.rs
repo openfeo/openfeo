@@ -106,7 +106,12 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
             events = driver.step() => {
                 for event in events.map_err(failed)? {
                     let line = event_line(lan, &event);
-                    if matches!(event, ServerEvent::Exhausted { .. } | ServerEvent::Conflict { .. }) {
+                    if matches!(
+                        event,
+                        ServerEvent::Exhausted { .. }
+                            | ServerEvent::Conflict { .. }
+                            | ServerEvent::ReservationInUse { .. }
+                    ) {
                         // A LAN can provoke these at packet rate: one per window on the console.
                         if let Some(line) = noisy.line(Instant::now(), &line) {
                             info!("{line}");
@@ -134,7 +139,11 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
                 if let Some(index) = index
                     && index != ifindex
                 {
-                    // The bridge was recreated: the sockets are bound to the old index.
+                    // The bridge was recreated: the sockets are bound to the old index. A save
+                    // still owed is written first; the restart reads it back.
+                    if save_at.is_some() {
+                        save_leases(&path, lan, &driver);
+                    }
                     return Err(format!(
                         "dhcp4 server {lan}: {bridge} changed index {ifindex} -> {index}; restarting"
                     )
@@ -169,37 +178,61 @@ fn unix_now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// The file's leases for `lan` as the core's records: wall-clock times become the driver's
-/// clock (`now` and `unix_now` are the same instant), expired ones are dropped, as is anything
-/// that does not parse. Another LAN's file yields nothing.
+/// The file's leases for `lan` as the core's records, and one line per entry left out saying
+/// which and why: wall-clock times become the driver's clock (`now` and `unix_now` are the same
+/// instant), expired ones are dropped, as is anything that does not parse. Another LAN's file
+/// yields nothing.
 #[must_use]
 pub fn records_from_file(
     file: &Dhcp4ServerLeases,
     lan: &str,
     now: Timestamp,
     unix_now: u64,
-) -> Vec<LeaseRecord> {
+) -> (Vec<LeaseRecord>, Vec<String>) {
     if file.lan != lan {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    file.leases
-        .iter()
-        .filter(|lease| lease.expires_unix > unix_now)
-        .filter_map(|lease| {
-            Some(LeaseRecord {
-                address: lease.address.parse().ok()?,
-                mac: parse_mac(&lease.mac)?,
-                client_id: if lease.client_id.is_empty() {
-                    None
-                } else {
-                    Some(from_hex(&lease.client_id)?)
-                },
-                hostname: (!lease.hostname.is_empty()).then(|| lease.hostname.clone()),
-                granted_at: now.saturating_sub(unix_now.saturating_sub(lease.granted_unix)),
-                expires_at: now + (lease.expires_unix - unix_now),
-            })
-        })
-        .collect()
+    let mut records = Vec::new();
+    let mut dropped = Vec::new();
+    for lease in &file.leases {
+        match record_from(lease, now, unix_now) {
+            Ok(record) => records.push(record),
+            Err(why) => dropped.push(format!("{}: {why}", lease.address)),
+        }
+    }
+    (records, dropped)
+}
+
+/// One file entry as a record, or why it is left out.
+fn record_from(
+    lease: &Dhcp4ServerLease,
+    now: Timestamp,
+    unix_now: u64,
+) -> Result<LeaseRecord, String> {
+    if lease.expires_unix <= unix_now {
+        return Err("expired".to_owned());
+    }
+    let address = lease
+        .address
+        .parse()
+        .map_err(|_| format!("address {:?} does not parse", lease.address))?;
+    let mac = parse_mac(&lease.mac).ok_or_else(|| format!("mac {:?} does not parse", lease.mac))?;
+    let client_id = if lease.client_id.is_empty() {
+        None
+    } else {
+        Some(
+            from_hex(&lease.client_id)
+                .ok_or_else(|| format!("client id {:?} is not hex", lease.client_id))?,
+        )
+    };
+    Ok(LeaseRecord {
+        address,
+        mac,
+        client_id,
+        hostname: (!lease.hostname.is_empty()).then(|| lease.hostname.clone()),
+        granted_at: now.saturating_sub(unix_now.saturating_sub(lease.granted_unix)),
+        expires_at: now + (lease.expires_unix - unix_now),
+    })
 }
 
 /// The core's records as the file, with wall-clock times.
@@ -245,7 +278,13 @@ pub fn facts_from(records: &[LeaseRecord], now: Timestamp, unix_now: u64) -> Vec
 fn read_leases(path: &Path, lan: &str, now: Timestamp, unix_now: u64) -> Vec<LeaseRecord> {
     match fs::read_to_string(path) {
         Ok(text) => match file::parse_dhcp4_server_leases(&text) {
-            Ok(leases) => records_from_file(&leases, lan, now, unix_now),
+            Ok(leases) => {
+                let (records, dropped) = records_from_file(&leases, lan, now, unix_now);
+                for why in dropped {
+                    warn!("lan {lan} dhcp ignoring lease {why}");
+                }
+                records
+            }
             Err(err) => {
                 warn!(
                     "lan {lan} dhcp ignoring unreadable lease database {}: {err}",
@@ -351,6 +390,11 @@ fn event_line(lan: &str, event: &ServerEvent) -> String {
         ServerEvent::Exhausted { mac } => {
             format!("lan {lan} dhcp pool exhausted for {}", mac_text(*mac))
         }
+        ServerEvent::ReservationInUse { address, mac, by } => format!(
+            "lan {lan} dhcp reservation {} in use by {}",
+            at(*address, *mac, "for"),
+            mac_text(*by)
+        ),
     }
 }
 
@@ -465,7 +509,7 @@ mod tests {
             }
         );
         assert_eq!(
-            records_from_file(&file, "lan0", 0, 1_800_000_200),
+            records_from_file(&file, "lan0", 0, 1_800_000_200).0,
             vec![LeaseRecord {
                 granted_at: 0,
                 expires_at: 43_100,
@@ -491,7 +535,7 @@ mod tests {
                 lease("52:54:00:fe:10:13", "192.168.1.113", 1_800_009_000),
             ],
         };
-        let records = records_from_file(&file, "lan0", 50, 1_800_000_100);
+        let (records, _) = records_from_file(&file, "lan0", 50, 1_800_000_100);
         assert_eq!(
             records
                 .iter()
@@ -506,7 +550,7 @@ mod tests {
             "Server::new drops 10.0.0.5"
         );
         assert_eq!(
-            records_from_file(&file, "lan1", 50, 1_800_000_100),
+            records_from_file(&file, "lan1", 50, 1_800_000_100).0,
             Vec::new(),
             "another LAN's file is ignored"
         );
@@ -658,6 +702,45 @@ mod tests {
         assert_eq!(
             server_lease_path("lan0").to_str(),
             Some("/state/leases/dhcp4-server-lan0.toml")
+        );
+    }
+
+    #[test]
+    fn dropped_lease_entries_are_reported() {
+        let lease = |mac: &str, address: &str, expires_unix| Dhcp4ServerLease {
+            mac: mac.into(),
+            address: address.into(),
+            expires_unix,
+            ..Default::default()
+        };
+        let file = Dhcp4ServerLeases {
+            lan: "lan0".into(),
+            leases: vec![
+                lease("nope", "192.168.1.12", 1_800_009_000),
+                lease("52:54:00:fe:10:13", "192.168.1.113", 1_800_000_000),
+            ],
+        };
+        let (records, dropped) = records_from_file(&file, "lan0", 50, 1_800_000_100);
+        assert_eq!(records, Vec::new());
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        assert!(
+            dropped[0].contains("192.168.1.12") && dropped[1].contains("expired"),
+            "{dropped:?}"
+        );
+    }
+
+    #[test]
+    fn a_squatted_reservation_line_names_both_hosts() {
+        assert_eq!(
+            event_line(
+                "lan0",
+                &ServerEvent::ReservationInUse {
+                    address: ip("192.168.1.10"),
+                    mac: MAC,
+                    by: MAC_A
+                }
+            ),
+            "lan lan0 dhcp reservation 192.168.1.10 for 52:54:00:fe:10:10 in use by 02:00:00:00:00:0a"
         );
     }
 }
