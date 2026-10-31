@@ -24,8 +24,11 @@ driven over a packet socket until it is bound and over UDP after; it renews the 
 it again after a link flap and after a reboot (INIT-REBOOT from the lease kept under
 `/state/leases`), and never holds the LAN back when no server answers. Each `[lans.dhcp]` LAN runs a
 DHCPv4 server with a pool, static reservations, DHCPINFORM, an ARP probe before every offer,
-authoritative NAKs and a lease database under `/state/leases`, published as facts. Still to come in
-M1: the DNS forwarder and SNTP.
+authoritative NAKs and a lease database under `/state/leases`, published as facts. The router
+answers DNS on each LAN: `<hostname>.home.arpa` and reverse names from the leases and
+reservations, everything else through upstreams typed in or learned from the WAN, with a TTL
+cache, negative caching, EDNS0, TCP, and rebinding protection; block lists are the next thing to
+slot in. Still to come in M1: SNTP.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).

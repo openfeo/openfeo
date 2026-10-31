@@ -11,9 +11,13 @@
 //! address through INIT-REBOOT, and a WAN without a server that leaves the LAN working. Part 3a,
 //! the LAN DHCPv4 server: a LAN host leases from the router and fetches through NAT on it, the
 //! `nas` reservation, the lease database across a reset, and a lease from another router refused with a NAK.
+//! Part 3b, the DNS forwarder: a LAN host resolves `nas.home.arpa` from the router, ISP names
+//! through the upstream the WAN lease named, a rebinding answer refused, and local names with no
+//! WAN at all.
 //! Run inside the rootless sandbox; `harness = false`: this binary is its own runner and an
 //! optional first argument filters scenarios by substring.
 
+use std::net::Ipv4Addr;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -21,7 +25,7 @@ use anyhow::Context as _;
 
 use openfeo_harness::daemons::{self, Daemon};
 use openfeo_harness::lab::{BOOT_TIMEOUT, ISP_HTTP_BODY, LAN_HTTP_BODY, Lab};
-use openfeo_harness::lanclient;
+use openfeo_harness::lanclient::{self, DigAnswer};
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::netns::{self, NetNs};
 use openfeo_harness::sandbox;
@@ -104,6 +108,18 @@ const SCENARIOS: &[Scenario] = &[
         name: "a_foreign_lease_is_naked_on_the_new_router",
         run: a_foreign_lease_is_naked_on_the_new_router,
     },
+    Scenario {
+        name: "lan_client_resolves_nas_home_arpa",
+        run: lan_client_resolves_nas_home_arpa,
+    },
+    Scenario {
+        name: "lan_client_resolves_isp_names_through_the_learned_upstream",
+        run: lan_client_resolves_isp_names_through_the_learned_upstream,
+    },
+    Scenario {
+        name: "rebinding_answers_are_refused",
+        run: rebinding_answers_are_refused,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -148,6 +164,34 @@ const UDHCPC_TIMEOUT: Duration = Duration::from_secs(20);
 const NAK_TIMEOUT: Duration = Duration::from_secs(30);
 /// The harness binary: `dhcp-client` runs our DHCP client inside the LAN namespace.
 const HARNESS_BIN: &str = env!("CARGO_BIN_EXE_openfeo-harness");
+/// The router's LAN address, where the LAN host sends its DNS queries.
+const ROUTER_DNS: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+/// How long one `dig` from the LAN host may take in all.
+const DIG_TIMEOUT: Duration = Duration::from_secs(6);
+/// The upstreams line once the WAN's `203.0.113.1` is in use.
+const UPSTREAMS_LEARNED: &str = r"openfeo: dns upstreams 203\.0\.113\.1 \(learned from wan0\)";
+
+/// `dig <name> <qtype>` at the router from the LAN host.
+fn dig_lan(lab: &Lab, name: &str, qtype: &str) -> anyhow::Result<DigAnswer> {
+    lanclient::dig(&lab.lan0, ROUTER_DNS, name, qtype, &[], DIG_TIMEOUT)
+}
+
+/// `answer` must be `NOERROR` with exactly one A record, `addr`.
+fn expect_a(answer: &DigAnswer, name: &str, addr: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        answer.status == "NOERROR",
+        "{name}: status {} in {answer:?}",
+        answer.status
+    );
+    let addrs: Vec<&str> = answer
+        .answers
+        .iter()
+        .filter(|row| row.2 == "A")
+        .map(|row| row.3.as_str())
+        .collect();
+    anyhow::ensure!(addrs == [addr], "{name}: answers {:?}", answer.answers);
+    Ok(())
+}
 
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|err| panic!("bad test regex {pattern:?}: {err}"))
@@ -737,6 +781,17 @@ fn dhcp_without_a_server_keeps_the_lan_working(lab: &mut Lab) -> anyhow::Result<
         c.count(&re(r"openfeo: apply \S+ failed")) == 0,
         "an apply failed"
     );
+    // Local names need no WAN at all.
+    c.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: dns no upstreams: only local names resolve"),
+        SOON,
+    )?;
+    expect_a(
+        &dig_lan(lab, "nas.home.arpa", "A")?,
+        "nas.home.arpa without a WAN",
+        "192.168.1.10",
+    )?;
     Ok(())
 }
 
@@ -946,6 +1001,75 @@ fn a_foreign_lease_is_naked_on_the_new_router(lab: &mut Lab) -> anyhow::Result<(
             r"openfeo: lan lan0 dhcp nak 192\.168\.1\.77 to {} \(outside pool\)",
             lan_mac(lab)?
         )),
+        SOON,
+    )?;
+    Ok(())
+}
+
+/// SPEC §12 M1: a LAN host resolves `nas.home.arpa` (the reservation) and the router's own name
+/// from the router, authoritatively; an unknown local name is NXDOMAIN; the console announces the
+/// listener, the static WAN's server as the upstream, and the one local name.
+fn lan_client_resolves_nas_home_arpa(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.start_dnsmasq()?;
+    boot_static_with_lan_host(lab, "")?;
+    let c = lab.console()?;
+    for line in [
+        r"openfeo: dns listening on br-lan0",
+        UPSTREAMS_LEARNED,
+        r"openfeo: dns local names 1",
+    ] {
+        c.wait_for(&mut Cursor::default(), &re(line), SOON)?;
+    }
+    let nas = dig_lan(lab, "nas.home.arpa", "A")?;
+    expect_a(&nas, "nas.home.arpa", "192.168.1.10")?;
+    anyhow::ensure!(
+        nas.flags.iter().any(|flag| flag == "aa"),
+        "nas.home.arpa is not authoritative: {nas:?}"
+    );
+    expect_a(
+        &dig_lan(lab, "openfeo.home.arpa", "A")?,
+        "openfeo.home.arpa",
+        "192.168.1.1",
+    )?;
+    let missing = dig_lan(lab, "printer.home.arpa", "A")?;
+    anyhow::ensure!(
+        missing.status == "NXDOMAIN",
+        "printer.home.arpa: {missing:?}"
+    );
+    Ok(())
+}
+
+/// A WAN leased from Kea names 203.0.113.1 as its DNS server; the forwarder takes it up and a
+/// LAN host resolves an ISP name through it.
+fn lan_client_resolves_isp_names_through_the_learned_upstream(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.start_dnsmasq()?;
+    let (mut cur, _) = boot_dhcp(lab)?;
+    let c = lab.console()?;
+    c.wait_for(&mut cur, &re(UPSTREAMS_LEARNED), SOON)?;
+    // The forwarder started before the lease (the console said so) or after it; either way
+    // the learned line is the one that stands.
+    let silent = c.count(&re(r"openfeo: dns no upstreams: only local names resolve"));
+    anyhow::ensure!(silent <= 1, "no-upstreams announced {silent} times");
+    lab.lan_side_host()?;
+    expect_a(
+        &dig_lan(lab, "www.isp.example", "A")?,
+        "www.isp.example",
+        "198.51.100.10",
+    )?;
+    Ok(())
+}
+
+/// A public name answering with a LAN address is refused, and the console says so.
+fn rebinding_answers_are_refused(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.start_dnsmasq()?;
+    let mut cur = boot_static_with_lan_host(lab, "")?;
+    let c = lab.console()?;
+    c.wait_for(&mut Cursor::default(), &re(UPSTREAMS_LEARNED), SOON)?;
+    let evil = dig_lan(lab, "evil.isp.example", "A")?;
+    anyhow::ensure!(evil.status == "REFUSED", "evil.isp.example: {evil:?}");
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo: dns rebind dropped evil\.isp\.example -> 192\.168\.1\.5 for 192\.168\.1\.2"),
         SOON,
     )?;
     Ok(())
