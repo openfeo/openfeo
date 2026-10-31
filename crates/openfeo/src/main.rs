@@ -13,6 +13,7 @@ mod dhcp4_server;
 mod dns;
 mod heartbeat;
 mod router;
+mod time;
 mod version;
 
 use openfeo_init::cmdline;

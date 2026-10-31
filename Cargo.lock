@@ -991,6 +991,7 @@ dependencies = [
  "openfeo-platform",
  "openfeo-proto-dhcp4",
  "openfeo-proto-dns",
+ "openfeo-proto-sntp",
  "openfeo-reconcile",
  "openfeo-runtime",
  "openfeo-world",

@@ -24,6 +24,7 @@ openfeo-apply = { path = "../openfeo-apply" }
 openfeo-net = { path = "../openfeo-net" }
 openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
 openfeo-proto-dns = { path = "../openfeo-proto-dns" }
+openfeo-proto-sntp = { path = "../openfeo-proto-sntp" }
 ipnet.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
