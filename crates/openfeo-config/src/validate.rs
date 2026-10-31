@@ -290,7 +290,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     }
 
     if let Some(dns_config) = &config.dns {
-        dns(&mut report, dns_config);
+        dns(&mut report, dns_config, &lan_subnets);
     }
 
     for (k, (path, net)) in subnets.iter().enumerate() {
@@ -621,11 +621,36 @@ fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Ne
     }
 }
 
-/// `[dns]` (SPEC §7.7): upstreams that are IPv4 addresses, no block lists yet, allow-listed
-/// names that are host names.
-fn dns(report: &mut Report, dns: &Dns) {
+/// `[dns]` (SPEC §7.7): upstreams that are IPv4 addresses a resolver could answer from (not
+/// loopback, multicast, broadcast, `0.0.0.0/8` or the router's own LAN address, which would be
+/// the forwarder asking itself), no block lists yet, allow-listed names that are host names.
+fn dns(report: &mut Report, dns: &Dns, lan_subnets: &[Ipv4Net]) {
     for (i, upstream) in dns.upstreams.iter().enumerate() {
-        report.addr4(&format!("dns.upstreams[{i}]"), upstream);
+        let path = format!("dns.upstreams[{i}]");
+        let Some(addr) = report.addr4(&path, upstream) else {
+            continue;
+        };
+        let [first, ..] = addr.octets();
+        let why = if addr.is_loopback() {
+            Some("a loopback address")
+        } else if addr.is_multicast() {
+            Some("a multicast address")
+        } else if addr.is_broadcast() {
+            Some("the broadcast address")
+        } else if first == 0 {
+            Some("in 0.0.0.0/8")
+        } else if lan_subnets.iter().any(|net| net.addr() == addr) {
+            Some("the router's own address, so the forwarder would be asking itself")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            report.push(
+                path,
+                Code::InvalidAddress,
+                format!("{upstream} is {why}, not a resolver"),
+            );
+        }
     }
     if !dns.blocklists.is_empty() {
         report.push(
@@ -1406,5 +1431,36 @@ mod dns_tests {
                 "{ok:?}"
             );
         }
+    }
+
+    #[test]
+    fn local_addresses_are_not_upstreams() {
+        for bad in [
+            "127.0.0.1",
+            "224.0.0.251",
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "192.168.1.1",
+        ] {
+            let config = file::parse(&format!(
+                "config_version = 1\n[[lans]]\nname = \"lan0\"\nports = [\"p0\"]\nipv4 = \"192.168.1.1/24\"\n[dns]\nupstreams = [\"{bad}\"]\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                codes(&validate(&config, &live())),
+                vec![("dns.upstreams[0]".to_owned(), Code::InvalidAddress)],
+                "{bad}"
+            );
+        }
+        let fine = file::parse(
+            "config_version = 1\n[[lans]]\nname = \"lan0\"\nports = [\"p0\"]\nipv4 = \"192.168.1.1/24\"\n[dns]\nupstreams = [\"192.168.1.53\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codes(&validate(&fine, &live())),
+            vec![],
+            "a resolver on the LAN is fine; the router itself is not"
+        );
     }
 }
