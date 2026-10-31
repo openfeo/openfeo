@@ -18,10 +18,10 @@ fuzz_target!(|data: &[u8]| {
     match (ours, theirs) {
         (Err(err), Ok(_)) => panic!("hickory decodes what we refuse: {err}"),
         (Ok(ours), Ok(theirs)) => {
-            assert_eq!(ours.header.id, theirs.id());
-            assert_eq!(ours.header.rcode, theirs.response_code().low());
-            assert_eq!(ours.questions.len(), theirs.queries().len());
-            for (q, their_q) in ours.questions.iter().zip(theirs.queries()) {
+            assert_eq!(ours.header.id, theirs.metadata.id);
+            assert_eq!(ours.header.rcode, theirs.metadata.response_code.low());
+            assert_eq!(ours.questions.len(), theirs.queries.len());
+            for (q, their_q) in ours.questions.iter().zip(&theirs.queries) {
                 // By label bytes: hickory's text form escapes unusual bytes, ours does not.
                 let their_labels: Vec<Vec<u8>> = their_q
                     .name()
@@ -31,12 +31,12 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(q.name.labels(), their_labels.as_slice(), "question name");
                 assert_eq!(q.qtype, u16::from(their_q.query_type()));
             }
-            assert_eq!(ours.answers.len(), theirs.answers().len());
-            assert_eq!(ours.authorities.len(), theirs.name_servers().len());
+            assert_eq!(ours.answers.len(), theirs.answers.len());
+            assert_eq!(ours.authorities.len(), theirs.authorities.len());
             // hickory lifts the OPT record out of the additionals.
             assert_eq!(
                 ours.additionals.len(),
-                theirs.additionals().len() + usize::from(theirs.extensions().is_some())
+                theirs.additionals.len() + usize::from(theirs.edns.is_some())
             );
         }
         _ => {}

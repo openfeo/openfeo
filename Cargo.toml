@@ -45,7 +45,7 @@ proptest = "1"
 # M1 part 2b: differential oracle for openfeo-proto-dhcp4's codec; dev-dependency and fuzz only, never shipped
 dhcproto = "0.15"
 # M1 part 3b: differential oracle for openfeo-proto-dns's codec; dev-dependency and fuzz only, never shipped (ADR-0015)
-hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

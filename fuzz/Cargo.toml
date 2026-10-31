@@ -17,7 +17,7 @@ openfeo-proto-dhcp4 = { path = "../crates/openfeo-proto-dhcp4" }
 dhcproto = "0.15"
 openfeo-proto-dns = { path = "../crates/openfeo-proto-dns" }
 # The oracle for the differential DNS target (ADR-0015); a fuzz dependency only, never shipped.
-hickory-proto = { version = "0.25", default-features = false, features = ["std"] }
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "config_toml"

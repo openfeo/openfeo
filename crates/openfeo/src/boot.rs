@@ -48,7 +48,7 @@ pub fn kernel_decision(read: io::Result<String>, mode: Mode) -> KernelDecision {
 #[derive(Debug)]
 pub enum ConfigDecision {
     /// The file (or first-boot defaults when there was none).
-    Use(Loaded),
+    Use(Box<Loaded>),
     /// The file is unusable: run first-boot defaults so the box stays reachable, and say why.
     Defaults {
         /// One line for the console.
@@ -62,7 +62,7 @@ pub enum ConfigDecision {
 #[must_use]
 pub fn config_decision(result: Result<Loaded, ConfigError>) -> ConfigDecision {
     match result {
-        Ok(loaded) => ConfigDecision::Use(loaded),
+        Ok(loaded) => ConfigDecision::Use(Box::new(loaded)),
         Err(ConfigError::Invalid(violations)) => ConfigDecision::Defaults {
             reason: format!("invalid ({} errors)", violations.len()),
             violations,

@@ -31,3 +31,7 @@ minute, which is the kind of return an independent second implementation gives.
 - A parser we maintain and fuzz nightly, with the same obligations as the DHCPv4 one.
 - DNSSEC validation, should it ever be wanted, would be the moment to revisit: it is where a
   library earns its weight.
+- The oracle follows hickory's releases: `cargo deny` flagged 0.25.2 (RUSTSEC-2026-0118 and
+  RUSTSEC-2026-0119, with no fix on the 0.25 line) the same day, so the oracle moved to 0.26.
+  Neither advisory could have reached a user of OpenFeO, which is the point of keeping the
+  library out of the binary.
