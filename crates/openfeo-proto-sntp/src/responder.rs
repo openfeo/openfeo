@@ -9,12 +9,15 @@ use crate::client::SyncState;
 use crate::packet::{
     LI_UNSYNCHRONISED, MODE_CLIENT, MODE_SERVER, PACKET_LEN, Packet, STRATUM_UNSYNCHRONISED,
 };
-use crate::timestamp::{NtpTimestamp, nanos_to_short};
+use crate::timestamp::{NANOS_PER_SEC, NtpTimestamp, nanos_to_short};
 
 /// Our precision: about a microsecond (2^-20 s).
 pub const PRECISION: i8 = -20;
-/// Dispersion we add to the upstream's: we do not track our own drift.
+/// Dispersion we add to the upstream's at the moment of a sample.
 pub const OWN_DISPERSION_NS: i64 = 1_000_000;
+/// RFC 5905 §11.2 PHI: the dispersion grows by this many parts per million of the time since the
+/// last sample, our clock's assumed drift.
+pub const PHI_PPM: i64 = 15;
 
 /// The reply to a client's `query`, or `None` for anything that is not a version 3 or 4 mode 3
 /// request: version copied, mode 4; while synced LI 0, stratum one below the source's (16 stays
@@ -29,6 +32,14 @@ pub fn respond(query: &[u8], now_unix_ns: i64, state: &SyncState) -> Option<[u8;
     }
     let now = NtpTimestamp::from_unix_nanos(now_unix_ns);
     let synced = state.synced && state.source.is_some();
+    // Seconds since the last sample, aged at PHI: a clock last set an hour ago is 54 ms looser.
+    let age_secs = state
+        .last_sync_unix_secs
+        .map_or(0, |last| (now_unix_ns / NANOS_PER_SEC - last).max(0));
+    let aged_dispersion = state
+        .root_dispersion_ns
+        .saturating_add(OWN_DISPERSION_NS)
+        .saturating_add(age_secs.saturating_mul(PHI_PPM * 1_000));
     let reply = Packet {
         leap: if synced { 0 } else { LI_UNSYNCHRONISED },
         version: query.version,
@@ -41,7 +52,7 @@ pub fn respond(query: &[u8], now_unix_ns: i64, state: &SyncState) -> Option<[u8;
         poll: query.poll,
         precision: PRECISION,
         root_delay: nanos_to_short(state.root_delay_ns.saturating_add(state.delay_ns)),
-        root_dispersion: nanos_to_short(state.root_dispersion_ns.saturating_add(OWN_DISPERSION_NS)),
+        root_dispersion: nanos_to_short(aged_dispersion),
         reference_id: match state.source {
             Some(source) if synced => source.octets(),
             _ => [0; 4],
@@ -180,6 +191,39 @@ mod tests {
             )
             .is_none(),
             "version 2"
+        );
+    }
+
+    #[test]
+    fn root_dispersion_ages_at_phi_since_the_last_sample() {
+        let state = SyncState {
+            synced: true,
+            source: Some(ip("203.0.113.1")),
+            stratum: 2,
+            root_dispersion_ns: 5_000_000,
+            last_sync_unix_secs: Some(1_793_448_000),
+            ..SyncState::default()
+        };
+        let query = Packet {
+            version: 4,
+            mode: MODE_CLIENT,
+            transmit: NtpTimestamp(0x1234_5678_9abc_def0),
+            ..Packet::default()
+        };
+        let fresh = Packet::decode(&respond(&query.encode(), UNIX_2026, &state).unwrap()).unwrap();
+        assert!(
+            (short_to_nanos(fresh.root_dispersion) - 6_000_000).abs() < 16_000,
+            "5 ms upstream + 1 ms own, got {}",
+            short_to_nanos(fresh.root_dispersion)
+        );
+        let later = Packet::decode(
+            &respond(&query.encode(), UNIX_2026 + 1_000 * NANOS_PER_SEC, &state).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            (short_to_nanos(later.root_dispersion) - 21_000_000).abs() < 16_000,
+            "1000 s at 15 ppm is 15 ms more, got {}",
+            short_to_nanos(later.root_dispersion)
         );
     }
 }
