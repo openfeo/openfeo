@@ -16,6 +16,11 @@ use crate::lines::Lines;
 use crate::netns::NetNs;
 use crate::qemu::VERBOSE_ENV;
 
+/// Kea's DHCPv4 config: 60 s leases renewing at 20 s and rebinding at 40 s, with routers, DNS,
+/// domain, MTU, NTP and classless static routes. Option 121 is given by code as RFC 3442 bytes
+/// (`00 CB007101` = 0.0.0.0/0 via 203.0.113.1, `18 C63364 CB007101` = 198.51.100.0/24 via
+/// 203.0.113.1) because Kea 2.4.1 (Ubuntu 24.04, CI) has no definition for
+/// `classless-static-route` and Kea 3.x refuses a user definition of it; the bytes work on both.
 const KEA_DHCP4_TEMPLATE: &str = include_str!("../fixtures/kea-dhcp4.json.tmpl");
 /// Time a daemon gets to leave after SIGTERM before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -140,5 +145,35 @@ mod tests {
             !rendered.contains("{{"),
             "unreplaced placeholder in {rendered}"
         );
+    }
+
+    /// Ubuntu 24.04's Kea 2.4.1 (CI) has no definition for option 121 and refuses the option by
+    /// name, while Kea 3.x refuses a user definition of it; every Kea accepts it by code as the
+    /// RFC 3442 bytes.
+    #[test]
+    fn template_sends_classless_routes_by_code_as_rfc3442_bytes() {
+        let rendered: serde_json::Value =
+            serde_json::from_str(&render_kea_dhcp4("wan0")).expect("strict JSON");
+        let options = rendered["Dhcp4"]["subnet4"][0]["option-data"]
+            .as_array()
+            .expect("option-data");
+        assert!(
+            options
+                .iter()
+                .all(|o| o["name"] != "classless-static-route"),
+            "option 121 must be given by code, Kea 2.4.1 has no definition for it"
+        );
+        let route_option = options
+            .iter()
+            .find(|o| o["code"] == 121)
+            .expect("option 121 by code");
+        assert_eq!(route_option["csv-format"], false);
+        let data = route_option["data"].as_str().expect("hex data");
+        let bytes: Vec<u8> = (0..data.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&data[i..i + 2], 16).expect("hex"))
+            .collect();
+        // 0.0.0.0/0 via 203.0.113.1, then 198.51.100.0/24 via 203.0.113.1 (RFC 3442 §5).
+        assert_eq!(bytes, [0, 203, 0, 113, 1, 24, 198, 51, 100, 203, 0, 113, 1]);
     }
 }
