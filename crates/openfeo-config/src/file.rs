@@ -69,6 +69,26 @@ pub fn render_dhcp4_lease(lease: &Dhcp4Lease) -> Result<String, ConfigError> {
     to_toml(lease)
 }
 
+/// Parse `/state/leases/dhcp4-server-<lan>.toml`, a LAN's lease database (SPEC §7.6).
+///
+/// # Errors
+///
+/// As [`parse`].
+pub fn parse_dhcp4_server_leases(text: &str) -> Result<crate::Dhcp4ServerLeases, ConfigError> {
+    from_table(table(text)?)
+}
+
+/// Render `/state/leases/dhcp4-server-<lan>.toml`.
+///
+/// # Errors
+///
+/// As [`render`].
+pub fn render_dhcp4_server_leases(
+    leases: &crate::Dhcp4ServerLeases,
+) -> Result<String, ConfigError> {
+    to_toml(leases)
+}
+
 /// The TOML document as a table, the form migrations work on.
 ///
 /// # Errors
@@ -249,5 +269,33 @@ ipv4 = "192.168.1.1/24"
         assert_eq!(map.ports.len(), 2);
         assert_eq!(map.ports[1].name, "p1");
         assert_eq!(parse_portmap(&render_portmap(&map).unwrap()).unwrap(), map);
+    }
+}
+
+#[cfg(test)]
+mod dhcp4_server_leases_tests {
+    use super::*;
+    use crate::{Dhcp4ServerLease, Dhcp4ServerLeases};
+
+    #[test]
+    fn dhcp4_server_leases_round_trip() {
+        let leases = Dhcp4ServerLeases {
+            lan: "lan0".into(),
+            leases: vec![Dhcp4ServerLease {
+                mac: "52:54:00:fe:10:10".into(),
+                client_id: String::new(),
+                address: "192.168.1.10".into(),
+                hostname: "nas".into(),
+                granted_unix: 1_800_000_000,
+                expires_unix: 1_800_043_200,
+            }],
+        };
+        let text = render_dhcp4_server_leases(&leases).unwrap();
+        assert!(text.contains("[[leases]]"), "{text}");
+        assert_eq!(parse_dhcp4_server_leases(&text).unwrap(), leases);
+        assert!(
+            parse_dhcp4_server_leases("lan = \"lan0\"\nbogus = 1\n").is_err(),
+            "unknown keys are refused"
+        );
     }
 }

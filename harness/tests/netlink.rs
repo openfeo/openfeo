@@ -403,6 +403,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         ports: Arc::new(ports),
         links: Arc::new(links),
         dhcp4: Arc::new(BTreeMap::new()),
+        leases: Arc::new(BTreeMap::new()),
     }
 }
 
@@ -623,6 +624,7 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
             name: "guest-network".into(), // br-guest-network is 16 bytes: EINVAL from the kernel
             ports: vec!["p1".into()],
             ipv4: "192.168.9.1/24".into(),
+            dhcp: None,
         });
         let mut rig = Rig::connect().await?;
         let cache = rig.rx.borrow_and_update().clone();

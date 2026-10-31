@@ -8,5 +8,6 @@
 #![deny(unsafe_code)]
 
 pub mod dhcp4;
+pub mod dhcp4_server;
 #[allow(unsafe_code)]
 mod sys;

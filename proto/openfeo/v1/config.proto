@@ -137,4 +137,46 @@ message Lan {
   repeated string ports = 2;
   // The router's address and the LAN subnet, "192.168.1.1/24".
   string ipv4 = 3;
+  // Present when the LAN runs a DHCPv4 server (SPEC §7.6).
+  LanDhcp dhcp = 4;
+}
+
+// The DHCPv4 server of one LAN (SPEC §7.6; `[lans.dhcp]` in §8.2).
+message LanDhcp {
+  // The inclusive pool: exactly two host addresses of the LAN subnet, first <= last, the
+  // router outside it.
+  repeated string range = 1;
+  // Lease time in seconds; 0 means 43200, otherwise at least 60.
+  uint32 lease_secs = 2;
+  repeated StaticLease static = 3;
+  // DNS servers handed out; empty means the router.
+  repeated string dns = 4;
+}
+
+// A static lease: the client with this MAC (or client identifier) always gets `ip` and
+// resolves as `hostname`.
+message StaticLease {
+  string mac = 1;
+  string ip = 2;
+  // One DNS label; empty for no name.
+  string hostname = 3;
+  // Optional, lowercase hex: match the client identifier (option 61) instead of the MAC.
+  string client_id = 4;
+}
+
+// One lease the server granted, kept in `/state/leases/dhcp4-server-<lan>.toml` (SPEC §5.2).
+message Dhcp4ServerLease {
+  string mac = 1;
+  // Lowercase hex; empty when the client sent none.
+  string client_id = 2;
+  string address = 3;
+  string hostname = 4;
+  uint64 granted_unix = 5;
+  uint64 expires_unix = 6;
+}
+
+// A LAN's lease database.
+message Dhcp4ServerLeases {
+  string lan = 1;
+  repeated Dhcp4ServerLease leases = 2;
 }

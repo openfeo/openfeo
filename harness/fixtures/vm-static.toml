@@ -23,6 +23,13 @@ dns = ["203.0.113.1"]
 name = "lan0"
 ports = ["p2"]
 ipv4 = "192.168.1.1/24"
+[lans.dhcp]
+range = ["192.168.1.100", "192.168.1.200"]
+lease_secs = 43200
+[[lans.dhcp.static]]
+mac = "52:54:00:fe:10:10"
+ip = "192.168.1.10"
+hostname = "nas"
 
 [firewall]
 wan_ping = true                 # the lab pings the WAN address from the ISP side

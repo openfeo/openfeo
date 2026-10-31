@@ -22,8 +22,10 @@ router-process crash does not interrupt traffic. A WAN configured `[wans.dhcp]` 
 address, routes, MTU and DNS from the ISP's DHCPv4 server through an in-house sans-IO client,
 driven over a packet socket until it is bound and over UDP after; it renews the lease, confirms
 it again after a link flap and after a reboot (INIT-REBOOT from the lease kept under
-`/state/leases`), and never holds the LAN back when no server answers. Still to come in M1: the
-LAN DHCP server, the DNS forwarder and SNTP.
+`/state/leases`), and never holds the LAN back when no server answers. Each `[lans.dhcp]` LAN runs a
+DHCPv4 server with a pool, static reservations, DHCPINFORM, an ARP probe before every offer,
+authoritative NAKs and a lease database under `/state/leases`, published as facts. Still to come in
+M1: the DNS forwarder and SNTP.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
@@ -41,8 +43,9 @@ decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
 
 Needs Rust stable with the `x86_64-unknown-linux-musl` target, a musl C compiler (`musl-gcc`:
 package `musl` on Arch, `musl-tools` on Debian and Ubuntu), `pkg-config`, `cargo-deny`, `buf`, QEMU
-(`qemu-system-x86_64`), `iproute2`, `ping`, `python3`, Kea (`kea-dhcp4`), `mkfs.ext4` (e2fsprogs), `ccache`,
-and the usual kernel build dependencies (`bc`, `flex`, `bison`, `libelf`, `libssl`, `zstd`, `cpio`).
+(`qemu-system-x86_64`), `iproute2`, `ping`, `python3`, Kea (`kea-dhcp4`), busybox (`busybox` on Arch,
+`busybox-static` on Debian and Ubuntu; its `udhcpc` is the lab's reference DHCP client), `mkfs.ext4`
+(e2fsprogs), `ccache`, and the usual kernel build dependencies (`bc`, `flex`, `bison`, `libelf`, `libssl`, `zstd`, `cpio`).
 `make` fetches the pinned sources of nftables, libnftnl, libmnl and jansson (`nft/sources.txt`),
 verifies them and builds them statically for the firewall backend, against the UAPI headers of
 the pinned kernel (ADR-0012). The lab runs without

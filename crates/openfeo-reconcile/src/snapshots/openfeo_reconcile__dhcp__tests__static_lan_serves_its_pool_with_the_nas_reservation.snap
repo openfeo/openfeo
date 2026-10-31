@@ -1,0 +1,26 @@
+---
+source: crates/openfeo-reconcile/src/dhcp.rs
+expression: desired
+---
+lan0:
+  ifname: br-lan0
+  server: 192.168.1.1
+  prefix: 24
+  pool:
+    - 192.168.1.100
+    - 192.168.1.200
+  lease_secs: 43200
+  dns:
+    - 192.168.1.1
+  domain: home.arpa
+  reservations:
+    - mac:
+        - 82
+        - 84
+        - 0
+        - 254
+        - 16
+        - 16
+      client_id: ~
+      address: 192.168.1.10
+      hostname: nas
