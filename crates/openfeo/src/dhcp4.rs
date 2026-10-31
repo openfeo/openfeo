@@ -288,7 +288,7 @@ async fn run(
         mac,
         client,
         initial_lease,
-        seed: seed(ifindex),
+        seed: seed(u64::from(ifindex)),
     })
     .map_err(failed)?;
     let mut carrier = true;
@@ -452,17 +452,18 @@ fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publisher, eve
     }
 }
 
-/// Eight random bytes for the client's transaction ids and jitter.
-fn seed(ifindex: u32) -> u64 {
+/// Eight random bytes for a protocol core's transaction ids and jitter; `salt` tells the
+/// clock fallback's callers apart.
+pub(crate) fn seed(salt: u64) -> u64 {
     let mut bytes = [0u8; 8];
     match fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut bytes)) {
         Ok(()) => u64::from_ne_bytes(bytes),
         Err(err) => {
-            warn!("dhcp4: /dev/urandom: {err}; seeding from the clock");
+            warn!("/dev/urandom: {err}; seeding from the clock");
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |since| u64::from(since.subsec_nanos()));
-            nanos ^ u64::from(ifindex).rotate_left(32)
+            nanos ^ salt.rotate_left(32)
         }
     }
 }

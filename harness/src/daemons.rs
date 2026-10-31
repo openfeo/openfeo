@@ -130,6 +130,60 @@ pub fn http_server(ns: &NetNs, bind: &str, port: u16, dir: &Path, body: &str) ->
     Daemon::spawn(&format!("http-{}-{port}", ns.name), cmd)
 }
 
+/// The zone the lab's upstream resolver is authoritative for.
+pub const ISP_DNS_ZONE: &str = "isp.example";
+/// `www.isp.example`: an ordinary public answer.
+pub const ISP_WWW_ADDR: &str = "198.51.100.10";
+/// `evil.isp.example`: a public name answering with a LAN address, the rebinding attack.
+pub const ISP_EVIL_ADDR: &str = "192.168.1.5";
+/// `allowed.isp.example`: private too, but allow-listed by the scenarios.
+pub const ISP_ALLOWED_ADDR: &str = "192.168.1.6";
+/// `big.isp.example` has this many TXT records of [`ISP_TXT_LEN`] bytes: over 1232 bytes in all,
+/// so the upstream truncates over UDP and the forwarder must come back over TCP.
+pub const ISP_TXT_RECORDS: usize = 6;
+/// The length of each of `big.isp.example`'s TXT strings.
+pub const ISP_TXT_LEN: usize = 250;
+
+/// dnsmasq as the ISP's resolver on `iface` inside `ns`: authoritative for [`ISP_DNS_ZONE`]
+/// alone (names outside it are refused, so it never forwards), logging every query as
+/// `auth[A] www.isp.example from 203.0.113.10`. It stays root: the sandbox maps one user, so
+/// there is no `nobody` to drop to.
+///
+/// # Errors
+///
+/// When `dnsmasq` cannot be spawned.
+pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
+    let mut cmd = ns.command("dnsmasq")?;
+    cmd.args([
+        "--no-daemon",
+        "--log-queries",
+        "--log-facility=-",
+        "--no-hosts",
+        "--no-resolv",
+        "--user=root",
+        "--group=root",
+        "--pid-file=",
+        "--bind-interfaces",
+        "--except-interface=lo",
+        &format!("--interface={iface}"),
+        &format!("--auth-zone={ISP_DNS_ZONE}"),
+        &format!("--auth-server=ns.{ISP_DNS_ZONE},{iface}"),
+        &format!("--auth-soa=1,hostmaster.{ISP_DNS_ZONE},30,30,30"),
+        "--auth-ttl=60",
+        &format!("--host-record=ns.{ISP_DNS_ZONE},203.0.113.1"),
+        &format!("--host-record=www.{ISP_DNS_ZONE},{ISP_WWW_ADDR}"),
+        &format!("--host-record=evil.{ISP_DNS_ZONE},{ISP_EVIL_ADDR}"),
+        &format!("--host-record=allowed.{ISP_DNS_ZONE},{ISP_ALLOWED_ADDR}"),
+    ]);
+    for i in 0..ISP_TXT_RECORDS {
+        let letter = char::from(b'a' + u8::try_from(i).unwrap_or(0));
+        let text: String = std::iter::repeat_n(letter, ISP_TXT_LEN).collect();
+        cmd.arg(format!("--txt-record=big.{ISP_DNS_ZONE},{text}"));
+    }
+    cmd.current_dir(run_dir);
+    Daemon::spawn("dnsmasq", cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

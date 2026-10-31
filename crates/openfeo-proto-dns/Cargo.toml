@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-proto-dns"
+description = "OpenFeO DNS without sockets: wire format, cache and the sans-IO forwarder core (SPEC §7.7, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ipnet.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The differential oracle for our codec (ADR-0015); tests and fuzzing only, never shipped.
+hickory-proto.workspace = true
+
+[lints]
+workspace = true

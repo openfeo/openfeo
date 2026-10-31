@@ -33,13 +33,12 @@ use openfeo_world::{LeaseFact, MacAddr};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
+
 use crate::dhcp4::{LEASES_DIR, mac_text, wait_for_link};
 
 /// The least time between two writes of a lease database (SPEC §5.2).
 pub const SAVE_INTERVAL: Duration = Duration::from_secs(5);
-/// Console lines the LAN can provoke at will (`pool exhausted`, `conflict`) are limited to one
-/// per this window, the rest counted.
-pub const NOISY_WINDOW: Duration = Duration::from_secs(10);
 
 /// The events after which the leases differ, so the facts and the database must follow.
 pub(crate) fn changes_leases(event: &ServerEvent) -> bool {
@@ -51,39 +50,6 @@ pub(crate) fn changes_leases(event: &ServerEvent) -> bool {
             | ServerEvent::Expired(_)
             | ServerEvent::Declined { .. }
     )
-}
-
-/// One line per window; the lines held back are counted and reported with the next one.
-#[derive(Debug)]
-pub(crate) struct Throttle {
-    window: Duration,
-    last: Option<Instant>,
-    held: u32,
-}
-
-impl Throttle {
-    pub(crate) fn new(window: Duration) -> Self {
-        Throttle {
-            window,
-            last: None,
-            held: 0,
-        }
-    }
-
-    /// `Some(held)` when a line may go out, with the number held back since the last one;
-    /// `None` to hold this one.
-    pub(crate) fn admit(&mut self, now: Instant) -> Option<u32> {
-        match self.last {
-            Some(last) if now < last + self.window => {
-                self.held = self.held.saturating_add(1);
-                None
-            }
-            _ => {
-                self.last = Some(now);
-                Some(std::mem::take(&mut self.held))
-            }
-        }
-    }
 }
 
 /// `/state/leases/dhcp4-server-<lan>.toml`.
@@ -142,13 +108,10 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
                     let line = event_line(lan, &event);
                     if matches!(event, ServerEvent::Exhausted { .. } | ServerEvent::Conflict { .. }) {
                         // A LAN can provoke these at packet rate: one per window on the console.
-                        match noisy.admit(Instant::now()) {
-                            Some(0) => info!("{line}"),
-                            Some(held) => info!(
-                                "{line} (and {held} more such lines in the last {}s)",
-                                NOISY_WINDOW.as_secs()
-                            ),
-                            None => debug!("{line}"),
+                        if let Some(line) = noisy.line(Instant::now(), &line) {
+                            info!("{line}");
+                        } else {
+                            debug!("{line}");
                         }
                     } else {
                         info!("{line}");
@@ -475,23 +438,6 @@ mod tests {
         ] {
             assert!(!changes_leases(&event), "{event:?}");
         }
-    }
-
-    /// Review finding: lines a LAN can provoke at packet rate (`pool exhausted`, `conflict`)
-    /// are throttled: one per window, then a count of what was held back.
-    #[test]
-    fn noisy_lines_are_throttled_to_one_per_window_with_a_count() {
-        let t0 = Instant::now();
-        let mut throttle = Throttle::new(Duration::from_secs(10));
-        assert_eq!(throttle.admit(t0), Some(0), "the first line passes");
-        assert_eq!(throttle.admit(t0 + Duration::from_secs(1)), None);
-        assert_eq!(throttle.admit(t0 + Duration::from_secs(2)), None);
-        assert_eq!(
-            throttle.admit(t0 + Duration::from_secs(10)),
-            Some(2),
-            "the window ends: pass, with the two held back"
-        );
-        assert_eq!(throttle.admit(t0 + Duration::from_secs(25)), Some(0));
     }
 
     #[test]

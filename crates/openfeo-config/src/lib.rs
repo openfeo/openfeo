@@ -17,8 +17,8 @@ pub mod validate;
 
 pub use error::ConfigError;
 pub use generated::{
-    Config, Dhcp4Lease, Dhcp4Route, Dhcp4ServerLease, Dhcp4ServerLeases, DhcpWan, Firewall, Lan,
-    LanDhcp, PortForward, PortMap, PortMapEntry, StaticLease, StaticWan, System, Wan, wan,
+    Config, Dhcp4Lease, Dhcp4Route, Dhcp4ServerLease, Dhcp4ServerLeases, DhcpWan, Dns, Firewall,
+    Lan, LanDhcp, PortForward, PortMap, PortMapEntry, StaticLease, StaticWan, System, Wan, wan,
 };
 
 #[cfg(test)]

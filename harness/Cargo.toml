@@ -27,6 +27,7 @@ openfeo-apply = { path = "../crates/openfeo-apply" }
 openfeo-config = { path = "../crates/openfeo-config" }
 openfeo-netlink = { path = "../crates/openfeo-netlink" }
 openfeo-platform = { path = "../crates/openfeo-platform" }
+openfeo-proto-dns = { path = "../crates/openfeo-proto-dns" }
 openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
 openfeo-world = { path = "../crates/openfeo-world" }
 ipnet.workspace = true
@@ -49,6 +50,11 @@ harness = false
 [[test]]
 name = "dhcp4_server"
 path = "tests/dhcp4_server.rs"
+harness = false
+
+[[test]]
+name = "dns"
+path = "tests/dns.rs"
 harness = false
 
 [[test]]
