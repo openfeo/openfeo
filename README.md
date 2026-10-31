@@ -28,7 +28,9 @@ authoritative NAKs and a lease database under `/state/leases`, published as fact
 answers DNS on each LAN: `<hostname>.home.arpa` and reverse names from the leases and
 reservations, everything else through upstreams typed in or learned from the WAN, with a TTL
 cache, negative caching, EDNS0, TCP, and rebinding protection; block lists are the next thing to
-slot in. Still to come in M1: SNTP.
+slot in. The router keeps its clock from SNTP servers (configured, `pool.ntp.org` by default,
+plus the ones the WAN lease names), never earlier than its own build, publishes whether it is
+synced, and serves time to the LAN, which the leases point at. That completes M1.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).

@@ -9,6 +9,7 @@ config_version = 1
 [system]
 hostname = "openfeo"
 domain = "home.arpa"
+ntp_servers = ["ntp.isp.example"]    # the lab's time server, by the name dnsmasq answers
 
 [[wans]]
 name = "wan0"

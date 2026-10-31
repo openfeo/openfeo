@@ -171,6 +171,7 @@ pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
         &format!("--auth-soa=1,hostmaster.{ISP_DNS_ZONE},30,30,30"),
         "--auth-ttl=60",
         &format!("--host-record=ns.{ISP_DNS_ZONE},203.0.113.1"),
+        &format!("--host-record=ntp.{ISP_DNS_ZONE},203.0.113.1"),
         &format!("--host-record=www.{ISP_DNS_ZONE},{ISP_WWW_ADDR}"),
         &format!("--host-record=evil.{ISP_DNS_ZONE},{ISP_EVIL_ADDR}"),
         &format!("--host-record=allowed.{ISP_DNS_ZONE},{ISP_ALLOWED_ADDR}"),
