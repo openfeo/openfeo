@@ -637,6 +637,118 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<std::process
         .with_context(|| format!("collect {rendered}"))
 }
 
+/// What `dig` reported: the status, the header flags, and the answer section as
+/// `(name, ttl, type, rdata)` rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DigAnswer {
+    /// `NOERROR`, `NXDOMAIN`, `REFUSED`, `SERVFAIL`, ...
+    pub status: String,
+    /// `qr`, `aa`, `tc`, `rd`, `ra`, ... as dig prints them.
+    pub flags: Vec<String>,
+    pub answers: Vec<(String, u32, String, String)>,
+}
+
+/// `dig @<server> +time=2 +tries=1 +noall +comments +answer <extra> <name> <qtype>` from inside
+/// `ns`. A dig that gets no answer at all (its own timeout) is an error, as is one that cannot
+/// be run or outlives `timeout`.
+///
+/// # Errors
+///
+/// When dig cannot be run, times out, or prints no header.
+pub fn dig(
+    ns: &NetNs,
+    server: Ipv4Addr,
+    name: &str,
+    qtype: &str,
+    extra: &[&str],
+    timeout: Duration,
+) -> Result<DigAnswer> {
+    let mut cmd = ns.command("dig")?;
+    cmd.arg(format!("@{server}"))
+        .args(["+time=2", "+tries=1", "+noall", "+comments", "+answer"])
+        .args(extra)
+        .args([name, qtype]);
+    let output = run_with_timeout(&mut cmd, timeout)?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_dig(&stdout).with_context(|| {
+        format!(
+            "dig {name} {qtype} @{server}: {}",
+            if stdout.trim().is_empty() {
+                String::from_utf8_lossy(&output.stderr).trim().to_owned()
+            } else {
+                stdout.trim().to_owned()
+            }
+        )
+    })
+}
+
+/// dig's `+noall +comments +answer` output: the last header's status and flags (a TCP retry
+/// prints two), and every answer row.
+///
+/// # Errors
+///
+/// When there is no header line (dig got no answer).
+pub fn parse_dig(stdout: &str) -> Result<DigAnswer> {
+    let mut status = None;
+    let mut flags = Vec::new();
+    let mut answers = Vec::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix(";; ->>HEADER<<-") {
+            status = rest
+                .split(',')
+                .map(str::trim)
+                .find_map(|part| part.strip_prefix("status: "))
+                .map(str::to_owned);
+            answers.clear();
+        } else if let Some(rest) = line.strip_prefix(";; flags:") {
+            flags = rest
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+        } else if !line.starts_with(';') && !line.trim().is_empty() {
+            // Fields are separated by runs of tabs (dig pads short names); the RDATA keeps its
+            // own spacing (TXT strings).
+            let mut rest = line;
+            let (Some(name), Some(ttl), Some(_class), Some(rtype)) = (
+                take_field(&mut rest),
+                take_field(&mut rest),
+                take_field(&mut rest),
+                take_field(&mut rest),
+            ) else {
+                bail!("dig answer row has too few fields: {line:?}");
+            };
+            let ttl = ttl
+                .parse::<u32>()
+                .with_context(|| format!("dig answer row TTL: {line:?}"))?;
+            answers.push((
+                name.to_owned(),
+                ttl,
+                rtype.to_owned(),
+                rest.trim().to_owned(),
+            ));
+        }
+    }
+    let status = status.with_context(|| format!("dig printed no header: {}", stdout.trim()))?;
+    Ok(DigAnswer {
+        status,
+        flags,
+        answers,
+    })
+}
+
+/// The next whitespace-delimited field of `rest`, advancing past it; `None` when the line has
+/// no further field followed by whitespace.
+fn take_field<'a>(rest: &mut &'a str) -> Option<&'a str> {
+    let trimmed = rest.trim_start();
+    let end = trimmed.find(char::is_whitespace)?;
+    let (field, after) = trimmed.split_at(end);
+    *rest = after;
+    Some(field)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +800,54 @@ mod dhcp_client_tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1]["address"], "192.168.1.100");
         assert!(parse_json_lines("not json\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod dns_client_tests {
+    use super::*;
+
+    #[test]
+    fn dig_output_parses_status_flags_and_answers() {
+        let out = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 41696\n;; flags: qr aa rd; QUERY: 1, ANSWER: 1, AUTHORITY: 1, ADDITIONAL: 1\n; EDNS: version: 0, flags:; udp: 1232\nwww.isp.example.\t60\tIN\tA\t198.51.100.10\n";
+        let parsed = parse_dig(out).unwrap();
+        assert_eq!(parsed.status, "NOERROR");
+        assert_eq!(parsed.flags, vec!["qr", "aa", "rd"]);
+        assert_eq!(
+            parsed.answers,
+            vec![(
+                "www.isp.example.".into(),
+                60,
+                "A".into(),
+                "198.51.100.10".into()
+            )]
+        );
+        assert!(parse_dig(";; connection timed out; no servers could be reached\n").is_err());
+    }
+
+    /// dig that fell back to TCP prints two headers: the answer is the last one's.
+    #[test]
+    fn dig_output_keeps_the_last_header_and_joins_txt_strings() {
+        let out = ";; Truncated, retrying in TCP mode.\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; flags: qr tc rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 1\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 2\n;; flags: qr rd ra; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1\nbig.isp.example.\t60\tIN\tTXT\t\"aaa\" \"bbb\"\nbig.isp.example.\t60\tIN\tTXT\t\"ccc\"\n";
+        let parsed = parse_dig(out).unwrap();
+        assert_eq!(parsed.flags, vec!["qr", "rd", "ra"]);
+        assert_eq!(parsed.answers.len(), 2);
+        assert_eq!(parsed.answers[0].3, "\"aaa\" \"bbb\"");
+    }
+
+    /// dig pads short owner names with a second tab.
+    #[test]
+    fn dig_output_rows_with_padded_names_parse() {
+        let out = ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 3\n;; flags: qr aa rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1\nnas.home.arpa.\t\t60\tIN\tA\t192.168.1.10\n";
+        let parsed = parse_dig(out).unwrap();
+        assert_eq!(
+            parsed.answers,
+            vec![(
+                "nas.home.arpa.".into(),
+                60,
+                "A".into(),
+                "192.168.1.10".into()
+            )]
+        );
     }
 }

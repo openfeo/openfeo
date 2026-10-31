@@ -137,6 +137,24 @@ impl Lab {
         Ok(())
     }
 
+    /// Start dnsmasq on ISP A's `wan0` at 203.0.113.1 as the authoritative resolver for
+    /// `isp.example` (`daemons::dnsmasq`); returns once it announces itself. The daemon joins
+    /// [`Lab::daemons`], named `dnsmasq`.
+    ///
+    /// # Errors
+    ///
+    /// When dnsmasq cannot be started or does not come up within 10 s.
+    pub fn start_dnsmasq(&mut self) -> Result<()> {
+        let dnsmasq = daemons::dnsmasq(&self.isp0, "wan0", &self.run_dir)?;
+        dnsmasq.log.wait_for(
+            &mut Cursor::default(),
+            &Regex::new("started, version").context("regex")?,
+            Duration::from_secs(10),
+        )?;
+        self.daemons.push(dnsmasq);
+        Ok(())
+    }
+
     /// Teach the ISP namespace the way to the LAN subnet through the router's WAN address, so
     /// an ISP-side host can try to reach LAN hosts directly (which the firewall must refuse).
     ///
