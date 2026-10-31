@@ -37,4 +37,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "dhcp4_server"
+path = "fuzz_targets/dhcp4_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dhcp4_arp"
+path = "fuzz_targets/dhcp4_arp.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

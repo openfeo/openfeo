@@ -8,11 +8,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arp;
 pub mod client;
 pub mod identity;
+pub mod server;
 pub mod udp;
 pub mod wire;
 
 pub use client::{
     Client, ClientConfig, Input, Lease, LeaseError, Output, PARAMETERS, State, Timestamp, Unbound,
+};
+pub use server::{
+    Destination, LeaseRecord, NakReason, Reservation, Server, ServerConfig, ServerEvent,
 };

@@ -3,5 +3,11 @@ corpus/*
 !corpus/dhcp4_message/
 corpus/dhcp4_message/*
 !corpus/dhcp4_message/seed-*.bin
+!corpus/dhcp4_server/
+corpus/dhcp4_server/*
+!corpus/dhcp4_server/seed-*.bin
+!corpus/dhcp4_arp/
+corpus/dhcp4_arp/*
+!corpus/dhcp4_arp/seed-*.bin
 artifacts
 coverage
