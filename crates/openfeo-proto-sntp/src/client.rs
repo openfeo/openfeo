@@ -24,6 +24,13 @@ pub const SERVER_HOLD_MS: u64 = 1_024_000;
 pub const LOST_SYNC_ROUNDS: u8 = 4;
 /// RFC 5905 MAXDISP: a sample whose root distance reaches it is unusable.
 pub const MAX_ROOT_DISTANCE_NS: i64 = 16_000_000_000;
+/// The longest round trip a sample may show; longer means the server's stamps and our clock
+/// disagree, not that the network is slow.
+pub const MAX_DELAY_NS: i64 = 2_000_000_000;
+/// How negative a round trip may measure before it is wrong: timestamp precision, clock rate,
+/// and a server whose processing time exceeds a LAN round trip, not a server that answered an
+/// hour before it was asked.
+pub const MIN_DELAY_NS: i64 = -10_000_000;
 /// Our poll exponent in requests: 2^6 = 64 s, the conventional minimum.
 const REQUEST_POLL: i8 = 6;
 /// Our precision in requests: about a microsecond.
@@ -76,6 +83,9 @@ pub enum Reject {
     Format,
     /// Root delay and dispersion too large to trust.
     RootDistance,
+    /// A round trip no WAN has, or a negative one: the server's receive and transmit stamps do
+    /// not agree with our clock, so its offset means nothing.
+    Delay,
 }
 
 /// What happened, for the console and the World.
@@ -102,9 +112,10 @@ pub enum Event {
         server: Ipv4Addr,
         offset_ns: i64,
     },
-    /// The server's time is before the build.
+    /// The server's time, or the time it would have set, is before the build.
     Refused {
         server: Ipv4Addr,
+        /// The offending time: the server's transmit stamp, or the lower time we would have set.
         transmit_unix_secs: i64,
         floor_unix_secs: u64,
     },
@@ -148,6 +159,15 @@ struct ServerState {
     hold_until: Option<u64>,
     /// Told us to go away for good.
     unusable: bool,
+}
+
+/// One valid measurement.
+#[derive(Debug, Clone, Copy)]
+struct Sample {
+    offset_ns: i64,
+    delay_ns: i64,
+    /// The time the clock is set to, in seconds: `T4 + offset`.
+    result_unix_secs: i64,
 }
 
 /// A request awaiting its reply.
@@ -380,6 +400,7 @@ impl Client {
         if packet.leap == LI_UNSYNCHRONISED
             || packet.stratum >= STRATUM_UNSYNCHRONISED
             || packet.transmit.is_zero()
+            || packet.receive.is_zero()
         {
             return rejected(Reject::Unsynchronised);
         }
@@ -393,23 +414,61 @@ impl Client {
         let t2 = packet.receive.to_unix_nanos(floor);
         let t3 = packet.transmit.to_unix_nanos(floor);
         let t4 = now.unix_ns;
+        let offset_ns = (t2 - t1).midpoint(t3 - t4);
+        let delay_ns = (t4 - t1) - (t3 - t2);
+        if !(MIN_DELAY_NS..=MAX_DELAY_NS).contains(&delay_ns) {
+            return rejected(Reject::Delay);
+        }
+        // The floor guards the server's time and the time we would set, both.
+        let floor_secs = i64::try_from(floor).unwrap_or(i64::MAX);
         let transmit_unix_secs = t3.div_euclid(NANOS_PER_SEC);
-        if transmit_unix_secs < i64::try_from(floor).unwrap_or(i64::MAX) {
+        let result_unix_secs = t4.saturating_add(offset_ns).div_euclid(NANOS_PER_SEC);
+        if transmit_unix_secs < floor_secs || result_unix_secs < floor_secs {
             self.pending = None;
             outputs.push(Output::Event(Event::Refused {
                 server,
-                transmit_unix_secs,
+                transmit_unix_secs: if transmit_unix_secs < floor_secs {
+                    transmit_unix_secs
+                } else {
+                    result_unix_secs
+                },
                 floor_unix_secs: floor,
             }));
             self.fail(server, now, &mut outputs);
             self.ask_next(now, &mut outputs);
             return outputs;
         }
-        let offset_ns = (t2 - t1).midpoint(t3 - t4);
-        let delay_ns = (t4 - t1) - (t3 - t2);
         self.pending = None;
+        self.adopt(
+            server,
+            &packet,
+            Sample {
+                offset_ns,
+                delay_ns,
+                result_unix_secs,
+            },
+            &mut outputs,
+        );
+        outputs
+    }
+
+    /// A valid sample: move the clock as the discipline decides, report it, and make the server
+    /// the source.
+    fn adopt(
+        &mut self,
+        server: Ipv4Addr,
+        packet: &Packet,
+        sample: Sample,
+        outputs: &mut Vec<Output>,
+    ) {
+        let Sample {
+            offset_ns,
+            delay_ns,
+            result_unix_secs,
+        } = sample;
         let synced_before = self.state.synced;
-        match decide(offset_ns, synced_before) {
+        let decision = decide(offset_ns, synced_before);
+        match decision {
             Decision::Step(ns) => {
                 outputs.push(Output::Step(ns));
                 outputs.push(Output::Event(Event::Step {
@@ -427,7 +486,7 @@ impl Client {
             }
             Decision::Hold => {}
         }
-        if !synced_before || matches!(decide(offset_ns, synced_before), Decision::Step(_)) {
+        if !synced_before || matches!(decision, Decision::Step(_)) {
             outputs.push(Output::Event(Event::Synced {
                 server,
                 offset_ns,
@@ -441,17 +500,16 @@ impl Client {
             stratum: packet.stratum,
             offset_ns,
             delay_ns,
-            root_delay_ns: root_delay,
-            root_dispersion_ns: root_dispersion,
+            root_delay_ns: short_to_nanos(packet.root_delay),
+            root_dispersion_ns: short_to_nanos(packet.root_dispersion),
             reference: packet.transmit,
-            last_sync_unix_secs: Some((t4 + offset_ns).div_euclid(NANOS_PER_SEC)),
+            last_sync_unix_secs: Some(result_unix_secs),
         };
         if let Some(state) = self.servers.iter_mut().find(|s| s.addr == server) {
             state.failures = 0;
             state.hold_until = None;
         }
-        self.end_round(true, &mut outputs);
-        outputs
+        self.end_round(true, outputs);
     }
 
     /// `DENY` and `RSTR` retire the server; `RATE` (or any other code) holds it twice as long
@@ -526,8 +584,10 @@ mod tests {
         LI_UNSYNCHRONISED, MODE_CLIENT, MODE_SERVER, STRATUM_KISS, STRATUM_UNSYNCHRONISED,
     };
 
-    /// 2026-10-31T12:00:00Z, the build floor of these tests, in nanoseconds.
+    /// 2026-10-31T12:00:00Z, the tests' wall clock, in nanoseconds.
     const UNIX_2026: i64 = 1_793_448_000 * NANOS_PER_SEC;
+    /// The tests' build floor: a thousand seconds before the wall clock.
+    const FLOOR: u64 = 1_793_447_000;
 
     fn ip(text: &str) -> Ipv4Addr {
         text.parse().unwrap()
@@ -545,7 +605,7 @@ mod tests {
     fn config(servers: &[&str]) -> Config {
         Config {
             servers: servers.iter().map(|s| ip(s)).collect(),
-            floor_unix_secs: 1_793_448_000,
+            floor_unix_secs: FLOOR,
         }
     }
 
@@ -698,7 +758,7 @@ mod tests {
             vec![Output::Event(Event::Refused {
                 server,
                 transmit_unix_secs: 1_377_993_600,
-                floor_unix_secs: 1_793_448_000,
+                floor_unix_secs: FLOOR,
             })]
         );
         assert!(!c.state().synced);
@@ -876,6 +936,96 @@ mod tests {
         assert_eq!(server, ip("203.0.113.99"), "and tried again after it");
     }
 
+    /// Review finding: a server with a zeroed or skewed receive timestamp, or one whose answer
+    /// took longer than any WAN round trip, could step the clock by years; its delay must be
+    /// sane before its time is believed.
+    #[test]
+    fn a_reply_with_no_receive_time_or_an_absurd_delay_moves_nothing() {
+        let mut c = Client::new(config(&["203.0.113.1"]), 1);
+        let (server, request) = poll(&mut c, 0);
+        let mut no_receive = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
+        no_receive.receive = NtpTimestamp::default();
+        assert_eq!(
+            c.handle(
+                Input::Reply {
+                    server,
+                    bytes: no_receive.encode().to_vec(),
+                },
+                now(5, UNIX_2026),
+            ),
+            vec![Output::Event(Event::Rejected {
+                server,
+                reason: Reject::Unsynchronised,
+            })]
+        );
+        let mut skewed = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
+        skewed.receive = NtpTimestamp::from_unix_nanos(UNIX_2026 - 3_600 * NANOS_PER_SEC);
+        assert_eq!(
+            c.handle(
+                Input::Reply {
+                    server,
+                    bytes: skewed.encode().to_vec(),
+                },
+                now(6, UNIX_2026),
+            ),
+            vec![Output::Event(Event::Rejected {
+                server,
+                reason: Reject::Delay,
+            })]
+        );
+        // The server's clock reads T1 when it answers, but the answer reaches us three seconds
+        // later: a round trip no WAN has.
+        assert_eq!(
+            c.handle(
+                Input::Reply {
+                    server,
+                    bytes: reply_to(&request, UNIX_2026, 2),
+                },
+                now(3_000, UNIX_2026 + 3 * NANOS_PER_SEC),
+            ),
+            vec![Output::Event(Event::Rejected {
+                server,
+                reason: Reject::Delay,
+            })]
+        );
+        assert!(!c.state().synced, "nothing moved the clock");
+        assert_eq!(
+            c.next_poll(),
+            Some(REPLY_TIMEOUT_MS),
+            "the request is still pending"
+        );
+    }
+
+    /// Review finding: the floor guards the time the clock would be set to, not only the
+    /// server's transmit stamp.
+    #[test]
+    fn a_result_below_the_floor_is_refused_even_when_the_transmit_time_is_not() {
+        let mut c = Client::new(config(&["203.0.113.1"]), 1);
+        let (server, request) = poll(&mut c, 0);
+        // The server transmits exactly at the floor and received two milliseconds earlier; our
+        // round trip is 1.5 ms, so the time we would adopt is a quarter millisecond before it.
+        let floor_ns = i64::try_from(FLOOR).unwrap() * NANOS_PER_SEC;
+        let mut at_floor = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
+        at_floor.transmit = NtpTimestamp::from_unix_nanos(floor_ns);
+        at_floor.receive = NtpTimestamp::from_unix_nanos(floor_ns - 2_000_000);
+        let out = c.handle(
+            Input::Reply {
+                server,
+                bytes: at_floor.encode().to_vec(),
+            },
+            now(2, UNIX_2026 + 1_500_000),
+        );
+        assert_eq!(
+            out,
+            vec![Output::Event(Event::Refused {
+                server,
+                transmit_unix_secs: 1_793_446_999,
+                floor_unix_secs: FLOOR,
+            })]
+        );
+        assert!(!c.state().synced);
+    }
+
     #[test]
     fn four_empty_rounds_lose_the_sync_and_configure_keeps_what_it_can() {
         let mut c = synced_client();
@@ -904,7 +1054,7 @@ mod tests {
         let out = c.handle(
             Input::Configure(Config {
                 servers: vec![],
-                floor_unix_secs: 1_793_448_000,
+                floor_unix_secs: FLOOR,
             }),
             now(0, UNIX_2026),
         );

@@ -220,11 +220,13 @@ impl<C: Clock> SntpDriver<C> {
                 if !resolved.ok {
                     debug!("time: {} did not resolve; trying again in {}s", resolved.name, RESOLVE_RETRY.as_secs());
                 }
-                self.resolved.insert(resolved.name, Lookup {
-                    addrs: resolved.addrs,
-                    at: Instant::now(),
-                    ok: resolved.ok,
-                });
+                let lookup = Lookup::after(
+                    self.resolved.get(&resolved.name),
+                    resolved.addrs,
+                    resolved.ok,
+                    Instant::now(),
+                );
+                self.resolved.insert(resolved.name, lookup);
                 return Ok(self.reconfigure_core());
             }
         };
@@ -278,7 +280,6 @@ impl<C: Clock> SntpDriver<C> {
         let addrs: BTreeMap<Name, Vec<Ipv4Addr>> = self
             .resolved
             .iter()
-            .filter(|(_, lookup)| lookup.ok)
             .map(|(name, lookup)| (name.clone(), lookup.addrs.clone()))
             .collect();
         let servers = core_servers(&self.servers, &addrs, &self.learned);
@@ -409,6 +410,23 @@ impl<C: Clock> Drop for SntpDriver<C> {
 }
 
 impl Lookup {
+    /// The record after a lookup came back: the new addresses when it succeeded, the ones it had
+    /// before when it did not (a name that stops resolving keeps the servers it named, so the
+    /// core keeps polling them and can lose sync like any other), and the time for the retry.
+    fn after(previous: Option<&Lookup>, addrs: Vec<Ipv4Addr>, ok: bool, now: Instant) -> Lookup {
+        Lookup {
+            addrs: if ok {
+                addrs
+            } else {
+                previous
+                    .map(|lookup| lookup.addrs.clone())
+                    .unwrap_or_default()
+            },
+            at: now,
+            ok,
+        }
+    }
+
     /// When this name should be resolved again.
     fn due(&self) -> Instant {
         self.at
@@ -490,6 +508,28 @@ mod tests {
 
     fn ip(text: &str) -> Ipv4Addr {
         text.parse().unwrap()
+    }
+
+    /// Review finding: a name that stops resolving (the forwarder has no upstream during a WAN
+    /// outage) must keep the addresses it had, or the core is left with nothing to poll, never
+    /// loses sync, and the LAN is told the router is synced indefinitely.
+    #[test]
+    fn a_failed_lookup_keeps_the_addresses_it_had() {
+        let now = Instant::now();
+        let first = Lookup::after(None, vec![ip("203.0.113.1")], true, now);
+        assert_eq!(
+            (first.addrs.clone(), first.ok, first.due()),
+            (vec![ip("203.0.113.1")], true, now + RESOLVE_INTERVAL)
+        );
+        let failed = Lookup::after(Some(&first), Vec::new(), false, now);
+        assert_eq!(
+            (failed.addrs.clone(), failed.ok, failed.due()),
+            (vec![ip("203.0.113.1")], false, now + RESOLVE_RETRY)
+        );
+        let changed = Lookup::after(Some(&failed), vec![ip("203.0.113.2")], true, now);
+        assert_eq!(changed.addrs, vec![ip("203.0.113.2")]);
+        let never = Lookup::after(None, Vec::new(), false, now);
+        assert!(never.addrs.is_empty() && !never.ok);
     }
 
     #[test]
