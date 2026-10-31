@@ -7,9 +7,13 @@
 
 #![deny(unsafe_code)]
 
+pub mod bound;
+pub mod clock;
 pub mod dhcp4;
 pub mod dhcp4_server;
 pub mod dns;
+pub mod resolve;
+pub mod sntp;
 #[allow(unsafe_code)]
 mod sys;
 pub mod throttle;

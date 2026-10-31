@@ -7,16 +7,11 @@
 //! one message at a time, so the core sees a single ordered stream.
 
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nix::sys::socket::{
-    AddressFamily, Backlog, SockFlag, SockProtocol, SockType, SockaddrIn, bind, listen, setsockopt,
-    socket, sockopt,
-};
+use nix::sys::socket::{Backlog, SockProtocol, SockType, listen};
 use openfeo_proto_dns::Timestamp;
 use openfeo_proto_dns::cache::CacheStats;
 use openfeo_proto_dns::forwarder::{self, Event, Forwarder, Input, Output, QueryId, Transport};
@@ -27,6 +22,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
+use crate::bound::bound_socket;
 use crate::dhcp4::{DriverError, RECEIVE_BUFFER, io_err, is_transient, socket_err, wait_until};
 use crate::throttle::{NOISY_WINDOW, Throttle};
 
@@ -44,6 +40,8 @@ pub const TCP_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const INBOX: usize = 256;
 /// The listen queue of each TCP listener.
 const BACKLOG: i32 = 128;
+/// The loopback device, for the box's own lookups.
+const LOOPBACK: &str = "lo";
 /// How long to wait after a socket error the link will cure.
 const TRANSIENT_WAIT: Duration = Duration::from_secs(1);
 
@@ -52,6 +50,9 @@ const TRANSIENT_WAIT: Duration = Duration::from_secs(1);
 pub struct DnsDriverConfig {
     /// Bridge names (`br-<lan>`), for `SO_BINDTODEVICE`.
     pub listeners: Vec<String>,
+    /// Also listen on `127.0.0.1:53` for the box's own lookups (time server names, later TLS
+    /// and updates).
+    pub loopback: bool,
     pub forwarder: forwarder::Config,
     /// Randomness for the upstream query ids.
     pub seed: u64,
@@ -149,6 +150,23 @@ impl DnsDriver {
             tasks.push(tokio::spawn(tcp_accept_loop(
                 ifname.clone(),
                 listener_tcp(ifname)?,
+                inbox_tx.clone(),
+                Arc::clone(&tcp_clients),
+            )));
+        }
+        if config.loopback {
+            let index = listeners.len();
+            let udp = Arc::new(loopback_udp()?);
+            tasks.push(tokio::spawn(udp_listener_loop(
+                index,
+                LOOPBACK.to_owned(),
+                Arc::clone(&udp),
+                inbox_tx.clone(),
+            )));
+            listeners.push(udp);
+            tasks.push(tokio::spawn(tcp_accept_loop(
+                LOOPBACK.to_owned(),
+                loopback_tcp()?,
                 inbox_tx.clone(),
                 Arc::clone(&tcp_clients),
             )));
@@ -380,37 +398,57 @@ impl Drop for DnsDriver {
 /// A UDP socket on port 53 of one bridge: `SO_REUSEADDR` so every bridge may have one,
 /// `SO_BINDTODEVICE` so each hears its own LAN and answers out of it.
 fn listener_udp(ifname: &str) -> Result<UdpSocket, DriverError> {
-    let fd = bound_socket(ifname, SockType::Datagram, SockProtocol::Udp)?;
+    let fd = bound_socket(
+        Some(ifname),
+        Ipv4Addr::UNSPECIFIED,
+        DNS_PORT,
+        SockType::Datagram,
+        SockProtocol::Udp,
+    )?;
     UdpSocket::from_std(std::net::UdpSocket::from(fd)).map_err(io_err("register UDP listener"))
 }
 
 /// The TCP listener on port 53 of one bridge, with the same options.
 fn listener_tcp(ifname: &str) -> Result<TcpListener, DriverError> {
-    let fd = bound_socket(ifname, SockType::Stream, SockProtocol::Tcp)?;
+    let fd = bound_socket(
+        Some(ifname),
+        Ipv4Addr::UNSPECIFIED,
+        DNS_PORT,
+        SockType::Stream,
+        SockProtocol::Tcp,
+    )?;
     let backlog = Backlog::new(BACKLOG).map_err(socket_err("listen queue"))?;
     listen(&fd, backlog).map_err(socket_err("listen on TCP port 53"))?;
     TcpListener::from_std(std::net::TcpListener::from(fd)).map_err(io_err("register TCP listener"))
 }
 
-/// A non-blocking socket bound to `0.0.0.0:53` on `ifname`.
-fn bound_socket(
-    ifname: &str,
-    kind: SockType,
-    protocol: SockProtocol,
-) -> Result<OwnedFd, DriverError> {
-    let fd = socket(
-        AddressFamily::Inet,
-        kind,
-        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-        protocol,
-    )
-    .map_err(socket_err("open listener socket"))?;
-    setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(socket_err("SO_REUSEADDR"))?;
-    setsockopt(&fd, sockopt::BindToDevice, &OsString::from(ifname))
-        .map_err(socket_err("SO_BINDTODEVICE"))?;
-    bind(fd.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, DNS_PORT))
-        .map_err(socket_err("bind port 53"))?;
-    Ok(fd)
+/// The UDP socket on `127.0.0.1:53` for the box's own lookups; `SO_REUSEADDR` as the bridge
+/// sockets have it, or the kernel refuses the port next to their wildcard binding.
+fn loopback_udp() -> Result<UdpSocket, DriverError> {
+    let fd = bound_socket(
+        Some(LOOPBACK),
+        Ipv4Addr::LOCALHOST,
+        DNS_PORT,
+        SockType::Datagram,
+        SockProtocol::Udp,
+    )?;
+    UdpSocket::from_std(std::net::UdpSocket::from(fd))
+        .map_err(io_err("register loopback UDP listener"))
+}
+
+/// The TCP listener on `127.0.0.1:53`.
+fn loopback_tcp() -> Result<TcpListener, DriverError> {
+    let fd = bound_socket(
+        Some(LOOPBACK),
+        Ipv4Addr::LOCALHOST,
+        DNS_PORT,
+        SockType::Stream,
+        SockProtocol::Tcp,
+    )?;
+    let backlog = Backlog::new(BACKLOG).map_err(socket_err("listen queue"))?;
+    listen(&fd, backlog).map_err(socket_err("listen on TCP 127.0.0.1:53"))?;
+    TcpListener::from_std(std::net::TcpListener::from(fd))
+        .map_err(io_err("register loopback TCP listener"))
 }
 
 /// A UDP socket towards the upstreams, on a kernel-chosen port.

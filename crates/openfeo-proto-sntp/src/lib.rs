@@ -16,3 +16,11 @@ pub mod timestamp;
 
 pub use packet::Packet;
 pub use timestamp::{Now, NtpTimestamp, iso8601};
+
+/// A time server as configured: an address, or a name the driver resolves through the box's own
+/// forwarder before each poll interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerSpec {
+    Address(std::net::Ipv4Addr),
+    Name(openfeo_proto_dns::Name),
+}

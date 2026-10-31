@@ -1076,6 +1076,7 @@ dependencies = [
  "nix",
  "openfeo-proto-dhcp4",
  "openfeo-proto-dns",
+ "openfeo-proto-sntp",
  "thiserror",
  "tokio",
  "tracing",
@@ -1136,6 +1137,7 @@ dependencies = [
 name = "openfeo-proto-sntp"
 version = "0.1.0"
 dependencies = [
+ "openfeo-proto-dns",
  "thiserror",
 ]
 

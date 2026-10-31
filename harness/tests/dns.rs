@@ -181,6 +181,7 @@ impl Rig {
         rt.block_on(async {
             DnsDriver::new(DnsDriverConfig {
                 listeners: vec![LAN_IF.to_owned()],
+                loopback: true,
                 forwarder: config,
                 seed: 0x5eed,
             })

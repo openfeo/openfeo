@@ -10,6 +10,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+openfeo-proto-dns = { path = "../openfeo-proto-dns" }
 thiserror.workspace = true
 
 [lints]
