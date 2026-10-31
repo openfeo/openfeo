@@ -638,85 +638,81 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<std::process
         .with_context(|| format!("collect {rendered}"))
 }
 
-/// What busybox `ntpd` reported about one server.
+/// What a reference SNTP client (`ntpdate -q`) reported about one server.
 #[derive(Debug, Clone, PartialEq)]
-pub struct NtpdReply {
+pub struct NtpReply {
     pub server: Ipv4Addr,
     /// The server's clock minus the client's, in seconds.
     pub offset_s: f64,
-    pub delay_s: f64,
+    /// The round trip, when the client prints one (ntp.org's does, ntpsec's does not).
+    pub delay_s: Option<f64>,
     pub stratum: u8,
 }
 
-/// `busybox ntpd -w -n -d -d -p <server>` inside `ns` (query only, never set the clock) until
-/// its first `reply from` line, then SIGTERM; the line parsed. busybox discards an
-/// unsynchronised answer with a different line, which is an error here.
+/// `ntpdate -q <server>` inside `ns`: query only, never set the clock. Both implementations
+/// are served, ntp.org's (`ntp` on Arch) and ntpsec's wrapper around `ntpdig`
+/// (`ntpsec-ntpdate` on Debian and Ubuntu); each prints the server, its stratum and the offset,
+/// and refuses an unsynchronised server (`no server suitable for synchronization found`),
+/// which is an error here.
 ///
 /// # Errors
 ///
-/// When busybox cannot be run, prints no usable reply within `timeout`, or the reply does not
-/// parse.
-pub fn ntpd_query(ns: &NetNs, server: Ipv4Addr, timeout: Duration) -> Result<NtpdReply> {
-    let mut cmd = ns.command("busybox")?;
-    cmd.args(["ntpd", "-w", "-n", "-d", "-d", "-p", &server.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("spawn busybox ntpd")?;
-    let stderr = child.stderr.take().context("ntpd stderr")?;
-    let (lines_tx, lines_rx) = mpsc::channel::<String>();
-    let reader = thread::spawn(move || {
-        let mut lines = Vec::new();
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            let _ = lines_tx.send(line.clone());
-            lines.push(line);
-        }
-        lines
-    });
-    let deadline = Instant::now() + timeout;
-    let mut replied = false;
-    while !replied && Instant::now() < deadline {
-        match lines_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(line) => replied = line.contains("reply from "),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-    }
-    let _ = child.wait();
-    let lines = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("ntpd reader thread panicked"))?;
-    let output = lines.join("\n");
-    parse_ntpd(&output)
-        .with_context(|| format!("busybox ntpd @{server}: no reply parsed from: {output}"))
+/// When ntpdate cannot be run, outlives `timeout`, or prints no reply it accepted.
+pub fn ntpdate_query(ns: &NetNs, server: Ipv4Addr, timeout: Duration) -> Result<NtpReply> {
+    let mut cmd = ns.command("ntpdate")?;
+    cmd.args(["-q", &server.to_string()]);
+    let output = run_with_timeout(&mut cmd, timeout)?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_ntpdate(&text)
+        .with_context(|| format!("ntpdate -q {server}: no reply parsed from: {}", text.trim()))
 }
 
-/// busybox 1.36's verbose line, the last one in `output`: `ntpd: reply from 192.168.1.1:
-/// offset:+7200.001234 delay:0.000456 status:0x24 strat:3 refid:0xcb007101 rootdelay:0.001
-/// reach:0x01`.
+/// The reply line of either `ntpdate`: ntp.org's `server 192.168.1.1, stratum 3, offset
+/// +7200.000003, delay 0.02567`, or ntpsec's (and `sntp`'s) `2026-10-31 23:29:30.681928 (+0000)
+/// +7200.000020 +/- 0.000079 192.168.1.1 s3 no-leap`.
 #[must_use]
-pub fn parse_ntpd(output: &str) -> Option<NtpdReply> {
-    let line = output.lines().rfind(|line| line.contains("reply from "))?;
-    let rest = line.split("reply from ").nth(1)?;
-    let (server, fields) = rest.split_once(':')?;
-    let server = server.trim().parse().ok()?;
-    let field = |key: &str| -> Option<&str> {
-        fields
-            .split_whitespace()
-            .find_map(|token| token.strip_prefix(key))
-    };
-    Some(NtpdReply {
-        server,
-        offset_s: field("offset:")?.parse().ok()?,
-        delay_s: field("delay:")?.parse().ok()?,
-        stratum: field("strat:")?.parse().ok()?,
-    })
+pub fn parse_ntpdate(output: &str) -> Option<NtpReply> {
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("server ") {
+            let mut parts = rest.split(',').map(str::trim);
+            let server = parts.next()?.parse().ok()?;
+            let (mut stratum, mut offset, mut delay) = (None, None, None);
+            for part in parts {
+                if let Some(value) = part.strip_prefix("stratum ") {
+                    stratum = value.parse().ok();
+                } else if let Some(value) = part.strip_prefix("offset ") {
+                    offset = value.parse().ok();
+                } else if let Some(value) = part.strip_prefix("delay ") {
+                    delay = value.parse().ok();
+                }
+            }
+            return Some(NtpReply {
+                server,
+                offset_s: offset?,
+                delay_s: delay,
+                stratum: stratum?,
+            });
+        }
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let Some(pos) = tokens.iter().position(|token| *token == "+/-")
+            && pos >= 1
+        {
+            let offset_s = tokens[pos - 1].parse().ok()?;
+            let server = tokens.get(pos + 2)?.parse().ok()?;
+            let stratum = tokens.get(pos + 3)?.strip_prefix('s')?.parse().ok()?;
+            return Some(NtpReply {
+                server,
+                offset_s,
+                delay_s: None,
+                stratum,
+            });
+        }
+    }
+    None
 }
 
 /// One raw SNTP request to `server` from inside `ns`, the reply decoded: the exact leap, stratum
@@ -953,18 +949,34 @@ mod dns_client_tests {
     }
 
     #[test]
-    fn ntpd_output_parses_the_reply_line() {
-        let out = "ntpd: sending query to 192.168.1.1\nntpd: reply from 192.168.1.1: offset:+7200.001234 delay:0.000456 status:0x24 strat:3 refid:0xcb007101 rootdelay:0.001 reach:0x01\n";
+    fn ntpdate_output_parses_both_the_classic_and_the_ntpsec_lines() {
+        let classic = "server 192.168.1.1, stratum 3, offset +7200.000003, delay 0.02567\n31 Oct 21:30:43 ntpdate[1394612]: step time server 192.168.1.1 offset +7200.000003 sec\n";
         assert_eq!(
-            parse_ntpd(out),
-            Some(NtpdReply {
+            parse_ntpdate(classic),
+            Some(NtpReply {
                 server: "192.168.1.1".parse().unwrap(),
-                offset_s: 7_200.001_234,
-                delay_s: 0.000_456,
+                offset_s: 7_200.000_003,
+                delay_s: Some(0.025_67),
                 stratum: 3,
             })
         );
-        assert_eq!(parse_ntpd("ntpd: sending query to 192.168.1.1\n"), None);
+        let ntpsec =
+            "2026-10-31 23:29:30.681928 (+0000) +7200.000020 +/- 0.000079 192.168.1.1 s3 no-leap\n";
+        assert_eq!(
+            parse_ntpdate(ntpsec),
+            Some(NtpReply {
+                server: "192.168.1.1".parse().unwrap(),
+                offset_s: 7_200.000_02,
+                delay_s: None,
+                stratum: 3,
+            })
+        );
+        assert_eq!(
+            parse_ntpdate(
+                "31 Oct 21:30:46 ntpdate[1394649]: no server suitable for synchronization found\n"
+            ),
+            None
+        );
     }
 
     /// dig pads short owner names with a second tab.

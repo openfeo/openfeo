@@ -1106,7 +1106,8 @@ fn rebinding_answers_are_refused(lab: &mut Lab) -> anyhow::Result<()> {
 }
 
 /// SPEC §7.10: the box takes its time from the configured server (a name resolved through its
-/// own forwarder), stepping once at boot, and serves it to the LAN one stratum below.
+/// own forwarder), stepping once at boot, and serves it to the LAN one stratum below, which a
+/// reference client (`ntpdate -q`) confirms.
 fn router_steps_to_the_isp_time_at_boot(lab: &mut Lab) -> anyhow::Result<()> {
     lab.start_dnsmasq()?;
     lab.start_sntp(7_200)?;
@@ -1124,7 +1125,7 @@ fn router_steps_to_the_isp_time_at_boot(lab: &mut Lab) -> anyhow::Result<()> {
     )?;
     c.wait_for(&mut Cursor::default(), &re(STEPPED), SYNC_TIMEOUT)?;
     c.wait_for(&mut Cursor::default(), &re(SYNCED), SOON)?;
-    let reply = lanclient::ntpd_query(&lab.lan0, ROUTER_DNS, DIG_TIMEOUT)?;
+    let reply = lanclient::ntpdate_query(&lab.lan0, ROUTER_DNS, DIG_TIMEOUT)?;
     anyhow::ensure!(reply.stratum == 3, "stratum {} in {reply:?}", reply.stratum);
     anyhow::ensure!(
         (reply.offset_s - 7_200.0).abs() < 2.0,

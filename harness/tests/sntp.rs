@@ -3,7 +3,7 @@
 
 //! The SNTP driver (`openfeo-net`) against real peers inside the rootless sandbox, no QEMU: a
 //! veth pair whose far end is the ISP (where the lab's Python SNTP server answers with a clock
-//! the scenario dials), another whose far end is the LAN host (busybox `ntpd` and raw queries),
+//! the scenario dials), another whose far end is the LAN host (`ntpdate -q` and raw queries),
 //! and the driver here on a recording clock, since the sandbox may not move the real one.
 //! `harness = false`: this binary is its own runner; an optional first argument filters
 //! scenarios by substring.
@@ -401,7 +401,7 @@ fn lan_clients_get_answers_at_stratum_plus_one(lab: &mut Lab) -> anyhow::Result<
     let rt = runtime()?;
     let (mut driver, _) = synced_driver(&rt, vec![SERVER])?;
     let (_, reply) = serve_while(&rt, &mut driver, || {
-        lanclient::ntpd_query(&rig.client, ROUTER, LOOKUP)
+        lanclient::ntpdate_query(&rig.client, ROUTER, LOOKUP)
     })?;
     ensure!(
         reply.stratum == 3,
@@ -410,7 +410,7 @@ fn lan_clients_get_answers_at_stratum_plus_one(lab: &mut Lab) -> anyhow::Result<
     );
     ensure!(
         (reply.offset_s - 7_200.0).abs() < 1.0,
-        "busybox saw offset {}: {reply:?}",
+        "ntpdate saw offset {}: {reply:?}",
         reply.offset_s
     );
     let (_, packet) = serve_while(&rt, &mut driver, || {

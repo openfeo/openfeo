@@ -51,7 +51,8 @@ package `musl` on Arch, `musl-tools` on Debian and Ubuntu), `pkg-config`, `cargo
 (`qemu-system-x86_64`), `iproute2`, `ping`, `python3`, Kea (`kea-dhcp4`), busybox (`busybox` on Arch,
 `busybox-static` on Debian and Ubuntu; its `udhcpc` is the lab's reference DHCP client), `dnsmasq`
 (`dnsmasq-base` on Debian and Ubuntu; the lab's upstream resolver), `dig` (`bind` on Arch,
-`bind9-dnsutils` on Debian and Ubuntu; the lab's DNS client), `mkfs.ext4`
+`bind9-dnsutils` on Debian and Ubuntu; the lab's DNS client), `ntpdate` (`ntp` on Arch,
+`ntpsec-ntpdate` on Debian and Ubuntu; the lab's reference time client), `mkfs.ext4`
 (e2fsprogs), `ccache`, and the usual kernel build dependencies (`bc`, `flex`, `bison`, `libelf`, `libssl`, `zstd`, `cpio`).
 `make` fetches the pinned sources of nftables, libnftnl, libmnl and jansson (`nft/sources.txt`),
 verifies them and builds them statically for the firewall backend, against the UAPI headers of
