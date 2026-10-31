@@ -7,12 +7,15 @@
 #![forbid(unsafe_code)]
 
 use std::fs::File;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use openfeo_harness::lab::{ISP_HTTP_BODY, ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
+use openfeo_harness::lanclient::{self, DhcpClientArgs};
 use openfeo_harness::{daemons, qemu, sandbox};
 use openfeo_harness::{nftprobe, scenario};
 
@@ -54,6 +57,27 @@ enum Cmd {
     /// 3 if it cannot load their modules, 1 on any other error.
     #[command(hide = true)]
     ProbeNft,
+    /// Internal: our DHCPv4 client on an interface of the current namespace, one JSON event per
+    /// line; the LAN side of the DHCPv4 server scenarios.
+    #[command(hide = true)]
+    DhcpClient {
+        #[arg(long)]
+        iface: String,
+        /// Start with INIT-REBOOT for this address.
+        #[arg(long)]
+        request: Option<Ipv4Addr>,
+        /// Option 12 to send.
+        #[arg(long)]
+        hostname: Option<String>,
+        /// Exit after the first renewal instead of the first lease.
+        #[arg(long)]
+        until_renewed: bool,
+        /// Send one DHCPINFORM from this address instead of running the client.
+        #[arg(long)]
+        inform: Option<Ipv4Addr>,
+        #[arg(long, default_value_t = 15)]
+        timeout_secs: u64,
+    },
 }
 
 /// Exit code of `probe-nft` for a kernel that cannot load the nft modules.
@@ -71,6 +95,21 @@ fn main() -> ExitCode {
         Cmd::Check => check(),
         Cmd::CheckSandbox => sandbox::enter().map(|()| ExitCode::SUCCESS),
         Cmd::ProbeNft => probe_nft(),
+        Cmd::DhcpClient {
+            iface,
+            request,
+            hostname,
+            until_renewed,
+            inform,
+            timeout_secs,
+        } => lanclient::run_dhcp_client(&DhcpClientArgs {
+            iface,
+            request,
+            hostname,
+            until_renewed,
+            inform,
+            timeout: Duration::from_secs(timeout_secs),
+        }),
     };
     result.unwrap_or_else(|err| {
         eprintln!("error: {err:#}");
@@ -143,6 +182,7 @@ fn check() -> Result<ExitCode> {
         "qemu-system-x86_64",
         "ip",
         "kea-dhcp4",
+        "busybox",
         "mkfs.ext4",
         "ping",
         "python3",

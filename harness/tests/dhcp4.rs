@@ -13,6 +13,7 @@ use std::time::Duration;
 use anyhow::{Context, ensure};
 use openfeo_harness::daemons::{self, Daemon};
 use openfeo_harness::lab::Lab;
+use openfeo_harness::lanclient::link_info;
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::netns::{self, NetNs};
 use openfeo_harness::sandbox;
@@ -134,29 +135,6 @@ impl Drop for Rig {
 
 /// `(ifindex, mac)` of `name` from `ip -o link show`, since the sandbox's sysfs shows the
 /// host's devices rather than its own.
-fn link_info(name: &str) -> anyhow::Result<(u32, [u8; 6])> {
-    let line = netns::ip(&["-o", "link", "show", name])?;
-    let index: u32 = line
-        .split(':')
-        .next()
-        .and_then(|index| index.trim().parse().ok())
-        .with_context(|| format!("no ifindex in {line:?}"))?;
-    let mac_text = line
-        .split_whitespace()
-        .skip_while(|word| *word != "link/ether")
-        .nth(1)
-        .with_context(|| format!("no link/ether in {line:?}"))?;
-    let bytes: Vec<u8> = mac_text
-        .split(':')
-        .map(|part| u8::from_str_radix(part, 16))
-        .collect::<Result<_, _>>()
-        .with_context(|| format!("bad mac {mac_text:?}"))?;
-    let mac: [u8; 6] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("mac {mac_text:?} is not six bytes"))?;
-    Ok((index, mac))
-}
-
 fn block_on<F: std::future::Future>(future: F) -> anyhow::Result<F::Output> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
