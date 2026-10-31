@@ -17,8 +17,8 @@ pub mod validate;
 
 pub use error::ConfigError;
 pub use generated::{
-    Config, Dhcp4Lease, Dhcp4Route, DhcpWan, Firewall, Lan, PortForward, PortMap, PortMapEntry,
-    StaticWan, System, Wan, wan,
+    Config, Dhcp4Lease, Dhcp4Route, Dhcp4ServerLease, Dhcp4ServerLeases, DhcpWan, Firewall, Lan,
+    LanDhcp, PortForward, PortMap, PortMapEntry, StaticLease, StaticWan, System, Wan, wan,
 };
 
 #[cfg(test)]
@@ -33,6 +33,7 @@ mod tests {
                 name: "lan0".into(),
                 ports: vec!["p2".into()],
                 ipv4: "192.168.1.1/24".into(),
+                dhcp: None,
             }],
             ..Default::default()
         };
