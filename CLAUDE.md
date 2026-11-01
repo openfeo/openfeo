@@ -30,6 +30,19 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 - Commits: `git commit -s` (DCO, identity `Andrew Newton <andy@vitri.ltd>`, set repo-locally), subject `<area>: <summary>`.
 - Test hooks (`openfeo.chaos=`) exist only under the `harness` cargo feature; release builds carry none.
 
+## Process
+- Milestone work follows the superpowers plugin's process (enabled for this project in `.claude/settings.json`):
+  brainstorm, then a design under `docs/superpowers/specs/`, then a plan under `docs/superpowers/plans/`, then
+  execution. Plans run inline: the executor works every task itself, test-first, keeps a ledger, does not stop to
+  check in between tasks, and reports the rulings it made on the plan's behalf together at the end, each with what
+  it costs if wrong; one fresh whole-branch review follows, then one fix pass. Minors it defers and follow-ups it
+  finds become GitHub issues, not chat memory.
+- Nothing is pushed, no PR opened, no branch force-pushed or deleted except on the maintainer's explicit word. Before
+  every push the branch is swept: author and committer are the DCO identity above, and no personal paths, employer
+  addresses, scratch or temp paths appear in files or messages.
+- Every word in the repo is public writing: documentation ranges (RFC 5737, RFC 3849) in examples and fixtures, and
+  no real addresses, accounts or ISP details beyond what `SPEC.md` already names.
+
 ## Harness
 Rootless: user + mount + net namespaces, no sudo. Needs `/dev/kvm` (falls back to TCG) and `/dev/net/tun`
 readable, and unprivileged user namespaces enabled. Host-side `pppd` (M3) additionally needs `/dev/ppp`
