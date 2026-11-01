@@ -95,6 +95,16 @@ if ! command -v buf >/dev/null 2>&1; then
   rm -f /tmp/buf
 fi
 
+log "superpowers plugin (the project enables it in .claude/settings.json; the VM must hold a copy)"
+# A cloud session reads the project's enabledPlugins but installs nothing itself (probed
+# 2026-11-01: the session had no superpowers skills), so install the plugin here, as the session's
+# user. Tolerated failure: the facts below say whether it is present.
+if command -v claude >/dev/null 2>&1; then
+  timeout 180 claude plugin install superpowers@claude-plugins-official --json </dev/null 2>&1 | tail -n 1 || true
+else
+  echo "claude: not on PATH here; the session must install the plugin itself"
+fi
+
 log "kernel knobs the harness wants (each may fail: the facts below and check-env report it)"
 # Ubuntu confines unprivileged user namespaces behind AppArmor; the harness needs them (ADR-0006).
 $SUDO sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
@@ -167,5 +177,9 @@ for tool in rustc cargo cargo-deny buf qemu-system-x86_64 kea-dhcp4 dnsmasq; do
     echo "$tool: MISSING"
   fi
 done
+if command -v claude >/dev/null 2>&1; then
+  plugins=$(timeout 60 claude plugin list </dev/null 2>&1 | grep -i 'superpowers' | head -n 1 || true)
+  echo "superpowers plugin: ${plugins:-not installed (the session will lack the process skills)}"
+fi
 echo "BUILD=$BUILD (set the same BUILD in the environment's variables so every make reuses it)"
 echo "setup took ${SECONDS}s (under about 300 s the filesystem is snapshotted for later sessions)"
