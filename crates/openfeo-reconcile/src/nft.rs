@@ -55,7 +55,7 @@ pub fn nft(world: &World) -> DesiredNft {
         .wans
         .iter()
         .filter(|wan| world.ports.id_of(&wan.port).is_some())
-        .map(|wan| wan.port.clone())
+        .map(crate::wan_ifname)
         .collect();
     let lan_if: BTreeSet<String> = world
         .config

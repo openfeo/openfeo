@@ -67,8 +67,9 @@ pub fn routing(world: &World) -> DesiredRouting {
         if world.ports.id_of(&wan_config.port).is_none() {
             continue;
         }
+        let ifname = crate::wan_ifname(wan_config);
         let route = |dst: Option<IpNet>, gateway: IpAddr| DesiredRoute {
-            ifname: wan_config.port.clone(),
+            ifname: ifname.clone(),
             dst,
             gateway: Some(gateway),
             table: TABLE_MAIN,
@@ -79,7 +80,7 @@ pub fn routing(world: &World) -> DesiredRouting {
             Some(wan::Kind::Static(static_wan)) => {
                 if let Ok(net) = static_wan.address.parse::<IpNet>() {
                     desired.addrs.insert(DesiredAddr {
-                        ifname: wan_config.port.clone(),
+                        ifname: ifname.clone(),
                         net,
                     });
                 }
@@ -92,7 +93,7 @@ pub fn routing(world: &World) -> DesiredRouting {
                     continue;
                 };
                 desired.addrs.insert(DesiredAddr {
-                    ifname: wan_config.port.clone(),
+                    ifname: ifname.clone(),
                     net: IpNet::V4(lease.address),
                 });
                 // RFC 3442: classless routes replace the router option, and `0.0.0.0/0` among
@@ -115,7 +116,7 @@ pub fn routing(world: &World) -> DesiredRouting {
                 for (dst, via) in wanted {
                     if !lease.address.contains(&via) {
                         desired.routes.insert(DesiredRoute {
-                            ifname: wan_config.port.clone(),
+                            ifname: ifname.clone(),
                             dst: Some(IpNet::V4(Ipv4Net::from(via))),
                             gateway: None,
                             table: TABLE_MAIN,

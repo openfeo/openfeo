@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The lab's VLAN configuration (M2 part 1): the WAN leases on VLAN 101 of p0 (isp0's Kea serves
+# on wan0.101); p2 carries lan0 untagged, guest tagged 223 and trusted tagged 224; p3 (lan1) is a
+# trusted access port. Trusted reaches everything, lan0 only the internet, guest only the
+# internet; one rule lets lan0 reach the trusted host's port 8080. Used by the m2 VLAN and policy
+# scenarios and by the reconcile snapshot tests.
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+
+[[wans]]
+name = "wan0"
+port = "p0"
+vlan = 101
+priority = 10
+[wans.dhcp]
+hostname = "openfeo-lab"
+
+[[lans]]
+name = "lan0"
+ports = ["p2"]
+ipv4 = "192.168.1.1/24"
+reaches = ["wan"]
+[lans.dhcp]
+range = ["192.168.1.100", "192.168.1.200"]
+lease_secs = 43200
+
+[[lans]]
+name = "guest"
+ports = ["p2.223"]
+ipv4 = "192.168.2.1/24"
+[lans.dhcp]
+range = ["192.168.2.100", "192.168.2.200"]
+lease_secs = 43200
+
+[[lans]]
+name = "trusted"
+ports = ["p2.224", "p3"]
+ipv4 = "192.168.3.1/24"
+reaches = ["wan", "lan0", "guest"]
+
+[firewall]
+wan_ping = true
+
+[[firewall.port_forwards]]
+name = "lan-http"
+proto = "tcp"
+port = 2222
+to = "192.168.1.2"
+to_port = 8080
+
+[[firewall.rules]]
+name = "admin-web"
+from = "lan0"
+to = "192.168.3.2"
+proto = "tcp"
+ports = ["8080"]

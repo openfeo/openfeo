@@ -13,6 +13,7 @@ use openfeo_world::{Dhcp4Fact, LeaseFact, LinkFact, MacAddr, TimeFact, World};
 
 pub const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
 pub const VM_DHCP: &str = include_str!("../../../harness/fixtures/vm-dhcp.toml");
+pub const VM_VLANS: &str = include_str!("../../../harness/fixtures/vm-vlans.toml");
 
 pub fn portmap() -> PortMap {
     PortMap {
@@ -127,4 +128,40 @@ pub fn dhcp_world() -> World {
 /// `vm-dhcp.toml` before any lease: the WAN port is up and has nothing else.
 pub fn dhcp_world_without_lease() -> World {
     world(openfeo_config::file::parse(VM_DHCP).expect("fixture parses"))
+}
+
+/// The lab with its optional fourth port: `p0..p3`.
+pub fn portmap4() -> PortMap {
+    let mut map = portmap();
+    map.ports.push(PortMapEntry {
+        id: "pci-0000:00:06.0".to_owned(),
+        name: "p3".to_owned(),
+    });
+    map
+}
+
+/// Link facts for `p0..p3`.
+pub fn link_facts4() -> BTreeMap<String, LinkFact> {
+    let mut facts = link_facts();
+    facts.insert(
+        "p3".to_owned(),
+        LinkFact {
+            index: 5,
+            name: "p3".to_owned(),
+            up: false,
+            carrier: false,
+            mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x03])),
+            mtu: 1500,
+        },
+    );
+    facts
+}
+
+/// `vm-vlans.toml` on the four-port lab, before any lease: a tagged DHCP WAN on p0.101, lan0
+/// untagged on p2, guest tagged 223 on p2, trusted tagged 224 on p2 and untagged on p3.
+pub fn vlans_world() -> World {
+    let mut world = world(openfeo_config::file::parse(VM_VLANS).expect("fixture parses"));
+    world.ports = Arc::new(portmap4());
+    world.links = Arc::new(link_facts4());
+    world
 }

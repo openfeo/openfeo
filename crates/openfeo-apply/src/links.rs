@@ -2,15 +2,16 @@
 // Copyright (C) 2026 Andrew Newton
 
 //! The links applier: create the LAN bridges (VLAN filtering on), delete stray `br-*` bridges,
-//! set bridge MACs, enslave and release ports, bring ports and bridges up or down. Order inside a
-//! pass: bridges, MACs, membership, ports up/down, bridges up, so a bridge never comes up with a
-//! random MAC. A pass is best-effort: a bridge the kernel refuses (or cannot be found) is reported
-//! at the end, after every other LAN was dealt with.
+//! create the VLAN sub-interfaces `pN.V` and delete stray ones (ADR-0017), set bridge MACs,
+//! enslave and release ports, bring ports and bridges up or down. Order inside a pass: bridges,
+//! VLANs, MACs, membership, ports up/down, bridges up, so a bridge never comes up with a random
+//! MAC. A pass is best-effort: a bridge the kernel refuses (or cannot be found) is reported at
+//! the end, after every other LAN was dealt with.
 
 use openfeo_netlink::{Cache, Error as NetlinkError, Link, LinkKind, Netlink};
-use openfeo_reconcile::links::DesiredLinks;
+use openfeo_reconcile::links::{DesiredLinks, PortKind};
 
-use crate::{ApplyError, Pass, Report, resolve};
+use crate::{ApplyError, Pass, Report, is_vlan_port_name, resolve};
 
 /// Makes the kernel's links match [`DesiredLinks`].
 #[derive(Debug, Default)]
@@ -38,6 +39,7 @@ impl LinksApplier {
     ) -> Result<Report, ApplyError> {
         let mut pass = Pass::default();
         bridges(&mut pass, desired, observed, nl).await;
+        vlans(&mut pass, desired, observed, nl).await;
         bridge_macs(&mut pass, desired, observed, nl).await;
         membership(&mut pass, desired, observed, nl).await;
         up_down(&mut pass, desired, observed, nl).await;
@@ -81,6 +83,43 @@ async fn bridges(pass: &mut Pass, desired: &DesiredLinks, observed: &Cache, nl: 
         if is_our_bridge(link) && !desired.bridges.contains_key(&link.name) {
             pass.op(
                 &format!("del bridge {}", link.name),
+                nl.link_del(link.index).await,
+                NetlinkError::is_absent,
+            );
+        }
+    }
+}
+
+/// Create missing VLAN sub-interfaces (a parent that cannot be found fails the pass for that
+/// one), delete `pN.V` links that no LAN or WAN wants.
+async fn vlans(pass: &mut Pass, desired: &DesiredLinks, observed: &Cache, nl: &Netlink) {
+    for (name, port) in &desired.ports {
+        let PortKind::Vlan { parent, id } = &port.kind else {
+            continue;
+        };
+        if observed.link_by_name(name).is_some() {
+            continue;
+        }
+        let parent_index = match resolve(observed, nl, parent).await {
+            Ok(index) => index,
+            Err(err) => {
+                pass.fail(err);
+                continue;
+            }
+        };
+        pass.op(
+            &format!("add vlan {name}"),
+            nl.link_add_vlan(parent_index, *id, name).await,
+            NetlinkError::is_exist,
+        );
+    }
+    for link in observed.links.values() {
+        if link.kind == Some(LinkKind::Vlan)
+            && is_vlan_port_name(&link.name)
+            && !desired.ports.contains_key(&link.name)
+        {
+            pass.op(
+                &format!("del vlan {}", link.name),
                 nl.link_del(link.index).await,
                 NetlinkError::is_absent,
             );

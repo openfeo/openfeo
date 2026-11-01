@@ -107,7 +107,47 @@ const SCENARIOS: &[Scenario] = &[
         name: "blackhole_route_primitive_and_facts",
         run: blackhole_route_primitive_and_facts,
     },
+    Scenario {
+        name: "stray_vlan_sub_interfaces_are_removed",
+        run: stray_vlan_sub_interfaces_are_removed,
+    },
 ];
+
+/// A `p1.223` nobody wants is deleted by the links applier; a VLAN that is not ours (`vlan7` on
+/// a foreign link) is left alone.
+fn stray_vlan_sub_interfaces_are_removed(_lab: &mut Lab) -> anyhow::Result<()> {
+    vlanprobe::require_vlan_links()?;
+    let _ports = FakePorts::create()?;
+    let _ = netns::ip(&["link", "del", "vlan7"]);
+    block_on(async {
+        let (mut rig, config) = build_static().await?;
+        netns::ip(&[
+            "link", "add", "link", "p1", "name", "p1.223", "type", "vlan", "id", "223",
+        ])?;
+        netns::ip(&[
+            "link", "add", "link", "h0", "name", "vlan7", "type", "vlan", "id", "7",
+        ])?;
+        wait_until(&mut rig.rx, "both VLANs in the cache", |c| {
+            c.link_by_name("p1.223").is_some() && c.link_by_name("vlan7").is_some()
+        })
+        .await?;
+        let ops = rig.apply(&config).await?;
+        ensure!(
+            ops == (1, 0),
+            "expected only the stray p1.223 to go: {ops:?}"
+        );
+        wait_until(&mut rig.rx, "p1.223 gone", |c| {
+            c.link_by_name("p1.223").is_none()
+        })
+        .await?;
+        ensure!(
+            rig.rx.borrow().link_by_name("vlan7").is_some(),
+            "vlan7 is not ours"
+        );
+        let _ = netns::ip(&["link", "del", "vlan7"]);
+        anyhow::Ok(())
+    })?
+}
 
 /// A VLAN sub-interface is created on a fake port, seen by the monitor with its kind, parent and
 /// id, enslaved to a bridge, and deleted (ADR-0017).

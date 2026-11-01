@@ -230,7 +230,7 @@ pub fn spawn_all(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: 
         };
         let task = WanTask {
             wan: wan.name.clone(),
-            port: wan.port.clone(),
+            port: openfeo_reconcile::wan_ifname(wan),
             hostname: (!dhcp.hostname.is_empty()).then(|| dhcp.hostname.clone()),
             vendor_class: (!dhcp.vendor_class.is_empty())
                 .then(|| dhcp.vendor_class.clone().into_bytes()),

@@ -30,3 +30,13 @@ pub const TABLE: &str = "openfeo";
 pub fn bridge_name(lan: &str) -> String {
     format!("br-{lan}")
 }
+
+/// The kernel interface a WAN runs on (SPEC §7.2): its port, or the 802.1Q sub-interface `pN.V`
+/// when `vlan` is set (ADR-0017).
+#[must_use]
+pub fn wan_ifname(wan: &openfeo_config::Wan) -> String {
+    match u16::try_from(wan.vlan) {
+        Ok(id) if id != 0 => openfeo_config::portname::vlan_ifname(&wan.port, id),
+        _ => wan.port.clone(),
+    }
+}
