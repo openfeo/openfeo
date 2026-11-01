@@ -37,8 +37,12 @@ group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4`
 DHCP client), `dnsmasq` (the upstream resolver), `dig` (the DNS client), `ntpdate` (the reference time client), `mkfs.ext4`,
 `ping`, `python3` (HTTP targets and the lab's SNTP server);
 building needs `musl-gcc`, `pkg-config`, `bison`, `flex`. The sandboxed nft scenarios need the
-kernel to load the `ct`/`fib`/`nat` nft modules; a host that cannot (upgraded, not rebooted) makes them skip with
-a reason, `make check-env` says so, and CI sets `OPENFEO_NO_SKIP=1` so a skip fails there. The `dhcp4` sandbox
+kernel to load the `ct`/`fib`/`nat`/`limit` nft modules, and every VLAN scenario (sandbox and QEMU alike: the
+ISP and LAN sides tag with the host kernel's `8021q`) needs that module; a host that cannot load them (upgraded,
+not rebooted) makes them skip with a reason, `make check-env` says so, and CI loads the modules and sets
+`OPENFEO_NO_SKIP=1` so a skip fails there. Scenarios that need two LANs call `Lab::add_lan1` for a `lan1`
+namespace on the router's `p3`; a VLAN client is a sub-interface of a LAN tap moved into its own namespace
+(`Lab::vlan_host`); `Lab::isp0_tagged` moves ISP A onto `wan0.<vid>` for the tagged WAN. The `dhcp4` sandbox
 suite runs the DHCPv4 client against Kea over a veth pair, no QEMU, and the `dhcp4_server` suite runs the
 DHCPv4 server driver against the LAN-side clients (our own as the hidden `openfeo-harness dhcp-client`
 subcommand, busybox `udhcpc` as the reference; `OPENFEO_TRACE=1` shows their and the driver's account of a

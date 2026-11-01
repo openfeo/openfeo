@@ -1874,6 +1874,24 @@ mod lan_dhcp_tests {
         }
     }
 
+    /// The M2 part 1 fixtures (tagged members, a tagged WAN, `reaches`, rules, public blocks, a
+    /// forward on a public address) are valid on the four-port lab.
+    #[test]
+    fn m2_fixtures_are_valid() {
+        let mut live4 = live();
+        live4.ports.push(PortMapEntry {
+            id: "pci-0000:00:06.0".to_owned(),
+            name: "p3".to_owned(),
+        });
+        for fixture in [
+            include_str!("../../../harness/fixtures/vm-vlans.toml"),
+            include_str!("../../../harness/fixtures/vm-public.toml"),
+        ] {
+            let config = crate::file::parse(fixture).expect("fixture parses");
+            assert_eq!(validate(&config, &live4), vec![]);
+        }
+    }
+
     #[test]
     fn range_must_be_two_ordered_host_addresses_of_the_subnet_without_the_router() {
         let range = |text: &str| codes(&validate(&with_dhcp(&format!("range = {text}")), &live()));

@@ -42,7 +42,7 @@ decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
 | `kernel/` | Linux 6.18 LTS built from `allnoconfig` plus checked-in fragments, with the binary as its initramfs |
 | `crates/openfeo` | The binary: argument parsing, port enumeration, the router process |
 | `crates/openfeo-init` | PID 1: mounts, sysctls, watchdog, supervisor, console log |
-| `harness/` | Rootless QEMU lab: network namespaces for a fake ISP and a LAN, reference daemons, scenario tests |
+| `harness/` | Rootless QEMU lab: network namespaces for two fake ISPs and one or two LANs (plus VLAN clients), reference daemons, scenario tests |
 
 ## Building and running the lab
 
