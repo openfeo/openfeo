@@ -51,8 +51,11 @@ pub struct DesiredDns {
     pub domain: String,
     /// `<hostname>.<domain>`.
     pub router_name: String,
-    /// The LAN addresses.
+    /// The LAN addresses: the router's A records, and never a valid upstream answer.
     pub router_addrs: Vec<Ipv4Addr>,
+    /// The active WAN's address: never a valid upstream answer, and not an A record of the
+    /// router's name.
+    pub wan_addrs: Vec<Ipv4Addr>,
     pub lan_subnets: Vec<Ipv4Net>,
     /// Every LAN's reservations with a hostname, then lease facts with a hostname not already
     /// named.
@@ -112,20 +115,28 @@ pub fn desired(world: &World) -> DesiredDns {
     }
     let mut learned_from = None;
     let mut wan_upstreams = Vec::new();
-    if dns.use_wan_dns.unwrap_or(true)
-        && let Some(active) = active_wan(world)
-    {
-        wan_upstreams = wan_dns(world, active);
-        if !wan_upstreams.is_empty() {
-            learned_from = Some(active.name.clone());
-            for upstream in &wan_upstreams {
-                push_unique(&mut upstreams, *upstream);
+    let router_addrs: Vec<Ipv4Addr> = listeners.iter().map(|listener| listener.address).collect();
+    let mut wan_addrs: Vec<Ipv4Addr> = Vec::new();
+    if let Some(active) = active_wan(world) {
+        if dns.use_wan_dns.unwrap_or(true) {
+            wan_upstreams = wan_dns(world, active);
+            if !wan_upstreams.is_empty() {
+                learned_from = Some(active.name.clone());
+                for upstream in &wan_upstreams {
+                    push_unique(&mut upstreams, *upstream);
+                }
             }
+        }
+        // The WAN address is the router's too: a public name resolving to it is rebinding, but it
+        // is not an A record of the router's name, so it is kept apart from the LAN addresses.
+        if let Some(addr) = wan_address(world, active) {
+            push_unique(&mut wan_addrs, addr);
         }
     }
 
     DesiredDns {
-        router_addrs: listeners.iter().map(|listener| listener.address).collect(),
+        router_addrs,
+        wan_addrs,
         listeners,
         upstreams,
         learned_from,
@@ -163,6 +174,7 @@ pub fn forwarder_config(desired: &DesiredDns) -> Config {
         domain,
         router_name,
         router_addrs: desired.router_addrs.clone(),
+        wan_addrs: desired.wan_addrs.clone(),
         lan_subnets: desired.lan_subnets.clone(),
         local: desired
             .local
@@ -207,6 +219,19 @@ fn wan_dns(world: &World, wan: &Wan) -> Vec<Ipv4Addr> {
             .filter_map(|text| text.parse().ok())
             .collect(),
         None => Vec::new(),
+    }
+}
+
+/// The address `wan` has now: its lease's, or a static WAN's own.
+fn wan_address(world: &World, wan: &Wan) -> Option<Ipv4Addr> {
+    match &wan.kind {
+        Some(wan::Kind::Dhcp(_)) => world.dhcp4.get(&wan.name).map(|lease| lease.address.addr()),
+        Some(wan::Kind::Static(static_wan)) => static_wan
+            .address
+            .parse::<Ipv4Net>()
+            .ok()
+            .map(|net| net.addr()),
+        None => None,
     }
 }
 
@@ -361,6 +386,23 @@ mod tests {
                     addr: Ipv4Addr::new(192, 168, 1, 120),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn the_wan_address_is_never_a_valid_answer() {
+        let d = desired(&fixtures::static_world());
+        assert_eq!(d.wan_addrs, vec![Ipv4Addr::new(203, 0, 113, 10)]);
+        assert_eq!(
+            d.router_addrs,
+            vec![Ipv4Addr::new(192, 168, 1, 1)],
+            "the router's A records stay the LAN's"
+        );
+        let d = desired(&fixtures::dhcp_world());
+        assert_eq!(d.wan_addrs, vec![Ipv4Addr::new(203, 0, 113, 100)]);
+        assert_eq!(
+            desired(&fixtures::dhcp_world_without_lease()).wan_addrs,
+            Vec::<Ipv4Addr>::new()
         );
     }
 }

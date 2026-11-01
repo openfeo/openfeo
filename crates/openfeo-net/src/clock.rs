@@ -30,6 +30,13 @@ pub trait Clock: Clone + Send + Sync + 'static {
     ///
     /// When the kernel refuses (no `CAP_SYS_TIME`).
     fn slew(&self, ns: i64) -> io::Result<()>;
+    /// Tell the kernel whether the clock is synchronised: `STA_UNSYNC` cleared (`true`) or set
+    /// (`false`). The kernel keeps the RTC only while it is clear.
+    ///
+    /// # Errors
+    ///
+    /// When the kernel refuses (no `CAP_SYS_TIME`).
+    fn set_synced(&self, synced: bool) -> io::Result<()>;
 }
 
 /// The box's clock: `tokio::time::Instant` for `mono_ms` since the driver started, `SystemTime`
@@ -69,6 +76,10 @@ impl Clock for SystemClock {
     fn slew(&self, ns: i64) -> io::Result<()> {
         sys::adjtimex_slew(ns)
     }
+
+    fn set_synced(&self, synced: bool) -> io::Result<()> {
+        sys::adjtimex_status(synced)
+    }
 }
 
 /// A clock for the sandbox: real monotonic time, Unix time shifted by every step and slew it was
@@ -84,6 +95,7 @@ struct Inner {
     shift_ns: i64,
     steps: Vec<i64>,
     slews: Vec<i64>,
+    synced_flags: Vec<bool>,
 }
 
 impl Recording {
@@ -95,6 +107,7 @@ impl Recording {
                 shift_ns: 0,
                 steps: Vec::new(),
                 slews: Vec::new(),
+                synced_flags: Vec::new(),
             })),
         }
     }
@@ -123,6 +136,12 @@ impl Recording {
     #[must_use]
     pub fn shift_ns(&self) -> i64 {
         self.with(|inner| inner.shift_ns)
+    }
+
+    /// Every `set_synced` so far, in order.
+    #[must_use]
+    pub fn synced_flags(&self) -> Vec<bool> {
+        self.with(|inner| inner.synced_flags.clone())
     }
 }
 
@@ -153,6 +172,11 @@ impl Clock for Recording {
             inner.shift_ns = inner.shift_ns.saturating_add(ns);
             inner.slews.push(ns);
         });
+        Ok(())
+    }
+
+    fn set_synced(&self, synced: bool) -> io::Result<()> {
+        self.with(|inner| inner.synced_flags.push(synced));
         Ok(())
     }
 }
@@ -193,5 +217,13 @@ mod tests {
         let shared = clock.clone();
         shared.step(1).unwrap();
         assert_eq!(clock.steps().len(), 2, "clones share one record");
+    }
+
+    #[test]
+    fn the_recording_clock_remembers_the_sync_flag() {
+        let clock = Recording::new();
+        clock.set_synced(true).unwrap();
+        clock.set_synced(false).unwrap();
+        assert_eq!(clock.synced_flags(), vec![true, false]);
     }
 }

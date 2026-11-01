@@ -50,7 +50,10 @@ pub struct Config {
     pub router_name: Option<Name>,
     /// The LAN addresses: the router's A records, and never a valid upstream answer.
     pub router_addrs: Vec<Ipv4Addr>,
-    /// Reverse zones the forwarder is authoritative for.
+    /// The router's other addresses (the WAN's): never a valid upstream answer either, but not
+    /// A records of the router's name.
+    pub wan_addrs: Vec<Ipv4Addr>,
+    /// Reverse zones the forwarder is authoritative for, and never a valid upstream answer.
     pub lan_subnets: Vec<Ipv4Net>,
     /// Reservations first, then leases; the first match wins.
     pub local: Vec<LocalRecord>,
@@ -101,6 +104,11 @@ pub enum Output {
         bytes: Vec<u8>,
     },
     Event(Event),
+    /// The query will never be answered (a response, or no header to answer with): the driver
+    /// forgets the client.
+    Drop {
+        id: QueryId,
+    },
 }
 
 /// What happened, for the console.
@@ -241,17 +249,16 @@ impl Forwarder {
         now: Timestamp,
     ) -> Vec<Output> {
         let Ok(msg) = Message::decode(bytes) else {
-            return Message::formerr(bytes)
-                .map(|formerr| {
-                    vec![Output::Reply {
-                        id,
-                        bytes: formerr.encode(),
-                    }]
-                })
-                .unwrap_or_default();
+            return match Message::formerr(bytes) {
+                Some(formerr) => vec![Output::Reply {
+                    id,
+                    bytes: formerr.encode(),
+                }],
+                None => vec![Output::Drop { id }],
+            };
         };
         if msg.header.response {
-            return Vec::new();
+            return vec![Output::Drop { id }];
         }
         let refused = if msg.header.opcode != OPCODE_QUERY {
             Some(rcode::NOTIMP)
@@ -396,6 +403,25 @@ impl Forwarder {
             outputs.push(self.send_upstream_as(uid, pending));
             return outputs;
         }
+        // An error from one upstream is that upstream's failure, not the name's: while another
+        // upstream has not been asked, it is asked next. The answer is relayed only when every
+        // one has failed. An answer is not a silence, so nothing is marked down.
+        let failed_answer = matches!(
+            msg.header.rcode,
+            rcode::FORMERR | rcode::NOTIMP | rcode::REFUSED | rcode::SERVFAIL
+        );
+        let attempts_allowed = usize::from(MAX_ATTEMPTS).min(self.config.upstreams.len());
+        if failed_answer
+            && usize::from(pending.attempts) < attempts_allowed
+            && let Some(next) = self.pick_upstream(now, Some(upstream))
+        {
+            pending.upstream = next;
+            pending.upstream_transport = Transport::Udp;
+            pending.deadline = now + UPSTREAM_TIMEOUT;
+            pending.attempts += 1;
+            outputs.push(self.send_upstream(pending));
+            return outputs;
+        }
         let question = &pending.query.questions[0];
         if let Some(addr) = self.rebinding_address(&msg) {
             outputs.push(Output::Event(Event::RebindDropped {
@@ -427,7 +453,8 @@ impl Forwarder {
         outputs
     }
 
-    /// Every pending query past its deadline: its upstream goes down, and it moves to the next
+    /// Every pending query past its deadline: its upstream goes down (unless the wait was for a
+    /// TCP retry, which the upstream had already answered over UDP), and it moves to the next
     /// upstream or fails.
     fn timeout(&mut self, now: Timestamp) -> Vec<Output> {
         let expired: Vec<u16> = self
@@ -442,7 +469,8 @@ impl Forwarder {
                 continue;
             };
             let failed = pending.upstream;
-            if self.down.insert(failed, now + UPSTREAM_DOWN_HOLD).is_none() {
+            let silent = pending.upstream_transport == Transport::Udp;
+            if silent && self.down.insert(failed, now + UPSTREAM_DOWN_HOLD).is_none() {
                 outputs.push(Output::Event(Event::UpstreamDown(failed)));
             }
             let next = if pending.attempts < MAX_ATTEMPTS {
@@ -486,14 +514,20 @@ impl Forwarder {
         if config.upstreams.is_empty() {
             outputs.push(Output::Event(Event::NoUpstreams));
         }
+        if config.cache_capacity != self.config.cache_capacity {
+            self.cache.set_capacity(config.cache_capacity);
+        }
         self.config = config;
         outputs
     }
 
     /// The next upstream in turn that is not marked down, skipping `except`; when all are down,
-    /// the next one anyway. `None` when nothing but `except` is left.
+    /// the next one anyway. `None` when nothing but `except` is left, or there is none at all.
     fn pick_upstream(&mut self, now: Timestamp, except: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
         let n = self.config.upstreams.len();
+        if n == 0 {
+            return None;
+        }
         let candidates = (0..n)
             .map(|i| (self.cursor + i) % n)
             .filter(|index| Some(self.config.upstreams[*index]) != except);
@@ -534,13 +568,24 @@ impl Forwarder {
         })
     }
 
-    /// RFC 1918, link-local, loopback, `0.0.0.0/8` or one of the router's own addresses.
+    /// RFC 1918, the shared space of RFC 6598 (`100.64.0.0/10`, the address a home behind
+    /// carrier NAT sits at), link-local, loopback, `0.0.0.0/8`, the broadcast address, a LAN
+    /// subnet (whatever it is numbered from) or one of the router's own addresses.
     fn is_internal_v4(&self, addr: Ipv4Addr) -> bool {
+        let [a, b, _, _] = addr.octets();
         addr.is_private()
+            || (a == 100 && (64..=127).contains(&b))
             || addr.is_link_local()
             || addr.is_loopback()
-            || addr.octets()[0] == 0
+            || a == 0
+            || addr.is_broadcast()
+            || self
+                .config
+                .lan_subnets
+                .iter()
+                .any(|subnet| subnet.contains(&addr))
             || self.config.router_addrs.contains(&addr)
+            || self.config.wan_addrs.contains(&addr)
     }
 
     /// ULA, link-local, loopback, or an IPv4-mapped address that [`Forwarder::is_internal_v4`]
@@ -763,6 +808,7 @@ mod tests {
             domain: name("home.arpa"),
             router_name: Some(name("openfeo.home.arpa")),
             router_addrs: vec![ip("192.168.1.1")],
+            wan_addrs: Vec::new(),
             lan_subnets: vec!["192.168.1.0/24".parse().unwrap()],
             local: vec![
                 LocalRecord {
@@ -1011,7 +1057,11 @@ mod tests {
     fn odd_queries_are_answered_with_an_error_and_never_forwarded() {
         let mut f = Forwarder::new(config(), 1);
         let at = |f: &mut Forwarder, bytes: Vec<u8>| f.handle(client(9, Transport::Tcp, bytes), 0);
-        assert_eq!(at(&mut f, vec![0; 5]), Vec::new(), "no header, no reply");
+        assert_eq!(
+            at(&mut f, vec![0; 5]),
+            vec![Output::Drop { id: 9 }],
+            "no header, no reply: the client is dropped"
+        );
         let mut cut = q("x.example", rtype::A);
         cut.truncate(14);
         assert_eq!(reply(&at(&mut f, cut)).header.rcode, rcode::FORMERR);
@@ -1041,7 +1091,7 @@ mod tests {
         );
         let mut response = Message::decode(&q("x.example", rtype::A)).unwrap();
         response.header.response = true;
-        assert_eq!(at(&mut f, response.encode()), Vec::new());
+        assert_eq!(at(&mut f, response.encode()), vec![Output::Drop { id: 9 }]);
         assert_eq!(
             at(&mut f, vec![0xff; 65_535]).len(),
             1,
@@ -1594,6 +1644,221 @@ mod tests {
             forwards(&out).len(),
             1,
             "a CD=0 client is not served a CD=1 client's answer: {out:?}"
+        );
+    }
+
+    #[test]
+    fn rebinding_covers_shared_space_broadcast_lan_subnets_and_the_wan_address() {
+        let mut cfg = config();
+        // A LAN numbered outside RFC 1918, and the WAN address as the reconciler supplies it.
+        cfg.lan_subnets.push("198.18.0.0/15".parse().unwrap());
+        cfg.wan_addrs.push(ip("203.0.113.10"));
+        let mut f = Forwarder::new(cfg, 1);
+        let cases = [
+            ("cgnat.isp.example", "100.64.1.2"),
+            ("bcast.isp.example", "255.255.255.255"),
+            ("lan.isp.example", "198.18.0.9"),
+            ("wan.isp.example", "203.0.113.10"),
+        ];
+        for (id, (qname, addr)) in cases.into_iter().enumerate() {
+            let id = QueryId::try_from(id).unwrap() + 1;
+            let out = f.handle(client(id, Transport::Udp, q(qname, rtype::A)), 0);
+            let (upstream, transport, fwd) = forwards(&out).remove(0);
+            let r = reply(&f.handle(
+                Input::UpstreamReply {
+                    upstream,
+                    transport,
+                    bytes: upstream_answer(&fwd, &[a(qname, 60, addr)]),
+                },
+                1,
+            ));
+            assert_eq!(r.header.rcode, rcode::REFUSED, "{qname}");
+        }
+    }
+
+    #[test]
+    fn an_upstream_error_fails_over_to_the_next_before_the_client_hears_it() {
+        let mut cfg = config();
+        cfg.upstreams = vec![ip("203.0.113.1"), ip("203.0.113.2")];
+        let mut f = Forwarder::new(cfg, 1);
+        let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        let out = f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport,
+                bytes: Message::reply_to(&fwd, rcode::REFUSED).encode(),
+            },
+            10,
+        );
+        assert!(
+            !out.iter().any(|o| matches!(o, Output::Reply { .. })),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains(&Output::Event(Event::UpstreamDown(upstream))),
+            "an answer is not a silence"
+        );
+        let (second, transport, fwd) = forwards(&out).remove(0);
+        assert_eq!(second, ip("203.0.113.2"));
+        let r = reply(&f.handle(
+            Input::UpstreamReply {
+                upstream: second,
+                transport,
+                bytes: upstream_answer(&fwd, &[a("www.isp.example", 60, "198.51.100.10")]),
+            },
+            20,
+        ));
+        assert_eq!(r.header.rcode, rcode::NOERROR);
+        // Every upstream failing: the last answer is relayed.
+        let out = f.handle(
+            client(2, Transport::Udp, q("nope.isp.example", rtype::A)),
+            30,
+        );
+        let (u1, t1, f1) = forwards(&out).remove(0);
+        let out = f.handle(
+            Input::UpstreamReply {
+                upstream: u1,
+                transport: t1,
+                bytes: Message::reply_to(&f1, rcode::SERVFAIL).encode(),
+            },
+            31,
+        );
+        let (u2, t2, f2) = forwards(&out).remove(0);
+        let r = reply(&f.handle(
+            Input::UpstreamReply {
+                upstream: u2,
+                transport: t2,
+                bytes: Message::reply_to(&f2, rcode::SERVFAIL).encode(),
+            },
+            32,
+        ));
+        assert_eq!(r.header.rcode, rcode::SERVFAIL);
+    }
+
+    #[test]
+    fn a_tcp_retry_that_times_out_marks_nothing_down() {
+        let mut f = Forwarder::new(config(), 1);
+        let out = f.handle(
+            client(1, Transport::Tcp, q("big.isp.example", rtype::TXT)),
+            0,
+        );
+        let (upstream, _, fwd) = forwards(&out).remove(0);
+        let mut tc = Message::decode(&upstream_answer(&fwd, &[])).unwrap();
+        tc.header.truncated = true;
+        f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport: Transport::Udp,
+                bytes: tc.encode(),
+            },
+            10,
+        );
+        let out = f.handle(Input::Timeout, 10 + UPSTREAM_TIMEOUT);
+        assert!(
+            !out.contains(&Output::Event(Event::UpstreamDown(upstream))),
+            "{out:?}"
+        );
+        assert_eq!(
+            reply(&out).header.rcode,
+            rcode::SERVFAIL,
+            "one upstream: nothing else to try"
+        );
+    }
+
+    #[test]
+    fn queries_the_core_will_never_answer_are_dropped_explicitly() {
+        let mut f = Forwarder::new(config(), 1);
+        let mut response = Message::decode(&q("www.isp.example", rtype::A)).unwrap();
+        response.header.response = true;
+        assert_eq!(
+            f.handle(client(7, Transport::Udp, response.encode()), 0),
+            vec![Output::Drop { id: 7 }]
+        );
+        assert_eq!(
+            f.handle(client(8, Transport::Udp, vec![1, 2, 3]), 0),
+            vec![Output::Drop { id: 8 }],
+            "no header at all"
+        );
+    }
+
+    /// Pins, unless one fails: then it is a finding and a fix in this task.
+    #[test]
+    fn apex_and_any_queries_are_answered_locally_and_full_queues_servfail() {
+        let mut f = Forwarder::new(config(), 1);
+        let r = reply(&f.handle(client(1, Transport::Udp, q("home.arpa", rtype::SOA)), 0));
+        assert_eq!(
+            (r.header.authoritative, r.answers.len(), r.answers[0].rtype),
+            (true, 1, rtype::SOA)
+        );
+        let r = reply(&f.handle(client(2, Transport::Udp, q("home.arpa", rtype::NS)), 0));
+        assert_eq!(
+            (r.header.rcode, r.answers.len(), r.authorities[0].rtype),
+            (rcode::NOERROR, 0, rtype::SOA),
+            "NODATA with the SOA"
+        );
+        let r = reply(&f.handle(client(3, Transport::Udp, q("nas.home.arpa", rtype::ANY)), 0));
+        assert_eq!(r.answers[0].rdata, RData::A(ip("192.168.1.10")));
+        let mut any_class = Message::decode(&q("nas.home.arpa", rtype::A)).unwrap();
+        any_class.questions[0].qclass = CLASS_ANY;
+        assert_eq!(
+            reply(&f.handle(client(4, Transport::Udp, any_class.encode()), 0)).answers[0].rdata,
+            RData::A(ip("192.168.1.10"))
+        );
+        for i in 0..MAX_PENDING {
+            let id = 100 + QueryId::try_from(i).unwrap();
+            f.handle(
+                client(
+                    id,
+                    Transport::Udp,
+                    q(&format!("h{i}.isp.example"), rtype::A),
+                ),
+                1,
+            );
+        }
+        assert_eq!(
+            reply(&f.handle(
+                client(9_999, Transport::Udp, q("one-more.isp.example", rtype::A)),
+                2
+            ))
+            .header
+            .rcode,
+            rcode::SERVFAIL
+        );
+        let out = f.handle(
+            Input::Configure(Config {
+                upstreams: vec![],
+                ..config()
+            }),
+            3,
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|o| matches!(o, Output::Reply { .. }))
+                .count(),
+            MAX_PENDING,
+            "every pending query gets SERVFAIL"
+        );
+    }
+
+    #[test]
+    fn the_routers_name_resolves_to_its_lan_addresses_only() {
+        let mut cfg = config();
+        cfg.wan_addrs.push(ip("203.0.113.10"));
+        let mut f = Forwarder::new(cfg, 1);
+        let r = reply(&f.handle(
+            client(1, Transport::Udp, q("openfeo.home.arpa", rtype::A)),
+            0,
+        ));
+        let addrs: Vec<RData> = r
+            .answers
+            .iter()
+            .map(|record| record.rdata.clone())
+            .collect();
+        assert_eq!(
+            addrs,
+            vec![RData::A(ip("192.168.1.1"))],
+            "the WAN address guards; it is not an A record of the router"
         );
     }
 }

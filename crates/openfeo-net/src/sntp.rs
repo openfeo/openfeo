@@ -96,7 +96,6 @@ pub struct SntpDriver<C: Clock> {
     /// What the listeners answer from.
     shared: Arc<Mutex<SyncState>>,
     served: Arc<AtomicU64>,
-    start: Instant,
     stats: SntpStats,
     tasks: Vec<JoinHandle<()>>,
     clock_failures: Throttle,
@@ -168,7 +167,6 @@ impl<C: Clock> SntpDriver<C> {
             inbox_tx,
             shared,
             served,
-            start: Instant::now(),
             stats: SntpStats::default(),
             tasks,
             clock_failures: Throttle::new(NOISY_WINDOW),
@@ -187,10 +185,10 @@ impl<C: Clock> SntpDriver<C> {
     /// When the time socket cannot be read, or the lookup tasks are gone.
     pub async fn step(&mut self) -> Result<Vec<Event>, DriverError> {
         self.refresh_names();
-        let poll_at = self
-            .client
-            .next_poll()
-            .map(|ms| self.start + Duration::from_millis(ms));
+        // The core's deadlines are in the clock's monotonic milliseconds, whatever clock it is.
+        let poll_at = self.client.next_poll().map(|ms| {
+            Instant::now() + Duration::from_millis(ms.saturating_sub(self.clock.now().mono_ms))
+        });
         let resolve_at = self.next_resolution();
         let mut buf = vec![0u8; RECEIVE_BUFFER];
         let input = tokio::select! {
@@ -359,19 +357,32 @@ impl<C: Clock> SntpDriver<C> {
                         Ok(_) => self.stats.sent += 1,
                         Err(err) => {
                             // Every poll ends here while the servers have no route (before the
-                            // WAN comes up): one line per window, the rest counted.
+                            // WAN comes up): one line per window, the rest counted. The core
+                            // hears of it, so the round moves on without a failure counted.
                             let line = format!("time: request to {server} failed: {err}");
                             if let Some(line) = self.send_failures.line(Instant::now(), &line) {
                                 warn!("{line}");
                             } else {
                                 debug!("{line}");
                             }
+                            let now = self.clock.now();
+                            let more = self.client.handle(Input::Unreachable { server }, now);
+                            events.extend(self.perform(more));
                         }
                     }
                 }
                 Output::Step(ns) => self.move_clock("step", ns, C::step),
                 Output::Slew(ns) => self.move_clock("slew", ns, C::slew),
-                Output::Event(event) => events.push(event),
+                Output::Event(event) => {
+                    match event {
+                        // Every adopted sample, slews included: `Synced` is only the first one
+                        // and the steps, and the kernel forgets within hours.
+                        Event::Synced { .. } | Event::Slewed { .. } => self.mark_synced(true),
+                        Event::LostSync { .. } => self.mark_synced(false),
+                        _ => {}
+                    }
+                    events.push(event);
+                }
             }
         }
         if let Ok(mut shared) = self.shared.lock() {
@@ -384,11 +395,26 @@ impl<C: Clock> SntpDriver<C> {
     fn move_clock(&mut self, what: &str, ns: i64, apply: fn(&C, i64) -> std::io::Result<()>) {
         if let Err(err) = apply(&self.clock, ns) {
             let line = format!("time: cannot {what} the clock by {ns}ns: {err}");
-            if let Some(line) = self.clock_failures.line(Instant::now(), &line) {
-                warn!("{line}");
-            } else {
-                debug!("{line}");
-            }
+            self.clock_failure(&line);
+        }
+    }
+
+    /// Tell the kernel the clock is synced (on every adopted sample: it grows its own error
+    /// estimate and raises `STA_UNSYNC` again within hours) or that the sync is lost; a refusal
+    /// is logged like a refused step.
+    fn mark_synced(&mut self, synced: bool) {
+        if let Err(err) = self.clock.set_synced(synced) {
+            let state = if synced { "synced" } else { "unsynced" };
+            let line = format!("time: cannot mark the clock {state}: {err}");
+            self.clock_failure(&line);
+        }
+    }
+
+    fn clock_failure(&mut self, line: &str) {
+        if let Some(line) = self.clock_failures.line(Instant::now(), line) {
+            warn!("{line}");
+        } else {
+            debug!("{line}");
         }
     }
 

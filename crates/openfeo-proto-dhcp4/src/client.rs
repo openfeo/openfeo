@@ -29,8 +29,10 @@ const MAX_BACKOFF: Timestamp = 64 * MS;
 const JITTER: Timestamp = MS;
 /// RENEWING and REBINDING retransmit at half the time left, never sooner than this (§4.4.5).
 const MIN_RETRANSMIT: Timestamp = 60 * MS;
-/// REQUESTING and REBOOTING give up after this many sends and go back to INIT.
-const MAX_REQUEST_SENDS: u8 = 3;
+/// REQUESTING and REBOOTING give up after this many sends and go back to INIT: four sends over
+/// 4+8+16+32 s, about a minute, since a cable modem's CMTS can take half of that to relay a
+/// reply after link-up.
+const MAX_REQUEST_SENDS: u8 = 4;
 const INFINITE: u32 = u32::MAX;
 /// A lease shorter than this is no lease: it would renew, rebind and expire at once.
 const MIN_LEASE_SECS: u32 = 10;
@@ -532,6 +534,7 @@ impl Client {
                 match t1 {
                     Some(t1) if now >= t1 => {
                         self.state = State::Renewing;
+                        self.xid = self.random_xid();
                         self.started = now;
                         self.send_renew_request(now, out);
                     }
@@ -546,6 +549,7 @@ impl Client {
                     .map(|lease| self.deadline(lease.t2_secs));
                 if t2.is_some_and(|t2| now >= t2) {
                     self.state = State::Rebinding;
+                    self.xid = self.random_xid();
                 }
                 self.send_renew_request(now, out);
             }
@@ -570,6 +574,12 @@ impl Client {
             return;
         };
         if msg.op != Op::BootReply || msg.xid != self.xid || msg.chaddr[..6] != self.config.mac {
+            return;
+        }
+        if let Some(DhcpOption::ClientIdentifier(id)) = msg.option(61)
+            && *id != self.config.client_id
+        {
+            // RFC 6842: a reply echoing another client's identifier is another client's.
             return;
         }
         let Some(kind) = msg.message_type() else {
@@ -601,6 +611,16 @@ impl Client {
                     return;
                 };
                 let renewed = matches!(self.state, State::Renewing | State::Rebinding);
+                if renewed
+                    && self
+                        .lease
+                        .as_ref()
+                        .is_some_and(|held| held.address != lease.address)
+                {
+                    // A renewal that moves the address is no renewal: the lease we hold stands
+                    // until it expires, and a server that insists gets its way then.
+                    return;
+                }
                 self.state = State::Bound;
                 self.bound_at = now;
                 self.addressed = true;
@@ -639,7 +659,15 @@ impl Client {
                 self.send_reboot_request(now, out);
             }
             State::Bound | State::Renewing | State::Rebinding => {
-                if let Some(lease) = self.lease.clone() {
+                let Some(lease) = self.lease.clone() else {
+                    return;
+                };
+                if !lease.is_infinite() && now >= self.deadline(lease.lease_secs) {
+                    // The lease ran out while the link was down: nothing left to confirm.
+                    out.push(Output::Unbound(Unbound::Expired));
+                    self.lease = None;
+                    self.discover(now, out);
+                } else {
                     self.reboot(lease, now, out);
                 }
             }
@@ -1089,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn requesting_gives_up_after_three_sends_and_discovers_again() {
+    fn requesting_gives_up_after_four_sends_and_discovers_again() {
         let mut c = client();
         let out = c.handle(Input::Start { lease: None }, 0);
         let (_, _, discover) = sent(&out);
@@ -1099,7 +1127,7 @@ mod tests {
         );
         let (_, _, first) = sent(&out);
         assert_eq!(first.message_type(), Some(MessageType::Request));
-        for _ in 0..2 {
+        for _ in 0..3 {
             let timeout = c.next_timeout().unwrap();
             let out = c.handle(Input::Timeout, timeout);
             let (_, _, again) = sent(&out);
@@ -1192,10 +1220,10 @@ mod tests {
     }
 
     #[test]
-    fn reboot_times_out_after_three_sends_then_discovers() {
+    fn reboot_times_out_after_four_sends_then_discovers() {
         let (_, lease) = bound();
         let (mut c, _) = rebooting(&lease);
-        for _ in 0..2 {
+        for _ in 0..3 {
             let timeout = c.next_timeout().unwrap();
             let out = c.handle(Input::Timeout, timeout);
             let (_, _, again) = sent(&out);
@@ -1203,6 +1231,10 @@ mod tests {
             assert_eq!(c.state(), State::Rebooting);
         }
         let timeout = c.next_timeout().unwrap();
+        assert!(
+            (56 * SEC..=64 * SEC).contains(&timeout),
+            "gives up about a minute in: {timeout}"
+        );
         let out = c.handle(Input::Timeout, timeout);
         assert!(out.contains(&Output::Unbound(Unbound::RebootTimedOut)));
         assert!(has(&out, |o| matches!(o, Output::Discover)));
@@ -1561,5 +1593,75 @@ mod tests {
         assert_eq!(lease.gateway, None, "option 3 yields to classless routes");
         assert_eq!(lease.default_gateway(), None, "no default route invented");
         assert_eq!(lease.routes.len(), 1);
+    }
+
+    #[test]
+    fn a_renewal_ack_for_another_address_is_ignored() {
+        let (mut c, lease) = bound();
+        let at = SEC + Timestamp::from(lease.t1_secs) * SEC;
+        let out = c.handle(Input::Timeout, at);
+        let (_, _, request) = sent(&out);
+        let mut other =
+            Message::decode(&reply(&request, MessageType::Ack, lease_options())).unwrap();
+        other.yiaddr = Ipv4Addr::new(203, 0, 113, 77);
+        let out = c.handle(Input::Packet(other.encode()), at + 1);
+        assert_eq!(out, Vec::new());
+        assert_eq!(
+            (c.state(), c.lease().map(|l| l.address)),
+            (State::Renewing, Some(lease.address))
+        );
+    }
+
+    #[test]
+    fn a_reply_echoing_another_client_identifier_is_ignored() {
+        let mut c = client();
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let mut offer =
+            Message::decode(&reply(&discover, MessageType::Offer, lease_options())).unwrap();
+        offer
+            .options
+            .push(DhcpOption::ClientIdentifier(vec![0xff, 9, 9, 9, 9]));
+        assert_eq!(c.handle(Input::Packet(offer.encode()), 1), Vec::new());
+        assert_eq!(c.state(), State::Selecting);
+    }
+
+    #[test]
+    fn renewing_and_rebinding_take_fresh_transaction_ids() {
+        let mut c = client();
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let out = c.handle(
+            Input::Packet(reply(&discover, MessageType::Offer, lease_options())),
+            500,
+        );
+        let (_, _, request) = sent(&out);
+        assert_eq!(
+            request.xid, discover.xid,
+            "one transaction from DISCOVER to ACK"
+        );
+        c.handle(
+            Input::Packet(reply(&request, MessageType::Ack, lease_options())),
+            SEC,
+        );
+        let out = c.handle(Input::Timeout, SEC + 20 * SEC);
+        let (_, _, renew) = sent(&out);
+        assert_ne!(renew.xid, request.xid);
+        let out = c.handle(Input::Timeout, SEC + 40 * SEC);
+        let (_, _, rebind) = sent(&out);
+        assert_ne!(rebind.xid, renew.xid);
+    }
+
+    #[test]
+    fn a_lease_expired_while_the_link_was_down_discovers_on_link_up() {
+        let (mut c, lease) = bound();
+        c.handle(Input::LinkDown, 10 * SEC);
+        let out = c.handle(
+            Input::LinkUp,
+            SEC + (Timestamp::from(lease.lease_secs) + 1) * SEC,
+        );
+        assert!(out.contains(&Output::Unbound(Unbound::Expired)), "{out:?}");
+        assert!(has(&out, |o| matches!(o, Output::Discover)));
+        assert_eq!((c.state(), c.lease()), (State::Selecting, None));
     }
 }

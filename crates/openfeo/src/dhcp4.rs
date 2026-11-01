@@ -29,6 +29,8 @@ use openfeo_runtime::{Publisher, Supervisor};
 use openfeo_world::{Dhcp4Fact, World};
 use tracing::{debug, info, warn};
 
+use crate::state;
+
 /// The box's DUID (DUID-LL, RFC 8415 §11.4) as lowercase hex (SPEC §5.2 `identity/`).
 pub const DUID_PATH: &str = "/state/identity/duid";
 /// Where each WAN's last DHCPv4 lease is kept (SPEC §5.2 `leases/`).
@@ -325,7 +327,7 @@ async fn run(
             }
         };
         for event in events {
-            publish(task, mac, &path, publisher, event);
+            publish(task, mac, &path, publisher, event).await;
         }
     }
 }
@@ -388,18 +390,14 @@ fn read_lease(path: &Path, wan: &str, mac: [u8; 6]) -> Option<Lease> {
     lease
 }
 
-fn save_lease(path: &Path, wan: &str, mac: [u8; 6], lease: &Lease) {
+async fn save_lease(path: &Path, wan: &str, mac: [u8; 6], lease: &Lease) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    let result = file::render_dhcp4_lease(&lease_file(wan, mac, lease, now))
-        .map_err(|err| io::Error::other(err.to_string()))
-        .and_then(|text| {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            atomic::write(path, text.as_bytes(), STATE_FILE_MODE)
-        });
+    let result = match file::render_dhcp4_lease(&lease_file(wan, mac, lease, now)) {
+        Ok(text) => state::write(path, text).await,
+        Err(err) => Err(io::Error::other(err.to_string())),
+    };
     match result {
         Ok(()) => debug!("wan {wan} dhcp lease saved {}", path.display()),
         Err(err) => warn!(
@@ -410,7 +408,7 @@ fn save_lease(path: &Path, wan: &str, mac: [u8; 6], lease: &Lease) {
 }
 
 /// Log the contract line, publish the fact, keep the file.
-fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publisher, event: Event) {
+async fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publisher, event: Event) {
     let wan = &task.wan;
     match event {
         Event::Discover => info!("wan {wan} dhcp discover"),
@@ -431,7 +429,7 @@ fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publisher, eve
             publisher.update(|world| {
                 Arc::make_mut(&mut world.dhcp4).insert(wan.clone(), fact);
             });
-            save_lease(path, wan, mac, &lease);
+            save_lease(path, wan, mac, &lease).await;
         }
         Event::Unbound(why) => {
             match &why {

@@ -80,11 +80,21 @@ impl Cache {
         }
     }
 
+    /// Hold at most `capacity` entries (at least one) from now on, evicting the least recently
+    /// used down to it.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        while self.entries.len() > self.capacity {
+            self.evict();
+        }
+    }
+
     /// Store `response` for `key` at `now`. A positive answer lives its smallest TTL (0 is not
     /// cached, over [`MAX_TTL`] is clamped); NXDOMAIN and NODATA live the smaller of the SOA's
     /// TTL and minimum, capped at [`MAX_NEGATIVE_TTL`], and only with an SOA in the authority
-    /// section, whose TTL becomes that negative TTL; SERVFAIL, REFUSED and truncated messages
-    /// are not stored. Returns whether it was stored.
+    /// section, whose TTL becomes that negative TTL (any CNAME chain in the answer section is
+    /// kept, capped at it too); SERVFAIL, REFUSED and truncated messages are not stored. Returns
+    /// whether it was stored.
     pub fn store(&mut self, key: Key, response: &Message, now: Timestamp) -> bool {
         if response.header.truncated {
             return false;
@@ -122,7 +132,16 @@ impl Cache {
                 };
                 Entry {
                     rcode: response.header.rcode,
-                    answers: Vec::new(),
+                    // The CNAME chain that led to the negative answer travels with it (RFC 2308
+                    // §2.1), living no longer than the answer does.
+                    answers: response
+                        .answers
+                        .iter()
+                        .map(|record| Record {
+                            ttl: record.ttl.min(ttl),
+                            ..record.clone()
+                        })
+                        .collect(),
                     authorities: response
                         .authorities
                         .iter()
@@ -405,5 +424,38 @@ mod tests {
         assert!(c.lookup(&key("a", rtype::A), 2_000).is_some());
         assert_eq!(c.stats().evictions, 1);
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn capacity_can_shrink_live_and_negative_entries_keep_their_cname_chain() {
+        let mut cache = Cache::new(4);
+        for i in 0..4u8 {
+            let text = format!("h{i}.example");
+            assert!(cache.store(key(&text, rtype::A), &answer(&text, &[(rtype::A, 60)]), 0));
+        }
+        cache.set_capacity(2);
+        assert_eq!(cache.len(), 2);
+        let mut nx = nxdomain_with_soa("alias.example", 3600, 60);
+        nx.answers.push(Record {
+            name: name("alias.example"),
+            rtype: rtype::CNAME,
+            class: CLASS_IN,
+            ttl: 300,
+            rdata: RData::Cname(name("gone.example")),
+        });
+        assert!(cache.store(key("alias.example", rtype::A), &nx, 0));
+        let entry = cache
+            .lookup(&key("alias.example", rtype::A), 1_000)
+            .unwrap();
+        assert_eq!(entry.rcode, rcode::NXDOMAIN);
+        assert_eq!(
+            entry.answers.len(),
+            1,
+            "the chain travels with the negative answer"
+        );
+        assert_eq!(
+            entry.answers[0].ttl, 59,
+            "capped at the negative TTL and aged a second"
+        );
     }
 }

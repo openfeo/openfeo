@@ -41,7 +41,6 @@ ipnet = { version = "2", features = ["serde"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 mimalloc = "0.1"
 insta = { version = "1", features = ["yaml"] }
-proptest = "1"
 # M1 part 2b: differential oracle for openfeo-proto-dhcp4's codec; dev-dependency and fuzz only, never shipped
 dhcproto = "0.15"
 # M1 part 3b: differential oracle for openfeo-proto-dns's codec; dev-dependency and fuzz only, never shipped (ADR-0015)

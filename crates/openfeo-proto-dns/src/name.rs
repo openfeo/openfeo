@@ -128,13 +128,23 @@ impl FromStr for Name {
 }
 
 impl fmt::Display for Name {
-    /// Labels joined by dots with the trailing root dot; the root alone is `.`.
+    /// Labels joined by dots with the trailing root dot; the root alone is `.`. Bytes other than
+    /// letters, digits, `-` and `_` are escaped as RFC 1035 §5.1 has it (`\.`, `\\`, else
+    /// `\DDD`), so a name from the wire cannot forge a console line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.labels.is_empty() {
             return f.write_str(".");
         }
         for label in &self.labels {
-            f.write_str(&String::from_utf8_lossy(label))?;
+            for &byte in label {
+                match byte {
+                    b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => {
+                        write!(f, "{}", char::from(byte))?;
+                    }
+                    b'.' | b'\\' => write!(f, "\\{}", char::from(byte))?,
+                    _ => write!(f, "\\{byte:03}")?,
+                }
+            }
             f.write_str(".")?;
         }
         Ok(())
@@ -166,8 +176,19 @@ pub fn reverse_addr(name: &Name) -> Option<Ipv4Addr> {
     if in_addr != b"in-addr" || arpa != b"arpa" {
         return None;
     }
-    let octet = |label: &Vec<u8>| std::str::from_utf8(label).ok()?.parse::<u8>().ok();
     Some(Ipv4Addr::new(octet(a)?, octet(b)?, octet(c)?, octet(d)?))
+}
+
+/// A label as a decimal octet: one to three digits, no sign, no leading zero (`010` and `+10`
+/// are names, not addresses).
+fn octet(label: &[u8]) -> Option<u8> {
+    let plain = (1..=3).contains(&label.len())
+        && label.iter().all(u8::is_ascii_digit)
+        && (label.len() == 1 || label[0] != b'0');
+    if !plain {
+        return None;
+    }
+    std::str::from_utf8(label).ok()?.parse().ok()
 }
 
 #[cfg(test)]
@@ -223,5 +244,41 @@ mod tests {
             None
         );
         assert_eq!(reverse_addr(&"nas.home.arpa".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn display_escapes_what_is_not_a_plain_label_byte() {
+        let name = Name::from_labels(vec![
+            b"a b".to_vec(),
+            b"x\ny".to_vec(),
+            b"c.d".to_vec(),
+            b"ok-1".to_vec(),
+        ])
+        .unwrap();
+        assert_eq!(name.to_string(), r"a\032b.x\010y.c\.d.ok-1.");
+        assert_eq!(
+            "nas.home.arpa".parse::<Name>().unwrap().to_string(),
+            "nas.home.arpa."
+        );
+    }
+
+    #[test]
+    fn reverse_names_need_plain_decimal_octets() {
+        assert_eq!(
+            reverse_addr(&"10.1.168.192.in-addr.arpa".parse().unwrap()),
+            Some(Ipv4Addr::new(192, 168, 1, 10))
+        );
+        assert_eq!(
+            reverse_addr(&"0.1.168.192.in-addr.arpa".parse().unwrap()),
+            Some(Ipv4Addr::new(192, 168, 1, 0))
+        );
+        for odd in [
+            "010.1.168.192.in-addr.arpa",
+            "+10.1.168.192.in-addr.arpa",
+            "1.168.192.in-addr.arpa",
+            "256.1.168.192.in-addr.arpa",
+        ] {
+            assert_eq!(reverse_addr(&odd.parse().unwrap()), None, "{odd}");
+        }
     }
 }

@@ -14,6 +14,8 @@ domain: home.arpa
 router_name: openfeo.home.arpa
 router_addrs:
   - 192.168.1.1
+wan_addrs:
+  - 203.0.113.10
 lan_subnets:
   - 192.168.1.0/24
 local:

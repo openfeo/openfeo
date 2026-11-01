@@ -54,6 +54,11 @@ pub enum Input {
         bytes: Vec<u8>,
     },
     Configure(Config),
+    /// The driver could not send to the server (no route, say): the request is over and the
+    /// round moves on; no failure is counted, since the server was never reached to fail.
+    Unreachable {
+        server: Ipv4Addr,
+    },
 }
 
 /// What the client wants done or known.
@@ -113,6 +118,9 @@ pub enum Event {
         offset_ns: i64,
     },
     /// The server's time, or the time it would have set, is before the build.
+    ///
+    /// NTP stamps carry 32 bits of seconds, so a time more than 68 years from the floor reads in
+    /// the other era: a server at 2096 looks like 1960 and is refused here, as it should be.
     Refused {
         server: Ipv4Addr,
         /// The offending time: the server's transmit stamp, or the lower time we would have set.
@@ -124,6 +132,9 @@ pub enum Event {
         reason: Reject,
     },
     ServerDown(Ipv4Addr),
+    /// The server answered without time (LI 3, stratum 16, a zero stamp or an unusable root
+    /// distance); said once per server until it answers properly.
+    ServerUnsynced(Ipv4Addr),
     /// `DENY` or `RSTR`: the server is never asked again.
     ServerUnusable {
         server: Ipv4Addr,
@@ -159,6 +170,8 @@ struct ServerState {
     hold_until: Option<u64>,
     /// Told us to go away for good.
     unusable: bool,
+    /// [`Event::ServerUnsynced`] has been emitted and no valid sample has come since.
+    unsynced_reported: bool,
 }
 
 /// One valid measurement.
@@ -221,6 +234,7 @@ impl Client {
             Input::Poll => self.poll(now),
             Input::Reply { server, bytes } => self.reply(server, &bytes, now),
             Input::Configure(config) => self.configure(config),
+            Input::Unreachable { server } => self.unreachable(server, now),
         }
     }
 
@@ -297,7 +311,7 @@ impl Client {
         };
         self.round_pos = index + 1;
         let server = self.servers[index].addr;
-        let transmit = self.noisy_transmit(now.unix_ns);
+        let transmit = self.noisy_transmit();
         let request = Packet {
             leap: 0,
             version: 4,
@@ -397,17 +411,32 @@ impl Client {
             self.ask_next(now, &mut outputs);
             return outputs;
         }
-        if packet.leap == LI_UNSYNCHRONISED
+        let root_delay = short_to_nanos(packet.root_delay);
+        let root_dispersion = short_to_nanos(packet.root_dispersion);
+        let no_time = if packet.leap == LI_UNSYNCHRONISED
             || packet.stratum >= STRATUM_UNSYNCHRONISED
             || packet.transmit.is_zero()
             || packet.receive.is_zero()
         {
-            return rejected(Reject::Unsynchronised);
-        }
-        let root_delay = short_to_nanos(packet.root_delay);
-        let root_dispersion = short_to_nanos(packet.root_dispersion);
-        if root_delay / 2 + root_dispersion >= MAX_ROOT_DISTANCE_NS {
-            return rejected(Reject::RootDistance);
+            Some(Reject::Unsynchronised)
+        } else if root_delay / 2 + root_dispersion >= MAX_ROOT_DISTANCE_NS {
+            Some(Reject::RootDistance)
+        } else {
+            None
+        };
+        if let Some(reason) = no_time {
+            // The server answered, so this request is over and the round moves on; an answer
+            // without time is not a silence, so nothing counts against the server.
+            self.pending = None;
+            outputs.push(Output::Event(Event::Rejected { server, reason }));
+            if let Some(state) = self.servers.iter_mut().find(|s| s.addr == server)
+                && !state.unsynced_reported
+            {
+                state.unsynced_reported = true;
+                outputs.push(Output::Event(Event::ServerUnsynced(server)));
+            }
+            self.ask_next(now, &mut outputs);
+            return outputs;
         }
         let floor = self.config.floor_unix_secs;
         let t1 = pending.sent_unix_ns;
@@ -508,8 +537,20 @@ impl Client {
         if let Some(state) = self.servers.iter_mut().find(|s| s.addr == server) {
             state.failures = 0;
             state.hold_until = None;
+            state.unsynced_reported = false;
         }
         self.end_round(true, outputs);
+    }
+
+    /// The driver could not send to `server`: forget the request and ask the next one. Nothing
+    /// counts against a server that was never reached.
+    fn unreachable(&mut self, server: Ipv4Addr, now: Now) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        if self.pending.is_some_and(|pending| pending.server == server) {
+            self.pending = None;
+            self.ask_next(now, &mut outputs);
+        }
+        outputs
     }
 
     /// `DENY` and `RSTR` retire the server; `RATE` (or any other code) holds it twice as long
@@ -534,27 +575,34 @@ impl Client {
             outputs.push(Output::Event(Event::NoServers));
         }
         self.servers = server_states(&config.servers, &self.servers);
-        if self
-            .pending
-            .is_some_and(|pending| !config.servers.contains(&pending.server))
-        {
-            self.pending = None;
-        }
+        let kept = self.pending.and_then(|pending| {
+            config
+                .servers
+                .iter()
+                .position(|addr| *addr == pending.server)
+        });
         self.config = config;
-        self.round_start = None;
-        self.round_active = false;
-        self.round_pos = 0;
+        if let Some(index) = kept {
+            // The request outlives the reconfiguration, and so does its round: the servers after
+            // the pending one in the new list are the ones still to ask.
+            self.round_pos = index + 1;
+        } else {
+            self.pending = None;
+            self.round_start = None;
+            self.round_active = false;
+            self.round_pos = 0;
+        }
         outputs
     }
 
-    /// `unix_ns` as a transmit timestamp with its low 16 fraction bits randomised (RFC 4330 §3),
-    /// so a reply can be matched to its request and not guessed.
-    fn noisy_transmit(&mut self, unix_ns: i64) -> NtpTimestamp {
+    /// A transmit timestamp that is nothing but noise (RFC 4330 §3 allows randomising it): the
+    /// reply must echo it, so an off-path attacker cannot guess an answer, and nobody on the path
+    /// learns our clock from the request. The real T1 is kept in [`Pending::sent_unix_ns`].
+    fn noisy_transmit(&mut self) -> NtpTimestamp {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
-        let stamp = NtpTimestamp::from_unix_nanos(unix_ns);
-        NtpTimestamp((stamp.0 & !0xffff) | (self.rng & 0xffff))
+        NtpTimestamp(self.rng)
     }
 }
 
@@ -572,6 +620,7 @@ fn server_states(servers: &[Ipv4Addr], previous: &[ServerState]) -> Vec<ServerSt
                     failures: 0,
                     hold_until: None,
                     unusable: false,
+                    unsynced_reported: false,
                 })
         })
         .collect()
@@ -832,21 +881,25 @@ mod tests {
         let mut unsynced = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
         unsynced.leap = LI_UNSYNCHRONISED;
         unsynced.stratum = STRATUM_UNSYNCHRONISED;
-        assert_eq!(
-            c.handle(
-                Input::Reply {
-                    server,
-                    bytes: unsynced.encode().to_vec(),
-                },
-                now(5, UNIX_2026),
-            ),
-            vec![Output::Event(Event::Rejected {
+        let out = c.handle(
+            Input::Reply {
                 server,
-                reason: Reject::Unsynchronised,
-            })]
+                bytes: unsynced.encode().to_vec(),
+            },
+            now(5, UNIX_2026),
         );
-        // The round moves on to .2 once .1's request times out.
-        let (server, request) = poll(&mut c, REPLY_TIMEOUT_MS);
+        assert_eq!(
+            out[..2],
+            [
+                Output::Event(Event::Rejected {
+                    server,
+                    reason: Reject::Unsynchronised,
+                }),
+                Output::Event(Event::ServerUnsynced(server)),
+            ]
+        );
+        // An answer without time ends the request: the round moves on to .2 at once.
+        let (server, request) = sent(&out).remove(0);
         assert_eq!(server, ip("203.0.113.2"));
         let mut deny = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
         deny.stratum = STRATUM_KISS;
@@ -943,21 +996,6 @@ mod tests {
     fn a_reply_with_no_receive_time_or_an_absurd_delay_moves_nothing() {
         let mut c = Client::new(config(&["203.0.113.1"]), 1);
         let (server, request) = poll(&mut c, 0);
-        let mut no_receive = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
-        no_receive.receive = NtpTimestamp::default();
-        assert_eq!(
-            c.handle(
-                Input::Reply {
-                    server,
-                    bytes: no_receive.encode().to_vec(),
-                },
-                now(5, UNIX_2026),
-            ),
-            vec![Output::Event(Event::Rejected {
-                server,
-                reason: Reject::Unsynchronised,
-            })]
-        );
         let mut skewed = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
         skewed.receive = NtpTimestamp::from_unix_nanos(UNIX_2026 - 3_600 * NANOS_PER_SEC);
         assert_eq!(
@@ -988,11 +1026,34 @@ mod tests {
                 reason: Reject::Delay,
             })]
         );
-        assert!(!c.state().synced, "nothing moved the clock");
         assert_eq!(
             c.next_poll(),
             Some(REPLY_TIMEOUT_MS),
-            "the request is still pending"
+            "a bad delay keeps the request pending: the real reply may still come"
+        );
+        let mut no_receive = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
+        no_receive.receive = NtpTimestamp::default();
+        assert_eq!(
+            c.handle(
+                Input::Reply {
+                    server,
+                    bytes: no_receive.encode().to_vec(),
+                },
+                now(3_001, UNIX_2026 + 3 * NANOS_PER_SEC),
+            ),
+            vec![
+                Output::Event(Event::Rejected {
+                    server,
+                    reason: Reject::Unsynchronised,
+                }),
+                Output::Event(Event::ServerUnsynced(server)),
+            ]
+        );
+        assert!(!c.state().synced, "nothing moved the clock");
+        assert_eq!(
+            c.next_poll(),
+            Some(POLL_UNSYNCED_MS),
+            "an answer without time ends the request; the next round waits its turn"
         );
     }
 
@@ -1071,5 +1132,194 @@ mod tests {
             "nothing to ask"
         );
         assert_eq!(c.next_poll(), None);
+    }
+
+    #[test]
+    fn an_unsynchronised_answer_ends_the_request_and_is_reported_once() {
+        let mut c = Client::new(config(&["203.0.113.1", "203.0.113.2"]), 1);
+        let (server, request) = poll(&mut c, 0);
+        let mut unsynced = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
+        unsynced.leap = LI_UNSYNCHRONISED;
+        unsynced.stratum = STRATUM_UNSYNCHRONISED;
+        let out = c.handle(
+            Input::Reply {
+                server,
+                bytes: unsynced.encode().to_vec(),
+            },
+            now(5, UNIX_2026),
+        );
+        assert!(out.contains(&Output::Event(Event::Rejected {
+            server,
+            reason: Reject::Unsynchronised,
+        })));
+        assert!(out.contains(&Output::Event(Event::ServerUnsynced(server))));
+        assert_eq!(
+            sent(&out)[0].0,
+            ip("203.0.113.2"),
+            "the round moved on at once: {out:?}"
+        );
+        // .2 stays silent: the round is over.
+        c.handle(
+            Input::Poll,
+            now(5 + REPLY_TIMEOUT_MS, unix_at(5 + REPLY_TIMEOUT_MS)),
+        );
+        let (again, request) = poll(&mut c, POLL_UNSYNCED_MS);
+        assert_eq!(again, server, "an answer is not a silence: not held");
+        let mut unsynced =
+            Packet::decode(&reply_to(&request, unix_at(POLL_UNSYNCED_MS), 2)).unwrap();
+        unsynced.leap = LI_UNSYNCHRONISED;
+        let out = c.handle(
+            Input::Reply {
+                server,
+                bytes: unsynced.encode().to_vec(),
+            },
+            now(POLL_UNSYNCED_MS + 5, unix_at(POLL_UNSYNCED_MS + 5)),
+        );
+        assert!(
+            !out.contains(&Output::Event(Event::ServerUnsynced(server))),
+            "reported once: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_server_is_skipped_without_a_failure() {
+        let mut c = Client::new(config(&["203.0.113.1", "203.0.113.2"]), 1);
+        let mut downs = 0;
+        for round in 0..3u64 {
+            let start = round * POLL_UNSYNCED_MS;
+            let (first, _) = poll(&mut c, start);
+            assert_eq!(
+                first,
+                ip("203.0.113.1"),
+                "round {round}: asked again, never held"
+            );
+            let out = c.handle(
+                Input::Unreachable { server: first },
+                now(start + 1, unix_at(start + 1)),
+            );
+            assert_eq!(
+                sent(&out)[0].0,
+                ip("203.0.113.2"),
+                "moved on at once: {out:?}"
+            );
+            let out = c.handle(
+                Input::Unreachable {
+                    server: ip("203.0.113.2"),
+                },
+                now(start + 2, unix_at(start + 2)),
+            );
+            downs += out
+                .iter()
+                .filter(|o| matches!(o, Output::Event(Event::ServerDown(_))))
+                .count();
+        }
+        assert_eq!(downs, 0);
+    }
+
+    /// Pin: `kiss()` already does this; the reviews found it untested.
+    #[test]
+    fn rate_holds_the_server_twice_as_long_and_rstr_retires_it() {
+        let mut c = Client::new(config(&["203.0.113.1", "203.0.113.2"]), 1);
+        let (server, request) = poll(&mut c, 0);
+        let mut rate = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
+        rate.stratum = STRATUM_KISS;
+        rate.reference_id = *b"RATE";
+        let out = c.handle(
+            Input::Reply {
+                server,
+                bytes: rate.encode().to_vec(),
+            },
+            now(5, UNIX_2026),
+        );
+        assert_eq!(sent(&out)[0].0, ip("203.0.113.2"), "{out:?}");
+        c.handle(
+            Input::Poll,
+            now(5 + REPLY_TIMEOUT_MS, unix_at(5 + REPLY_TIMEOUT_MS)),
+        );
+        let (next, _) = poll(&mut c, POLL_UNSYNCED_MS);
+        assert_eq!(next, ip("203.0.113.2"), "RATE holds .1");
+
+        let mut c = Client::new(config(&["203.0.113.1"]), 1);
+        let (server, request) = poll(&mut c, 0);
+        let mut rstr = Packet::decode(&reply_to(&request, UNIX_2026, 2)).unwrap();
+        rstr.stratum = STRATUM_KISS;
+        rstr.reference_id = *b"RSTR";
+        let out = c.handle(
+            Input::Reply {
+                server,
+                bytes: rstr.encode().to_vec(),
+            },
+            now(5, UNIX_2026),
+        );
+        assert!(out.contains(&Output::Event(Event::ServerUnusable {
+            server,
+            code: *b"RSTR",
+        })));
+        assert_eq!(c.next_poll(), None, "nobody left to ask");
+    }
+
+    /// Pin: `next_usable()` already clears the earliest hold; the reviews found it untested.
+    #[test]
+    fn when_every_server_is_held_the_earliest_hold_is_cleared() {
+        let mut c = Client::new(config(&["203.0.113.1", "203.0.113.2"]), 1);
+        let mut downs = 0;
+        while downs < 2 {
+            let at = c.next_poll().unwrap();
+            let out = c.handle(Input::Poll, now(at, unix_at(at)));
+            downs += out
+                .iter()
+                .filter(|o| matches!(o, Output::Event(Event::ServerDown(_))))
+                .count();
+        }
+        let at = c.next_poll().unwrap();
+        let out = c.handle(Input::Poll, now(at, unix_at(at)));
+        assert_eq!(sent(&out).len(), 1, "asked anyway: {out:?}");
+    }
+
+    #[test]
+    fn configure_with_the_pending_server_kept_continues_the_round() {
+        let mut c = Client::new(config(&["203.0.113.1", "203.0.113.2"]), 1);
+        let (server, _) = poll(&mut c, 0);
+        c.handle(
+            Input::Configure(config(&["203.0.113.1", "203.0.113.2"])),
+            now(1, unix_at(1)),
+        );
+        assert_eq!(
+            c.next_poll(),
+            Some(REPLY_TIMEOUT_MS),
+            "still waiting for {server}"
+        );
+        let out = c.handle(
+            Input::Poll,
+            now(REPLY_TIMEOUT_MS, unix_at(REPLY_TIMEOUT_MS)),
+        );
+        assert_eq!(
+            sent(&out)[0].0,
+            ip("203.0.113.2"),
+            "the round moves on, not back to the start: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_transmit_stamp_is_random_and_still_matched() {
+        let mut c = Client::new(config(&["203.0.113.1"]), 1);
+        let (server, request) = poll(&mut c, 0);
+        assert_ne!(
+            request.transmit.0 >> 32,
+            NtpTimestamp::from_unix_nanos(UNIX_2026).0 >> 32,
+            "even the seconds are noise"
+        );
+        let out = c.handle(
+            Input::Reply {
+                server,
+                bytes: reply_to(&request, unix_at(5), 2),
+            },
+            now(5, unix_at(5)),
+        );
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Output::Event(Event::Synced { .. }))),
+            "{out:?}"
+        );
     }
 }

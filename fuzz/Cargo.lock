@@ -608,6 +608,7 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "openfeo-platform",
+ "openfeo-proto-dhcp4",
  "pbjson",
  "pbjson-build",
  "prost",
@@ -659,6 +660,7 @@ dependencies = [
 name = "openfeo-proto-sntp"
 version = "0.1.0"
 dependencies = [
+ "openfeo-proto-dns",
  "thiserror",
 ]
 

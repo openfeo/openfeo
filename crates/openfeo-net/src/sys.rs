@@ -70,8 +70,11 @@ pub fn adjtimex_step(ns: i64) -> std::io::Result<()> {
     adjtimex(&mut tx)
 }
 
-/// `adjtimex(2)` with `ADJ_OFFSET_SINGLESHOT`: slew the clock `ns` nanoseconds, within the
-/// kernel's bound of half a second either way.
+/// `adjtimex(2)` with `ADJ_OFFSET_SINGLESHOT`: slew the clock `ns` nanoseconds. The kernel's
+/// single-shot path takes any offset and corrects it at 500 parts per million (it is glibc's
+/// `adjtime(3)` wrapper that bounds it, at about ±2145 s; the PLL path, `ADJ_OFFSET`, stops at
+/// `MAXPHASE`, half a second). The half-second clamp here is our own (ADR-0016): half a second
+/// already takes 1000 s to slew out, and the discipline steps anything larger.
 ///
 /// # Errors
 ///
@@ -82,6 +85,35 @@ pub fn adjtimex_slew(ns: i64) -> std::io::Result<()> {
     tx.modes = libc::ADJ_OFFSET_SINGLESHOT;
     tx.offset = libc::c_long::try_from((ns / 1000).clamp(-500_000, 500_000))
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    adjtimex(&mut tx)
+}
+
+/// `adjtimex(2)` with `ADJ_STATUS | ADJ_MAXERROR | ADJ_ESTERROR`: tell the kernel whether the
+/// clock is synchronised. The status word is read first (modes 0) and written back with only
+/// `STA_UNSYNC` changed. `maxerror` and `esterror` are reset too: the kernel grows `maxerror` by
+/// 500 µs every second and raises `STA_UNSYNC` itself once it passes 16 s, so a sync every
+/// 17 minutes keeps the flag clear only if each one resets the error. While the flag is clear the
+/// kernel writes the system time to the RTC every eleven minutes (`CONFIG_RTC_SYSTOHC`).
+///
+/// # Errors
+///
+/// When the kernel refuses: no `CAP_SYS_TIME`.
+pub fn adjtimex_status(synced: bool) -> std::io::Result<()> {
+    // SAFETY: as in `adjtimex_step`.
+    let mut current: libc::timex = unsafe { std::mem::zeroed() };
+    adjtimex(&mut current)?;
+    // SAFETY: as in `adjtimex_step`.
+    let mut tx: libc::timex = unsafe { std::mem::zeroed() };
+    tx.modes = libc::ADJ_STATUS | libc::ADJ_MAXERROR | libc::ADJ_ESTERROR;
+    tx.status = if synced {
+        current.status & !libc::STA_UNSYNC
+    } else {
+        current.status | libc::STA_UNSYNC
+    };
+    // Microseconds: half a second of error after a sync, the kernel's own ceiling after a loss.
+    let error_us = if synced { 500_000 } else { 16_000_000 };
+    tx.maxerror = error_us;
+    tx.esterror = error_us;
     adjtimex(&mut tx)
 }
 

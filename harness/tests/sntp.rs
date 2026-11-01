@@ -292,6 +292,11 @@ fn the_first_valid_answer_steps_the_recording_clock(lab: &mut Lab) -> anyhow::Re
             .any(|e| matches!(e, Event::Step { server, stratum: 2, .. } if *server == SERVER)),
         "{events:?}"
     );
+    ensure!(
+        driver.clock().synced_flags().first() == Some(&true),
+        "the kernel is told the clock is synced: {:?}",
+        driver.clock().synced_flags()
+    );
     ensure!(rig.queries()? >= 1, "the server saw no query");
     Ok(())
 }
@@ -320,6 +325,13 @@ fn small_offsets_slew_after_the_first_sync(lab: &mut Lab) -> anyhow::Result<()> 
         driver.clock().steps().len() == 1,
         "a second step: {:?}",
         driver.clock().steps()
+    );
+    // Every adopted sample tells the kernel the clock is synced, slews included: the kernel
+    // forgets within hours otherwise, and the RTC write-back stops with it.
+    ensure!(
+        driver.clock().synced_flags() == vec![true, true],
+        "the slew did not re-mark the clock synced: {:?}",
+        driver.clock().synced_flags()
     );
     Ok(())
 }

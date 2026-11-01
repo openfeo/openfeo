@@ -29,6 +29,8 @@ pub enum Watchdog {
         timeout: u32,
         /// The driver's name for the device (`i6300ESB timer`, `iTCO_wdt`, …).
         identity: String,
+        /// Why setting [`TIMEOUT_SECS`] failed, when it did: `timeout` is then the driver's own.
+        set_error: Option<String>,
     },
     /// No device: PID 1 reboots when `timeout` passes without a pet.
     Software {
@@ -55,15 +57,21 @@ impl Watchdog {
         let Ok(dev) = OpenOptions::new().write(true).open(DEVICE) else {
             return Self::software(now);
         };
-        let timeout = crate::sys::wdt_set_timeout(&dev, TIMEOUT_SECS)
-            .ok()
-            .or_else(|| sysfs_attr("timeout")?.parse().ok())
-            .unwrap_or(0);
+        let (timeout, set_error) = match crate::sys::wdt_set_timeout(&dev, TIMEOUT_SECS) {
+            Ok(timeout) => (timeout, None),
+            Err(err) => (
+                sysfs_attr("timeout")
+                    .and_then(|timeout| timeout.parse().ok())
+                    .unwrap_or(0),
+                Some(err.to_string()),
+            ),
+        };
         let identity = sysfs_attr("identity").unwrap_or_else(|| "unknown".to_owned());
         Self::Hardware {
             dev,
             timeout,
             identity,
+            set_error,
         }
     }
 
@@ -99,8 +107,16 @@ impl Watchdog {
     pub fn describe(&self) -> String {
         match self {
             Self::Hardware {
-                timeout, identity, ..
-            } => format!("{DEVICE} timeout={timeout}s identity=\"{identity}\""),
+                timeout,
+                identity,
+                set_error,
+                ..
+            } => {
+                let kept = set_error.as_ref().map_or_else(String::new, |err| {
+                    format!(" (driver's; setting {TIMEOUT_SECS}s failed: {err})")
+                });
+                format!("{DEVICE} timeout={timeout}s identity=\"{identity}\"{kept}")
+            }
             Self::Software { timeout, .. } => {
                 format!("none, software fallback timeout={}s", timeout.as_secs())
             }
@@ -134,10 +150,25 @@ mod tests {
             dev: File::open("/dev/null").unwrap(),
             timeout: 60,
             identity: "i6300ESB timer".to_owned(),
+            set_error: None,
         };
         assert_eq!(
             wd.describe(),
             "/dev/watchdog0 timeout=60s identity=\"i6300ESB timer\""
+        );
+    }
+
+    #[test]
+    fn describe_says_when_the_driver_kept_its_own_timeout() {
+        let wd = Watchdog::Hardware {
+            dev: File::open("/dev/null").unwrap(),
+            timeout: 30,
+            identity: "iTCO_wdt".to_owned(),
+            set_error: Some("EINVAL".to_owned()),
+        };
+        assert_eq!(
+            wd.describe(),
+            "/dev/watchdog0 timeout=30s identity=\"iTCO_wdt\" (driver's; setting 60s failed: EINVAL)"
         );
     }
 

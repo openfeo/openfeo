@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 openfeo-platform = { path = "../openfeo-platform" }
+openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
 prost.workspace = true
 pbjson.workspace = true
 serde.workspace = true

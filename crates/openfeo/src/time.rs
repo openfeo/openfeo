@@ -169,6 +169,7 @@ fn event_line(event: &Event) -> Option<String> {
             iso8601(i64::try_from(*floor_unix_secs).unwrap_or(i64::MAX))
         )),
         Event::ServerDown(server) => Some(format!("time server {server} down")),
+        Event::ServerUnsynced(server) => Some(format!("time server {server} has no time")),
         Event::ServerUnusable { server, code } => Some(format!(
             "time server {server} unusable: kiss of death {}",
             String::from_utf8_lossy(code).trim_end_matches('\0')
@@ -295,6 +296,10 @@ mod tests {
         assert_eq!(
             event_line(&Event::ServerDown(server)),
             Some("time server 203.0.113.1 down".into())
+        );
+        assert_eq!(
+            event_line(&Event::ServerUnsynced(server)),
+            Some("time server 203.0.113.1 has no time".into())
         );
         assert_eq!(
             event_line(&Event::ServerUnusable {

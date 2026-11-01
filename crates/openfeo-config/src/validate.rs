@@ -64,7 +64,7 @@ pub enum Code {
     InvalidMac,
     /// A static lease address that is not a host address of the LAN subnet, or is the router's.
     StaticOutsideSubnet,
-    /// A static lease MAC or address used twice within one LAN.
+    /// A static lease MAC, address or hostname used twice within one LAN.
     DuplicateStatic,
     /// A static lease client identifier that is not hex of 1 to 255 bytes.
     InvalidClientId,
@@ -87,10 +87,10 @@ pub const MAX_WAN_NAME: usize = 15 - "ppp-".len();
 pub const MAX_HOSTNAME: usize = 253;
 /// Longest vendor class sent as DHCP option 60 (one option's payload).
 pub const MAX_VENDOR_CLASS: usize = 255;
-/// Longest DNS label (a static lease's hostname).
-pub const MAX_LABEL: usize = 63;
-/// Shortest DHCPv4 lease `[lans.dhcp] lease_secs` may ask for; 0 means the default.
-pub const MIN_LEASE_SECS: u32 = 60;
+// The DHCPv4 server's own limits, so the file and the server agree on them: the longest DNS
+// label (a static lease's hostname) and the shortest lease `[lans.dhcp] lease_secs` may ask for
+// (0 means the default).
+pub use openfeo_proto_dhcp4::server::{MAX_LABEL, MIN_LEASE_SECS};
 
 /// A DNS host name (RFC 1123 §2.1): dot-separated labels of `[A-Za-z0-9-]`, 1 to 63 bytes each,
 /// never starting or ending with a hyphen, at most [`MAX_HOSTNAME`] bytes in all.
@@ -290,7 +290,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     }
 
     if let Some(dns_config) = &config.dns {
-        dns(&mut report, dns_config);
+        dns(&mut report, dns_config, &lan_subnets);
     }
 
     for (k, (path, net)) in subnets.iter().enumerate() {
@@ -380,7 +380,7 @@ fn lan_dhcp(report: &mut Report, path: &str, net: Ipv4Net, dhcp: &LanDhcp) {
             ),
         );
     }
-    let mut seen = (BTreeSet::new(), BTreeSet::new());
+    let mut seen = SeenStatics::default();
     for (j, lease) in dhcp.r#static.iter().enumerate() {
         static_lease(
             report,
@@ -456,14 +456,23 @@ fn dhcp_range(report: &mut Report, path: &str, net: Ipv4Net, range: &[String]) {
     }
 }
 
-/// `lans[i].dhcp.static[j]`: a MAC and a host address not seen before in this LAN, a label,
-/// an optional hex client identifier.
+/// What one LAN's static leases have claimed so far: a MAC, an address or a hostname (compared
+/// without case, as DNS does) may appear once.
+#[derive(Default)]
+struct SeenStatics {
+    macs: BTreeSet<[u8; 6]>,
+    addrs: BTreeSet<Ipv4Addr>,
+    hostnames: BTreeSet<String>,
+}
+
+/// `lans[i].dhcp.static[j]`: a MAC, a host address and a hostname not seen before in this LAN,
+/// the hostname a label, an optional hex client identifier.
 fn static_lease(
     report: &mut Report,
     path: &str,
     net: Ipv4Net,
     lease: &StaticLease,
-    seen: &mut (BTreeSet<[u8; 6]>, BTreeSet<Ipv4Addr>),
+    seen: &mut SeenStatics,
 ) {
     match parse_mac(&lease.mac) {
         None => report.push(
@@ -474,7 +483,7 @@ fn static_lease(
                 lease.mac
             ),
         ),
-        Some(mac) if !seen.0.insert(mac) => report.push(
+        Some(mac) if !seen.macs.insert(mac) => report.push(
             format!("{path}.mac"),
             Code::DuplicateStatic,
             format!("{} already has a static lease", lease.mac),
@@ -495,7 +504,7 @@ fn static_lease(
                 net.trunc()
             ),
         ),
-        Ok(ip) if !seen.1.insert(ip) => report.push(
+        Ok(ip) if !seen.addrs.insert(ip) => report.push(
             format!("{path}.ip"),
             Code::DuplicateStatic,
             format!("{ip} already has a static lease"),
@@ -508,6 +517,17 @@ fn static_lease(
             Code::InvalidHostname,
             format!(
                 "{:?} is not a DNS label: [A-Za-z0-9-] up to {MAX_LABEL} bytes, not starting or ending with a hyphen",
+                lease.hostname
+            ),
+        );
+    } else if !lease.hostname.is_empty()
+        && !seen.hostnames.insert(lease.hostname.to_ascii_lowercase())
+    {
+        report.push(
+            format!("{path}.hostname"),
+            Code::DuplicateStatic,
+            format!(
+                "{:?} already names a static lease in this LAN (names compare without case)",
                 lease.hostname
             ),
         );
@@ -621,11 +641,36 @@ fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Ne
     }
 }
 
-/// `[dns]` (SPEC §7.7): upstreams that are IPv4 addresses, no block lists yet, allow-listed
-/// names that are host names.
-fn dns(report: &mut Report, dns: &Dns) {
+/// `[dns]` (SPEC §7.7): upstreams that are IPv4 addresses a resolver could answer from (not
+/// loopback, multicast, broadcast, `0.0.0.0/8` or the router's own LAN address, which would be
+/// the forwarder asking itself), no block lists yet, allow-listed names that are host names.
+fn dns(report: &mut Report, dns: &Dns, lan_subnets: &[Ipv4Net]) {
     for (i, upstream) in dns.upstreams.iter().enumerate() {
-        report.addr4(&format!("dns.upstreams[{i}]"), upstream);
+        let path = format!("dns.upstreams[{i}]");
+        let Some(addr) = report.addr4(&path, upstream) else {
+            continue;
+        };
+        let [first, ..] = addr.octets();
+        let why = if addr.is_loopback() {
+            Some("a loopback address")
+        } else if addr.is_multicast() {
+            Some("a multicast address")
+        } else if addr.is_broadcast() {
+            Some("the broadcast address")
+        } else if first == 0 {
+            Some("in 0.0.0.0/8")
+        } else if lan_subnets.iter().any(|net| net.addr() == addr) {
+            Some("the router's own address, so the forwarder would be asking itself")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            report.push(
+                path,
+                Code::InvalidAddress,
+                format!("{upstream} is {why}, not a resolver"),
+            );
+        }
     }
     if !dns.blocklists.is_empty() {
         report.push(
@@ -1310,6 +1355,20 @@ mod lan_dhcp_tests {
         assert_eq!(parse_mac("52-54-00-fe-10-10"), None);
         assert_eq!(parse_mac("52:54:00:fe:10"), None);
     }
+
+    #[test]
+    fn duplicate_static_hostnames_are_refused() {
+        let bad = format!(
+            "{RANGE}[[lans.dhcp.static]]\nmac = \"52:54:00:fe:10:10\"\nip = \"192.168.1.10\"\nhostname = \"nas\"\n[[lans.dhcp.static]]\nmac = \"52:54:00:fe:10:11\"\nip = \"192.168.1.11\"\nhostname = \"NAS\"\n"
+        );
+        assert_eq!(
+            codes(&validate(&with_dhcp(&bad), &live())),
+            vec![(
+                "lans[0].dhcp.static[1].hostname".to_owned(),
+                Code::DuplicateStatic
+            )]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1406,5 +1465,36 @@ mod dns_tests {
                 "{ok:?}"
             );
         }
+    }
+
+    #[test]
+    fn local_addresses_are_not_upstreams() {
+        for bad in [
+            "127.0.0.1",
+            "224.0.0.251",
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "192.168.1.1",
+        ] {
+            let config = file::parse(&format!(
+                "config_version = 1\n[[lans]]\nname = \"lan0\"\nports = [\"p0\"]\nipv4 = \"192.168.1.1/24\"\n[dns]\nupstreams = [\"{bad}\"]\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                codes(&validate(&config, &live())),
+                vec![("dns.upstreams[0]".to_owned(), Code::InvalidAddress)],
+                "{bad}"
+            );
+        }
+        let fine = file::parse(
+            "config_version = 1\n[[lans]]\nname = \"lan0\"\nports = [\"p0\"]\nipv4 = \"192.168.1.1/24\"\n[dns]\nupstreams = [\"192.168.1.53\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codes(&validate(&fine, &live())),
+            vec![],
+            "a resolver on the LAN is fine; the router itself is not"
+        );
     }
 }

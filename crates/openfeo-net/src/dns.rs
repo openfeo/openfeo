@@ -220,20 +220,9 @@ impl DnsDriver {
                 None => return Ok(Vec::new()),
             },
         };
-        let is_query = matches!(input, Input::Query { .. });
-        let pending_before = self.forwarder.pending();
         let now = self.now();
         let outputs = self.forwarder.handle(input, now);
-        let replied = outputs
-            .iter()
-            .any(|output| matches!(output, Output::Reply { .. }));
-        let events = self.perform(outputs);
-        if is_query && !replied && self.forwarder.pending() == pending_before {
-            // The core ignored it (a response, say): nothing will ever answer, so forget the
-            // client; a TCP client sees its connection close.
-            self.clients.remove(&(self.next_id - 1));
-        }
-        Ok(events)
+        Ok(self.perform(outputs))
     }
 
     /// Replace the core's settings live: upstreams, local names, allow list. The cache stays.
@@ -327,6 +316,11 @@ impl DnsDriver {
                     tokio::spawn(upstream_tcp(upstream, bytes, self.inbox_tx.clone()));
                 }
                 Output::Event(event) => events.push(event),
+                Output::Drop { id } => {
+                    // Nothing will ever answer: forget the client; a TCP client sees its
+                    // connection close.
+                    self.clients.remove(&id);
+                }
             }
         }
         events
