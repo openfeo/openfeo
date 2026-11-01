@@ -166,6 +166,7 @@ impl Rig {
             router_name: Some("openfeo.home.arpa".parse().context("a name")?),
             router_addrs: vec![ROUTER],
             lan_subnets: vec!["192.168.1.0/24".parse().context("a subnet")?],
+            guard_subnets: vec!["192.168.1.0/24".parse().context("a subnet")?],
             local: vec![
                 LocalRecord {
                     name: "nas.home.arpa".parse().context("a name")?,
