@@ -12,7 +12,7 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 - `make test`          unit tests; `make test-harness` runs the QEMU scenarios (`FILTER=name` to pick one)
 - `make lint`          fmt, clippy (-D warnings), cargo-deny, SPDX headers
 - `make ci`            everything CI runs, in CI's order
-- `make check-env`     is this machine able to run the harness?
+- `make check-env`     is this machine able to run the harness? (fetches the headers and sources first, like `bin`)
 - `make bin`, `lint` and `test` first run `make kernel-headers nft-src` (kernel UAPI headers, pinned nftables sources;
   ADR-0012) and export `OPENFEO_NFT_SRC` and `OPENFEO_UAPI_INCLUDE`; a bare `cargo build` needs both set.
 
@@ -36,7 +36,7 @@ readable, and unprivileged user namespaces enabled. Host-side `pppd` (M3) additi
 group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4`, `busybox` (`udhcpc`, the reference
 DHCP client), `dnsmasq` (the upstream resolver), `dig` (the DNS client), `ntpdate` (the reference time client), `mkfs.ext4`,
 `ping`, `python3` (HTTP targets and the lab's SNTP server);
-building needs `musl-gcc`, `pkg-config`, `bison`, `flex`. The sandboxed nft scenarios need the
+building needs `musl-gcc`, `pkg-config`, `bison`, `flex` and `rsync` (the kernel's `headers_install`). The sandboxed nft scenarios need the
 kernel to load the `ct`/`fib`/`nat`/`limit` nft modules, and every VLAN scenario (sandbox and QEMU alike: the
 ISP and LAN sides tag with the host kernel's `8021q`) needs that module; a host that cannot load them (upgraded,
 not rebooted) makes them skip with a reason, `make check-env` says so, and CI loads the modules and sets

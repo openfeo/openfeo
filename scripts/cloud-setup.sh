@@ -46,7 +46,7 @@ if [ -z "$REPO" ]; then
   REPO=$(git rev-parse --show-toplevel 2>/dev/null || true)
 fi
 if [ -z "$REPO" ] || [ ! -f "$REPO/kernel/build.sh" ]; then
-  REPO=$(find /root /home /workspace /workspaces /work /src /mnt -maxdepth 3 -type f -path '*/kernel/build.sh' \
+  REPO=$(find /root /home /workspace /workspaces /work /src /mnt -maxdepth 4 -type f -path '*/kernel/build.sh' \
     2>/dev/null | head -n 1 | xargs -r dirname | xargs -r dirname || true)
 fi
 export BUILD="${BUILD:-/opt/openfeo/build}"
@@ -55,7 +55,7 @@ log "packages (the two CI jobs' lists, without recommends to stay inside the sna
 export DEBIAN_FRONTEND=noninteractive
 $SUDO apt-get update -qq
 $SUDO apt-get install -y -qq --no-install-recommends \
-  build-essential ca-certificates curl git xz-utils kmod procps \
+  build-essential ca-certificates curl git xz-utils kmod procps rsync \
   musl-tools pkg-config bison flex bc libelf-dev libssl-dev ccache zstd cpio e2fsprogs \
   qemu-system-x86 kea-dhcp4-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate \
   iproute2 iputils-ping python3
