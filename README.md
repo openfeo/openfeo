@@ -9,33 +9,12 @@ FeO is iron(II) oxide, that is, rust.
 
 ## Status
 
-Pre-alpha. Milestone M0 of [`SPEC.md`](SPEC.md) §12 is done and M1 (the IPv4 router) is under
-way: the kernel boots in QEMU to the OpenFeO PID 1, which supervises the router process and pets
-the hardware watchdog only while it reports healthy; the router process checks the kernel against
-`kernel/required.config`, names the ports by bus path, loads a protobuf-defined configuration from
-`/state/config.toml`, and makes the kernel match it through a netlink monitor and appliers that own
-only what they tag: LAN bridge, static WAN address and default route, and one `table inet openfeo`
-ruleset generated from the configuration and applied through libnftables linked in-process (zones
-as named sets, default deny inbound on the WAN, masquerade, port forwards with hairpin,
-reverse-path filtering in nft). Forwarding is switched on only together with that ruleset, and a
-router-process crash does not interrupt traffic. A WAN configured `[wans.dhcp]` takes its
-address, routes, MTU and DNS from the ISP's DHCPv4 server through an in-house sans-IO client,
-driven over a packet socket until it is bound and over UDP after; it renews the lease, confirms
-it again after a link flap and after a reboot (INIT-REBOOT from the lease kept under
-`/state/leases`), and never holds the LAN back when no server answers. Each `[lans.dhcp]` LAN runs a
-DHCPv4 server with a pool, static reservations, DHCPINFORM, an ARP probe before every offer,
-authoritative NAKs and a lease database under `/state/leases`, published as facts. The router
-answers DNS on each LAN: `<hostname>.home.arpa` and reverse names from the leases and
-reservations, everything else through upstreams typed in or learned from the WAN, with a TTL
-cache, negative caching, EDNS0, TCP, and rebinding protection; block lists are the next thing to
-slot in. The router keeps its clock from SNTP servers (configured, `pool.ntp.org` by default,
-plus the ones the WAN lease names), never earlier than its own build, publishes whether it is
-synced, and serves time to the LAN, which the leases point at. That completes M1. M2 (IPv6) is
-under way, and its first part, the IPv4 groundwork, is in: a LAN member may be a tagged VLAN on a
-port (`p2.223`) and a WAN may be tagged; `[[public_ipv4]]` declares blocks the ISP routes to the
-router, so a LAN numbered from one is a DMZ that is never translated and is reached only through
-`[[firewall.rules]]`, a port forward may listen on a public address, and every block gets a
-blackhole route; each LAN says which zones it `reaches`.
+Pre-alpha. Of the milestones in [`SPEC.md`](SPEC.md) §12, M0 (the harness and skeleton) and M1
+(the IPv4 router: port identity, the LAN bridge, static and DHCPv4 WANs, the nftables ruleset with
+NAT and port forwards, the DHCPv4 server, the DNS forwarder and SNTP) are done, and M2 (IPv6) is
+under way with its IPv4 groundwork in: LAN VLANs, a tagged WAN, routed public blocks with DMZ LANs,
+per-LAN reach policy and firewall rules. [`docs/progress.md`](docs/progress.md) is the log of what
+has landed against the spec, one entry per change, and the pull requests it links hold the detail.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
@@ -48,6 +27,7 @@ decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
 | `crates/openfeo` | The binary: argument parsing, port enumeration, the router process |
 | `crates/openfeo-init` | PID 1: mounts, sysctls, watchdog, supervisor, console log |
 | `harness/` | Rootless QEMU lab: network namespaces for two fake ISPs and one or two LANs (plus VLAN clients), reference daemons, scenario tests |
+| `docs/` | ADRs (`adr/`), the design and plan documents each part was built from (`superpowers/`), third-party notes, and `progress.md`, the log of what has landed against SPEC §12 |
 
 ## Building and running the lab
 

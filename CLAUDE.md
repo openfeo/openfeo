@@ -36,7 +36,8 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
   execution. Plans run inline: the executor works every task itself, test-first, keeps a ledger, does not stop to
   check in between tasks, and reports the rulings it made on the plan's behalf together at the end, each with what
   it costs if wrong; one fresh whole-branch review follows, then one fix pass. Minors it defers and follow-ups it
-  finds become GitHub issues, not chat memory.
+  finds become GitHub issues, not chat memory. A PR that lands milestone work appends its entry to
+  `docs/progress.md` in the same PR; `SPEC.md` carries no status.
 - Nothing is pushed, no PR opened, no branch force-pushed or deleted except on the maintainer's explicit word. Before
   every push the branch is swept: author and committer are the DCO identity above, and no personal paths, employer
   addresses, scratch or temp paths appear in files or messages.
