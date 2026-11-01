@@ -23,6 +23,9 @@ use crate::wire::{
 pub const UPSTREAM_TIMEOUT: Timestamp = 2_000;
 /// Attempts per client query, each on the next upstream.
 pub const MAX_ATTEMPTS: u8 = 3;
+/// How long a forward the driver could not send (no route to the upstream yet) waits before
+/// it is sent again, within the attempt's [`UPSTREAM_TIMEOUT`].
+pub const FORWARD_RETRY: Timestamp = 250;
 /// How long a silent upstream is skipped.
 pub const UPSTREAM_DOWN_HOLD: Timestamp = 30_000;
 /// The TTL of local answers.
@@ -86,6 +89,14 @@ pub enum Input {
         bytes: Vec<u8>,
     },
     UpstreamReply {
+        upstream: Ipv4Addr,
+        transport: Transport,
+        bytes: Vec<u8>,
+    },
+    /// An [`Output::Forward`] the driver could not send (`ENETUNREACH` before the WAN's routes
+    /// exist, a full socket buffer): `bytes` as the forward carried them. The upstream never
+    /// saw the query, so it is not a silence; the query is sent again after [`FORWARD_RETRY`].
+    ForwardFailed {
         upstream: Ipv4Addr,
         transport: Transport,
         bytes: Vec<u8>,
@@ -170,6 +181,16 @@ struct Pending {
     deadline: Timestamp,
     /// Upstreams tried so far, this one included.
     attempts: u8,
+    /// When the last send failed: the time to send again. The upstream has not been asked.
+    retry_at: Option<Timestamp>,
+}
+
+impl Pending {
+    /// When the core next wants a timeout for this query.
+    fn due(&self) -> Timestamp {
+        self.retry_at
+            .map_or(self.deadline, |retry| retry.min(self.deadline))
+    }
 }
 
 /// The forwarder.
@@ -217,15 +238,21 @@ impl Forwarder {
                 transport,
                 bytes,
             } => self.upstream_reply(upstream, transport, &bytes, now),
+            Input::ForwardFailed {
+                upstream,
+                transport,
+                bytes,
+            } => self.forward_failed(upstream, transport, &bytes, now),
             Input::Timeout => self.timeout(now),
             Input::Configure(config) => self.configure(config),
         }
     }
 
-    /// When [`Forwarder::handle`] next wants an [`Input::Timeout`]: the earliest deadline.
+    /// When [`Forwarder::handle`] next wants an [`Input::Timeout`]: the earliest deadline or
+    /// retry.
     #[must_use]
     pub fn next_timeout(&self) -> Option<Timestamp> {
-        self.pending.values().map(|pending| pending.deadline).min()
+        self.pending.values().map(Pending::due).min()
     }
 
     #[must_use]
@@ -338,6 +365,7 @@ impl Forwarder {
             upstream_transport: Transport::Udp,
             deadline: now + UPSTREAM_TIMEOUT,
             attempts: 1,
+            retry_at: None,
         };
         vec![self.send_upstream(pending)]
     }
@@ -404,6 +432,7 @@ impl Forwarder {
         if msg.header.truncated && transport == Transport::Udp {
             pending.upstream_transport = Transport::Tcp;
             pending.deadline = now + UPSTREAM_TIMEOUT;
+            pending.retry_at = None;
             outputs.push(self.send_upstream_as(uid, pending));
             return outputs;
         }
@@ -423,6 +452,7 @@ impl Forwarder {
             pending.upstream_transport = Transport::Udp;
             pending.deadline = now + UPSTREAM_TIMEOUT;
             pending.attempts += 1;
+            pending.retry_at = None;
             outputs.push(self.send_upstream(pending));
             return outputs;
         }
@@ -457,9 +487,32 @@ impl Forwarder {
         outputs
     }
 
+    /// The driver could not send the forward filed under `bytes`' id: send it again after
+    /// [`FORWARD_RETRY`], unless the attempt's deadline comes first. A report for a query no
+    /// longer pending (answered meanwhile) changes nothing.
+    fn forward_failed(
+        &mut self,
+        upstream: Ipv4Addr,
+        transport: Transport,
+        bytes: &[u8],
+        now: Timestamp,
+    ) -> Vec<Output> {
+        let Some(uid) = bytes.first_chunk::<2>().map(|id| u16::from_be_bytes(*id)) else {
+            return Vec::new();
+        };
+        if let Some(pending) = self.pending.get_mut(&uid)
+            && pending.upstream == upstream
+            && pending.upstream_transport == transport
+        {
+            pending.retry_at = Some(now + FORWARD_RETRY);
+        }
+        Vec::new()
+    }
+
     /// Every pending query past its deadline: its upstream goes down (unless the wait was for a
-    /// TCP retry, which the upstream had already answered over UDP), and it moves to the next
-    /// upstream or fails.
+    /// TCP retry, which the upstream had already answered over UDP, or the last send failed and
+    /// the upstream was never asked), and it moves to the next upstream or fails. Every query
+    /// whose retry is due is sent again to the same upstream under the same id.
     fn timeout(&mut self, now: Timestamp) -> Vec<Output> {
         let expired: Vec<u16> = self
             .pending
@@ -473,7 +526,7 @@ impl Forwarder {
                 continue;
             };
             let failed = pending.upstream;
-            let silent = pending.upstream_transport == Transport::Udp;
+            let silent = pending.upstream_transport == Transport::Udp && pending.retry_at.is_none();
             if silent && self.down.insert(failed, now + UPSTREAM_DOWN_HOLD).is_none() {
                 outputs.push(Output::Event(Event::UpstreamDown(failed)));
             }
@@ -488,10 +541,24 @@ impl Forwarder {
                     pending.upstream_transport = Transport::Udp;
                     pending.deadline = now + UPSTREAM_TIMEOUT;
                     pending.attempts += 1;
+                    pending.retry_at = None;
                     outputs.push(self.send_upstream(pending));
                 }
                 None => outputs.push(servfail(&pending)),
             }
+        }
+        let retries: Vec<u16> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.retry_at.is_some_and(|retry| retry <= now))
+            .map(|(uid, _)| *uid)
+            .collect();
+        for uid in retries {
+            let Some(mut pending) = self.pending.remove(&uid) else {
+                continue;
+            };
+            pending.retry_at = None;
+            outputs.push(self.send_upstream_as(uid, pending));
         }
         outputs
     }
@@ -1281,6 +1348,132 @@ mod tests {
             ip("203.0.113.99"),
             "and tried again after the hold"
         );
+    }
+
+    /// Issue #12: a forward the driver could not send (no route to the upstream yet, as during
+    /// the seconds between a WAN lease and its routes) is retried on the same upstream after
+    /// `FORWARD_RETRY`, under the same id, and marks nothing down: the upstream never saw it.
+    #[test]
+    fn a_forward_whose_send_failed_is_retried_soon_and_marks_nothing_down() {
+        let mut f = Forwarder::new(config(), 1);
+        let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        let out = f.handle(
+            Input::ForwardFailed {
+                upstream,
+                transport,
+                bytes: fwd.encode(),
+            },
+            1,
+        );
+        assert!(out.is_empty(), "nothing to do until the retry: {out:?}");
+        assert_eq!(f.pending(), 1);
+        assert_eq!(f.next_timeout(), Some(1 + FORWARD_RETRY));
+        let out = f.handle(Input::Timeout, 1 + FORWARD_RETRY);
+        assert!(
+            !out.contains(&Output::Event(Event::UpstreamDown(upstream))),
+            "{out:?}"
+        );
+        let (again, again_transport, again_fwd) = forwards(&out).remove(0);
+        assert_eq!((again, again_transport), (upstream, transport));
+        assert_eq!(again_fwd.header.id, fwd.header.id, "the same query, resent");
+        assert_eq!(
+            f.next_timeout(),
+            Some(UPSTREAM_TIMEOUT),
+            "the attempt's deadline stands"
+        );
+        assert_eq!(
+            reply(&f.handle(
+                Input::UpstreamReply {
+                    upstream,
+                    transport,
+                    bytes: upstream_answer(
+                        &again_fwd,
+                        &[a("www.isp.example", 60, "198.51.100.10")]
+                    ),
+                },
+                300,
+            ))
+            .answers[0]
+                .rdata,
+            RData::A(ip("198.51.100.10"))
+        );
+        assert_eq!(f.pending(), 0);
+    }
+
+    /// A send that keeps failing until the attempt's deadline fails the query as before, but
+    /// the upstream stays up for the next one.
+    #[test]
+    fn a_forward_that_never_sends_fails_the_query_without_marking_the_upstream_down() {
+        let mut f = Forwarder::new(config(), 1);
+        let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
+        let (upstream, transport, mut fwd) = forwards(&out).remove(0);
+        let mut now = 0;
+        while now < UPSTREAM_TIMEOUT {
+            let out = f.handle(
+                Input::ForwardFailed {
+                    upstream,
+                    transport,
+                    bytes: fwd.encode(),
+                },
+                now,
+            );
+            assert!(out.is_empty(), "{out:?}");
+            now = f.next_timeout().unwrap();
+            let out = f.handle(Input::Timeout, now);
+            if now < UPSTREAM_TIMEOUT {
+                fwd = forwards(&out).remove(0).2;
+            } else {
+                assert!(
+                    !out.contains(&Output::Event(Event::UpstreamDown(upstream))),
+                    "{out:?}"
+                );
+                assert_eq!(reply(&out).header.rcode, rcode::SERVFAIL);
+            }
+        }
+        assert_eq!(f.pending(), 0);
+        let out = f.handle(
+            client(2, Transport::Udp, q("other.example", rtype::A)),
+            now + 1,
+        );
+        assert_eq!(
+            forwards(&out)[0].0,
+            upstream,
+            "still the upstream of choice"
+        );
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Output::Event(Event::UpstreamUp(_)))),
+            "it was never down: {out:?}"
+        );
+    }
+
+    /// A failure report for a query the core no longer waits on (answered meanwhile, or made
+    /// up) changes nothing.
+    #[test]
+    fn a_stale_forward_failure_is_ignored() {
+        let mut f = Forwarder::new(config(), 1);
+        let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport,
+                bytes: upstream_answer(&fwd, &[a("www.isp.example", 60, "198.51.100.10")]),
+            },
+            5,
+        );
+        let out = f.handle(
+            Input::ForwardFailed {
+                upstream,
+                transport,
+                bytes: fwd.encode(),
+            },
+            6,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(f.pending(), 0);
+        assert_eq!(f.next_timeout(), None);
     }
 
     #[test]

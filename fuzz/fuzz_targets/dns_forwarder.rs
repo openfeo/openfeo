@@ -2,9 +2,10 @@
 // Copyright (C) 2026 Andrew Newton
 
 //! Fuzz the DNS forwarder core (SPEC §11): arbitrary bytes as a client's query over UDP and
-//! TCP, then as the upstream's reply under the forwarded id, then every timeout, must never
-//! panic, never leave more than `MAX_PENDING` queries waiting, and leave none waiting once every
-//! attempt has timed out.
+//! TCP, then (for the TCP client) the forward reported unsendable, then the bytes as the
+//! upstream's reply under the forwarded id, then every timeout, must never panic, never leave
+//! more than `MAX_PENDING` queries waiting, and leave none waiting once every attempt has timed
+//! out.
 //!
 //! The input is a two-byte big-endian length, the client's query, and the upstream's reply.
 
@@ -66,6 +67,16 @@ fuzz_target!(|data: &[u8]| {
                 continue;
             };
             let forwarded = Message::decode(&bytes).expect("our own upstream query decodes");
+            if id == 2 {
+                let _ = forwarder.handle(
+                    Input::ForwardFailed {
+                        upstream,
+                        transport,
+                        bytes: bytes.clone(),
+                    },
+                    1,
+                );
+            }
             let mut reply = reply.to_vec();
             if let Some(id) = reply.first_chunk_mut::<2>() {
                 *id = forwarded.header.id.to_be_bytes();
