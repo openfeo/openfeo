@@ -587,6 +587,7 @@ mod tests {
             port: 27015,
             to: "192.168.1.9".into(),
             to_port: 0,
+            address: String::new(),
         });
         world.config = std::sync::Arc::new(config);
         let desired = nft(&world);

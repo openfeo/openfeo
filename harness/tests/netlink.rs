@@ -626,6 +626,7 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
             ports: vec!["p1".into()],
             ipv4: "192.168.9.1/24".into(),
             dhcp: None,
+            reaches: Vec::new(),
         });
         let mut rig = Rig::connect().await?;
         let cache = rig.rx.borrow_and_update().clone();

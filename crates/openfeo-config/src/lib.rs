@@ -13,12 +13,14 @@ mod generated;
 pub mod load;
 pub mod migrate;
 mod portmap;
+pub mod portname;
 pub mod validate;
 
 pub use error::ConfigError;
 pub use generated::{
     Config, Dhcp4Lease, Dhcp4Route, Dhcp4ServerLease, Dhcp4ServerLeases, DhcpWan, Dns, Firewall,
-    Lan, LanDhcp, PortForward, PortMap, PortMapEntry, StaticLease, StaticWan, System, Wan, wan,
+    Lan, LanDhcp, PortForward, PortMap, PortMapEntry, PublicIpv4, Rule, StaticLease, StaticWan,
+    System, Wan, wan,
 };
 
 #[cfg(test)]
@@ -34,6 +36,7 @@ mod tests {
                 ports: vec!["p2".into()],
                 ipv4: "192.168.1.1/24".into(),
                 dhcp: None,
+                reaches: Vec::new(),
             }],
             ..Default::default()
         };

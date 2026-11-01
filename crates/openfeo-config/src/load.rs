@@ -70,9 +70,11 @@ impl Config {
                     range: vec![FIRST_BOOT_POOL.0.to_owned(), FIRST_BOOT_POOL.1.to_owned()],
                     ..crate::LanDhcp::default()
                 }),
+                reaches: Vec::new(),
             }],
             firewall: None,
             dns: None,
+            public_ipv4: Vec::new(),
         }
     }
 }

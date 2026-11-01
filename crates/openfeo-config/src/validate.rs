@@ -11,7 +11,9 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::Ipv4Net;
 
-use crate::{Config, DhcpWan, Dns, Firewall, LanDhcp, PortMap, StaticLease, System, wan};
+use crate::{
+    Config, DhcpWan, Dns, Firewall, LanDhcp, PortMap, StaticLease, System, Wan, portname, wan,
+};
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,6 +28,10 @@ pub enum Code {
     UnknownPort,
     /// A port given to two roles.
     PortUsedTwice,
+    /// A VLAN id outside 1-4094 on a WAN or a tagged LAN member.
+    InvalidVlan,
+    /// A tagged LAN member on a port that is a WAN (a port is a WAN or carries LANs, not both).
+    PortRoleConflict,
     /// Two subnets that overlap.
     Overlap,
     /// A static WAN gateway outside the WAN subnet.
@@ -140,6 +146,8 @@ impl Code {
             Code::DuplicateName => "duplicate_name",
             Code::UnknownPort => "unknown_port",
             Code::PortUsedTwice => "port_used_twice",
+            Code::InvalidVlan => "invalid_vlan",
+            Code::PortRoleConflict => "port_role_conflict",
             Code::Overlap => "overlap",
             Code::GatewayOutsideSubnet => "gateway_outside_subnet",
             Code::MissingKind => "missing_kind",
@@ -198,7 +206,7 @@ impl fmt::Display for Violation {
 pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     let mut report = Report::default();
     let mut names: BTreeSet<&str> = BTreeSet::new();
-    let mut used_ports: BTreeSet<&str> = BTreeSet::new();
+    let mut owners = PortOwners::default();
     let mut subnets: Vec<(String, Ipv4Net)> = Vec::new();
     let mut lan_subnets: Vec<Ipv4Net> = Vec::new();
 
@@ -227,7 +235,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     for (i, wan) in config.wans.iter().enumerate() {
         let path = format!("wans[{i}]");
         report.name(&mut names, &format!("{path}.name"), &wan.name, MAX_WAN_NAME);
-        report.port(&mut used_ports, ports, &format!("{path}.port"), &wan.port);
+        wan_port(&mut report, &mut owners, ports, &path, wan);
         match &wan.kind {
             None => report.push(
                 format!("{path}.kind"),
@@ -263,27 +271,15 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         }
     }
 
-    for (i, lan) in config.lans.iter().enumerate() {
-        let path = format!("lans[{i}]");
-        report.name(&mut names, &format!("{path}.name"), &lan.name, MAX_LAN_NAME);
-        if lan.ports.is_empty() {
-            report.push(
-                format!("{path}.ports"),
-                Code::EmptyPorts,
-                "a LAN needs at least one port".to_owned(),
-            );
-        }
-        for (j, port) in lan.ports.iter().enumerate() {
-            report.port(&mut used_ports, ports, &format!("{path}.ports[{j}]"), port);
-        }
-        if let Some(net) = report.cidr(&format!("{path}.ipv4"), &lan.ipv4) {
-            subnets.push((format!("{path}.ipv4"), net));
-            lan_subnets.push(net);
-            if let Some(dhcp) = &lan.dhcp {
-                lan_dhcp(&mut report, &path, net, dhcp);
-            }
-        }
-    }
+    lans(
+        &mut report,
+        config,
+        ports,
+        &mut names,
+        &mut owners,
+        &mut subnets,
+        &mut lan_subnets,
+    );
 
     if let Some(firewall) = &config.firewall {
         port_forwards(&mut report, firewall, &lan_subnets);
@@ -303,6 +299,40 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         }
     }
     report.0
+}
+
+/// `[[lans]]`: names, members (SPEC §7.1), the subnet and `[lans.dhcp]`; the subnets join the
+/// overlap pool and the LAN list the firewall and DNS checks read.
+fn lans<'c>(
+    report: &mut Report,
+    config: &'c Config,
+    ports: &PortMap,
+    names: &mut BTreeSet<&'c str>,
+    owners: &mut PortOwners<'c>,
+    subnets: &mut Vec<(String, Ipv4Net)>,
+    lan_subnets: &mut Vec<Ipv4Net>,
+) {
+    for (i, lan) in config.lans.iter().enumerate() {
+        let path = format!("lans[{i}]");
+        report.name(names, &format!("{path}.name"), &lan.name, MAX_LAN_NAME);
+        if lan.ports.is_empty() {
+            report.push(
+                format!("{path}.ports"),
+                Code::EmptyPorts,
+                "a LAN needs at least one port".to_owned(),
+            );
+        }
+        for (j, member) in lan.ports.iter().enumerate() {
+            lan_member(report, owners, ports, &format!("{path}.ports[{j}]"), member);
+        }
+        if let Some(net) = report.cidr(&format!("{path}.ipv4"), &lan.ipv4) {
+            subnets.push((format!("{path}.ipv4"), net));
+            lan_subnets.push(net);
+            if let Some(dhcp) = &lan.dhcp {
+                lan_dhcp(report, &path, net, dhcp);
+            }
+        }
+    }
 }
 
 /// `[system]`: the hostname is one DNS label and the domain a host name (together they are the
@@ -696,6 +726,105 @@ fn overlaps(a: Ipv4Net, b: Ipv4Net) -> bool {
     a.contains(&b.network()) || b.contains(&a.network())
 }
 
+/// Who owns which port (SPEC §7.1): a physical port is a WAN or an untagged LAN member at most
+/// once; a `(port, vlan)` pair is a tagged member or a tagged WAN at most once; a WAN's port
+/// carries no LAN at all.
+#[derive(Default)]
+struct PortOwners<'c> {
+    /// WAN ports and untagged LAN members.
+    untagged: BTreeSet<&'c str>,
+    /// Tagged members and tagged WANs.
+    tagged: BTreeSet<(&'c str, u16)>,
+    /// Every WAN's physical port.
+    wan: BTreeSet<&'c str>,
+}
+
+/// A WAN's port and VLAN: the port must exist and be unassigned; `vlan` is 0 (untagged) or a
+/// VLAN id, and a tagged WAN takes its `(port, vlan)` pair.
+fn wan_port<'c>(
+    report: &mut Report,
+    owners: &mut PortOwners<'c>,
+    live: &PortMap,
+    path: &str,
+    wan: &'c Wan,
+) {
+    report.port(
+        &mut owners.untagged,
+        live,
+        &format!("{path}.port"),
+        &wan.port,
+    );
+    owners.wan.insert(&wan.port);
+    if wan.vlan == 0 {
+        return;
+    }
+    let Some(vlan) = u16::try_from(wan.vlan)
+        .ok()
+        .filter(|vlan| (portname::MIN_VLAN..=portname::MAX_VLAN).contains(vlan))
+    else {
+        report.push(
+            format!("{path}.vlan"),
+            Code::InvalidVlan,
+            format!("{} is not a VLAN id (1-4094)", wan.vlan),
+        );
+        return;
+    };
+    if !owners.tagged.insert((&wan.port, vlan)) {
+        report.push(
+            format!("{path}.vlan"),
+            Code::PortUsedTwice,
+            format!(
+                "{:?} is already assigned",
+                portname::vlan_ifname(&wan.port, vlan)
+            ),
+        );
+    }
+}
+
+/// One LAN member, `pN` or `pN.V` (SPEC §7.1): the port must exist; untagged, it is assigned
+/// once like a WAN port; tagged, its VLAN id must be valid, its port must not be a WAN's, and
+/// the `(port, vlan)` pair is assigned once.
+fn lan_member<'c>(
+    report: &mut Report,
+    owners: &mut PortOwners<'c>,
+    live: &PortMap,
+    path: &str,
+    member: &'c str,
+) {
+    let Some((port, vid)) = member.split_once('.') else {
+        report.port(&mut owners.untagged, live, path, member);
+        return;
+    };
+    if live.id_of(port).is_none() {
+        // The same "no port named …" message as for an untagged member.
+        report.port(&mut owners.untagged, live, path, member);
+        return;
+    }
+    let Some(vlan) = portname::parse_vlan(vid) else {
+        report.push(
+            path.to_owned(),
+            Code::InvalidVlan,
+            format!("{vid:?} is not a VLAN id (1-4094)"),
+        );
+        return;
+    };
+    if owners.wan.contains(port) {
+        report.push(
+            path.to_owned(),
+            Code::PortRoleConflict,
+            format!("{port:?} is a WAN port and may not carry a LAN"),
+        );
+        return;
+    }
+    if !owners.tagged.insert((port, vlan)) {
+        report.push(
+            path.to_owned(),
+            Code::PortUsedTwice,
+            format!("{member:?} is already assigned"),
+        );
+    }
+}
+
 #[derive(Default)]
 struct Report(Vec<Violation>);
 
@@ -842,6 +971,7 @@ mod tests {
             ports: ports.iter().map(|s| (*s).to_owned()).collect(),
             ipv4: ipv4.into(),
             dhcp: None,
+            reaches: Vec::new(),
         }
     }
 
@@ -863,6 +993,44 @@ mod tests {
             .into_iter()
             .map(|v| (v.path, v.code))
             .collect()
+    }
+
+    fn codes(cfg: &Config) -> Vec<Code> {
+        found(cfg).into_iter().map(|(_, code)| code).collect()
+    }
+
+    #[test]
+    fn a_tagged_member_is_accepted_and_its_port_may_carry_other_lans() {
+        let mut cfg = base(); // lan0 untagged on p1 and p2
+        cfg.lans
+            .push(lan("guest", &["p1.223", "p2.223"], "192.168.2.1/24"));
+        cfg.lans.push(lan("trusted", &["p1.224"], "192.168.3.1/24"));
+        assert_eq!(found(&cfg), vec![]);
+    }
+
+    #[test]
+    fn a_tagged_member_is_refused_twice_and_with_a_bad_vlan() {
+        let mut cfg = base();
+        cfg.lans.push(lan("guest", &["p1.223"], "192.168.2.1/24"));
+        cfg.lans.push(lan("more", &["p1.223"], "192.168.4.1/24"));
+        cfg.lans.push(lan("bad", &["p2.4095"], "192.168.5.1/24"));
+        let codes = codes(&cfg);
+        assert!(
+            codes.contains(&Code::PortUsedTwice) && codes.contains(&Code::InvalidVlan),
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_wan_port_may_not_carry_a_lan_and_a_wan_vlan_is_checked() {
+        let mut cfg = base(); // wan0 on p0
+        cfg.lans.push(lan("side", &["p0.10"], "192.168.6.1/24"));
+        cfg.wans[0].vlan = 4095;
+        let codes = codes(&cfg);
+        assert!(
+            codes.contains(&Code::PortRoleConflict) && codes.contains(&Code::InvalidVlan),
+            "{codes:?}"
+        );
     }
 
     #[test]
@@ -1081,6 +1249,7 @@ mod tests {
             port,
             to: to.into(),
             to_port,
+            address: String::new(),
         }
     }
 
@@ -1089,6 +1258,7 @@ mod tests {
         cfg.firewall = Some(Firewall {
             port_forwards: forwards,
             wan_ping: true,
+            rules: Vec::new(),
         });
         cfg
     }
