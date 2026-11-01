@@ -43,6 +43,23 @@ fn probe_ruleset() -> Vec<Value> {
             json!([{"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 1}}, {"dnat": {"family": "ip", "addr": "192.0.2.1"}}]),
         ),
         rule("snat", json!([{"masquerade": null}])),
+        // M2 part 1: a rate limit, and an interval set concatenating an interface name with an
+        // address range and a port (the rules sets, SPEC §7.5).
+        rule(
+            "pre",
+            json!([{"limit": {"rate": 50, "per": "second", "burst": 100}}, {"accept": null}]),
+        ),
+        json!({"add": {"set": {"family": "inet", "table": TABLE, "name": "probe_rules",
+            "type": ["ifname", "ipv4_addr", "inet_service"], "flags": ["interval"],
+            "elem": [{"concat": ["p0", {"range": ["192.0.2.1", "192.0.2.2"]}, 80]}]}}}),
+        rule(
+            "pre",
+            json!([{"match": {"op": "==", "left": {"concat": [
+                {"meta": {"key": "iifname"}},
+                {"payload": {"protocol": "ip", "field": "daddr"}},
+                {"payload": {"protocol": "tcp", "field": "dport"}}]},
+                "right": "@probe_rules"}}, {"accept": null}]),
+        ),
     ]
 }
 
