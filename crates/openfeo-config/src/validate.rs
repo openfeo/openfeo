@@ -90,6 +90,9 @@ pub enum Code {
     InvalidRuleTarget,
     /// A rule's `ports` missing or wrong for tcp/udp, or present for icmp/any.
     InvalidRulePorts,
+    /// Two rules from one zone in the same set whose targets and ports partly overlap (the
+    /// kernel refuses such interval elements, in an order-dependent way).
+    OverlappingRules,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -190,6 +193,7 @@ impl Code {
             Code::InvalidZone => "invalid_zone",
             Code::InvalidRuleTarget => "invalid_rule_target",
             Code::InvalidRulePorts => "invalid_rule_ports",
+            Code::OverlappingRules => "overlapping_rules",
         }
     }
 }
@@ -406,6 +410,7 @@ fn lans<'c>(
         for (j, member) in lan.ports.iter().enumerate() {
             lan_member(report, owners, ports, &format!("{path}.ports[{j}]"), member);
         }
+        lan_member_forms(report, &path, lan);
         let net = report.cidr(&format!("{path}.ipv4"), &lan.ipv4);
         if let Some(net) = net {
             pools.subnets.push((format!("{path}.ipv4"), net));
@@ -432,6 +437,35 @@ fn lans<'c>(
             name: &lan.name,
             net,
         });
+    }
+}
+
+/// One LAN may not carry the same port both untagged and tagged: `p2` and `p2.223` on one
+/// bridge would flood every frame twice onto the wire. The later form in the list is flagged.
+fn lan_member_forms(report: &mut Report, path: &str, lan: &crate::Lan) {
+    let mut untagged: BTreeSet<&str> = BTreeSet::new();
+    let mut tagged_parents: BTreeSet<&str> = BTreeSet::new();
+    for (j, member) in lan.ports.iter().enumerate() {
+        let clash = match member.split_once('.') {
+            None => {
+                untagged.insert(member);
+                tagged_parents.contains(member.as_str())
+            }
+            Some((port, _)) => {
+                tagged_parents.insert(port);
+                untagged.contains(port)
+            }
+        };
+        if clash {
+            report.push(
+                format!("{path}.ports[{j}]"),
+                Code::PortUsedTwice,
+                format!(
+                    "{member:?}: this LAN already carries its port in the other form (untagged \
+                     and tagged on one bridge would duplicate every frame)"
+                ),
+            );
+        }
     }
 }
 
@@ -462,6 +496,7 @@ fn reaches(report: &mut Report, path: &str, lan: &crate::Lan, lan_names: &BTreeS
 /// LAN, a protocol, and ports for tcp/udp only.
 fn firewall_rules(report: &mut Report, firewall: &Firewall, lans: &[LanZone<'_>]) {
     let mut rule_names: BTreeSet<&str> = BTreeSet::new();
+    let mut holes: Vec<Hole<'_>> = Vec::new();
     for (i, rule) in firewall.rules.iter().enumerate() {
         let path = format!("firewall.rules[{i}]");
         report.name(
@@ -470,6 +505,7 @@ fn firewall_rules(report: &mut Report, firewall: &Firewall, lans: &[LanZone<'_>]
             &rule.name,
             MAX_FORWARD_NAME,
         );
+        overlapping_rules(report, &path, rule, &mut holes);
         if rule.from != "wan" && !lans.iter().any(|lan| lan.name == rule.from) {
             report.push(
                 format!("{path}.from"),
@@ -503,6 +539,79 @@ fn firewall_rules(report: &mut Report, firewall: &Firewall, lans: &[LanZone<'_>]
             );
         }
     }
+}
+
+/// One element a rule contributes to a rules set: the zone, the set (tcp, udp, icmp or any), the
+/// target's bounds and, for tcp/udp, one port range.
+struct Hole<'c> {
+    name: &'c str,
+    from: &'c str,
+    proto: &'c str,
+    target: (Ipv4Addr, Ipv4Addr),
+    ports: Option<(u16, u16)>,
+}
+
+impl Hole<'_> {
+    /// Partly overlapping: same zone and set, intersecting targets and ports, not identical.
+    /// Identical holes merge in the kernel; partial overlaps are refused there.
+    fn clashes_with(&self, other: &Self) -> bool {
+        let same_set = self.from == other.from && self.proto == other.proto;
+        let targets_meet = self.target.0 <= other.target.1 && other.target.0 <= self.target.1;
+        let ports_meet = match (self.ports, other.ports) {
+            (Some(a), Some(b)) => a.0 <= b.1 && b.0 <= a.1,
+            _ => true,
+        };
+        let identical = self.target == other.target && self.ports == other.ports;
+        same_set && targets_meet && ports_meet && !identical
+    }
+}
+
+/// The kernel's interval sets refuse an element that partly overlaps another, and which of two
+/// such rules fails depends on their order in the file; two rules from one zone whose targets and
+/// ports overlap are refused here instead, naming both (SPEC §7.5). A rule whose target or ports
+/// do not parse is left to the checks that report that.
+fn overlapping_rules<'c>(
+    report: &mut Report,
+    path: &str,
+    rule: &'c crate::Rule,
+    holes: &mut Vec<Hole<'c>>,
+) {
+    let Some(target) = rules::parse_target(&rule.to) else {
+        return;
+    };
+    let ports: Vec<Option<(u16, u16)>> = match rule.proto.as_str() {
+        "tcp" | "udp" => match rules::parse_ports(&rule.ports) {
+            Some(ranges) => ranges.into_iter().map(Some).collect(),
+            None => return,
+        },
+        "icmp" | "any" => vec![None],
+        _ => return,
+    };
+    let new: Vec<Hole<'c>> = ports
+        .into_iter()
+        .map(|ports| Hole {
+            name: &rule.name,
+            from: &rule.from,
+            proto: &rule.proto,
+            target: target.bounds(),
+            ports,
+        })
+        .collect();
+    if let Some(other) = holes
+        .iter()
+        .find(|old| new.iter().any(|hole| hole.clashes_with(old)))
+    {
+        report.push(
+            path.to_owned(),
+            Code::OverlappingRules,
+            format!(
+                "{:?} overlaps {:?} (from {:?}, {}): the kernel refuses holes from one zone that \
+                 partly overlap; merge them or make them disjoint",
+                rule.name, other.name, rule.from, rule.proto
+            ),
+        );
+    }
+    holes.extend(new);
 }
 
 /// A rule's `to`: an address, an `a-b` range or a CIDR, inside exactly one LAN that is not the
@@ -1647,6 +1756,95 @@ mod tests {
             cfg.lans[0].reaches = bad.iter().map(|s| (*s).to_owned()).collect();
             assert!(codes(&cfg).contains(&Code::InvalidZone), "{bad:?}");
         }
+    }
+
+    /// The kernel refuses an interval element that partly overlaps another in the same set, and
+    /// which of two overlapping rules it refuses depends on their order; validation refuses the
+    /// pair up front. Identical holes merge, and holes in other zones, sets or ports are fine.
+    #[test]
+    fn overlapping_rules_from_one_zone_are_refused() {
+        let mut cfg = base();
+        cfg.lans[0].ports = vec!["p2".into()];
+        cfg.lans.push(lan("dmz", &["p1"], "192.0.2.233/29"));
+        cfg.public_ipv4 = public(&["192.0.2.232/29"]);
+        let web = rule("dmz-web", "wan", "192.0.2.234-192.0.2.238", "tcp", &["80"]);
+        let with = |other: Rule| {
+            let mut c = cfg.clone();
+            c.firewall.get_or_insert_with(Default::default).rules = vec![web.clone(), other];
+            c
+        };
+        for accepted in [
+            rule("dup", "wan", "192.0.2.234-192.0.2.238", "tcp", &["80"]),
+            rule("other-zone", "lan0", "192.0.2.236", "tcp", &["80"]),
+            rule("other-set", "wan", "192.0.2.236", "udp", &["80"]),
+            rule("other-port", "wan", "192.0.2.236", "tcp", &["443"]),
+        ] {
+            let name = accepted.name.clone();
+            assert_eq!(found(&with(accepted)), vec![], "{name}");
+        }
+        for refused in [
+            rule("one-host", "wan", "192.0.2.236", "tcp", &["80"]),
+            rule(
+                "wider-ports",
+                "wan",
+                "192.0.2.234-192.0.2.238",
+                "tcp",
+                &["80-443"],
+            ),
+            rule("subnet", "wan", "192.0.2.232/29", "tcp", &["80"]),
+            rule(
+                "range2",
+                "wan",
+                "192.0.2.237-192.0.2.238",
+                "tcp",
+                &["70-90"],
+            ),
+        ] {
+            let name = refused.name.clone();
+            let violations = validate(&with(refused), &live());
+            assert_eq!(violations.len(), 1, "{name}: {violations:?}");
+            assert_eq!(violations[0].code, Code::OverlappingRules, "{name}");
+            assert_eq!(violations[0].path, "firewall.rules[1]", "{name}");
+            assert!(
+                violations[0].message.contains("dmz-web"),
+                "{}",
+                violations[0].message
+            );
+        }
+        let mut c = cfg.clone();
+        c.firewall.get_or_insert_with(Default::default).rules = vec![
+            rule("all-dmz", "lan0", "192.0.2.232/29", "any", &[]),
+            rule("one-any", "lan0", "192.0.2.234", "any", &[]),
+        ];
+        assert!(
+            codes(&c).contains(&Code::OverlappingRules),
+            "{:?}",
+            found(&c)
+        );
+    }
+
+    /// One LAN listing a port both untagged and tagged would enslave `p2` and `p2.223` to the
+    /// same bridge, which floods every frame twice onto the wire; the same shapes across two LANs
+    /// are a trunk.
+    #[test]
+    fn a_port_carried_untagged_and_tagged_by_one_lan_is_refused() {
+        let mut cfg = base();
+        cfg.lans[0].ports = vec!["p2".into(), "p2.223".into()];
+        let violations = validate(&cfg, &live());
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(
+            (violations[0].path.as_str(), violations[0].code),
+            ("lans[0].ports[1]", Code::PortUsedTwice)
+        );
+        cfg.lans[0].ports = vec!["p2.223".into(), "p2".into()];
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[0].ports[1]".to_owned(), Code::PortUsedTwice)],
+            "the later form is the one flagged"
+        );
+        cfg.lans[0].ports = vec!["p2".into()];
+        cfg.lans.push(lan("guest", &["p2.223"], "192.168.2.1/24"));
+        assert_eq!(found(&cfg), vec![]);
     }
 
     #[test]

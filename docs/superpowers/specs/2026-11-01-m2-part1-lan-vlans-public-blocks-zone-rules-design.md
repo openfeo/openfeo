@@ -144,8 +144,9 @@ sub-interface.
 
 **Validation.** `pN` untagged in at most one LAN; `pN.V` in at most one LAN; a WAN's port, and a
 WAN's `pN.V`, in no LAN at all (one physical port is either a WAN or carries LANs, not both, in
-this part); `V` in 1..=4094; every named `pN` present in the port map, as today. Messages name
-the port and both owners.
+this part); `V` in 1..=4094; every named `pN` present in the port map, as today; one LAN never
+carries a port both untagged and tagged (both forms on one bridge would duplicate every frame).
+Messages name the port and both owners.
 
 ### Public IPv4 blocks
 
@@ -283,6 +284,9 @@ Validation: `name` is a label like a port forward's and unique among rules; `fro
 a LAN name; `to` parses as an address, an `a-b` range with `a <= b`, or a CIDR, and lies inside
 one LAN's subnet that is not `from`; `proto` is one of the four; `ports` is required for `tcp`
 and `udp` (each entry a port in 1..=65535 or a range `a-b` with `a <= b`) and forbidden otherwise.
+Two rules from one zone in the same set whose targets and ports partly overlap are refused,
+naming both: the kernel refuses such interval elements, and which of the two it refused would
+depend on their order in the file. Identical holes are fine (the kernel merges them).
 
 ### WAN echo rate limit
 
