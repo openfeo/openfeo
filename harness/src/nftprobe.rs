@@ -72,7 +72,7 @@ pub fn require_expressions() -> Result<()> {
     }
 }
 
-fn running_kernel() -> String {
+pub(crate) fn running_kernel() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map_or_else(|_| "?".to_owned(), |s| s.trim().to_owned())
 }

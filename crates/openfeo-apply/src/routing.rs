@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 
 use ipnet::IpNet;
 use openfeo_netlink::{
-    Cache, Error as NetlinkError, Netlink, RTPROT_OPENFEO, Route, SCOPE_UNIVERSE,
+    Cache, Error as NetlinkError, Netlink, RTPROT_OPENFEO, Route, RouteKind, SCOPE_UNIVERSE,
 };
 use openfeo_reconcile::routing::{DesiredRoute, DesiredRouting};
 
@@ -112,6 +112,7 @@ impl RoutingApplier {
                 oif: Some(oif),
                 protocol: desired_route.protocol,
                 priority: desired_route.priority,
+                kind: RouteKind::Unicast,
             };
             wanted_routes.insert(route.clone());
             if !observed.routes.contains(&route) {

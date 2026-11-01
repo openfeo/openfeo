@@ -12,11 +12,11 @@ use futures::TryStreamExt as _;
 use ipnet::IpNet;
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
-use netlink_packet_route::route::{RouteMessage, RouteProtocol, RouteScope};
-use rtnetlink::{LinkBridge, LinkUnspec, RouteMessageBuilder};
+use netlink_packet_route::route::{RouteMessage, RouteProtocol, RouteScope, RouteType};
+use rtnetlink::{LinkBridge, LinkUnspec, LinkVlan, RouteMessageBuilder};
 
 use crate::monitor::{Error, Netlink, request_error};
-use crate::types::Route;
+use crate::types::{Route, RouteKind};
 
 /// Linux errno values the appliers reason about.
 pub mod errno {
@@ -76,6 +76,22 @@ impl Netlink {
             .execute()
             .await
             .map_err(|e| request_error(format!("add bridge {name}"), e))
+    }
+
+    /// `ip link add link <parent> name <name> type vlan id <id>`: an 802.1Q sub-interface, a LAN
+    /// member or a tagged WAN (SPEC §7.1, §7.2, ADR-0017).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses (`EEXIST` when the name is taken).
+    pub async fn link_add_vlan(&self, parent: u32, id: u16, name: &str) -> Result<(), Error> {
+        let message = LinkVlan::new(name, parent, id).build();
+        self.handle
+            .link()
+            .add(message)
+            .execute()
+            .await
+            .map_err(|e| request_error(format!("add vlan {name} id {id} on link {parent}"), e))
     }
 
     /// Enslave link `index` to `master`, or release it with `None`.
@@ -251,12 +267,19 @@ impl Netlink {
     }
 }
 
-/// `default via 10.0.0.1 dev 3 proto 200 metric 10`, for errors and logs.
+/// `default via 10.0.0.1 dev 3 proto 200 metric 10`, or `blackhole 192.0.2.248/29 proto 200
+/// metric 1000`, for errors and logs.
 #[must_use]
 pub fn describe(route: &Route) -> String {
-    let mut text = route
-        .dst
-        .map_or_else(|| "default".to_owned(), |dst| dst.to_string());
+    let mut text = match route.kind {
+        RouteKind::Unicast => String::new(),
+        RouteKind::Blackhole => "blackhole ".to_owned(),
+    };
+    text.push_str(
+        &route
+            .dst
+            .map_or_else(|| "default".to_owned(), |dst| dst.to_string()),
+    );
     if let Some(gateway) = route.gateway {
         let _ = write!(text, " via {gateway}");
     }
@@ -271,12 +294,13 @@ pub fn describe(route: &Route) -> String {
     text
 }
 
-/// The message for `route`. A route without a gateway is a host or network on the device and
-/// gets link scope, as `ip route add <dst> dev <if>` does; a gateway route through such a host
-/// is refused unless the host route has that scope.
+/// The message for `route`. A unicast route without a gateway is a host or network on the device
+/// and gets link scope, as `ip route add <dst> dev <if>` does; a gateway route through such a
+/// host is refused unless the host route has that scope. A blackhole keeps universe scope and
+/// carries its type.
 fn route_message(route: &Route) -> RouteMessage {
     let mut message = route_message_builder(route);
-    if route.gateway.is_none() {
+    if route.gateway.is_none() && route.kind == RouteKind::Unicast {
         message.header.scope = RouteScope::Link;
     }
     message
@@ -284,11 +308,16 @@ fn route_message(route: &Route) -> RouteMessage {
 
 fn route_message_builder(route: &Route) -> RouteMessage {
     let protocol = RouteProtocol::from(route.protocol);
+    let kind = match route.kind {
+        RouteKind::Unicast => RouteType::Unicast,
+        RouteKind::Blackhole => RouteType::BlackHole,
+    };
     if route.v6 {
         let mut builder = RouteMessageBuilder::<Ipv6Addr>::new()
             .table_id(route.table)
             .protocol(protocol)
-            .priority(route.priority);
+            .priority(route.priority)
+            .kind(kind);
         if let Some(IpNet::V6(dst)) = route.dst {
             builder = builder.destination_prefix(dst.addr(), dst.prefix_len());
         }
@@ -303,7 +332,8 @@ fn route_message_builder(route: &Route) -> RouteMessage {
         let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
             .table_id(route.table)
             .protocol(protocol)
-            .priority(route.priority);
+            .priority(route.priority)
+            .kind(kind);
         if let Some(IpNet::V4(dst)) = route.dst {
             builder = builder.destination_prefix(dst.addr(), dst.prefix_len());
         }

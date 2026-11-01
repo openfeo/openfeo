@@ -15,5 +15,6 @@ pub mod types;
 pub use apply::describe;
 pub use monitor::{Error, Monitor, Netlink};
 pub use types::{
-    Addr, Cache, Link, LinkKind, RTPROT_OPENFEO, Route, SCOPE_LINK, SCOPE_UNIVERSE, TABLE_MAIN,
+    Addr, Cache, Link, LinkKind, RTPROT_OPENFEO, Route, RouteKind, SCOPE_LINK, SCOPE_UNIVERSE,
+    TABLE_MAIN,
 };

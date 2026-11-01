@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use openfeo_harness::lab::{ISP_HTTP_BODY, ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
 use openfeo_harness::lanclient::{self, DhcpClientArgs};
 use openfeo_harness::{daemons, qemu, sandbox};
-use openfeo_harness::{nftprobe, scenario};
+use openfeo_harness::{nftprobe, scenario, vlanprobe};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +57,10 @@ enum Cmd {
     /// 3 if it cannot load their modules, 1 on any other error.
     #[command(hide = true)]
     ProbeNft,
+    /// Internal: inside the sandbox, exit 0 if the kernel creates 802.1Q VLAN links, 3 if it
+    /// cannot load `8021q`, 1 on any other error.
+    #[command(hide = true)]
+    ProbeVlan,
     /// Internal: our DHCPv4 client on an interface of the current namespace, one JSON event per
     /// line; the LAN side of the DHCPv4 server scenarios.
     #[command(hide = true)]
@@ -95,6 +99,7 @@ fn main() -> ExitCode {
         Cmd::Check => check(),
         Cmd::CheckSandbox => sandbox::enter().map(|()| ExitCode::SUCCESS),
         Cmd::ProbeNft => probe_nft(),
+        Cmd::ProbeVlan => probe_vlan(),
         Cmd::DhcpClient {
             iface,
             request,
@@ -222,6 +227,10 @@ fn check() -> Result<ExitCode> {
         Ok(()) => report("nft ct/fib/nat expressions", true, ""),
         Err(detail) => report("nft ct/fib/nat expressions", false, &format!(" ({detail})")),
     }
+    match vlan_links_work()? {
+        Ok(()) => report("802.1Q VLAN links", true, ""),
+        Err(detail) => report("802.1Q VLAN links", false, &format!(" ({detail})")),
+    }
     match Lab::kernel_path() {
         Ok(path) => report("kernel image", true, &format!(" ({})", path.display())),
         Err(err) => report("kernel image", false, &format!(" ({err})")),
@@ -288,7 +297,19 @@ fn on_path(bin: &str) -> bool {
 /// `probe-nft`: enter the sandbox and ask the kernel.
 fn probe_nft() -> Result<ExitCode> {
     sandbox::enter()?;
-    match nftprobe::require_expressions() {
+    probe_exit(nftprobe::require_expressions())
+}
+
+/// `probe-vlan`: enter the sandbox and try to create a VLAN link.
+fn probe_vlan() -> Result<ExitCode> {
+    sandbox::enter()?;
+    probe_exit(vlanprobe::require_vlan_links())
+}
+
+/// A probe's answer as an exit code: success, [`PROBE_SKIP`] for a [`scenario::Skip`] (printed
+/// on stderr for the parent to show), or the error itself.
+fn probe_exit(result: Result<()>) -> Result<ExitCode> {
+    match result {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(err) if err.downcast_ref::<scenario::Skip>().is_some() => {
             eprintln!("{err}");
@@ -303,9 +324,20 @@ fn probe_nft() -> Result<ExitCode> {
 /// it cannot load their modules (the sandboxed nft scenarios will skip), `Err` when the probe
 /// itself broke.
 fn nft_expressions_work() -> Result<Result<(), String>> {
+    probe_in_child("probe-nft")
+}
+
+fn vlan_links_work() -> Result<Result<(), String>> {
+    probe_in_child("probe-vlan")
+}
+
+/// Re-run ourselves with a hidden probe subcommand (the sandbox is entered in a child, see
+/// [`sandbox_works`]): `Ok(Ok(()))` when the kernel can, `Ok(Err(reason))` when the probe
+/// skipped, an error when the probe itself failed.
+fn probe_in_child(subcommand: &str) -> Result<Result<(), String>> {
     let exe = std::env::current_exe().context("current_exe")?;
     let output = Command::new(exe)
-        .arg("probe-nft")
+        .arg(subcommand)
         .stdin(Stdio::null())
         .output()
         .context("spawn self")?;
@@ -315,7 +347,7 @@ fn nft_expressions_work() -> Result<Result<(), String>> {
     } else if output.status.code() == Some(i32::from(PROBE_SKIP)) {
         Ok(Err(stderr))
     } else {
-        anyhow::bail!("nft probe failed: {stderr}")
+        anyhow::bail!("{subcommand} failed: {stderr}")
     }
 }
 

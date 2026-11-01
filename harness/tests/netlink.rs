@@ -25,8 +25,8 @@ use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_harness::lab::Lab;
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::scenario::{Scenario, run_all};
-use openfeo_harness::{daemons, lanclient, netns, nftlist, nftprobe, sandbox};
-use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, TABLE_MAIN};
+use openfeo_harness::{daemons, lanclient, netns, nftlist, nftprobe, sandbox, vlanprobe};
+use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, RouteKind, TABLE_MAIN};
 use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
 use openfeo_reconcile::nft::nft;
@@ -99,7 +99,89 @@ const SCENARIOS: &[Scenario] = &[
         name: "routing_applier_adds_a_host_route_before_an_off_link_default",
         run: routing_applier_adds_a_host_route_before_an_off_link_default,
     },
+    Scenario {
+        name: "vlan_link_primitive_and_facts",
+        run: vlan_link_primitive_and_facts,
+    },
+    Scenario {
+        name: "blackhole_route_primitive_and_facts",
+        run: blackhole_route_primitive_and_facts,
+    },
 ];
+
+/// A VLAN sub-interface is created on a fake port, seen by the monitor with its kind, parent and
+/// id, enslaved to a bridge, and deleted (ADR-0017).
+fn vlan_link_primitive_and_facts(_lab: &mut Lab) -> anyhow::Result<()> {
+    vlanprobe::require_vlan_links()?;
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let p1 = nl.link_index("p1").await?.context("p1")?;
+        nl.link_add_vlan(p1, 223, "p1.223").await?;
+        wait_until(&mut rx, "p1.223 appears", |c| {
+            c.link_by_name("p1.223").is_some()
+        })
+        .await?;
+        let link = rx
+            .borrow()
+            .link_by_name("p1.223")
+            .context("p1.223")?
+            .clone();
+        ensure!(
+            link.kind == Some(LinkKind::Vlan)
+                && link.parent == Some(p1)
+                && link.vlan_id == Some(223),
+            "the monitor's account of p1.223: {link:?}"
+        );
+        nl.link_add_bridge("br-lan0", true).await?;
+        let br = nl.link_index("br-lan0").await?.context("br-lan0")?;
+        nl.link_set_master(link.index, Some(br)).await?;
+        wait_until(&mut rx, "p1.223 enslaved", |c| {
+            c.link_by_name("p1.223")
+                .is_some_and(|l| l.master == Some(br))
+        })
+        .await?;
+        nl.link_del(link.index).await?;
+        wait_until(&mut rx, "p1.223 gone", |c| {
+            c.link_by_name("p1.223").is_none()
+        })
+        .await?;
+        anyhow::Ok(())
+    })?
+}
+
+/// A blackhole route is added with its kind, cached with its kind, described, and deleted.
+fn blackhole_route_primitive_and_facts(_lab: &mut Lab) -> anyhow::Result<()> {
+    block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let route = Route {
+            v6: false,
+            table: TABLE_MAIN,
+            dst: Some("192.0.2.248/29".parse()?),
+            gateway: None,
+            oif: None,
+            protocol: RTPROT_OPENFEO,
+            priority: 1000,
+            kind: RouteKind::Blackhole,
+        };
+        let _ = nl.route_del(&route).await; // left by an interrupted run
+        nl.route_add(&route).await?;
+        wait_until(&mut rx, "blackhole cached", |c| c.routes.contains(&route)).await?;
+        ensure!(
+            openfeo_netlink::describe(&route)
+                == "blackhole 192.0.2.248/29 proto 200 metric 1000 table 254",
+            "describe: {}",
+            openfeo_netlink::describe(&route)
+        );
+        nl.route_del(&route).await?;
+        wait_until(&mut rx, "blackhole gone", |c| !c.routes.contains(&route)).await?;
+        anyhow::Ok(())
+    })?
+}
 
 fn main() -> ExitCode {
     if let Err(err) = sandbox::enter() {
@@ -295,6 +377,7 @@ fn addr_and_route_primitives(_lab: &mut Lab) -> anyhow::Result<()> {
             oif: Some(rv0),
             protocol: RTPROT_OPENFEO,
             priority: 10,
+            kind: RouteKind::Unicast,
         };
         nl.route_add(&route).await?;
         wait_until(&mut rx, "default route", |c| c.routes.contains(&route)).await?;
@@ -353,7 +436,7 @@ impl FakePorts {
     }
 
     fn cleanup() {
-        for name in ["p0", "p1", "p2", "br-lan0", "br-zz"] {
+        for name in ["p1.223", "p0", "p1", "p2", "br-lan0", "br-zz"] {
             let _ = netns::ip(&["link", "del", name]);
         }
     }
