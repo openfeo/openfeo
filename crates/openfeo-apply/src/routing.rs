@@ -16,7 +16,7 @@ use ipnet::IpNet;
 use openfeo_netlink::{
     Cache, Error as NetlinkError, Netlink, RTPROT_OPENFEO, Route, RouteKind, SCOPE_UNIVERSE,
 };
-use openfeo_reconcile::routing::{DesiredRoute, DesiredRouting};
+use openfeo_reconcile::routing::{DesiredRoute, DesiredRouting, RouteKind as DesiredKind};
 
 use crate::{ApplyError, Pass, Report, is_managed, resolve};
 
@@ -94,12 +94,15 @@ impl RoutingApplier {
         let mut ordered: Vec<&DesiredRoute> = desired.routes.iter().collect();
         ordered.sort_by_key(|route| route.gateway.is_some());
         for desired_route in ordered {
-            let oif = match resolve(observed, nl, &desired_route.ifname).await {
-                Ok(index) => index,
-                Err(err) => {
-                    pass.fail(err);
-                    continue;
-                }
+            let oif = match &desired_route.ifname {
+                Some(ifname) => match resolve(observed, nl, ifname).await {
+                    Ok(index) => Some(index),
+                    Err(err) => {
+                        pass.fail(err);
+                        continue;
+                    }
+                },
+                None => None,
             };
             let route = Route {
                 v6: desired_route.gateway.map_or_else(
@@ -109,14 +112,18 @@ impl RoutingApplier {
                 table: desired_route.table,
                 dst: desired_route.dst,
                 gateway: desired_route.gateway,
-                oif: Some(oif),
+                oif,
                 protocol: desired_route.protocol,
                 priority: desired_route.priority,
-                kind: RouteKind::Unicast,
+                kind: match desired_route.kind {
+                    DesiredKind::Unicast => RouteKind::Unicast,
+                    DesiredKind::Blackhole => RouteKind::Blackhole,
+                },
             };
             wanted_routes.insert(route.clone());
             if !observed.routes.contains(&route) {
-                let op = format!("add route {}", describe(&route, &desired_route.ifname));
+                let ifname = desired_route.ifname.as_deref().unwrap_or("-");
+                let op = format!("add route {}", describe(&route, ifname));
                 pass.op(&op, nl.route_add(&route).await, NetlinkError::is_exist);
             }
         }
@@ -136,19 +143,25 @@ impl RoutingApplier {
     }
 }
 
-/// `default via 203.0.113.1 dev p0 proto 200 metric 10`, the form the console shows.
+/// `default via 203.0.113.1 dev p0 proto 200 metric 10`, or `blackhole 192.0.2.248/29 proto 200
+/// metric 1000`: the form the console shows.
 fn describe(route: &Route, ifname: &str) -> String {
-    let mut text = route
-        .dst
-        .map_or_else(|| "default".to_owned(), |dst| dst.to_string());
+    let mut text = match route.kind {
+        RouteKind::Unicast => String::new(),
+        RouteKind::Blackhole => "blackhole ".to_owned(),
+    };
+    text.push_str(
+        &route
+            .dst
+            .map_or_else(|| "default".to_owned(), |dst| dst.to_string()),
+    );
     if let Some(gateway) = route.gateway {
         let _ = write!(text, " via {gateway}");
     }
-    let _ = write!(
-        text,
-        " dev {ifname} proto {} metric {}",
-        route.protocol, route.priority
-    );
+    if route.kind == RouteKind::Unicast {
+        let _ = write!(text, " dev {ifname}");
+    }
+    let _ = write!(text, " proto {} metric {}", route.protocol, route.priority);
     if route.table != openfeo_netlink::TABLE_MAIN {
         let _ = write!(text, " table {}", route.table);
     }

@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The lab's public-block configuration (M2 part 1): the static WAN and lan0 of vm-static.toml,
+# plus a DMZ on p3 (lan1) numbered from 192.0.2.232/29, a block the ISP routes to the router
+# (no NAT, inbound by rule: tcp 80 to the hosts), a second routed block 192.0.2.248/29 whose
+# .249 fronts a forward to the lan0 host, and the usual WAN-address forward. Used by the m2
+# public-block scenarios and by the reconcile snapshot tests.
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+
+[[wans]]
+name = "wan0"
+port = "p0"
+priority = 10
+[wans.static]
+address = "203.0.113.10/24"
+gateway = "203.0.113.1"
+dns = ["203.0.113.1"]
+
+[[public_ipv4]]
+prefix = "192.0.2.232/29"
+
+[[public_ipv4]]
+prefix = "192.0.2.248/29"
+
+[[lans]]
+name = "lan0"
+ports = ["p2"]
+ipv4 = "192.168.1.1/24"
+[lans.dhcp]
+range = ["192.168.1.100", "192.168.1.200"]
+lease_secs = 43200
+[[lans.dhcp.static]]
+mac = "52:54:00:fe:10:10"
+ip = "192.168.1.10"
+hostname = "nas"
+
+[[lans]]
+name = "dmz"
+ports = ["p3"]
+ipv4 = "192.0.2.233/29"
+
+[firewall]
+wan_ping = true
+
+[[firewall.port_forwards]]
+name = "lan-http"
+proto = "tcp"
+port = 2222
+to = "192.168.1.2"
+to_port = 8080
+
+[[firewall.port_forwards]]
+name = "pub-https"
+address = "192.0.2.249"
+proto = "tcp"
+port = 443
+to = "192.168.1.2"
+to_port = 8080
+
+[[firewall.rules]]
+name = "dmz-web"
+from = "wan"
+to = "192.0.2.234-192.0.2.238"
+proto = "tcp"
+ports = ["80"]

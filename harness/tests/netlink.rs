@@ -111,7 +111,45 @@ const SCENARIOS: &[Scenario] = &[
         name: "stray_vlan_sub_interfaces_are_removed",
         run: stray_vlan_sub_interfaces_are_removed,
     },
+    Scenario {
+        name: "routing_applier_owns_block_blackholes",
+        run: routing_applier_owns_block_blackholes,
+    },
 ];
+
+/// The routing applier adds a declared block's blackhole once, keeps it on a second pass, and
+/// removes it when the block leaves the config (SPEC §7.4).
+fn routing_applier_owns_block_blackholes(_lab: &mut Lab) -> anyhow::Result<()> {
+    fn has_blackhole(cache: &Cache) -> bool {
+        cache.routes.iter().any(|r| {
+            r.kind == RouteKind::Blackhole
+                && r.dst.map(|d| d.to_string()) == Some("192.0.2.248/29".to_owned())
+                && r.protocol == RTPROT_OPENFEO
+                && r.priority == 1000
+        })
+    }
+    let _ports = FakePorts::create()?;
+    block_on(async {
+        let (mut rig, mut config) = build_static().await?;
+        config.public_ipv4.push(openfeo_config::PublicIpv4 {
+            prefix: "192.0.2.248/29".into(),
+        });
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 1), "one blackhole added: {ops:?}");
+        wait_until(&mut rig.rx, "blackhole cached", has_blackhole).await?;
+        ensure!(
+            netns::ip(&["route", "show", "type", "blackhole"])?.contains("192.0.2.248/29"),
+            "the kernel has the blackhole"
+        );
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 0), "second pass is a no-op: {ops:?}");
+        config.public_ipv4.clear();
+        let ops = rig.apply(&config).await?;
+        ensure!(ops == (0, 1), "blackhole removed: {ops:?}");
+        wait_until(&mut rig.rx, "blackhole gone", |c| !has_blackhole(c)).await?;
+        anyhow::Ok(())
+    })?
+}
 
 /// A `p1.223` nobody wants is deleted by the links applier; a VLAN that is not ours (`vlan7` on
 /// a foreign link) is left alone.

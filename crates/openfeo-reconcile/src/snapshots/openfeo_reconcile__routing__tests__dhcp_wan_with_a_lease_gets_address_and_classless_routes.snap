@@ -14,9 +14,11 @@ routes:
     table: 254
     protocol: 200
     priority: 10
+    kind: Unicast
   - ifname: p0
     dst: 198.51.100.0/24
     gateway: 203.0.113.1
     table: 254
     protocol: 200
     priority: 10
+    kind: Unicast

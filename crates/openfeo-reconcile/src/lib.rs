@@ -11,6 +11,7 @@ pub mod dhcp;
 pub mod dns;
 pub mod links;
 pub mod nft;
+pub mod public;
 pub mod routing;
 pub mod sysctl;
 pub mod time;
