@@ -45,6 +45,9 @@ lint: kernel-headers nft-src
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo clippy -p openfeo --all-targets -- -D warnings
+	# The fuzz crate sits outside the workspace and is built only by the nightly fuzz workflow; a
+	# changed struct must not break a target unseen (the dns_forwarder target did, 2026-11-01).
+	cargo check --manifest-path fuzz/Cargo.toml --bins
 	cargo deny check
 	scripts/check-spdx.sh
 	scripts/check-deps.sh
