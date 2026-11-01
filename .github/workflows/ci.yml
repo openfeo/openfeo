@@ -73,8 +73,8 @@ jobs:
           restore-keys: ccache-
       - name: fetch the pinned sources and install the kernel UAPI headers (ADR-0012)
         run: make kernel-src kernel-headers nft-src
-      - name: load the nft modules the sandboxed scenarios use (autoload from a user namespace is not guaranteed)
-        run: sudo modprobe nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat
+      - name: load the nft and 802.1Q modules the sandboxed scenarios use (autoload from a user namespace is not guaranteed)
+        run: sudo modprobe nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q
       - run: make kernel
       - run: make check-env
       - run: make test-harness

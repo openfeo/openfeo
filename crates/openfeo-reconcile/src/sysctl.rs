@@ -34,7 +34,7 @@ pub fn sysctl(world: &World, forwarding: bool) -> DesiredSysctl {
     entries.insert(IP6_FORWARDING.to_owned(), on_off.to_owned());
     for wan in &world.config.wans {
         if world.ports.id_of(&wan.port).is_some() {
-            entries.insert(send_redirects(&wan.port), "0".to_owned());
+            entries.insert(send_redirects(&crate::wan_ifname(wan)), "0".to_owned());
         }
     }
     for lan in &world.config.lans {

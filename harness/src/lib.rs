@@ -21,3 +21,4 @@ pub mod sandbox;
 pub mod scenario;
 pub mod statedisk;
 pub mod tun;
+pub mod vlanprobe;

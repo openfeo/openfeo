@@ -73,5 +73,10 @@ name = "m1"
 path = "tests/m1.rs"
 harness = false
 
+[[test]]
+name = "m2"
+path = "tests/m2.rs"
+harness = false
+
 [lints]
 workspace = true

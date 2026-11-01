@@ -127,13 +127,26 @@ impl Pass {
     }
 }
 
-/// The interfaces OpenFeO manages, by name: its bridges and its physical ports (SPEC §7).
+/// The interfaces OpenFeO manages, by name: its bridges, its physical ports and their VLAN
+/// sub-interfaces `pN.V` (SPEC §7.1, ADR-0017).
 #[must_use]
 pub fn is_managed(ifname: &str) -> bool {
-    ifname.starts_with("br-")
-        || ifname
-            .strip_prefix('p')
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    ifname.starts_with("br-") || is_vlan_port_name(ifname) || is_port_name(ifname)
+}
+
+/// `p<digits>`.
+fn is_port_name(ifname: &str) -> bool {
+    ifname
+        .strip_prefix('p')
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `p<digits>.<digits>`: a VLAN sub-interface of a port.
+#[must_use]
+pub fn is_vlan_port_name(ifname: &str) -> bool {
+    ifname.split_once('.').is_some_and(|(port, vid)| {
+        is_port_name(port) && !vid.is_empty() && vid.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 #[cfg(test)]
@@ -155,6 +168,16 @@ mod tests {
             assert!(is_managed(name), "{name}");
         }
         for name in ["lo", "eth0", "p", "px", "p1a", "veth0", "ppp-wan0"] {
+            assert!(!is_managed(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn managed_interfaces_include_vlan_sub_interfaces() {
+        for name in ["p0.101", "p12.4094"] {
+            assert!(is_managed(name), "{name}");
+        }
+        for name in ["p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6"] {
             assert!(!is_managed(name), "{name}");
         }
     }

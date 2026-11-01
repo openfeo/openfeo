@@ -41,7 +41,66 @@ const SCENARIOS: &[Scenario] = &[
         name: "generated_ruleset_is_accepted_by_libnftables",
         run: generated_ruleset_is_accepted_by_libnftables,
     },
+    Scenario {
+        name: "generated_public_ruleset_is_accepted_by_libnftables",
+        run: generated_public_ruleset_is_accepted_by_libnftables,
+    },
 ];
+
+const VM_PUBLIC: &str = include_str!("../fixtures/vm-public.toml");
+
+/// The lab's four ports.
+fn lab_portmap4() -> PortMap {
+    let mut map = lab_portmap();
+    map.ports.push(PortMapEntry {
+        id: "pci-0000:00:06.0".to_owned(),
+        name: "p3".to_owned(),
+    });
+    map
+}
+
+/// The public-world ruleset, with its interval concatenations (rules sets with an `ifname`
+/// field), the public-address forward maps, the translated-subnet set and the echo limit, is
+/// accepted by the pinned libnftables and this kernel, and every set and map is listed. This is
+/// the proof the design asks for before the rules sets stand (SPEC §7.5).
+fn generated_public_ruleset_is_accepted_by_libnftables(_lab: &mut Lab) -> anyhow::Result<()> {
+    nftprobe::require_expressions()?;
+    let config = openfeo_config::file::parse(VM_PUBLIC)?;
+    let world = World::new(config, lab_portmap4());
+    let desired = nft(&world);
+    let mut nft = Nft::new()?;
+    let applied = nft.apply(&desired.ruleset);
+    let listed_ruleset = nft.list_ruleset();
+    drop_table(&mut nft, "openfeo");
+    applied.context("apply the public ruleset")?;
+    let ruleset = listed_ruleset?;
+    for set in [
+        "wan_if",
+        "lan_if",
+        "lan_priv_if",
+        "lan_pub_dhcp_if",
+        "lan_to_wan",
+        "lan_pairs",
+        "lan_same",
+        "nat_nets",
+        "rules_tcp",
+        "rules_udp",
+        "rules_other",
+        "rules_any",
+    ] {
+        ensure!(
+            listed(&ruleset, "set", set, Some("openfeo")).len() == 1,
+            "set {set} missing or duplicated: {ruleset}"
+        );
+    }
+    for map in ["fwd_tcp", "fwd_udp", "fwd_pub_tcp", "fwd_pub_udp"] {
+        ensure!(
+            listed(&ruleset, "map", map, Some("openfeo")).len() == 1,
+            "map {map} missing or duplicated: {ruleset}"
+        );
+    }
+    Ok(())
+}
 
 fn main() -> ExitCode {
     if let Err(err) = sandbox::enter() {

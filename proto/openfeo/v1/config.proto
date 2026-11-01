@@ -18,6 +18,16 @@ message Config {
   repeated Lan lans = 5;
   Firewall firewall = 6;
   Dns dns = 7;
+  // Public IPv4 blocks the ISP routes to this router (SPEC §7.4, §7.5; `[[public_ipv4]]`).
+  repeated PublicIpv4 public_ipv4 = 8;
+}
+
+// A block of public IPv4 addresses routed to this router. A LAN numbered from it is a public LAN
+// (no translation, inbound by rule); addresses no LAN uses may front port forwards. Every block
+// gets a blackhole route.
+message PublicIpv4 {
+  // The block, "192.0.2.232/29"; global unicast, disjoint from every other block and subnet.
+  string prefix = 1;
 }
 
 // The DNS forwarder (SPEC §7.7; `[dns]` in §8.2).
@@ -37,12 +47,14 @@ message Dns {
 // Firewall settings beyond the zone defaults of SPEC §7.5 (which the panel exposes in M4).
 message Firewall {
   repeated PortForward port_forwards = 1;
-  // Answer ICMP echo on WAN zones (SPEC §7.5 "optional ping"); off by default.
+  // Answer ICMP echo on WAN zones (SPEC §7.5 "optional ping"), rate limited; off by default.
   bool wan_ping = 2;
+  // Holes opened before the zone policy (SPEC §7.5); they never translate.
+  repeated Rule rules = 3;
 }
 
-// One DNAT from every WAN address (and, by hairpin, from LAN clients reaching a router address)
-// to a LAN host (SPEC §7.5).
+// One DNAT from the router's own addresses, or from a public-block address (`address`), and by
+// hairpin from LAN clients reaching that address, to a LAN host (SPEC §7.5).
 message PortForward {
   // Unique among forwards; shows in logs and the API.
   string name = 1;
@@ -55,6 +67,24 @@ message PortForward {
   string to = 4;
   // Port on `to`; 0 = same as `port`.
   uint32 to_port = 5;
+  // The public address this forward listens on: inside a `[[public_ipv4]]` block, outside every
+  // LAN. Empty means the WAN address (any address of the router's own).
+  string address = 6;
+}
+
+// One accepted hole in the forward chain (SPEC §7.5): new flows from zone `from` to the hosts in
+// `to`, for `proto` and, for tcp/udp, `ports`.
+message Rule {
+  // Unique among rules; shows in logs and the API.
+  string name = 1;
+  // "wan" or a LAN name.
+  string from = 2;
+  // An address, an `a-b` range or a CIDR, inside one LAN that is not `from`.
+  string to = 3;
+  // "tcp", "udp", "icmp" or "any".
+  string proto = 4;
+  // For tcp/udp: ports as strings, "443" or "1000-1010"; forbidden otherwise.
+  repeated string ports = 5;
 }
 
 message System {
@@ -146,14 +176,19 @@ message Dhcp4Lease {
   string broadcast = 15;
 }
 
-// A LAN is a bridge of one or more ports (SPEC §7.1).
+// A LAN is a bridge of one or more members (SPEC §7.1): a port untagged ("p6") or a tagged VLAN
+// on a port ("p6.224", ADR-0017).
 message Lan {
   string name = 1;
   repeated string ports = 2;
-  // The router's address and the LAN subnet, "192.168.1.1/24".
+  // The router's address and the LAN subnet, "192.168.1.1/24". Inside a `[[public_ipv4]]` block
+  // the LAN is public (SPEC §7.5).
   string ipv4 = 3;
   // Present when the LAN runs a DHCPv4 server (SPEC §7.6).
   LanDhcp dhcp = 4;
+  // Zones this LAN may initiate into: "wan", other LAN names, or the one word "none". Absent or
+  // empty means ["wan"] (SPEC §7.5).
+  repeated string reaches = 5;
 }
 
 // The DHCPv4 server of one LAN (SPEC §7.6; `[lans.dhcp]` in §8.2).

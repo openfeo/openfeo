@@ -29,6 +29,7 @@ fn config() -> Config {
         router_addrs: vec![Ipv4Addr::new(192, 168, 1, 1)],
         wan_addrs: Vec::new(),
         lan_subnets: vec!["192.168.1.0/24".parse().expect("a subnet")],
+        guard_subnets: vec!["192.168.1.0/24".parse().expect("a subnet")],
         local: vec![LocalRecord {
             name: "nas.home.arpa".parse().expect("a name"),
             addr: Ipv4Addr::new(192, 168, 1, 10),

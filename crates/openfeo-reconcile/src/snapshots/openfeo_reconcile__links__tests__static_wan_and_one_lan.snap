@@ -13,16 +13,19 @@ bridges:
 ports:
   p0:
     name: p0
+    kind: Physical
     up: true
     master: ~
     mtu: ~
   p1:
     name: p1
+    kind: Physical
     up: false
     master: ~
     mtu: ~
   p2:
     name: p2
+    kind: Physical
     up: true
     master: br-lan0
     mtu: ~

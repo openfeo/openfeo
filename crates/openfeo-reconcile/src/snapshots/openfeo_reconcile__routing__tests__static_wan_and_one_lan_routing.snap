@@ -14,3 +14,4 @@ routes:
     table: 254
     protocol: 200
     priority: 10
+    kind: Unicast

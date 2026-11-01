@@ -3,7 +3,8 @@
 
 //! Desired addresses and routes (SPEC §7.2 Static, §7.4): a LAN's address on its bridge, a static
 //! WAN's address on its port and a default route via its gateway in the main table, tagged with
-//! `RTPROT_OPENFEO` and carrying the WAN's priority as metric.
+//! `RTPROT_OPENFEO` and carrying the WAN's priority as metric; a blackhole per declared public
+//! block, so an address nobody answers for is dropped here and never sent back to the ISP.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -13,6 +14,7 @@ use openfeo_config::wan;
 use openfeo_world::World;
 use serde::Serialize;
 
+use crate::public::{self, BLOCK_METRIC};
 use crate::{RTPROT_OPENFEO, TABLE_MAIN, bridge_name};
 
 /// One address on one interface.
@@ -24,11 +26,21 @@ pub struct DesiredAddr {
     pub net: IpNet,
 }
 
+/// A route's type: unicast, or a blackhole for a declared public block (SPEC §7.4). Mirrors
+/// `openfeo_netlink::RouteKind`, which this pure crate may not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum RouteKind {
+    /// Through an interface, with or without a gateway.
+    Unicast,
+    /// Dropped silently; no interface.
+    Blackhole,
+}
+
 /// One route OpenFeO owns.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct DesiredRoute {
-    /// Output interface.
-    pub ifname: String,
+    /// Output interface; `None` for a blackhole.
+    pub ifname: Option<String>,
     /// Destination; `None` is the default route.
     pub dst: Option<IpNet>,
     /// Next hop.
@@ -37,8 +49,10 @@ pub struct DesiredRoute {
     pub table: u32,
     /// Always [`RTPROT_OPENFEO`].
     pub protocol: u8,
-    /// Metric: the WAN's priority.
+    /// Metric: the WAN's priority, or [`BLOCK_METRIC`] for a blackhole.
     pub priority: u32,
+    /// Unicast or blackhole.
+    pub kind: RouteKind,
 }
 
 /// Everything the routing applier makes true.
@@ -67,19 +81,21 @@ pub fn routing(world: &World) -> DesiredRouting {
         if world.ports.id_of(&wan_config.port).is_none() {
             continue;
         }
+        let ifname = crate::wan_ifname(wan_config);
         let route = |dst: Option<IpNet>, gateway: IpAddr| DesiredRoute {
-            ifname: wan_config.port.clone(),
+            ifname: Some(ifname.clone()),
             dst,
             gateway: Some(gateway),
             table: TABLE_MAIN,
             protocol: RTPROT_OPENFEO,
             priority: wan_config.priority,
+            kind: RouteKind::Unicast,
         };
         match &wan_config.kind {
             Some(wan::Kind::Static(static_wan)) => {
                 if let Ok(net) = static_wan.address.parse::<IpNet>() {
                     desired.addrs.insert(DesiredAddr {
-                        ifname: wan_config.port.clone(),
+                        ifname: ifname.clone(),
                         net,
                     });
                 }
@@ -92,7 +108,7 @@ pub fn routing(world: &World) -> DesiredRouting {
                     continue;
                 };
                 desired.addrs.insert(DesiredAddr {
-                    ifname: wan_config.port.clone(),
+                    ifname: ifname.clone(),
                     net: IpNet::V4(lease.address),
                 });
                 // RFC 3442: classless routes replace the router option, and `0.0.0.0/0` among
@@ -115,12 +131,13 @@ pub fn routing(world: &World) -> DesiredRouting {
                 for (dst, via) in wanted {
                     if !lease.address.contains(&via) {
                         desired.routes.insert(DesiredRoute {
-                            ifname: wan_config.port.clone(),
+                            ifname: Some(ifname.clone()),
                             dst: Some(IpNet::V4(Ipv4Net::from(via))),
                             gateway: None,
                             table: TABLE_MAIN,
                             protocol: RTPROT_OPENFEO,
                             priority: wan_config.priority,
+                            kind: RouteKind::Unicast,
                         });
                     }
                     desired.routes.insert(route(dst, IpAddr::V4(via)));
@@ -128,6 +145,17 @@ pub fn routing(world: &World) -> DesiredRouting {
             }
             None => {}
         }
+    }
+    for block in public::blocks(&world.config) {
+        desired.routes.insert(DesiredRoute {
+            ifname: None,
+            dst: Some(IpNet::V4(block)),
+            gateway: None,
+            table: TABLE_MAIN,
+            protocol: RTPROT_OPENFEO,
+            priority: BLOCK_METRIC,
+            kind: RouteKind::Blackhole,
+        });
     }
     desired
 }
@@ -150,7 +178,7 @@ mod tests {
         assert_eq!(addrs, ["br-lan0 192.168.1.1/24", "p0 203.0.113.10/24"]);
         assert_eq!(desired.routes.len(), 1);
         let route = desired.routes.iter().next().unwrap();
-        assert_eq!(route.ifname, "p0");
+        assert_eq!(route.ifname.as_deref(), Some("p0"));
         assert_eq!(route.dst, None);
         assert_eq!(
             route.gateway.map(|g| g.to_string()),
@@ -159,6 +187,44 @@ mod tests {
         assert_eq!(route.table, TABLE_MAIN);
         assert_eq!(route.protocol, RTPROT_OPENFEO);
         assert_eq!(route.priority, 10);
+        insta::assert_yaml_snapshot!(desired);
+    }
+
+    #[test]
+    fn every_declared_block_gets_a_blackhole_and_the_dmz_gets_its_address() {
+        let desired = routing(&fixtures::public_world());
+        let blackholes: Vec<&DesiredRoute> = desired
+            .routes
+            .iter()
+            .filter(|r| r.kind == RouteKind::Blackhole)
+            .collect();
+        assert_eq!(
+            blackholes
+                .iter()
+                .map(|r| r.dst.unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["192.0.2.232/29", "192.0.2.248/29"]
+        );
+        assert!(blackholes.iter().all(|r| r.ifname.is_none()
+            && r.gateway.is_none()
+            && r.priority == crate::public::BLOCK_METRIC
+            && r.table == TABLE_MAIN
+            && r.protocol == RTPROT_OPENFEO));
+        assert!(
+            desired
+                .addrs
+                .iter()
+                .any(|a| a.ifname == "br-dmz" && a.net.to_string() == "192.0.2.233/29")
+        );
+        assert_eq!(
+            desired
+                .routes
+                .iter()
+                .filter(|r| r.kind == RouteKind::Unicast)
+                .count(),
+            1,
+            "the WAN default is the only unicast route"
+        );
         insta::assert_yaml_snapshot!(desired);
     }
 
@@ -172,7 +238,7 @@ mod tests {
                     r.dst
                         .map_or_else(|| "default".to_owned(), |d| d.to_string()),
                     r.gateway.map_or_else(|| "-".to_owned(), |g| g.to_string()),
-                    r.ifname,
+                    r.ifname.as_deref().unwrap_or("-"),
                     r.protocol,
                     r.priority
                 )

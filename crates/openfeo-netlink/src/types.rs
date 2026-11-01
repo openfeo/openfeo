@@ -25,7 +25,9 @@ pub enum LinkKind {
     Bridge,
     /// One end of a veth pair.
     Veth,
-    /// Anything else the kernel names (`vlan`, `dummy`, `tun`, …).
+    /// An 802.1Q VLAN sub-interface of another link (ADR-0017).
+    Vlan,
+    /// Anything else the kernel names (`dummy`, `tun`, …).
     Other(String),
 }
 
@@ -40,6 +42,10 @@ pub struct Link {
     pub kind: Option<LinkKind>,
     /// The index of the bridge (or other controller) this link is enslaved to.
     pub master: Option<u32>,
+    /// `IFLA_LINK`: the lower device of a VLAN or other upper.
+    pub parent: Option<u32>,
+    /// `IFLA_VLAN_ID`: the 802.1Q id of a VLAN link.
+    pub vlan_id: Option<u16>,
     /// `IFF_UP`.
     pub up: bool,
     /// `IFF_LOWER_UP`: carrier present.
@@ -61,6 +67,17 @@ pub struct Addr {
     pub scope: u8,
 }
 
+/// A route's type (`RTN_*`): everything OpenFeO adds is unicast except the blackholes for
+/// declared public blocks (SPEC §7.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RouteKind {
+    /// `RTN_UNICAST`, the kernel's default.
+    #[default]
+    Unicast,
+    /// `RTN_BLACKHOLE`: silently dropped, no interface.
+    Blackhole,
+}
+
 /// One route.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Route {
@@ -78,6 +95,8 @@ pub struct Route {
     pub protocol: u8,
     /// Metric.
     pub priority: u32,
+    /// Unicast, or a blackhole (which has no `oif`).
+    pub kind: RouteKind,
 }
 
 /// Everything the monitor has seen, as of its last notification.

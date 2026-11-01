@@ -1,0 +1,79 @@
+---
+source: crates/openfeo-reconcile/src/links.rs
+expression: desired
+---
+bridges:
+  br-guest:
+    name: br-guest
+    vlan_filtering: true
+    mac: "52:54:00:fe:00:02"
+    members:
+      - p2.223
+    up: true
+  br-lan0:
+    name: br-lan0
+    vlan_filtering: true
+    mac: "52:54:00:fe:00:02"
+    members:
+      - p2
+    up: true
+  br-trusted:
+    name: br-trusted
+    vlan_filtering: true
+    mac: "52:54:00:fe:00:02"
+    members:
+      - p2.224
+      - p3
+    up: true
+ports:
+  p0:
+    name: p0
+    kind: Physical
+    up: true
+    master: ~
+    mtu: ~
+  p0.101:
+    name: p0.101
+    kind:
+      Vlan:
+        parent: p0
+        id: 101
+    up: true
+    master: ~
+    mtu: 1500
+  p1:
+    name: p1
+    kind: Physical
+    up: false
+    master: ~
+    mtu: ~
+  p2:
+    name: p2
+    kind: Physical
+    up: true
+    master: br-lan0
+    mtu: ~
+  p2.223:
+    name: p2.223
+    kind:
+      Vlan:
+        parent: p2
+        id: 223
+    up: true
+    master: br-guest
+    mtu: ~
+  p2.224:
+    name: p2.224
+    kind:
+      Vlan:
+        parent: p2
+        id: 224
+    up: true
+    master: br-trusted
+    mtu: ~
+  p3:
+    name: p3
+    kind: Physical
+    up: true
+    master: br-trusted
+    mtu: ~

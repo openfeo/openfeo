@@ -53,8 +53,12 @@ pub struct Config {
     /// The router's other addresses (the WAN's): never a valid upstream answer either, but not
     /// A records of the router's name.
     pub wan_addrs: Vec<Ipv4Addr>,
-    /// Reverse zones the forwarder is authoritative for, and never a valid upstream answer.
+    /// Reverse zones the forwarder is authoritative for: the private LANs, and public LANs whose
+    /// hosts the router names (SPEC §7.7).
     pub lan_subnets: Vec<Ipv4Net>,
+    /// The rebinding guard: subnets an upstream answer may never point into (the private LANs).
+    /// A public LAN's addresses are valid answers, so it is not here.
+    pub guard_subnets: Vec<Ipv4Net>,
     /// Reservations first, then leases; the first match wins.
     pub local: Vec<LocalRecord>,
     /// Names whose subdomains may resolve to private addresses.
@@ -569,8 +573,8 @@ impl Forwarder {
     }
 
     /// RFC 1918, the shared space of RFC 6598 (`100.64.0.0/10`, the address a home behind
-    /// carrier NAT sits at), link-local, loopback, `0.0.0.0/8`, the broadcast address, a LAN
-    /// subnet (whatever it is numbered from) or one of the router's own addresses.
+    /// carrier NAT sits at), link-local, loopback, `0.0.0.0/8`, the broadcast address, a guarded
+    /// subnet (a private LAN, whatever it is numbered from) or one of the router's own addresses.
     fn is_internal_v4(&self, addr: Ipv4Addr) -> bool {
         let [a, b, _, _] = addr.octets();
         addr.is_private()
@@ -581,7 +585,7 @@ impl Forwarder {
             || addr.is_broadcast()
             || self
                 .config
-                .lan_subnets
+                .guard_subnets
                 .iter()
                 .any(|subnet| subnet.contains(&addr))
             || self.config.router_addrs.contains(&addr)
@@ -810,6 +814,7 @@ mod tests {
             router_addrs: vec![ip("192.168.1.1")],
             wan_addrs: Vec::new(),
             lan_subnets: vec!["192.168.1.0/24".parse().unwrap()],
+            guard_subnets: vec!["192.168.1.0/24".parse().unwrap()],
             local: vec![
                 LocalRecord {
                     name: name("nas.home.arpa"),
@@ -1648,10 +1653,24 @@ mod tests {
     }
 
     #[test]
+    fn the_guard_reads_guard_subnets_not_the_reverse_zones() {
+        let mut cfg = config();
+        cfg.lan_subnets = vec!["192.0.2.232/29".parse().unwrap()]; // a reverse zone we answer for
+        cfg.guard_subnets = vec!["192.168.1.0/24".parse().unwrap()];
+        let f = Forwarder::new(cfg, 1);
+        assert!(
+            !f.is_internal_v4(ip("192.0.2.234")),
+            "a public LAN's addresses are valid answers"
+        );
+        assert!(f.is_internal_v4(ip("192.168.1.9")));
+    }
+
+    #[test]
     fn rebinding_covers_shared_space_broadcast_lan_subnets_and_the_wan_address() {
         let mut cfg = config();
-        // A LAN numbered outside RFC 1918, and the WAN address as the reconciler supplies it.
-        cfg.lan_subnets.push("198.18.0.0/15".parse().unwrap());
+        // A private LAN numbered outside RFC 1918, and the WAN address as the reconciler
+        // supplies it.
+        cfg.guard_subnets.push("198.18.0.0/15".parse().unwrap());
         cfg.wan_addrs.push(ip("203.0.113.10"));
         let mut f = Forwarder::new(cfg, 1);
         let cases = [

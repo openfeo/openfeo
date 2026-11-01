@@ -31,11 +31,12 @@ pub const WAN_ADDR: &str = "203.0.113.10";
 pub const ISP_HTTP_BODY: &str = "openfeo isp target";
 /// What the LAN-side HTTP target serves.
 pub const LAN_HTTP_BODY: &str = "openfeo lan target";
-/// The router's port MACs, in port order.
-pub const MACS: [&str; 3] = [
+/// The router's port MACs, in port order (`p3` exists only for labs with a second LAN).
+pub const MACS: [&str; 4] = [
     "52:54:00:fe:00:00",
     "52:54:00:fe:00:01",
     "52:54:00:fe:00:02",
+    "52:54:00:fe:00:03",
 ];
 /// How long a boot may take before a scenario gives up (TCG is slow).
 pub const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
@@ -63,8 +64,8 @@ pub struct Lab {
     pub vm: Option<Vm>,
     /// Reference daemons started by scenarios; stopped before the namespaces go.
     pub daemons: Vec<Daemon>,
-    /// Port taps in port order: wan0 (isp0), wan1 (isp1), lan0 (lan0). Dropped before the
-    /// namespaces so the namespaces can go.
+    /// Port taps in port order: wan0 (isp0), wan1 (isp1), lan0 (lan0) and, after
+    /// [`Lab::add_lan1`], lan1 (lan1). Dropped before the namespaces so the namespaces can go.
     taps: Vec<OwnedFd>,
     /// ISP A.
     pub isp0: NetNs,
@@ -72,6 +73,9 @@ pub struct Lab {
     pub isp1: NetNs,
     /// The LAN side.
     pub lan0: NetNs,
+    /// A second LAN side on the router's `p3`, for the scenarios that ask for two LANs
+    /// (SPEC §11); `None` until [`Lab::add_lan1`].
+    pub lan1: Option<NetNs>,
 }
 
 impl Lab {
@@ -104,7 +108,22 @@ impl Lab {
             isp0,
             isp1,
             lan0,
+            lan1: None,
         })
+    }
+
+    /// Add the second LAN namespace `<name>-lan1` with its tap, the router's `p3`, before boot.
+    ///
+    /// # Errors
+    ///
+    /// When already booted or already added, or when the namespace or tap cannot be created.
+    pub fn add_lan1(&mut self) -> Result<()> {
+        ensure!(self.vm.is_none(), "lan1 must be added before boot");
+        ensure!(self.lan1.is_none(), "lan1 already added");
+        let lan1 = NetNs::create(&format!("{}-lan1", self.name))?;
+        self.taps.push(lan1.add_tap("lan1", None)?);
+        self.lan1 = Some(lan1);
+        Ok(())
     }
 
     /// Make the LAN namespace a LAN host: `lan0` up at [`LAN_HOST_ADDR`] with the router as its
@@ -114,11 +133,68 @@ impl Lab {
     ///
     /// When `ip` fails.
     pub fn lan_side_host(&self) -> Result<()> {
-        self.lan0.ip(&["link", "set", "lan0", "up"])?;
-        self.lan0
-            .ip(&["addr", "replace", LAN_HOST_ADDR, "dev", "lan0"])?;
-        self.lan0
-            .ip(&["route", "replace", "default", "via", LAN_GATEWAY])?;
+        Self::host(&self.lan0, "lan0", LAN_HOST_ADDR, LAN_GATEWAY)
+    }
+
+    /// Make `ns` a host on `ifname`: up, at `addr_cidr`, with `gateway` as its default route.
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn host(ns: &NetNs, ifname: &str, addr_cidr: &str, gateway: &str) -> Result<()> {
+        ns.ip(&["link", "set", ifname, "up"])?;
+        ns.ip(&["addr", "replace", addr_cidr, "dev", ifname])?;
+        ns.ip(&["route", "replace", "default", "via", gateway])?;
+        Ok(())
+    }
+
+    /// A VLAN client: the 802.1Q sub-interface `<parent>.<vid>` of a tap in `base`, moved into a
+    /// namespace of its own (`<name>-<ns>`) and brought up, so every client helper works on it
+    /// unchanged. The sub-interface dies with the namespace.
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails (a kernel without `8021q` cannot create the sub-interface).
+    pub fn vlan_host(&self, base: &NetNs, parent: &str, vid: u16, ns: &str) -> Result<NetNs> {
+        let ifname = format!("{parent}.{vid}");
+        let vid = vid.to_string();
+        base.ip(&[
+            "link", "add", "link", parent, "name", &ifname, "type", "vlan", "id", &vid,
+        ])?;
+        let host = NetNs::create(&format!("{}-{ns}", self.name))?;
+        base.ip(&["link", "set", &ifname, "netns", &host.name])?;
+        host.ip(&["link", "set", &ifname, "up"])?;
+        Ok(host)
+    }
+
+    /// Move ISP A onto the tagged sub-interface `wan0.<vid>`: [`ISP0_ADDR`] leaves `wan0` for
+    /// it, so Kea (which picks its subnet by the receiving interface's address) and the HTTP
+    /// target serve a WAN that tags its traffic (SPEC §7.2). Returns the sub-interface's name.
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn isp0_tagged(&mut self, vid: u16) -> Result<String> {
+        let ifname = format!("wan0.{vid}");
+        let vid = vid.to_string();
+        self.isp0.ip(&[
+            "link", "add", "link", "wan0", "name", &ifname, "type", "vlan", "id", &vid,
+        ])?;
+        self.isp0.ip(&["addr", "flush", "dev", "wan0"])?;
+        self.isp0.ip(&["addr", "add", ISP0_ADDR, "dev", &ifname])?;
+        self.isp0.ip(&["link", "set", &ifname, "up"])?;
+        Ok(ifname)
+    }
+
+    /// Teach the ISP namespace that a public block is routed to the router's WAN address, as
+    /// the ISP of a `[[public_ipv4]]` block does (SPEC §7.4).
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn isp_route_block(&self, block: &str) -> Result<()> {
+        self.isp0
+            .ip(&["route", "replace", block, "via", WAN_ADDR])?;
         Ok(())
     }
 
@@ -130,7 +206,16 @@ impl Lab {
     ///
     /// When Kea cannot be started or does not come up within 15 s.
     pub fn start_kea(&mut self) -> Result<()> {
-        let kea = daemons::kea_dhcp4(&self.isp0, "wan0", &self.run_dir)?;
+        self.start_kea_on("wan0")
+    }
+
+    /// As [`Lab::start_kea`], on another interface of ISP A (a tagged `wan0.<vid>`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Lab::start_kea`].
+    pub fn start_kea_on(&mut self, iface: &str) -> Result<()> {
+        let kea = daemons::kea_dhcp4(&self.isp0, iface, &self.run_dir)?;
         kea.log.wait_for(
             &mut Cursor::default(),
             &Regex::new("DHCP4_STARTED").context("regex")?,
@@ -194,8 +279,8 @@ impl Lab {
         Ok(())
     }
 
-    /// Boot the router with the lab's three taps as ports `p0..p2` and the console captured.
-    /// `extra_cmdline` is appended to [`BASE_CMDLINE`].
+    /// Boot the router with the lab's taps as ports `p0..p2` (and `p3` after [`Lab::add_lan1`])
+    /// and the console captured. `extra_cmdline` is appended to [`BASE_CMDLINE`].
     ///
     /// # Errors
     ///

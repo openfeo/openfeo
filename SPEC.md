@@ -33,7 +33,7 @@ The name: FeO is iron(II) oxide, i.e. rust. `openfeo` in lowercase is used for t
 
 - Wi-Fi (AP mode needs hostapd; post-MVP as a sidecar, if ever).
 - WireGuard — the first post-MVP feature; the data model reserves a `vpn` zone.
-- LAN VLANs and multiple LAN zones — present in the data model from day one, not configurable in the MVP panel.
+- LAN VLANs and multiple LAN zones in the panel — configurable in the file from M2 part 1 (§7.1, §7.5), not in the MVP panel.
 - UPnP/PCP, mDNS reflector, DDNS, download shaping via IFB, WAN load balancing, packages and containers, gNMI/OTLP export.
 - An interactive shell or SSH of any kind (permanent).
 - MIPS targets (Rust tier 3) and swconfig switches (permanent).
@@ -51,7 +51,7 @@ These are settled. Change them only with an ADR.
 | Storage layout (x86) | GPT: ESP (FAT32, 512 MiB) holding systemd-boot, entries and both slots; `openfeo-state` (ext4, 1 GiB) for config, leases, keys and persisted logs; remainder unallocated. No root filesystem partitions: the initramfs is the OS. | Update = write one file. Installer, updater and rescue share one layout. |
 | Process model | The binary re-executes itself: PID 1 is a tiny supervisor (mounts, reaping, watchdog, child restart); all router logic runs in the child. Mode comes from `openfeo.mode=` on the kernel command line or `--mode`: `metal`, `vm`, `container`, `installer`, `rescue`. | A panic in PID 1 panics the kernel. Virtual and container modes exist from the first commit. |
 | Interface identity | Physical ports are identified by **bus path first** (PCI path on x86, device-tree port label on DSA boards), MAC as tiebreaker only. Ports are renamed `p0…pN` in path order; logical names (`wan0`, `lan0`) live in config. | WAN MAC cloning is a standard feature and breaks MAC-first identity. |
-| LAN model | A LAN is a **bridge** of one or more ports (software bridge on x86, DSA-offloaded on switch boards), with VLAN filtering enabled and reserved for later LAN VLANs. | Any multi-port box needs it; DSA ports only switch in hardware when bridged. |
+| LAN model | A LAN is a **bridge** of one or more ports (software bridge on x86, DSA-offloaded on switch boards), with VLAN filtering on; a LAN VLAN is an 802.1Q sub-interface of a port bridged into its LAN (ADR-0017). | Any multi-port box needs it; DSA ports only switch in hardware when bridged. |
 | Multi-WAN IPv6 | **Source-based routing always** (one `ip -6 rule from <prefix>` per delegated prefix), prefix **deprecation on failover**, and an `unreachable` default in a down WAN's table. NPTv6 is not used. | BCP38 at the ISP and RFC 4862's two-hour floor make source routing mandatory whichever renumbering strategy is used. |
 | Multi-WAN IPv4 | One routing table per WAN, flows tagged with a per-WAN **conntrack mark**, main-table default route follows the active WAN, probes bound to their WAN. | Selective conntrack flush on failover; sticky flows for load balancing later. |
 | Config | Protobuf schema is the single source of truth; **TOML** on disk using proto field names; `config_version` with forward migrations; **commit-confirmed** apply with a 60 s default; a pending config never survives a reboot. | Panel, API, CLI and file share one type system. |
@@ -240,7 +240,7 @@ What the reconcilers and protocol cores must do. Kernel names: physical ports `p
 ### 7.1 Ports, identity and roles
 
 - At boot the binary enumerates netdevs, computes each port's stable identity (`/sys/class/net/*/device` PCI path on x86; DSA port label from the device tree), sorts, renames to `p0…pN` while the interfaces are still down, and compares with `identity/portmap`. A new or missing port is reported on the console and in the panel; roles are never guessed.
-- Config maps roles to ports: a WAN is one port, optionally with an 802.1Q VLAN ID and a cloned MAC; a LAN is a set of ports bridged as `br-<lan>` (bridge MAC = lowest member MAC, `vlan_filtering` on, default PVID 1, STP off by default).
+- Config maps roles to ports: a WAN is one port, optionally with an 802.1Q VLAN ID and a cloned MAC; a LAN is a set of members bridged as `br-<lan>` (bridge MAC = lowest member MAC, `vlan_filtering` on, default PVID 1, STP off by default). A member is a port untagged (`p6`) or a tagged VLAN on a port (`p6.224`, id 1..4094), created as the 802.1Q sub-interface `pN.V` and enslaved to the LAN's bridge (ADR-0017). A port is untagged in at most one LAN and tagged in any number, and never both in the same LAN; a physical port is a WAN or carries LANs, not both. A tagged frame for a VLAN no LAN carries reaches the port's filtering bridge and is dropped there.
 - Link state, speed and duplex are facts from the netlink monitor; they feed the panel and WAN health.
 
 ### 7.2 WAN types (IPv4)
@@ -257,7 +257,7 @@ What the reconcilers and protocol cores must do. Kernel names: physical ports `p
 - Reconnect with exponential backoff; handle AC-initiated PADT and LCP Terminate; publish session id, addresses, DNS, MTU and uptime as facts.
 - MSS clamping (`tcp flags syn tcp option maxseg size set rt mtu`) is generated for any WAN whose MTU is below 1500.
 
-**VLAN-tagged WAN**: a `p0.101`-style sub-interface under any of the above.
+**VLAN-tagged WAN**: `vlan = V` on a WAN runs it on the `p0.101`-style sub-interface `pN.V`, under any of the above; everything downstream (routing, the DHCP client, the firewall zone, the console) names the sub-interface.
 
 ### 7.3 IPv6
 
@@ -283,12 +283,13 @@ What the reconcilers and protocol cores must do. Kernel names: physical ports `p
 - Health probes per WAN: ICMP echo and/or DNS queries to configurable targets, sockets bound with `SO_BINDTODEVICE` and `SO_MARK` so they test that WAN rather than the default route; up/down thresholds and interval configurable; a WAN with link down is down immediately.
 - Failover: the highest-priority `up` WAN is active. On change: main default routes (v4 and v6) are swapped, conntrack entries carrying the dead WAN's mark are deleted via ctnetlink (mark-filtered flush), RA and DNS upstreams are reconciled, an event is emitted. Fail-back is immediate when a higher-priority WAN returns, subject to a configurable hold-down.
 - Reverse-path filtering in nft, not sysctl: strict on LAN zones (`fib saddr . iif oif missing drop`), loose on WAN zones (`fib saddr oif missing drop`). Kernel `rp_filter` stays 0.
+- Public IPv4 blocks (`[[public_ipv4]]`, §7.5): every declared block gets a blackhole route in `main` (protocol 200, metric 1000), so an address nobody answers for is dropped at the router and never sent back out the default route; a LAN's connected route inside the block wins while its bridge is up. A block belongs to the ISP account that routes it; M6 pins its egress to the WANs of that account. Until then it follows the active WAN.
 
 ### 7.5 Firewall and NAT
 
-- Zones: one per WAN, one per LAN, `router` (local input/output), and a reserved `vpn`. Policies form a zone-pair matrix: LAN→WAN accept; WAN→LAN drop; LAN↔LAN per config (default accept within a LAN, drop between LANs); WAN→router drop except the DHCPv6 client (UDP 546), ICMPv6 per §7.3 and optional ping; LAN→router: DHCP, DNS, HTTPS, NTP, ICMP.
-- The ruleset is one `table inet openfeo` regenerated from the World and applied as a single libnftables batch: `add table inet openfeo; delete table inet openfeo;` followed by the full definition in the same buffer (the add/delete pair makes the replace idempotent and the batch makes it atomic). Named sets and maps hold port-forward targets, blocklists and WAN address sets; rule counts never grow with list sizes.
-- NAT: IPv4 masquerade per WAN; port forwards as `dnat` maps with **hairpin** (LAN clients reaching a forwarded port via the WAN address are DNATed and SNATed to the router); no IPv6 NAT.
+- Zones: one per WAN, one per LAN, `router` (local input/output), and a reserved `vpn`. A LAN whose subnet lies inside a declared `[[public_ipv4]]` block is a **public LAN** (a DMZ of hosts with their own public addresses); a LAN in global unicast space that no block declares is a configuration error, never a silently translated LAN. Policies form a zone-pair matrix, written per source LAN as `reaches` (zone names: `"wan"`, other LAN names, or `"none"` for a LAN that initiates into nothing; absent means `["wan"]`): LAN→WAN accept by default; WAN→LAN drop; within one LAN always accept; LAN→LAN only when listed; a flow a port forward translated is accepted from a WAN, and from a LAN only when that LAN reaches the destination LAN (hairpin follows the policy). **Rules** (`[[firewall.rules]]`: `from` a zone, `to` an address, `a-b` range or CIDR inside one LAN, `proto` tcp/udp/icmp/any, `ports` as strings including `"a-b"` ranges) open single holes before the policy and never translate; they are how a DMZ host's ports are opened from the WAN and how one LAN reaches one host in another. Two rules from one zone whose targets and ports partly overlap are refused by validation, since the kernel refuses such interval elements (identical holes merge). WAN→router drop except the DHCPv6 client (UDP 546), ICMPv6 per §7.3 and optional ping, rate limited at 50/second with a burst of 100; LAN→router: DHCP, DNS, HTTPS, NTP, ICMP for a private LAN; a public LAN gets ICMP, and DHCP, DNS and NTP only when it runs the DHCP server, never HTTPS.
+- The ruleset is one `table inet openfeo` regenerated from the World and applied as a single libnftables batch: `add table inet openfeo; delete table inet openfeo;` followed by the full definition in the same buffer (the add/delete pair makes the replace idempotent and the batch makes it atomic). Named sets and maps hold zone pairs, port-forward targets, the translated subnets, the rules (concatenated interval sets per protocol), blocklists and WAN address sets; rule counts never grow with list sizes.
+- NAT: IPv4 masquerade per WAN for the private LANs' subnets only (a public LAN leaves with its own addresses); port forwards as `dnat` maps keyed on the router's own addresses, or on a public-block address the forward names (`address`), with **hairpin** (LAN clients reaching a forwarded port via that address are DNATed and SNATed to the router); no IPv6 NAT.
 - Flowtable `ft` over the physical LAN and WAN ports with software offload for established flows (kernel ≥ 5.13 handles PPPoE and VLAN encapsulation); verified in the harness. Hardware offload is a per-WAN choice that disables CAKE on that WAN.
 - Logging rules use `log` with `limit`; the binary reads `/dev/kmsg` into the log ring, so firewall logs appear in the panel.
 - Conntrack sizing: `nf_conntrack_max` from RAM (16k per 64 MiB, capped), hashsize accordingly; default timeouts.
@@ -301,8 +302,8 @@ Per LAN: pool range, lease time, static leases (by MAC, optionally client-id) wi
 
 - Listens on every LAN address (v4 and v6), UDP and TCP 53; caches by TTL with negative caching (RFC 2308); EDNS0 with a 1232-byte UDP buffer; truncation → TCP retry; no recursion; DNSSEC bits passed through, no validation in MVP. Cache size scales with RAM.
 - Upstreams: learned per WAN (IPCP, DHCPv4, RDNSS, DHCPv6) for the active WAN, or user-configured; DNS-over-TLS upstreams SHOULD be supported since rustls is already linked.
-- Local zone: `<hostname>.<domain>` A records from leases, PTR reverse zones for LAN subnets, the router's own name; static leases resolve even before they are active.
-- **Rebinding protection**: upstream answers containing RFC 1918, link-local, ULA, loopback or the router's own addresses are dropped unless the name is on a configured allow-list.
+- Local zone: `<hostname>.<domain>` A records from leases, PTR reverse zones for the private LANs' subnets and for public LANs that run the DHCP server (the router names their hosts; a public LAN without it leaves its reverse zone to the ISP), the router's own name; static leases resolve even before they are active.
+- **Rebinding protection**: upstream answers containing RFC 1918, shared (100.64/10), link-local, ULA, loopback, broadcast, the private LANs' subnets or the router's own addresses (LAN and WAN) are dropped unless the name is on a configured allow-list. A public LAN's addresses are valid answers.
 - Blocklists (the Rustik Block design) slot in as named sets consulted before forwarding, answering NXDOMAIN or `0.0.0.0`/`::`.
 - Implementation MAY use `hickory-proto` for wire format or an in-tree parser; either way the parser has a fuzz target.
 
@@ -367,10 +368,16 @@ interval_secs = 5
 upload_kbit = 110000
 link = "ethernet"          # ethernet | vdsl-ptm | docsis | custom; PPPoE/VLAN overhead added automatically
 
+[[public_ipv4]]            # a block the ISP routes to this router (§7.4, §7.5)
+prefix = "192.0.2.232/29"  # a LAN numbered from it is a public LAN: no NAT, inbound by rule
+[[public_ipv4]]
+prefix = "192.0.2.248/29"  # addresses for port forwards
+
 [[lans]]
 name = "lan0"
 ports = ["p1", "p2", "p3"]
 ipv4 = "192.168.1.1/24"
+reaches = ["wan", "guest"] # zones this LAN may initiate into: "wan", LAN names, or "none"; absent = ["wan"]
 [lans.dhcp]
 range = ["192.168.1.100", "192.168.1.250"]
 lease_secs = 43200
@@ -379,15 +386,31 @@ mac = "aa:bb:cc:dd:ee:ff"
 ip = "192.168.1.10"
 hostname = "nas"
 
+[[lans]]
+name = "guest"
+ports = ["p3.223"]         # tagged VLAN 223 on p3, which carries lan0 untagged (§7.1)
+ipv4 = "192.168.2.1/24"
+
+[[lans]]
+name = "dmz"
+ports = ["p4"]
+ipv4 = "192.0.2.233/29"    # inside a declared block: a public LAN
+
 [firewall]
-wan_ping = false           # answer ICMP echo on WAN zones
-# zone policies stay as §7.5 defines until the panel (M4) exposes them
+wan_ping = false           # answer ICMP echo on WAN zones (rate limited)
 [[firewall.port_forwards]]
 name = "nas-ssh"
+# address = "192.0.2.249"  # a public-block address to listen on; omitted = the WAN address
 proto = "tcp"              # tcp | udp
 port = 2222                # never one of the router's own ports (53, 67, 68, 80, 123, 443)
 to = "192.168.1.10"        # inside a LAN subnet
 to_port = 22               # 0 = same as port
+[[firewall.rules]]         # a hole, never a translation (§7.5)
+name = "dmz-web"
+from = "wan"               # "wan" or a LAN name
+to = "192.0.2.234-192.0.2.238"  # an address, an a-b range or a CIDR inside one LAN
+proto = "tcp"              # tcp | udp | icmp | any
+ports = ["80", "443"]      # tcp/udp only; "1000-1010" is a range
 
 [dns]
 upstreams = []             # empty = learned from the active WAN
@@ -448,7 +471,7 @@ Vue 3 + TypeScript, built with Vite, embedded into the binary at build time. Pag
 
 - **Unit**: sans-IO cores against synthesised and recorded packets (`tests/fixtures/*.pcap`; no credentials committed); property tests (`proptest`) on parsers; reconcilers against World fixtures with `insta` snapshots of desired state (ruleset JSON, route sets, RA contents).
 - **Fuzzing**: `cargo fuzz` targets for every parser (DHCPv4, DHCPv6, ND/RA, PPPoE, LCP/IPCP/IPV6CP/PAP/CHAP, DNS, config TOML), run in a nightly CI job with a checked-in corpus.
-- **Harness** (`harness/`): the router runs in QEMU (KVM when the runner has it, TCG otherwise; i6300esb watchdog; virtio-net ports `p0` = WAN A, `p1` = WAN B, `p2` = LAN) attached through tap devices to network namespaces on the CI host. ISP namespaces run **reference daemons**: Kea (DHCPv4; DHCPv6 IA_NA and IA_PD), radvd, `pppoe-server` + pppd (PAP/CHAP, IPCP, IPV6CP, RFC 4638) with odhcpd or Kea for PD over PPP, plus HTTP and DNS targets. The LAN namespace runs a Rust test client (DHCPv4, SLAAC/DHCPv6, DNS, HTTP). Scenarios: link flap, lease expiry, prefix change, PADT, ISP down/up, power cut during update, broken-image rollback.
+- **Harness** (`harness/`): the router runs in QEMU (KVM when the runner has it, TCG otherwise; i6300esb watchdog; virtio-net ports `p0` = WAN A, `p1` = WAN B, `p2` = LAN, and `p3` = a second LAN namespace `lan1` for the scenarios that ask for two LANs) attached through tap devices to network namespaces on the CI host. ISP namespaces run **reference daemons**: Kea (DHCPv4; DHCPv6 IA_NA and IA_PD), radvd, `pppoe-server` + pppd (PAP/CHAP, IPCP, IPV6CP, RFC 4638) with odhcpd or Kea for PD over PPP, plus HTTP and DNS targets. The LAN namespace runs a Rust test client (DHCPv4, SLAAC/DHCPv6, DNS, HTTP). Scenarios: link flap, lease expiry, prefix change, PADT, ISP down/up, power cut during update, broken-image rollback.
 - **Panel**: Playwright end-to-end tests against the harness VM.
 - **CI matrix**: `cargo test`, `cargo clippy -D warnings`, `cargo deny check`, `buf lint` and `buf breaking`, kernel build (cached), image build, harness scenarios for every completed milestone, nightly fuzz.
 
@@ -460,8 +483,8 @@ MVP = M0–M6 green in CI plus 30 days of dogfooding on the AAISP line. A milest
 |---|---|---|
 | **M0 Harness and skeleton** | Workspace, CI, `required.config`, x86 kernel build, initramfs, PID 1 (mounts, watchdog, supervisor, console log), harness with one ISP namespace and a LAN namespace, `openfeo.mode=vm` | VM boots to PID 1 in CI, logs version and port map; child restart observed after kill; watchdog reboot observed when heartbeats stop |
 | **M1 IPv4 router** | Port identity and roles, LAN bridge, DHCPv4 client, static WAN, World/reconcile/apply loop, netlink monitor, libnftables ruleset (zones, masquerade, port forwards, hairpin), DHCPv4 server with static leases, DNS forwarder with local names and rebinding protection, SNTP, config load/validate/migrate, kernel-option check | LAN client gets a lease, resolves `nas.home.arpa`, fetches HTTP from the ISP side through NAT; port forward reachable from WAN and via hairpin; WAN lease renews; WAN link flap recovers; a child crash does not interrupt forwarding |
-| **M2 IPv6** | WAN IPv6 client (RA, SLAAC, DHCPv6 NA/PD, DUID persistence), LAN prefix assignment, ULA, RA server, stateless DHCPv6, source-based rules, ICMPv6 policy, deprecation | LAN client gets a GUA from the delegation and reaches an ISP-side v6 server; ISP changes the prefix → LAN renumbered within 10 s, old prefix deprecated, traffic from it receives ICMPv6 unreachable; WAN v6 loss → router lifetime 0 within one RA interval |
-| **M3 PPPoE and VLAN WAN** | Discovery, LCP, PAP/CHAP, IPCP, IPV6CP, kernel plumbing, keepalive, reconnect, RFC 4638, MSS clamp, 802.1Q WAN | v4 and v6 over PPP against `pppoe-server`/pppd at MTU 1492 and 1500; AC-initiated PADT and LCP echo failure both recover; a wrong password backs off and is reported; prefix delegation over PPP works |
+| **M2 IPv6** | Part 1 (IPv4 groundwork): LAN VLANs (`pN.V` members), 802.1Q WAN, routed public IPv4 blocks with public LANs, per-LAN `reaches`, firewall rules. Then: WAN IPv6 client (RA, SLAAC, DHCPv6 NA/PD, DUID persistence), LAN prefix assignment (a statically routed prefix first class), ULA, RA server, stateless DHCPv6, source-based rules, ICMPv6 policy, deprecation | Part 1: a tagged client leases from its own LAN and reaches only what its LAN reaches; a DMZ host with a public address is reached from the ISP side only through a rule and leaves untranslated; a forward on a public address reaches a LAN host. Then: LAN client gets a GUA from the delegation and reaches an ISP-side v6 server; ISP changes the prefix → LAN renumbered within 10 s, old prefix deprecated, traffic from it receives ICMPv6 unreachable; WAN v6 loss → router lifetime 0 within one RA interval |
+| **M3 PPPoE** | Discovery, LCP, PAP/CHAP, IPCP, IPV6CP, kernel plumbing, keepalive, reconnect, RFC 4638, MSS clamp (the 802.1Q WAN landed in M2 part 1) | v4 and v6 over PPP against `pppoe-server`/pppd at MTU 1492 and 1500; AC-initiated PADT and LCP echo failure both recover; a wrong password backs off and is reported; prefix delegation over PPP works |
 | **M4 API and panel** | Proto/pbjson/protobuf-es pipeline, HTTPS, auth, WebSocket envelope and subscriptions, gRPC, Vue panel pages, first-boot wizard, commit-confirm, logs and diagnostics views, packet capture | Playwright: wizard → routing; LAN subnet changed without confirming → reverted at 60 s; capture stream opens in Wireshark; a WS upgrade with a foreign `Origin` is refused |
 | **M5 Install, update, recovery** | USB installer, GPT layout, systemd-boot and entries, signed manifest and image, A/B write and bless, health protocol, console menu, triple power-cycle, encrypted backup/restore, factory reset | Install to a virtual disk and boot; update to a deliberately broken image → three failed boots → old slot boots and reports the rollback; update to a good image → blessed after health; power cut mid-download leaves the running slot intact |
 | **M6 Multi-WAN and CAKE** | Per-WAN tables, ct marks, bound probes, failover and fail-back, mark-filtered conntrack flush, IPv6 failover semantics, CAKE per WAN, flowtable, IRQ/RPS tuning | Two ISPs: kill ISP A → traffic flows via B within the configured threshold, v6 clients move to prefix B, flows with A's mark are gone; A returns → fail-back; CAKE present with the configured parameters (netlink dump) and qdisc stats visible in the panel |

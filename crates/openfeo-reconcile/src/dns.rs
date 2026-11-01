@@ -56,7 +56,10 @@ pub struct DesiredDns {
     /// The active WAN's address: never a valid upstream answer, and not an A record of the
     /// router's name.
     pub wan_addrs: Vec<Ipv4Addr>,
+    /// The reverse zones: the private LANs, and public LANs that run the DHCP server (SPEC §7.7).
     pub lan_subnets: Vec<Ipv4Net>,
+    /// The rebinding guard: the private LANs' subnets.
+    pub guard_subnets: Vec<Ipv4Net>,
     /// Every LAN's reservations with a hostname, then lease facts with a hostname not already
     /// named.
     pub local: Vec<DesiredLocalName>,
@@ -81,8 +84,10 @@ pub fn desired(world: &World) -> DesiredDns {
         .to_ascii_lowercase();
     let dns = world.config.dns.clone().unwrap_or_default();
 
+    let blocks = crate::public::blocks(&world.config);
     let mut listeners = Vec::new();
     let mut lan_subnets = Vec::new();
+    let mut guard_subnets = Vec::new();
     let mut local: Vec<DesiredLocalName> = Vec::new();
     for lan in &world.config.lans {
         let Ok(net) = lan.ipv4.parse::<Ipv4Net>() else {
@@ -92,7 +97,13 @@ pub fn desired(world: &World) -> DesiredDns {
             ifname: bridge_name(&lan.name),
             address: net.addr(),
         });
-        lan_subnets.push(net.trunc());
+        let public = crate::public::lan_is_public(lan, &blocks);
+        if !public || lan.dhcp.is_some() {
+            lan_subnets.push(net.trunc());
+        }
+        if !public {
+            guard_subnets.push(net.trunc());
+        }
         for reservation in lan.dhcp.iter().flat_map(|dhcp| &dhcp.r#static) {
             if let Ok(addr) = reservation.ip.parse::<Ipv4Addr>()
                 && !reservation.hostname.is_empty()
@@ -144,6 +155,7 @@ pub fn desired(world: &World) -> DesiredDns {
         router_name: format!("{hostname}.{domain}"),
         domain,
         lan_subnets,
+        guard_subnets,
         local,
         rebind_allow: dns.rebind_allow,
     }
@@ -176,6 +188,7 @@ pub fn forwarder_config(desired: &DesiredDns) -> Config {
         router_addrs: desired.router_addrs.clone(),
         wan_addrs: desired.wan_addrs.clone(),
         lan_subnets: desired.lan_subnets.clone(),
+        guard_subnets: desired.guard_subnets.clone(),
         local: desired
             .local
             .iter()
@@ -387,6 +400,38 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn public_lans_leave_the_guard_and_the_reverse_zones_unless_they_run_dhcp() {
+        let d = desired(&fixtures::public_world()); // the DMZ runs no DHCP
+        let private: Vec<Ipv4Net> = vec!["192.168.1.0/24".parse().unwrap()];
+        assert_eq!(d.guard_subnets, private);
+        assert_eq!(
+            d.lan_subnets, private,
+            "the ISP owns the DMZ's reverse zone"
+        );
+        let mut world = fixtures::public_world();
+        let mut config = (*world.config).clone();
+        config.lans[1].dhcp = Some(openfeo_config::LanDhcp {
+            range: vec!["192.0.2.234".into(), "192.0.2.238".into()],
+            ..Default::default()
+        });
+        world.config = Arc::new(config);
+        let d = desired(&world);
+        assert_eq!(
+            d.lan_subnets.len(),
+            2,
+            "a DHCP-served public LAN names its hosts, so its reverse zone is local"
+        );
+        assert_eq!(
+            d.guard_subnets, private,
+            "but its addresses stay valid answers"
+        );
+        let config = forwarder_config(&d);
+        assert_eq!(config.guard_subnets, private);
+        assert_eq!(config.lan_subnets.len(), 2);
+        insta::assert_yaml_snapshot!(d);
     }
 
     #[test]

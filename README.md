@@ -30,7 +30,12 @@ reservations, everything else through upstreams typed in or learned from the WAN
 cache, negative caching, EDNS0, TCP, and rebinding protection; block lists are the next thing to
 slot in. The router keeps its clock from SNTP servers (configured, `pool.ntp.org` by default,
 plus the ones the WAN lease names), never earlier than its own build, publishes whether it is
-synced, and serves time to the LAN, which the leases point at. That completes M1.
+synced, and serves time to the LAN, which the leases point at. That completes M1. M2 (IPv6) is
+under way, and its first part, the IPv4 groundwork, is in: a LAN member may be a tagged VLAN on a
+port (`p2.223`) and a WAN may be tagged; `[[public_ipv4]]` declares blocks the ISP routes to the
+router, so a LAN numbered from one is a DMZ that is never translated and is reached only through
+`[[firewall.rules]]`, a port forward may listen on a public address, and every block gets a
+blackhole route; each LAN says which zones it `reaches`.
 
 `SPEC.md` is the source of truth. `CLAUDE.md` holds the working rules, and every change to a
 decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
@@ -42,7 +47,7 @@ decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
 | `kernel/` | Linux 6.18 LTS built from `allnoconfig` plus checked-in fragments, with the binary as its initramfs |
 | `crates/openfeo` | The binary: argument parsing, port enumeration, the router process |
 | `crates/openfeo-init` | PID 1: mounts, sysctls, watchdog, supervisor, console log |
-| `harness/` | Rootless QEMU lab: network namespaces for a fake ISP and a LAN, reference daemons, scenario tests |
+| `harness/` | Rootless QEMU lab: network namespaces for two fake ISPs and one or two LANs (plus VLAN clients), reference daemons, scenario tests |
 
 ## Building and running the lab
 

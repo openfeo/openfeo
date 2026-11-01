@@ -18,6 +18,8 @@ wan_addrs:
   - 203.0.113.100
 lan_subnets:
   - 192.168.1.0/24
+guard_subnets:
+  - 192.168.1.0/24
 local:
   - name: nas.home.arpa
     addr: 192.168.1.10

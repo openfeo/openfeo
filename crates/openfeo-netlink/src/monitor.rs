@@ -15,14 +15,16 @@ use futures::channel::mpsc::UnboundedReceiver;
 use ipnet::IpNet;
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
-use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
-use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+use netlink_packet_route::link::{
+    InfoData, InfoKind, InfoVlan, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
+};
+use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteType};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::{Handle, MulticastGroup, RouteMessageBuilder};
 use tokio::sync::watch;
 use tracing::debug;
 
-use crate::types::{Addr, Cache, Link, LinkKind, Route};
+use crate::types::{Addr, Cache, Link, LinkKind, Route, RouteKind};
 
 /// Errors from the connection and from requests.
 #[derive(Debug, thiserror::Error)]
@@ -231,6 +233,8 @@ fn link_from(msg: &LinkMessage) -> Link {
         name: String::new(),
         kind: None,
         master: None,
+        parent: None,
+        vlan_id: None,
         up: flags.contains(LinkFlags::Up),
         carrier: flags.contains(LinkFlags::LowerUp),
         mac: None,
@@ -246,15 +250,27 @@ fn link_from(msg: &LinkMessage) -> Link {
             }
             LinkAttribute::Mtu(mtu) => link.mtu = *mtu,
             LinkAttribute::Controller(master) => link.master = Some(*master),
+            LinkAttribute::Link(parent) => link.parent = Some(*parent),
             LinkAttribute::LinkInfo(infos) => {
                 for info in infos {
-                    if let LinkInfo::Kind(kind) = info {
-                        link.kind = Some(match kind {
-                            InfoKind::Bridge => LinkKind::Bridge,
-                            InfoKind::Veth => LinkKind::Veth,
-                            InfoKind::Other(name) => LinkKind::Other(name.clone()),
-                            other => LinkKind::Other(format!("{other:?}").to_lowercase()),
-                        });
+                    match info {
+                        LinkInfo::Kind(kind) => {
+                            link.kind = Some(match kind {
+                                InfoKind::Bridge => LinkKind::Bridge,
+                                InfoKind::Veth => LinkKind::Veth,
+                                InfoKind::Vlan => LinkKind::Vlan,
+                                InfoKind::Other(name) => LinkKind::Other(name.clone()),
+                                other => LinkKind::Other(format!("{other:?}").to_lowercase()),
+                            });
+                        }
+                        LinkInfo::Data(InfoData::Vlan(vlan)) => {
+                            for data in vlan {
+                                if let InfoVlan::Id(id) = data {
+                                    link.vlan_id = Some(*id);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -298,6 +314,10 @@ fn route_from(msg: &RouteMessage) -> Option<Route> {
         oif: None,
         protocol: u8::from(msg.header.protocol),
         priority: 0,
+        kind: match msg.header.kind {
+            RouteType::BlackHole => RouteKind::Blackhole,
+            _ => RouteKind::Unicast,
+        },
     };
     for attr in &msg.attributes {
         match attr {
