@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use ipnet::Ipv4Net;
 
+use crate::rules;
 use crate::{
     Config, DhcpWan, Dns, Firewall, LanDhcp, PortMap, StaticLease, System, Wan, portname, wan,
 };
@@ -76,6 +77,19 @@ pub enum Code {
     InvalidClientId,
     /// `[dns] blocklists` is set; block lists arrive after M1 (SPEC §7.7).
     BlocklistsUnsupported,
+    /// A `[[public_ipv4]]` block that is not global unicast space or overlaps another block or a
+    /// WAN subnet.
+    InvalidPublicBlock,
+    /// A LAN numbered from global unicast space that no `[[public_ipv4]]` block declares.
+    UndeclaredPublicLan,
+    /// A port forward `address` that is not an address inside an unclaimed public block.
+    InvalidForwardAddress,
+    /// A `reaches` entry or a rule's `from` that is not `wan`, `none` (reaches only) or a LAN.
+    InvalidZone,
+    /// A rule's `to` that is not an address, range or CIDR inside one other LAN.
+    InvalidRuleTarget,
+    /// A rule's `ports` missing or wrong for tcp/udp, or present for icmp/any.
+    InvalidRulePorts,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -170,6 +184,12 @@ impl Code {
             Code::DuplicateStatic => "duplicate_static",
             Code::InvalidClientId => "invalid_client_id",
             Code::BlocklistsUnsupported => "blocklists_unsupported",
+            Code::InvalidPublicBlock => "invalid_public_block",
+            Code::UndeclaredPublicLan => "undeclared_public_lan",
+            Code::InvalidForwardAddress => "invalid_forward_address",
+            Code::InvalidZone => "invalid_zone",
+            Code::InvalidRuleTarget => "invalid_rule_target",
+            Code::InvalidRulePorts => "invalid_rule_ports",
         }
     }
 }
@@ -207,8 +227,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     let mut report = Report::default();
     let mut names: BTreeSet<&str> = BTreeSet::new();
     let mut owners = PortOwners::default();
-    let mut subnets: Vec<(String, Ipv4Net)> = Vec::new();
-    let mut lan_subnets: Vec<Ipv4Net> = Vec::new();
+    let mut pools = Pools::default();
 
     if let Some(system_config) = &config.system {
         system(&mut report, system_config);
@@ -265,30 +284,33 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
                     }
                 }
                 if let Some(net) = net {
-                    subnets.push((format!("{path}.static.address"), net));
+                    pools.subnets.push((format!("{path}.static.address"), net));
                 }
             }
         }
     }
 
+    let blocks = public_blocks(&mut report, config, &pools.subnets);
     lans(
         &mut report,
         config,
         ports,
         &mut names,
         &mut owners,
-        &mut subnets,
-        &mut lan_subnets,
+        &blocks,
+        &mut pools,
     );
 
     if let Some(firewall) = &config.firewall {
-        port_forwards(&mut report, firewall, &lan_subnets);
+        port_forwards(&mut report, firewall, &pools.lan_subnets, &blocks);
+        firewall_rules(&mut report, firewall, &pools.lans);
     }
 
     if let Some(dns_config) = &config.dns {
-        dns(&mut report, dns_config, &lan_subnets);
+        dns(&mut report, dns_config, &pools.lan_subnets);
     }
 
+    let subnets = &pools.subnets;
     for (k, (path, net)) in subnets.iter().enumerate() {
         if let Some((other_path, other)) = subnets[..k].iter().find(|(_, o)| overlaps(*o, *net)) {
             report.push(
@@ -301,17 +323,76 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     report.0
 }
 
-/// `[[lans]]`: names, members (SPEC §7.1), the subnet and `[lans.dhcp]`; the subnets join the
-/// overlap pool and the LAN list the firewall and DNS checks read.
+/// What the WAN and LAN passes collect for the checks that follow them.
+#[derive(Default)]
+struct Pools<'c> {
+    /// Every WAN static and LAN subnet with its path, for the overlap check.
+    subnets: Vec<(String, Ipv4Net)>,
+    /// Every LAN subnet as written (host bits kept), for the forward and DNS checks.
+    lan_subnets: Vec<Ipv4Net>,
+    /// Every LAN as a zone, for `reaches` and the rules.
+    lans: Vec<LanZone<'c>>,
+}
+
+/// One LAN as the firewall sees it.
+struct LanZone<'c> {
+    name: &'c str,
+    /// The subnet, when `ipv4` parsed.
+    net: Option<Ipv4Net>,
+}
+
+/// `[[public_ipv4]]` (SPEC §7.4, §7.5): every block global unicast space, disjoint from the
+/// other blocks and from the WAN static subnets. Returns the blocks that parsed.
+fn public_blocks(
+    report: &mut Report,
+    config: &Config,
+    wan_subnets: &[(String, Ipv4Net)],
+) -> Vec<Ipv4Net> {
+    let mut blocks: Vec<(String, Ipv4Net)> = Vec::new();
+    for (i, block) in config.public_ipv4.iter().enumerate() {
+        let path = format!("public_ipv4[{i}].prefix");
+        let Some(net) = report.cidr(&path, &block.prefix) else {
+            continue;
+        };
+        let net = net.trunc();
+        if !rules::is_global_unicast_v4(net) {
+            report.push(
+                path,
+                Code::InvalidPublicBlock,
+                format!("{net} is not global unicast space"),
+            );
+            continue;
+        }
+        let clash = blocks
+            .iter()
+            .chain(wan_subnets)
+            .find(|(_, other)| overlaps(*other, net));
+        if let Some((other_path, other)) = clash {
+            report.push(
+                path,
+                Code::InvalidPublicBlock,
+                format!("{net} overlaps {} ({other_path})", other.trunc()),
+            );
+            continue;
+        }
+        blocks.push((path, net));
+    }
+    blocks.into_iter().map(|(_, net)| net).collect()
+}
+
+/// `[[lans]]`: names, members (SPEC §7.1), the subnet (public space must lie inside a declared
+/// block, SPEC §7.5), `reaches` and `[lans.dhcp]`; the subnets join the overlap pool and the LAN
+/// lists the firewall and DNS checks read.
 fn lans<'c>(
     report: &mut Report,
     config: &'c Config,
     ports: &PortMap,
     names: &mut BTreeSet<&'c str>,
     owners: &mut PortOwners<'c>,
-    subnets: &mut Vec<(String, Ipv4Net)>,
-    lan_subnets: &mut Vec<Ipv4Net>,
+    blocks: &[Ipv4Net],
+    pools: &mut Pools<'c>,
 ) {
+    let lan_names: BTreeSet<&str> = config.lans.iter().map(|lan| lan.name.as_str()).collect();
     for (i, lan) in config.lans.iter().enumerate() {
         let path = format!("lans[{i}]");
         report.name(names, &format!("{path}.name"), &lan.name, MAX_LAN_NAME);
@@ -325,13 +406,132 @@ fn lans<'c>(
         for (j, member) in lan.ports.iter().enumerate() {
             lan_member(report, owners, ports, &format!("{path}.ports[{j}]"), member);
         }
-        if let Some(net) = report.cidr(&format!("{path}.ipv4"), &lan.ipv4) {
-            subnets.push((format!("{path}.ipv4"), net));
-            lan_subnets.push(net);
+        let net = report.cidr(&format!("{path}.ipv4"), &lan.ipv4);
+        if let Some(net) = net {
+            pools.subnets.push((format!("{path}.ipv4"), net));
+            pools.lan_subnets.push(net);
+            if rules::is_global_unicast_v4(net.trunc())
+                && !blocks.iter().any(|block| block.contains(&net.trunc()))
+            {
+                report.push(
+                    format!("{path}.ipv4"),
+                    Code::UndeclaredPublicLan,
+                    format!(
+                        "{} is public space that no [[public_ipv4]] block declares; declare the \
+                         block the ISP routes to this router, or use private space",
+                        net.trunc()
+                    ),
+                );
+            }
             if let Some(dhcp) = &lan.dhcp {
                 lan_dhcp(report, &path, net, dhcp);
             }
         }
+        reaches(report, &path, lan, &lan_names);
+        pools.lans.push(LanZone {
+            name: &lan.name,
+            net,
+        });
+    }
+}
+
+/// `reaches` (SPEC §7.5): each entry `"wan"`, `"none"` or another LAN's name, `"none"` alone,
+/// nothing twice. Empty means `["wan"]` and needs no check.
+fn reaches(report: &mut Report, path: &str, lan: &crate::Lan, lan_names: &BTreeSet<&str>) {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for (j, zone) in lan.reaches.iter().enumerate() {
+        let path = format!("{path}.reaches[{j}]");
+        let known = zone == "wan"
+            || zone == "none"
+            || (lan_names.contains(zone.as_str()) && *zone != lan.name);
+        if !known {
+            report.push(
+                path,
+                Code::InvalidZone,
+                format!("{zone:?} is not \"wan\", \"none\" or another LAN"),
+            );
+        } else if !seen.insert(zone) {
+            report.push(path, Code::InvalidZone, format!("{zone:?} is listed twice"));
+        } else if zone == "none" && lan.reaches.len() > 1 {
+            report.push(path, Code::InvalidZone, "\"none\" stands alone".to_owned());
+        }
+    }
+}
+
+/// `[[firewall.rules]]` (SPEC §7.5): a name, a zone to come from, a target inside one other
+/// LAN, a protocol, and ports for tcp/udp only.
+fn firewall_rules(report: &mut Report, firewall: &Firewall, lans: &[LanZone<'_>]) {
+    let mut rule_names: BTreeSet<&str> = BTreeSet::new();
+    for (i, rule) in firewall.rules.iter().enumerate() {
+        let path = format!("firewall.rules[{i}]");
+        report.name(
+            &mut rule_names,
+            &format!("{path}.name"),
+            &rule.name,
+            MAX_FORWARD_NAME,
+        );
+        if rule.from != "wan" && !lans.iter().any(|lan| lan.name == rule.from) {
+            report.push(
+                format!("{path}.from"),
+                Code::InvalidZone,
+                format!("{:?} is not \"wan\" or a LAN name", rule.from),
+            );
+        }
+        rule_target(report, &path, &rule.from, &rule.to, lans);
+        if !rules::PROTOS.contains(&rule.proto.as_str()) {
+            report.push(
+                format!("{path}.proto"),
+                Code::InvalidProto,
+                format!(
+                    "{:?} is not \"tcp\", \"udp\", \"icmp\" or \"any\"",
+                    rule.proto
+                ),
+            );
+        }
+        let wants_ports = matches!(rule.proto.as_str(), "tcp" | "udp");
+        if wants_ports && rules::parse_ports(&rule.ports).is_none() {
+            report.push(
+                format!("{path}.ports"),
+                Code::InvalidRulePorts,
+                "ports must be at least one of \"1\"-\"65535\" or an \"a-b\" range".to_owned(),
+            );
+        } else if !wants_ports && !rule.ports.is_empty() {
+            report.push(
+                format!("{path}.ports"),
+                Code::InvalidRulePorts,
+                "ports apply to tcp and udp only".to_owned(),
+            );
+        }
+    }
+}
+
+/// A rule's `to`: an address, an `a-b` range or a CIDR, inside exactly one LAN that is not the
+/// zone the rule comes from.
+fn rule_target(report: &mut Report, path: &str, from: &str, to: &str, lans: &[LanZone<'_>]) {
+    let path = format!("{path}.to");
+    let Some(target) = rules::parse_target(to) else {
+        report.push(
+            path,
+            Code::InvalidRuleTarget,
+            format!("{to:?} is not an address, an a-b range or a CIDR"),
+        );
+        return;
+    };
+    let inside = lans
+        .iter()
+        .find(|lan| lan.net.is_some_and(|net| target.within(net.trunc())));
+    match inside {
+        None => report.push(
+            path,
+            Code::InvalidRuleTarget,
+            format!("{to} is inside no LAN subnet"),
+        ),
+        Some(lan) if lan.name == from => report.push(
+            path,
+            Code::InvalidRuleTarget,
+            format!("{to} is inside {from:?} itself; a rule opens a hole from another zone"),
+        ),
+        Some(_) => {}
     }
 }
 
@@ -609,9 +809,14 @@ fn is_valid_client_id(text: &str) -> bool {
 
 /// `firewall.port_forwards[i]`: name, protocol, port (not one of the router's own), target
 /// inside a LAN, target port.
-fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Net]) {
+fn port_forwards(
+    report: &mut Report,
+    firewall: &Firewall,
+    lan_subnets: &[Ipv4Net],
+    blocks: &[Ipv4Net],
+) {
     let mut forward_names: BTreeSet<&str> = BTreeSet::new();
-    let mut forwarded: BTreeSet<(&str, u16)> = BTreeSet::new();
+    let mut forwarded: BTreeSet<(&str, &str, u16)> = BTreeSet::new();
     for (i, forward) in firewall.port_forwards.iter().enumerate() {
         let path = format!("firewall.port_forwards[{i}]");
         report.name(
@@ -620,6 +825,9 @@ fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Ne
             &forward.name,
             MAX_FORWARD_NAME,
         );
+        if !forward.address.is_empty() {
+            forward_address(report, &path, &forward.address, lan_subnets, blocks);
+        }
         if !matches!(forward.proto.as_str(), "tcp" | "udp") {
             report.push(
                 format!("{path}.proto"),
@@ -629,17 +837,31 @@ fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Ne
         }
         match u16::try_from(forward.port) {
             Ok(port) if port != 0 => {
-                if RESERVED_WAN_PORTS.contains(&port) {
+                // The router serves nothing on a public-block address, so a forward there may
+                // take any port; on the WAN address the router's own services win.
+                if RESERVED_WAN_PORTS.contains(&port) && forward.address.is_empty() {
                     report.push(
                         format!("{path}.port"),
                         Code::ReservedPort,
                         format!("port {port} is one of the router's own services"),
                     );
-                } else if !forwarded.insert((forward.proto.as_str(), port)) {
+                } else if !forwarded.insert((
+                    forward.address.as_str(),
+                    forward.proto.as_str(),
+                    port,
+                )) {
                     report.push(
                         format!("{path}.port"),
                         Code::DuplicateForward,
-                        format!("{port}/{} is already forwarded", forward.proto),
+                        format!(
+                            "{port}/{} is already forwarded on {}",
+                            forward.proto,
+                            if forward.address.is_empty() {
+                                "the WAN address"
+                            } else {
+                                forward.address.as_str()
+                            }
+                        ),
                     );
                 }
             }
@@ -668,6 +890,47 @@ fn port_forwards(report: &mut Report, firewall: &Firewall, lan_subnets: &[Ipv4Ne
                 ),
             );
         }
+    }
+}
+
+/// A forward's `address` (SPEC §7.5): an address inside a declared public block, outside every
+/// LAN subnet, and neither the block's network nor its broadcast address.
+fn forward_address(
+    report: &mut Report,
+    path: &str,
+    text: &str,
+    lan_subnets: &[Ipv4Net],
+    blocks: &[Ipv4Net],
+) {
+    let path = format!("{path}.address");
+    let Ok(addr) = text.parse::<Ipv4Addr>() else {
+        report.push(
+            path,
+            Code::InvalidForwardAddress,
+            format!("{text:?} is not an IPv4 address"),
+        );
+        return;
+    };
+    let Some(block) = blocks.iter().find(|block| block.contains(&addr)) else {
+        report.push(
+            path,
+            Code::InvalidForwardAddress,
+            format!("{addr} is inside no [[public_ipv4]] block"),
+        );
+        return;
+    };
+    if let Some(lan) = lan_subnets.iter().find(|net| net.contains(&addr)) {
+        report.push(
+            path,
+            Code::InvalidForwardAddress,
+            format!("{addr} is inside the LAN subnet {}", lan.trunc()),
+        );
+    } else if addr == block.network() || addr == block.broadcast() {
+        report.push(
+            path,
+            Code::InvalidForwardAddress,
+            format!("{addr} is the network or broadcast address of {block}"),
+        );
     }
 }
 
@@ -918,7 +1181,8 @@ impl Report {
 mod tests {
     use super::*;
     use crate::{
-        Config, DhcpWan, Firewall, Lan, PortForward, PortMap, PortMapEntry, StaticWan, Wan, wan,
+        Config, DhcpWan, Firewall, Lan, PortForward, PortMap, PortMapEntry, PublicIpv4, Rule,
+        StaticWan, Wan, wan,
     };
 
     fn entry(id: &str, name: &str) -> PortMapEntry {
@@ -1261,6 +1525,210 @@ mod tests {
             rules: Vec::new(),
         });
         cfg
+    }
+
+    fn public(prefixes: &[&str]) -> Vec<PublicIpv4> {
+        prefixes
+            .iter()
+            .map(|p| PublicIpv4 {
+                prefix: (*p).to_owned(),
+            })
+            .collect()
+    }
+
+    fn rule(name: &str, from: &str, to: &str, proto: &str, ports: &[&str]) -> Rule {
+        Rule {
+            name: name.into(),
+            from: from.into(),
+            to: to.into(),
+            proto: proto.into(),
+            ports: ports.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_public_lan_is_accepted_inside_a_declared_block() {
+        let mut cfg = base();
+        cfg.public_ipv4 = public(&["192.0.2.232/29", "192.0.2.248/29"]);
+        cfg.lans[0].ports = vec!["p1".into()];
+        cfg.lans.push(lan("dmz", &["p2"], "192.0.2.233/29"));
+        assert_eq!(found(&cfg), vec![]);
+    }
+
+    #[test]
+    fn a_lan_in_global_space_must_be_inside_a_declared_block() {
+        let mut cfg = base();
+        cfg.lans[0].ipv4 = "192.0.2.233/29".into();
+        let violations = validate(&cfg, &live());
+        assert_eq!(
+            violations[0].code,
+            Code::UndeclaredPublicLan,
+            "{violations:?}"
+        );
+        assert!(
+            violations[0].message.contains("[[public_ipv4]]"),
+            "{}",
+            violations[0].message
+        );
+    }
+
+    #[test]
+    fn public_blocks_must_be_global_and_disjoint_from_each_other_and_from_private_lans() {
+        let mut cfg = base();
+        cfg.public_ipv4 = public(&[
+            "10.9.0.0/29",
+            "192.0.2.232/29",
+            "192.0.2.232/30",
+            "192.168.1.0/24",
+        ]);
+        let codes = codes(&cfg);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| **c == Code::InvalidPublicBlock)
+                .count(),
+            3,
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn a_forward_address_comes_from_an_unclaimed_block_and_joins_the_duplicate_key() {
+        let mut cfg = with_forwards(vec![
+            forward("a", "tcp", 8443, "192.168.1.2", 0),
+            forward("b", "tcp", 443, "192.168.1.3", 0),
+        ]);
+        cfg.public_ipv4 = public(&["192.0.2.248/29"]);
+        cfg.firewall.as_mut().unwrap().port_forwards[1].address = "192.0.2.249".into();
+        assert_eq!(
+            found(&cfg),
+            vec![],
+            "443 is the router's own port on the WAN address only; a public address may forward it"
+        );
+        let first = &mut cfg.firewall.as_mut().unwrap().port_forwards[0];
+        first.address = "192.0.2.249".into();
+        first.port = 443;
+        assert!(
+            codes(&cfg).contains(&Code::DuplicateForward),
+            "the same address, protocol and port twice: {:?}",
+            found(&cfg)
+        );
+        for bad in [
+            "192.0.2.248",
+            "192.0.2.255",
+            "192.168.1.9",
+            "203.0.113.77",
+            "nope",
+        ] {
+            cfg.firewall.as_mut().unwrap().port_forwards[0].address = bad.into();
+            assert!(
+                codes(&cfg).contains(&Code::InvalidForwardAddress),
+                "{bad}: {:?}",
+                found(&cfg)
+            );
+        }
+    }
+
+    #[test]
+    fn reaches_names_wan_none_or_another_lan() {
+        let mut cfg = base();
+        cfg.lans[0].ports = vec!["p2".into()];
+        cfg.lans.push(lan("guest", &["p1"], "192.168.2.1/24"));
+        cfg.lans[0].reaches = vec!["wan".into(), "guest".into()];
+        assert_eq!(found(&cfg), vec![]);
+        cfg.lans[0].reaches = vec!["none".into()];
+        assert_eq!(found(&cfg), vec![]);
+        for bad in [
+            vec!["lan0"],
+            vec!["wan", "wan"],
+            vec!["none", "wan"],
+            vec!["dmz"],
+        ] {
+            cfg.lans[0].reaches = bad.iter().map(|s| (*s).to_owned()).collect();
+            assert!(codes(&cfg).contains(&Code::InvalidZone), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rules_name_a_zone_a_target_inside_another_lan_a_proto_and_ports() {
+        type Case<'a> = (&'a str, &'a str, &'a str, &'a str, &'a [&'a str], Code);
+        let mut cfg = base();
+        cfg.lans[0].ports = vec!["p2".into()];
+        cfg.lans.push(lan("dmz", &["p1"], "192.0.2.233/29"));
+        cfg.public_ipv4 = public(&["192.0.2.232/29"]);
+        let fw = cfg.firewall.get_or_insert_with(Default::default);
+        fw.rules = vec![
+            rule(
+                "dmz-web",
+                "wan",
+                "192.0.2.234-192.0.2.238",
+                "tcp",
+                &["80", "443"],
+            ),
+            rule("ping-dmz", "lan0", "192.0.2.232/29", "icmp", &[]),
+            rule("all-dmz", "lan0", "192.0.2.237", "any", &[]),
+        ];
+        assert_eq!(found(&cfg), vec![]);
+        let cases: [Case<'_>; 7] = [
+            (
+                "x",
+                "wan",
+                "192.0.2.234",
+                "tcp",
+                &[],
+                Code::InvalidRulePorts,
+            ),
+            (
+                "y",
+                "wan",
+                "192.0.2.234",
+                "icmp",
+                &["80"],
+                Code::InvalidRulePorts,
+            ),
+            ("z", "wan", "192.0.2.234", "gre", &[], Code::InvalidProto),
+            (
+                "w",
+                "dmz",
+                "192.0.2.234",
+                "tcp",
+                &["80"],
+                Code::InvalidRuleTarget,
+            ),
+            (
+                "v",
+                "wan",
+                "203.0.113.5",
+                "tcp",
+                &["80"],
+                Code::InvalidRuleTarget,
+            ),
+            (
+                "u",
+                "nowhere",
+                "192.0.2.234",
+                "tcp",
+                &["80"],
+                Code::InvalidZone,
+            ),
+            (
+                "dmz-web",
+                "wan",
+                "192.0.2.234",
+                "tcp",
+                &["80"],
+                Code::DuplicateName,
+            ),
+        ];
+        for (name, from, to, proto, ports, code) in cases {
+            let mut c = cfg.clone();
+            c.firewall
+                .as_mut()
+                .unwrap()
+                .rules
+                .push(rule(name, from, to, proto, ports));
+            assert!(codes(&c).contains(&code), "{name}: {:?}", found(&c));
+        }
     }
 
     #[test]
