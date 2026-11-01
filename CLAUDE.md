@@ -57,3 +57,16 @@ floor; Kea's one template serves 60-second leases
 renewing at 20 s to every lab run, so a renewal is observable within a scenario. CI runs Ubuntu 24.04's Kea
 2.4.1, so the template uses only what that version accepts (option 121 is given by code as RFC 3442 bytes);
 `make check-env` tests the template against the installed Kea and prints Kea's own error when it refuses.
+
+## Cloud sandbox
+`scripts/cloud-setup.sh` is the setup script for an ephemeral Ubuntu 24.04 sandbox (a Claude Code on the web
+environment: about 4 vCPUs, root, no shell of your own). It does to the VM what `.github/workflows/ci.yml` does to
+a runner (packages, the Rust toolchain, `buf`, `cargo-deny`, the pinned sources and UAPI headers, the kernel knobs
+the harness wants where the VM allows them) and prints the sandbox's facts. It builds nothing, to stay within the
+five-minute budget that gets the filesystem snapshotted for later sessions; sources and build products live in
+`BUILD=/opt/openfeo/build`, outside the clone, and the environment sets the same `BUILD` so every `make` reuses
+them. In such a session run `make check-env` before trusting the harness: without `/dev/kvm` QEMU runs under TCG
+(about 1.2x the KVM wall time, not broken), without the nft and `8021q` modules those scenarios skip with a reason,
+and `OPENFEO_NO_SKIP` stays unset (it is CI's assertion). `make kernel` and `make test-harness` outlast a
+foreground command there, so run them in the background; build the kernel once per session and only when a QEMU
+scenario is needed, since `make lint` and `make test` do not need it.
