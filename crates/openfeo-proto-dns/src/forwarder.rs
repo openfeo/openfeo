@@ -183,6 +183,9 @@ struct Pending {
     attempts: u8,
     /// When the last send failed: the time to send again. The upstream has not been asked.
     retry_at: Option<Timestamp>,
+    /// Whether a send failed during this attempt: the upstream was not asked for the whole
+    /// wait, so its silence at the deadline is no verdict on it.
+    retried: bool,
 }
 
 impl Pending {
@@ -366,6 +369,7 @@ impl Forwarder {
             deadline: now + UPSTREAM_TIMEOUT,
             attempts: 1,
             retry_at: None,
+            retried: false,
         };
         vec![self.send_upstream(pending)]
     }
@@ -433,6 +437,7 @@ impl Forwarder {
             pending.upstream_transport = Transport::Tcp;
             pending.deadline = now + UPSTREAM_TIMEOUT;
             pending.retry_at = None;
+            pending.retried = false;
             outputs.push(self.send_upstream_as(uid, pending));
             return outputs;
         }
@@ -453,6 +458,7 @@ impl Forwarder {
             pending.deadline = now + UPSTREAM_TIMEOUT;
             pending.attempts += 1;
             pending.retry_at = None;
+            pending.retried = false;
             outputs.push(self.send_upstream(pending));
             return outputs;
         }
@@ -505,14 +511,16 @@ impl Forwarder {
             && pending.upstream_transport == transport
         {
             pending.retry_at = Some(now + FORWARD_RETRY);
+            pending.retried = true;
         }
         Vec::new()
     }
 
     /// Every pending query past its deadline: its upstream goes down (unless the wait was for a
-    /// TCP retry, which the upstream had already answered over UDP, or the last send failed and
-    /// the upstream was never asked), and it moves to the next upstream or fails. Every query
-    /// whose retry is due is sent again to the same upstream under the same id.
+    /// TCP retry, which the upstream had already answered over UDP, or a send failed during the
+    /// attempt, so the upstream was not asked for the whole wait), and it moves to the next
+    /// upstream or fails. Every query whose retry is due is sent again to the same upstream under
+    /// the same id.
     fn timeout(&mut self, now: Timestamp) -> Vec<Output> {
         let expired: Vec<u16> = self
             .pending
@@ -526,7 +534,7 @@ impl Forwarder {
                 continue;
             };
             let failed = pending.upstream;
-            let silent = pending.upstream_transport == Transport::Udp && pending.retry_at.is_none();
+            let silent = pending.upstream_transport == Transport::Udp && !pending.retried;
             if silent && self.down.insert(failed, now + UPSTREAM_DOWN_HOLD).is_none() {
                 outputs.push(Output::Event(Event::UpstreamDown(failed)));
             }
@@ -542,6 +550,7 @@ impl Forwarder {
                     pending.deadline = now + UPSTREAM_TIMEOUT;
                     pending.attempts += 1;
                     pending.retry_at = None;
+                    pending.retried = false;
                     outputs.push(self.send_upstream(pending));
                 }
                 None => outputs.push(servfail(&pending)),
@@ -1441,6 +1450,48 @@ mod tests {
             upstream,
             "still the upstream of choice"
         );
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Output::Event(Event::UpstreamUp(_)))),
+            "it was never down: {out:?}"
+        );
+    }
+
+    /// A resend that goes out late in the window (the route came back at 1.75 s) leaves the
+    /// upstream only the rest of the attempt to answer; silence over so short a wait is no
+    /// verdict, so the query fails without the 30 s hold and the next query asks it afresh.
+    #[test]
+    fn a_late_resend_does_not_mark_the_upstream_down() {
+        let mut f = Forwarder::new(config(), 1);
+        let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        let mut now = 0;
+        while now < 1_750 {
+            f.handle(
+                Input::ForwardFailed {
+                    upstream,
+                    transport,
+                    bytes: fwd.encode(),
+                },
+                now,
+            );
+            now = f.next_timeout().unwrap();
+            let out = f.handle(Input::Timeout, now);
+            assert_eq!(forwards(&out).len(), 1, "resent at {now}");
+        }
+        // The resend at 1750 went out and the upstream does not answer within the 250 ms left.
+        let out = f.handle(Input::Timeout, UPSTREAM_TIMEOUT);
+        assert_eq!(reply(&out).header.rcode, rcode::SERVFAIL);
+        assert!(
+            !out.contains(&Output::Event(Event::UpstreamDown(upstream))),
+            "asked for only {} ms, yet held down: {out:?}",
+            UPSTREAM_TIMEOUT - now
+        );
+        let out = f.handle(
+            client(2, Transport::Udp, q("other.example", rtype::A)),
+            UPSTREAM_TIMEOUT + 1,
+        );
+        assert_eq!(forwards(&out)[0].0, upstream, "asked afresh");
         assert!(
             !out.iter()
                 .any(|o| matches!(o, Output::Event(Event::UpstreamUp(_)))),
