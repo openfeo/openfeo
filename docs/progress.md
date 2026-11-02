@@ -10,7 +10,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 |---|---|---|
 | M0 Harness and skeleton | done, 2026-10-30 | commits on `main`, before the repository took pull requests |
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
-| M2 IPv6 | part 1 done, 2026-11-01; parts 2 and 3 to come | #10 |
+| M2 IPv6 | part 1 done, 2026-11-01; parts 2 and 3 to come | #10; follow-up #20 |
 | M3 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -81,6 +81,12 @@ every block gets a blackhole route, and a port forward may listen on a public ad
 is rate limited (§7.5); the DNS rebinding guard is the private LANs only (§7.7). Follow-up found
 while timing the harness without KVM: [#12](https://github.com/openfeo/openfeo/issues/12), a query
 forwarded before the WAN route exists holds the only upstream down.
+
+**2026-11-02, [#20](https://github.com/openfeo/openfeo/pull/20), follow-up.** The fix for
+[#12](https://github.com/openfeo/openfeo/issues/12): a forward the driver could not send (no
+route to the upstream yet) is sent again a quarter of a second later under the same id and never
+counts as a silence, and an attempt in which a send failed marks no upstream down. The m1
+learned-upstream scenario passes under TCG, where it failed.
 
 Parts 2 and 3 are scoped in SPEC §12: a statically routed prefix as the first-class path, then
 DHCPv6 and the other-ISP cases.
