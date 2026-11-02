@@ -296,9 +296,26 @@ impl DnsDriver {
         id
     }
 
-    /// Send what the core wants sent, keep the events.
+    /// Send what the core wants sent, keep the events. A UDP forward that cannot be sent (no
+    /// route to the upstream yet: issue #12) goes back to the core as [`Input::ForwardFailed`],
+    /// which answers with a timer, never another forward, so one round of that is enough.
     fn perform(&mut self, outputs: Vec<Output>) -> Vec<Event> {
         let mut events = Vec::new();
+        let failed = self.perform_round(outputs, &mut events);
+        if !failed.is_empty() {
+            let now = self.now();
+            let outputs: Vec<Output> = failed
+                .into_iter()
+                .flat_map(|input| self.forwarder.handle(input, now))
+                .collect();
+            self.perform_round(outputs, &mut events);
+        }
+        events
+    }
+
+    /// One pass over `outputs`; the UDP forwards that could not be sent come back as inputs.
+    fn perform_round(&mut self, outputs: Vec<Output>, events: &mut Vec<Event>) -> Vec<Input> {
+        let mut failed = Vec::new();
         for output in outputs {
             match output {
                 Output::Reply { id, bytes } => self.reply(id, bytes),
@@ -306,7 +323,15 @@ impl DnsDriver {
                     upstream,
                     transport: Transport::Udp,
                     bytes,
-                } => self.forward_udp(upstream, &bytes),
+                } => {
+                    if !self.forward_udp(upstream, &bytes) {
+                        failed.push(Input::ForwardFailed {
+                            upstream,
+                            transport: Transport::Udp,
+                            bytes,
+                        });
+                    }
+                }
                 Output::Forward {
                     upstream,
                     transport: Transport::Tcp,
@@ -323,7 +348,7 @@ impl DnsDriver {
                 }
             }
         }
-        events
+        failed
     }
 
     /// A reply to the client the id belongs to. A send that fails is logged, not fatal: the
@@ -355,18 +380,21 @@ impl DnsDriver {
         }
     }
 
-    /// The upstream query over the pool socket its id selects.
-    fn forward_udp(&mut self, upstream: Ipv4Addr, bytes: &[u8]) {
+    /// The upstream query over the pool socket its id selects. `false` when it was not sent.
+    fn forward_udp(&mut self, upstream: Ipv4Addr, bytes: &[u8]) -> bool {
         let index = bytes
             .first_chunk::<2>()
             .map_or(0, |id| usize::from(u16::from_be_bytes(*id)))
             % self.upstream.len().max(1);
         let Some(socket) = self.upstream.get(index) else {
-            return;
+            return false;
         };
         let to = SocketAddr::V4(SocketAddrV4::new(upstream, DNS_PORT));
         match socket.try_send_to(bytes, to) {
-            Ok(_) => self.stats.forwarded += 1,
+            Ok(_) => {
+                self.stats.forwarded += 1;
+                true
+            }
             Err(err) => {
                 // Every LAN query ends here while the upstreams have no route (before the WAN
                 // lease, during an outage): one line per window, the rest counted.
@@ -376,6 +404,7 @@ impl DnsDriver {
                 } else {
                     debug!("{line}");
                 }
+                false
             }
         }
     }
