@@ -947,6 +947,7 @@ name = "openfeo-apply"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "openfeo-config",
  "openfeo-netlink",
  "openfeo-nft",
  "openfeo-platform",

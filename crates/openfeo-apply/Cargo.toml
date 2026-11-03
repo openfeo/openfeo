@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+openfeo-config = { path = "../openfeo-config" }
 openfeo-netlink = { path = "../openfeo-netlink" }
 openfeo-nft = { path = "../openfeo-nft" }
 openfeo-platform = { path = "../openfeo-platform" }

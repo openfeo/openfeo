@@ -88,6 +88,11 @@ route to the upstream yet) is sent again a quarter of a second later under the s
 counts as a silence, and an attempt in which a send failed marks no upstream down. The m1
 learned-upstream scenario passes under TCG, where it failed.
 
+**2026-11-03, follow-up.** The fix for [#16](https://github.com/openfeo/openfeo/issues/16): the
+applier decides which links it owns with the configuration's port-name grammar instead of its own
+copy, so `p1.0` and `p1.5000`, which the config refuses, are no longer taken for VLAN
+sub-interfaces it may delete.
+
 Parts 2 and 3 are scoped in SPEC §12: a statically routed prefix as the first-class path, then
 DHCPv6 and the other-ISP cases.
 

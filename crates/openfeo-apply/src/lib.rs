@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+use openfeo_config::portname::parse_port_ref;
+
 pub mod links;
 pub mod nft;
 pub mod routing;
@@ -128,25 +130,18 @@ impl Pass {
 }
 
 /// The interfaces OpenFeO manages, by name: its bridges, its physical ports and their VLAN
-/// sub-interfaces `pN.V` (SPEC §7.1, ADR-0017).
+/// sub-interfaces `pN.V` (SPEC §7.1, ADR-0017). Port names follow the configuration's one grammar
+/// (`openfeo_config::portname`), so a name the config refuses, such as `p1.0` or `p1.5000`, is
+/// never managed.
 #[must_use]
 pub fn is_managed(ifname: &str) -> bool {
-    ifname.starts_with("br-") || is_vlan_port_name(ifname) || is_port_name(ifname)
+    ifname.starts_with("br-") || parse_port_ref(ifname).is_some()
 }
 
-/// `p<digits>`.
-fn is_port_name(ifname: &str) -> bool {
-    ifname
-        .strip_prefix('p')
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// `p<digits>.<digits>`: a VLAN sub-interface of a port.
+/// `pN.V` with `V` in 1..=4094: a VLAN sub-interface of a port.
 #[must_use]
 pub fn is_vlan_port_name(ifname: &str) -> bool {
-    ifname.split_once('.').is_some_and(|(port, vid)| {
-        is_port_name(port) && !vid.is_empty() && vid.bytes().all(|b| b.is_ascii_digit())
-    })
+    parse_port_ref(ifname).is_some_and(|port| port.vlan.is_some())
 }
 
 #[cfg(test)]
@@ -177,8 +172,31 @@ mod tests {
         for name in ["p0.101", "p12.4094"] {
             assert!(is_managed(name), "{name}");
         }
-        for name in ["p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6"] {
+        for name in [
+            "p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6", "p1.0", "p1.4095", "p1.5000",
+        ] {
             assert!(!is_managed(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn managed_names_agree_with_the_config_grammar() {
+        use openfeo_config::portname::{MAX_VLAN, MIN_VLAN, parse_port_ref, vlan_ifname};
+        for name in [
+            "p0", "p12", "p1.1", "p1.4094", "p1.0", "p1.4095", "p1.", "p1a", "eth0.5",
+        ] {
+            let parsed = parse_port_ref(name);
+            assert_eq!(is_managed(name), parsed.is_some(), "{name}");
+            assert_eq!(
+                is_vlan_port_name(name),
+                parsed.is_some_and(|r| r.vlan.is_some()),
+                "{name}"
+            );
+        }
+        for vlan in [MIN_VLAN, MAX_VLAN] {
+            let name = vlan_ifname("p3", vlan);
+            assert!(is_vlan_port_name(&name), "{name}");
+            assert!(is_managed(&name), "{name}");
         }
     }
 }
