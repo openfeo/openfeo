@@ -24,16 +24,19 @@ const CLIENT: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 50);
 
 fn config() -> Config {
     Config {
-        upstreams: vec![Ipv4Addr::new(203, 0, 113, 1), Ipv4Addr::new(203, 0, 113, 2)],
+        upstreams: vec![
+            Ipv4Addr::new(203, 0, 113, 1).into(),
+            Ipv4Addr::new(203, 0, 113, 2).into(),
+        ],
         domain: "home.arpa".parse().expect("a name"),
         router_name: Some("openfeo.home.arpa".parse().expect("a name")),
-        router_addrs: vec![Ipv4Addr::new(192, 168, 1, 1)],
+        router_addrs: vec![Ipv4Addr::new(192, 168, 1, 1).into()],
         wan_addrs: Vec::new(),
         lan_subnets: vec!["192.168.1.0/24".parse().expect("a subnet")],
         guard_subnets: vec!["192.168.1.0/24".parse().expect("a subnet")],
         local: vec![LocalRecord {
             name: "nas.home.arpa".parse().expect("a name"),
-            addr: Ipv4Addr::new(192, 168, 1, 10),
+            addr: Ipv4Addr::new(192, 168, 1, 10).into(),
         }],
         rebind_allow: vec!["allowed.isp.example".parse().expect("a name")],
         cache_capacity: 16,
@@ -51,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
         let outputs = forwarder.handle(
             Input::Query {
                 id,
-                client: CLIENT,
+                client: CLIENT.into(),
                 transport,
                 bytes: query.to_vec(),
             },

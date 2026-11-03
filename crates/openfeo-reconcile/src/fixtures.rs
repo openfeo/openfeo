@@ -128,6 +128,11 @@ pub fn dhcp_fact() -> Dhcp4Fact {
 pub fn dhcp_world() -> World {
     let mut world = dhcp_world_without_lease();
     world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), dhcp_fact())]));
+    // The lease's default route is in the kernel, so its resolvers count (ADR-0019).
+    world.routes = Arc::new(std::collections::BTreeSet::from([DefaultRoute {
+        v6: false,
+        ifname: "p0".to_owned(),
+    }]));
     world
 }
 

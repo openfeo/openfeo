@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead as _, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -770,7 +770,7 @@ pub struct DigAnswer {
 /// When dig cannot be run, times out, or prints no header.
 pub fn dig(
     ns: &NetNs,
-    server: Ipv4Addr,
+    server: IpAddr,
     name: &str,
     qtype: &str,
     extra: &[&str],

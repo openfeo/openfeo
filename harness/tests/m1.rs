@@ -202,7 +202,7 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `dig <name> <qtype>` at the router from the LAN host.
 fn dig_lan(lab: &Lab, name: &str, qtype: &str) -> anyhow::Result<DigAnswer> {
-    lanclient::dig(&lab.lan0, ROUTER_DNS, name, qtype, &[], DIG_TIMEOUT)
+    lanclient::dig(&lab.lan0, ROUTER_DNS.into(), name, qtype, &[], DIG_TIMEOUT)
 }
 
 /// `answer` must be `NOERROR` with exactly one A record, `addr`.

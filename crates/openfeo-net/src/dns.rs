@@ -7,7 +7,7 @@
 //! one message at a time, so the core sees a single ordered stream.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,11 +45,20 @@ const LOOPBACK: &str = "lo";
 /// How long to wait after a socket error the link will cure.
 const TRANSIENT_WAIT: Duration = Duration::from_secs(1);
 
+/// One listening bridge in one family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listener {
+    /// `br-<lan>`.
+    pub ifname: String,
+    /// `[::]:53` instead of `0.0.0.0:53`.
+    pub v6: bool,
+}
+
 /// The forwarder and where it listens.
 #[derive(Debug, Clone)]
 pub struct DnsDriverConfig {
     /// Bridge names (`br-<lan>`), for `SO_BINDTODEVICE`.
-    pub listeners: Vec<String>,
+    pub listeners: Vec<Listener>,
     /// Also listen on `127.0.0.1:53` for the box's own lookups (time server names, later TLS
     /// and updates).
     pub loopback: bool,
@@ -82,11 +91,11 @@ enum Incoming {
         reply: oneshot::Sender<Vec<u8>>,
     },
     UpstreamUdp {
-        upstream: Ipv4Addr,
+        upstream: IpAddr,
         bytes: Vec<u8>,
     },
     UpstreamTcp {
-        upstream: Ipv4Addr,
+        upstream: IpAddr,
         bytes: Vec<u8>,
     },
 }
@@ -105,7 +114,10 @@ pub struct DnsDriver {
     inbox_tx: mpsc::Sender<Incoming>,
     /// The UDP socket of each listener, for the replies.
     listeners: Vec<Arc<UdpSocket>>,
+    /// The IPv4 pool towards the upstreams.
     upstream: Vec<Arc<UdpSocket>>,
+    /// The IPv6 pool towards the upstreams.
+    upstream6: Vec<Arc<UdpSocket>>,
     clients: HashMap<QueryId, ClientHandle>,
     next_id: QueryId,
     start: Instant,
@@ -138,18 +150,18 @@ impl DnsDriver {
         let mut listeners = Vec::new();
         let mut tasks = Vec::new();
         let tcp_clients = Arc::new(Semaphore::new(TCP_CLIENTS_MAX));
-        for (index, ifname) in config.listeners.iter().enumerate() {
-            let udp = Arc::new(listener_udp(ifname)?);
+        for (index, listener) in config.listeners.iter().enumerate() {
+            let udp = Arc::new(listener_udp(&listener.ifname, listener.v6)?);
             tasks.push(tokio::spawn(udp_listener_loop(
                 index,
-                ifname.clone(),
+                listener.ifname.clone(),
                 Arc::clone(&udp),
                 inbox_tx.clone(),
             )));
             listeners.push(udp);
             tasks.push(tokio::spawn(tcp_accept_loop(
-                ifname.clone(),
-                listener_tcp(ifname)?,
+                listener.ifname.clone(),
+                listener_tcp(&listener.ifname, listener.v6)?,
                 inbox_tx.clone(),
                 Arc::clone(&tcp_clients),
             )));
@@ -172,13 +184,16 @@ impl DnsDriver {
             )));
         }
         let mut upstream = Vec::new();
+        let mut upstream6 = Vec::new();
         for _ in 0..UPSTREAM_SOCKETS {
-            let socket = Arc::new(upstream_udp()?);
-            tasks.push(tokio::spawn(upstream_udp_loop(
-                Arc::clone(&socket),
-                inbox_tx.clone(),
-            )));
-            upstream.push(socket);
+            for (pool, v6) in [(&mut upstream, false), (&mut upstream6, true)] {
+                let socket = Arc::new(upstream_udp(v6)?);
+                tasks.push(tokio::spawn(upstream_udp_loop(
+                    Arc::clone(&socket),
+                    inbox_tx.clone(),
+                )));
+                pool.push(socket);
+            }
         }
         Ok(DnsDriver {
             forwarder: Forwarder::new(config.forwarder, config.seed),
@@ -186,6 +201,7 @@ impl DnsDriver {
             inbox_tx,
             listeners,
             upstream,
+            upstream6,
             clients: HashMap::new(),
             next_id: 1,
             start: Instant::now(),
@@ -215,10 +231,7 @@ impl DnsDriver {
         };
         let input = match incoming {
             None => Input::Timeout,
-            Some(incoming) => match self.admit(incoming) {
-                Some(input) => input,
-                None => return Ok(Vec::new()),
-            },
+            Some(incoming) => self.admit(incoming),
         };
         let now = self.now();
         let outputs = self.forwarder.handle(input, now);
@@ -249,42 +262,42 @@ impl DnsDriver {
 
     /// Turn a socket task's message into the core's input, remembering where a client's reply
     /// goes. `None` for a client we do not serve.
-    fn admit(&mut self, incoming: Incoming) -> Option<Input> {
+    fn admit(&mut self, incoming: Incoming) -> Input {
         match incoming {
             Incoming::Udp {
                 listener,
                 peer,
                 bytes,
             } => {
-                let client = client_v4(peer)?;
+                let client = peer.ip();
                 let id = self.take_id(ClientHandle::Udp { listener, peer });
-                Some(Input::Query {
+                Input::Query {
                     id,
                     client,
                     transport: Transport::Udp,
                     bytes,
-                })
+                }
             }
             Incoming::Tcp { peer, bytes, reply } => {
-                let client = client_v4(peer)?;
+                let client = peer.ip();
                 let id = self.take_id(ClientHandle::Tcp(reply));
-                Some(Input::Query {
+                Input::Query {
                     id,
                     client,
                     transport: Transport::Tcp,
                     bytes,
-                })
+                }
             }
-            Incoming::UpstreamUdp { upstream, bytes } => Some(Input::UpstreamReply {
+            Incoming::UpstreamUdp { upstream, bytes } => Input::UpstreamReply {
                 upstream,
                 transport: Transport::Udp,
                 bytes,
-            }),
-            Incoming::UpstreamTcp { upstream, bytes } => Some(Input::UpstreamReply {
+            },
+            Incoming::UpstreamTcp { upstream, bytes } => Input::UpstreamReply {
                 upstream,
                 transport: Transport::Tcp,
                 bytes,
-            }),
+            },
         }
     }
 
@@ -381,15 +394,20 @@ impl DnsDriver {
     }
 
     /// The upstream query over the pool socket its id selects. `false` when it was not sent.
-    fn forward_udp(&mut self, upstream: Ipv4Addr, bytes: &[u8]) -> bool {
+    fn forward_udp(&mut self, upstream: IpAddr, bytes: &[u8]) -> bool {
+        let pool = if upstream.is_ipv6() {
+            &self.upstream6
+        } else {
+            &self.upstream
+        };
         let index = bytes
             .first_chunk::<2>()
             .map_or(0, |id| usize::from(u16::from_be_bytes(*id)))
-            % self.upstream.len().max(1);
-        let Some(socket) = self.upstream.get(index) else {
+            % pool.len().max(1);
+        let Some(socket) = pool.get(index) else {
             return false;
         };
-        let to = SocketAddr::V4(SocketAddrV4::new(upstream, DNS_PORT));
+        let to = SocketAddr::new(upstream, DNS_PORT);
         match socket.try_send_to(bytes, to) {
             Ok(_) => {
                 self.stats.forwarded += 1;
@@ -418,12 +436,21 @@ impl Drop for DnsDriver {
     }
 }
 
-/// A UDP socket on port 53 of one bridge: `SO_REUSEADDR` so every bridge may have one,
-/// `SO_BINDTODEVICE` so each hears its own LAN and answers out of it.
-fn listener_udp(ifname: &str) -> Result<UdpSocket, DriverError> {
+/// The wildcard of one family.
+fn unspecified(v6: bool) -> IpAddr {
+    if v6 {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    }
+}
+
+/// A UDP socket on port 53 of one bridge, in one family: `SO_REUSEADDR` so every bridge may
+/// have one, `SO_BINDTODEVICE` so each hears its own LAN and answers out of it.
+fn listener_udp(ifname: &str, v6: bool) -> Result<UdpSocket, DriverError> {
     let fd = bound_socket(
         Some(ifname),
-        Ipv4Addr::UNSPECIFIED,
+        unspecified(v6),
         DNS_PORT,
         SockType::Datagram,
         SockProtocol::Udp,
@@ -431,11 +458,11 @@ fn listener_udp(ifname: &str) -> Result<UdpSocket, DriverError> {
     UdpSocket::from_std(std::net::UdpSocket::from(fd)).map_err(io_err("register UDP listener"))
 }
 
-/// The TCP listener on port 53 of one bridge, with the same options.
-fn listener_tcp(ifname: &str) -> Result<TcpListener, DriverError> {
+/// The TCP listener on port 53 of one bridge, in one family, with the same options.
+fn listener_tcp(ifname: &str, v6: bool) -> Result<TcpListener, DriverError> {
     let fd = bound_socket(
         Some(ifname),
-        Ipv4Addr::UNSPECIFIED,
+        unspecified(v6),
         DNS_PORT,
         SockType::Stream,
         SockProtocol::Tcp,
@@ -450,7 +477,7 @@ fn listener_tcp(ifname: &str) -> Result<TcpListener, DriverError> {
 fn loopback_udp() -> Result<UdpSocket, DriverError> {
     let fd = bound_socket(
         Some(LOOPBACK),
-        Ipv4Addr::LOCALHOST,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
         DNS_PORT,
         SockType::Datagram,
         SockProtocol::Udp,
@@ -463,7 +490,7 @@ fn loopback_udp() -> Result<UdpSocket, DriverError> {
 fn loopback_tcp() -> Result<TcpListener, DriverError> {
     let fd = bound_socket(
         Some(LOOPBACK),
-        Ipv4Addr::LOCALHOST,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
         DNS_PORT,
         SockType::Stream,
         SockProtocol::Tcp,
@@ -474,10 +501,11 @@ fn loopback_tcp() -> Result<TcpListener, DriverError> {
         .map_err(io_err("register loopback TCP listener"))
 }
 
-/// A UDP socket towards the upstreams, on a kernel-chosen port.
-fn upstream_udp() -> Result<UdpSocket, DriverError> {
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .map_err(io_err("bind upstream socket"))?;
+/// A UDP socket towards the upstreams of one family, on a kernel-chosen port; the IPv6 one
+/// sources from whatever the preferred-source route says (the router's loopback address).
+fn upstream_udp(v6: bool) -> Result<UdpSocket, DriverError> {
+    let socket =
+        std::net::UdpSocket::bind((unspecified(v6), 0)).map_err(io_err("bind upstream socket"))?;
     socket
         .set_nonblocking(true)
         .map_err(io_err("upstream socket non-blocking"))?;
@@ -584,9 +612,9 @@ async fn upstream_udp_loop(socket: Arc<UdpSocket>, inbox: mpsc::Sender<Incoming>
     let mut buf = vec![0u8; RECEIVE_BUFFER];
     loop {
         match socket.recv_from(&mut buf).await {
-            Ok((len, SocketAddr::V4(peer))) if peer.port() == DNS_PORT => {
+            Ok((len, peer)) if peer.port() == DNS_PORT => {
                 let message = Incoming::UpstreamUdp {
-                    upstream: *peer.ip(),
+                    upstream: peer.ip(),
                     bytes: buf[..len].to_vec(),
                 };
                 if inbox.send(message).await.is_err() {
@@ -609,10 +637,9 @@ async fn upstream_udp_loop(socket: Arc<UdpSocket>, inbox: mpsc::Sender<Incoming>
 
 /// One query to one upstream over TCP; its reply into the inbox. A failure sends nothing: the
 /// core's timer takes it from there.
-async fn upstream_tcp(upstream: Ipv4Addr, query: Vec<u8>, inbox: mpsc::Sender<Incoming>) {
+async fn upstream_tcp(upstream: IpAddr, query: Vec<u8>, inbox: mpsc::Sender<Incoming>) {
     let exchange = async {
-        let mut stream =
-            TcpStream::connect(SocketAddr::V4(SocketAddrV4::new(upstream, DNS_PORT))).await?;
+        let mut stream = TcpStream::connect(SocketAddr::new(upstream, DNS_PORT)).await?;
         stream.write_all(&frame(&query)).await?;
         let mut len = [0u8; 2];
         stream.read_exact(&mut len).await?;
@@ -626,14 +653,6 @@ async fn upstream_tcp(upstream: Ipv4Addr, query: Vec<u8>, inbox: mpsc::Sender<In
         }
         Ok(Err(err)) => debug!("dns: TCP to {upstream}: {err}"),
         Err(_) => debug!("dns: TCP to {upstream}: no reply within {TCP_UPSTREAM_TIMEOUT:?}"),
-    }
-}
-
-/// The client's IPv4 address; IPv6 peers are not served in M1.
-pub(crate) fn client_v4(peer: SocketAddr) -> Option<Ipv4Addr> {
-    match peer {
-        SocketAddr::V4(peer) => Some(*peer.ip()),
-        SocketAddr::V6(_) => None,
     }
 }
 
@@ -676,11 +695,8 @@ mod tests {
     }
 
     #[test]
-    fn only_ipv4_clients_are_served_in_m1() {
-        assert_eq!(
-            client_v4("192.168.1.50:5353".parse().unwrap()),
-            Some(Ipv4Addr::new(192, 168, 1, 50))
-        );
-        assert_eq!(client_v4("[fe80::1]:5353".parse().unwrap()), None);
+    fn the_wildcard_of_each_family() {
+        assert_eq!(unspecified(false), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(unspecified(true), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
     }
 }

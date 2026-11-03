@@ -5,9 +5,9 @@
 //! translation of `[dns]`, `[system]`, the LANs with their reservations and leases, and the
 //! active WAN's learned servers into what the forwarder runs with.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use openfeo_config::load::{DEFAULT_DOMAIN, DEFAULT_HOSTNAME};
 use openfeo_config::{Wan, wan};
 use openfeo_proto_dns::cache::DEFAULT_CAPACITY;
@@ -24,6 +24,8 @@ pub struct DesiredListener {
     /// `br-<lan>`.
     pub ifname: String,
     pub address: Ipv4Addr,
+    /// The LAN's IPv6 address, when it has one: a second listener on the same bridge.
+    pub address6: Option<Ipv6Addr>,
 }
 
 /// A name the forwarder answers itself.
@@ -31,7 +33,7 @@ pub struct DesiredListener {
 pub struct DesiredLocalName {
     /// `<hostname>.<domain>`, lowercase.
     pub name: String,
-    pub addr: Ipv4Addr,
+    pub addr: IpAddr,
 }
 
 /// What the forwarder runs with.
@@ -40,28 +42,30 @@ pub struct DesiredDns {
     /// One per LAN.
     pub listeners: Vec<DesiredListener>,
     /// The typed ones, then the active WAN's learned or static ones when `use_wan_dns`,
-    /// deduplicated in order.
-    pub upstreams: Vec<Ipv4Addr>,
+    /// deduplicated in order. A learned server joins only while the kernel has a default route
+    /// of its family through that WAN (ADR-0019); typed and static ones are never gated.
+    pub upstreams: Vec<IpAddr>,
     /// The WAN whose servers were appended.
     pub learned_from: Option<String>,
     /// The servers that WAN learned or was given, before deduplication: an upstream outside
     /// this list was typed into `[dns]`.
-    pub wan_upstreams: Vec<Ipv4Addr>,
+    pub wan_upstreams: Vec<IpAddr>,
     /// `[system] domain`, else `home.arpa`.
     pub domain: String,
     /// `<hostname>.<domain>`.
     pub router_name: String,
-    /// The LAN addresses: the router's A records, and never a valid upstream answer.
-    pub router_addrs: Vec<Ipv4Addr>,
-    /// The active WAN's address: never a valid upstream answer, and not an A record of the
+    /// The LAN addresses of both families and the IPv6 loopback address: the router's A and
+    /// AAAA records, and never a valid upstream answer.
+    pub router_addrs: Vec<IpAddr>,
+    /// The active WAN's addresses: never a valid upstream answer, and not a record of the
     /// router's name.
-    pub wan_addrs: Vec<Ipv4Addr>,
+    pub wan_addrs: Vec<IpAddr>,
     /// The reverse zones: the private LANs, and public LANs that run the DHCP server (SPEC §7.7).
     pub lan_subnets: Vec<Ipv4Net>,
     /// The rebinding guard: the private LANs' subnets.
     pub guard_subnets: Vec<Ipv4Net>,
     /// Every LAN's reservations with a hostname, then lease facts with a hostname not already
-    /// named.
+    /// named, then `[[dns.records]]` (one per name and family) not already named.
     pub local: Vec<DesiredLocalName>,
     pub rebind_allow: Vec<String>,
 }
@@ -96,6 +100,7 @@ pub fn desired(world: &World) -> DesiredDns {
         listeners.push(DesiredListener {
             ifname: bridge_name(&lan.name),
             address: net.addr(),
+            address6: lan.ipv6.parse::<Ipv6Net>().ok().map(|net| net.addr()),
         });
         let public = crate::public::lan_is_public(lan, &blocks);
         if !public || lan.dhcp.is_some() {
@@ -108,26 +113,27 @@ pub fn desired(world: &World) -> DesiredDns {
             if let Ok(addr) = reservation.ip.parse::<Ipv4Addr>()
                 && !reservation.hostname.is_empty()
             {
-                push_local(&mut local, &reservation.hostname, &domain, addr);
+                push_local(&mut local, &reservation.hostname, &domain, IpAddr::V4(addr));
             }
         }
     }
     for lan in &world.config.lans {
         for lease in world.leases.get(&lan.name).into_iter().flatten() {
             if let Some(hostname) = &lease.hostname {
-                push_local(&mut local, hostname, &domain, lease.address);
+                push_local(&mut local, hostname, &domain, IpAddr::V4(lease.address));
             }
         }
     }
+    push_records(&mut local, &dns.records, &domain);
 
-    let mut upstreams: Vec<Ipv4Addr> = Vec::new();
+    let mut upstreams: Vec<IpAddr> = Vec::new();
     for upstream in dns.upstreams.iter().filter_map(|text| text.parse().ok()) {
         push_unique(&mut upstreams, upstream);
     }
     let mut learned_from = None;
     let mut wan_upstreams = Vec::new();
-    let router_addrs: Vec<Ipv4Addr> = listeners.iter().map(|listener| listener.address).collect();
-    let mut wan_addrs: Vec<Ipv4Addr> = Vec::new();
+    let router_addrs = router_addrs(&listeners, world);
+    let mut wan_addrs: Vec<IpAddr> = Vec::new();
     if let Some(active) = active_wan(world) {
         if dns.use_wan_dns.unwrap_or(true) {
             wan_upstreams = wan_dns(world, active);
@@ -138,9 +144,10 @@ pub fn desired(world: &World) -> DesiredDns {
                 }
             }
         }
-        // The WAN address is the router's too: a public name resolving to it is rebinding, but it
-        // is not an A record of the router's name, so it is kept apart from the LAN addresses.
-        if let Some(addr) = wan_address(world, active) {
+        // The WAN addresses are the router's too: a public name resolving to one is rebinding,
+        // but they are not records of the router's name, so they are kept apart from the LAN
+        // addresses.
+        for addr in wan_addresses(world, active) {
             push_unique(&mut wan_addrs, addr);
         }
     }
@@ -218,45 +225,125 @@ pub(crate) fn active_wan(world: &World) -> Option<&Wan> {
         .min_by_key(|wan| wan.priority)
 }
 
-/// The servers `wan` learned (a DHCP WAN's lease) or was given (a static WAN's `dns`).
-fn wan_dns(world: &World, wan: &Wan) -> Vec<Ipv4Addr> {
-    match &wan.kind {
-        Some(wan::Kind::Dhcp(_)) => world
+/// The servers `wan` was given (a static WAN's `dns`, never gated) or learned (a DHCP WAN's
+/// lease over IPv4, the advertisements' RDNSS over IPv6), each learned family only while the
+/// kernel has a default route of that family through the WAN (ADR-0019).
+fn wan_dns(world: &World, wan: &Wan) -> Vec<IpAddr> {
+    let ifname = crate::wan_ifname(wan);
+    let mut servers: Vec<IpAddr> = match &wan.kind {
+        Some(wan::Kind::Dhcp(_)) if world.has_default(false, &ifname) => world
             .dhcp4
             .get(&wan.name)
-            .map(|lease| lease.dns.clone())
+            .map(|lease| lease.dns.iter().copied().map(IpAddr::V4).collect())
             .unwrap_or_default(),
+        Some(wan::Kind::Dhcp(_)) | None => Vec::new(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .dns
             .iter()
             .filter_map(|text| text.parse().ok())
             .collect(),
-        None => Vec::new(),
+    };
+    if wan
+        .ipv6
+        .as_ref()
+        .is_some_and(|ipv6| ipv6.mode != "disabled")
+        && world.has_default(true, &ifname)
+        && let Some(fact) = world.ipv6.get(&wan.name)
+    {
+        servers.extend(fact.dns.iter().copied().map(IpAddr::V6));
     }
+    servers
 }
 
-/// The address `wan` has now: its lease's, or a static WAN's own.
-fn wan_address(world: &World, wan: &Wan) -> Option<Ipv4Addr> {
-    match &wan.kind {
-        Some(wan::Kind::Dhcp(_)) => world.dhcp4.get(&wan.name).map(|lease| lease.address.addr()),
+/// The addresses `wan` has now: its lease's or a static WAN's own, and the ones its
+/// advertisement client made.
+fn wan_addresses(world: &World, wan: &Wan) -> Vec<IpAddr> {
+    let mut addrs: Vec<IpAddr> = match &wan.kind {
+        Some(wan::Kind::Dhcp(_)) => world
+            .dhcp4
+            .get(&wan.name)
+            .map(|lease| IpAddr::V4(lease.address.addr()))
+            .into_iter()
+            .collect(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .address
             .parse::<Ipv4Net>()
             .ok()
-            .map(|net| net.addr()),
-        None => None,
+            .map(|net| IpAddr::V4(net.addr()))
+            .into_iter()
+            .collect(),
+        None => Vec::new(),
+    };
+    if let Some(fact) = world.ipv6.get(&wan.name) {
+        addrs.extend(fact.addresses.iter().map(|net| IpAddr::V6(net.addr())));
+    }
+    addrs
+}
+
+/// The router's IPv6 loopback address, `::1` of the routed prefix's first /64 (SPEC §7.3),
+/// when a WAN declares a prefix.
+fn loopback6(world: &World) -> Option<Ipv6Addr> {
+    world
+        .config
+        .wans
+        .iter()
+        .filter(|wan| world.ports.id_of(&wan.port).is_some())
+        .filter_map(|wan| wan.ipv6.as_ref())
+        .filter(|ipv6| ipv6.mode != "disabled")
+        .find_map(|ipv6| ipv6.prefix.parse::<Ipv6Net>().ok())
+        .map(|prefix| crate::routing::router_address(prefix.trunc()))
+}
+
+/// `[[dns.records]]` as local names: a label is put under the domain, a dotted name stands;
+/// a name already answered for in the same family (a reservation, a lease) keeps its answer.
+fn push_records(
+    local: &mut Vec<DesiredLocalName>,
+    records: &[openfeo_config::Record],
+    domain: &str,
+) {
+    for record in records {
+        let Ok(addr) = record.address.parse::<IpAddr>() else {
+            continue;
+        };
+        let name = record.name.trim_end_matches('.').to_ascii_lowercase();
+        let name = if name.contains('.') {
+            name
+        } else {
+            format!("{name}.{domain}")
+        };
+        if !local
+            .iter()
+            .any(|entry| entry.name == name && entry.addr.is_ipv4() == addr.is_ipv4())
+        {
+            local.push(DesiredLocalName { name, addr });
+        }
     }
 }
 
+/// The router's own addresses: every LAN's, both families, and the IPv6 loopback address.
+fn router_addrs(listeners: &[DesiredListener], world: &World) -> Vec<IpAddr> {
+    let mut addrs: Vec<IpAddr> = listeners
+        .iter()
+        .map(|listener| IpAddr::V4(listener.address))
+        .collect();
+    addrs.extend(
+        listeners
+            .iter()
+            .filter_map(|listener| listener.address6.map(IpAddr::V6)),
+    );
+    addrs.extend(loopback6(world).map(IpAddr::V6));
+    addrs
+}
+
 /// `<hostname>.<domain>` at `addr`, unless the name is already taken.
-fn push_local(local: &mut Vec<DesiredLocalName>, hostname: &str, domain: &str, addr: Ipv4Addr) {
+fn push_local(local: &mut Vec<DesiredLocalName>, hostname: &str, domain: &str, addr: IpAddr) {
     let name = format!("{}.{domain}", hostname.to_ascii_lowercase());
     if !local.iter().any(|entry| entry.name == name) {
         local.push(DesiredLocalName { name, addr });
     }
 }
 
-fn push_unique(upstreams: &mut Vec<Ipv4Addr>, upstream: Ipv4Addr) {
+fn push_unique<T: PartialEq>(upstreams: &mut Vec<T>, upstream: T) {
     if !upstreams.contains(&upstream) {
         upstreams.push(upstream);
     }
@@ -268,8 +355,93 @@ mod tests {
     use crate::fixtures;
     use openfeo_config::Dns;
     use openfeo_proto_dns::cache::DEFAULT_CAPACITY;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn learned_resolvers_join_only_once_their_familys_default_route_exists() {
+        let with = desired(&fixtures::ipv6_world());
+        assert_eq!(
+            with.upstreams,
+            vec![ip("203.0.113.1"), ip("2001:db8:ffff::1")]
+        );
+        assert_eq!(
+            with.wan_upstreams,
+            vec![ip("203.0.113.1"), ip("2001:db8:ffff::1")]
+        );
+        assert_eq!(with.learned_from.as_deref(), Some("wan0"));
+        let without = desired(&fixtures::ipv6_world_without_route());
+        assert_eq!(
+            without.wan_upstreams,
+            vec![ip("203.0.113.1")],
+            "the RDNSS server waits for the route"
+        );
+        assert_eq!(
+            without.upstreams,
+            vec![ip("203.0.113.1"), ip("2001:db8:ffff::1")],
+            "typed ones never wait"
+        );
+        let mut lease_without_route = fixtures::dhcp_world();
+        lease_without_route.routes = std::sync::Arc::new(std::collections::BTreeSet::new());
+        let d = desired(&lease_without_route);
+        assert_eq!(
+            d.wan_upstreams,
+            Vec::<IpAddr>::new(),
+            "a lease's servers wait for the IPv4 route"
+        );
+        assert_eq!(d.learned_from, None);
+        let d = desired(&fixtures::dhcp_world());
+        assert!(
+            !d.wan_upstreams.is_empty(),
+            "with the route, the lease's servers are used"
+        );
+    }
+
+    #[test]
+    fn typed_upstreams_and_static_wan_dns_are_never_gated() {
+        let mut world = fixtures::static_world();
+        world.routes = std::sync::Arc::new(std::collections::BTreeSet::new());
+        let d = desired(&world);
+        assert_eq!(d.upstreams, vec![ip("203.0.113.1")]);
+        assert_eq!(d.learned_from.as_deref(), Some("wan0"));
+    }
+
+    #[test]
+    fn records_become_local_names_after_reservations_and_leases() {
+        let d = desired(&fixtures::ipv6_world());
+        let names: Vec<(String, IpAddr)> =
+            d.local.iter().map(|l| (l.name.clone(), l.addr)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("nas.home.arpa".to_owned(), ip("192.168.1.10")),
+                ("www.home.arpa".to_owned(), ip("2001:db8:1:232::10")),
+            ]
+        );
+        assert!(d.router_addrs.contains(&ip("2001:db8:1:222::1")));
+        assert!(
+            d.router_addrs.contains(&ip("2001:db8:1::1")),
+            "the loopback address: {:?}",
+            d.router_addrs
+        );
+        assert!(d.router_addrs.contains(&ip("192.168.1.1")));
+        assert_eq!(
+            d.listeners[0].address6,
+            Some("2001:db8:1:222::1".parse().unwrap())
+        );
+        let config = forwarder_config(&d);
+        assert_eq!(config.local.len(), 2);
+        assert_eq!(config.upstreams, d.upstreams);
+    }
+
+    #[test]
+    fn ipv6_world_dns_snapshot() {
+        insta::assert_yaml_snapshot!(desired(&fixtures::ipv6_world()));
+    }
 
     #[test]
     fn static_world_lists_the_lan_the_static_wan_dns_and_the_local_names() {
@@ -280,11 +452,15 @@ mod tests {
             vec![DesiredListener {
                 ifname: "br-lan0".into(),
                 address: Ipv4Addr::new(192, 168, 1, 1),
+                address6: None,
             }]
         );
         assert_eq!(
             (d.upstreams.clone(), d.learned_from.as_deref()),
-            (vec![Ipv4Addr::new(203, 0, 113, 1)], Some("wan0"))
+            (
+                vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))],
+                Some("wan0")
+            )
         );
         assert_eq!(
             (d.domain.as_str(), d.router_name.as_str()),
@@ -294,13 +470,17 @@ mod tests {
             d.local,
             vec![DesiredLocalName {
                 name: "nas.home.arpa".into(),
-                addr: Ipv4Addr::new(192, 168, 1, 10),
+                addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
             }]
         );
         let cfg = forwarder_config(&d);
         assert_eq!(
             (cfg.upstreams, cfg.local.len(), cfg.cache_capacity),
-            (vec![Ipv4Addr::new(203, 0, 113, 1)], 1, DEFAULT_CAPACITY)
+            (
+                vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))],
+                1,
+                DEFAULT_CAPACITY
+            )
         );
     }
 
@@ -313,7 +493,7 @@ mod tests {
         d.router_name = "bad..name".into();
         d.local.push(DesiredLocalName {
             name: format!("{}.home.arpa", "x".repeat(64)),
-            addr: Ipv4Addr::new(192, 168, 1, 77),
+            addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77)),
         });
         d.rebind_allow = vec!["ok.example".into(), "bad..name".into()];
         let cfg = forwarder_config(&d);
@@ -341,7 +521,10 @@ mod tests {
     fn dhcp_world_learns_from_the_lease_and_has_nothing_before_it() {
         let with = desired(&fixtures::dhcp_world());
         insta::assert_yaml_snapshot!(with);
-        assert_eq!(with.upstreams, vec![Ipv4Addr::new(203, 0, 113, 1)]);
+        assert_eq!(
+            with.upstreams,
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))]
+        );
         let without = desired(&fixtures::dhcp_world_without_lease());
         assert_eq!((without.upstreams.len(), without.learned_from), (0, None));
     }
@@ -357,7 +540,10 @@ mod tests {
         assert_eq!(
             (d.upstreams, d.learned_from.as_deref()),
             (
-                vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(203, 0, 113, 1)],
+                vec![
+                    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))
+                ],
                 Some("wan0")
             ),
             "deduplicated"
@@ -368,7 +554,10 @@ mod tests {
         assert_eq!(
             (d.upstreams, d.learned_from.as_deref()),
             (
-                vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(203, 0, 113, 1)],
+                vec![
+                    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))
+                ],
                 Some("wan0")
             ),
             "typed first, then the WAN's"
@@ -380,7 +569,7 @@ mod tests {
             .use_wan_dns = Some(false);
         assert_eq!(
             (desired(&world).upstreams, desired(&world).learned_from),
-            (vec![Ipv4Addr::new(9, 9, 9, 9)], None)
+            (vec![IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))], None)
         );
     }
 
@@ -392,11 +581,11 @@ mod tests {
             vec![
                 DesiredLocalName {
                     name: "nas.home.arpa".into(),
-                    addr: Ipv4Addr::new(192, 168, 1, 10),
+                    addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)),
                 },
                 DesiredLocalName {
                     name: "pc.home.arpa".into(),
-                    addr: Ipv4Addr::new(192, 168, 1, 120),
+                    addr: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 120)),
                 },
             ]
         );
@@ -437,14 +626,20 @@ mod tests {
     #[test]
     fn the_wan_address_is_never_a_valid_answer() {
         let d = desired(&fixtures::static_world());
-        assert_eq!(d.wan_addrs, vec![Ipv4Addr::new(203, 0, 113, 10)]);
+        assert_eq!(
+            d.wan_addrs,
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))]
+        );
         assert_eq!(
             d.router_addrs,
-            vec![Ipv4Addr::new(192, 168, 1, 1)],
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))],
             "the router's A records stay the LAN's"
         );
         let d = desired(&fixtures::dhcp_world());
-        assert_eq!(d.wan_addrs, vec![Ipv4Addr::new(203, 0, 113, 100)]);
+        assert_eq!(
+            d.wan_addrs,
+            vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 100))]
+        );
         assert_eq!(
             desired(&fixtures::dhcp_world_without_lease()).wan_addrs,
             Vec::<Ipv4Addr>::new()

@@ -134,6 +134,8 @@ pub fn http_server(ns: &NetNs, bind: &str, port: u16, dir: &Path, body: &str) ->
 pub const ISP_DNS_ZONE: &str = "isp.example";
 /// `www.isp.example`: an ordinary public answer.
 pub const ISP_WWW_ADDR: &str = "198.51.100.10";
+/// `www.isp.example`'s AAAA: on the ISP's IPv6 link.
+pub const ISP_WWW_ADDR6: &str = "2001:db8:ffff::10";
 /// `evil.isp.example`: a public name answering with a LAN address, the rebinding attack.
 pub const ISP_EVIL_ADDR: &str = "192.168.1.5";
 /// `allowed.isp.example`: private too, but allow-listed by the scenarios.
@@ -172,7 +174,7 @@ pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
         "--auth-ttl=60",
         &format!("--host-record=ns.{ISP_DNS_ZONE},203.0.113.1"),
         &format!("--host-record=ntp.{ISP_DNS_ZONE},203.0.113.1"),
-        &format!("--host-record=www.{ISP_DNS_ZONE},{ISP_WWW_ADDR}"),
+        &format!("--host-record=www.{ISP_DNS_ZONE},{ISP_WWW_ADDR},{ISP_WWW_ADDR6}"),
         &format!("--host-record=evil.{ISP_DNS_ZONE},{ISP_EVIL_ADDR}"),
         &format!("--host-record=allowed.{ISP_DNS_ZONE},{ISP_ALLOWED_ADDR}"),
     ]);

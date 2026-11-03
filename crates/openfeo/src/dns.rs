@@ -6,11 +6,10 @@
 //! learned servers and the LAN leases change. Every line logged here is a contract with the
 //! harness scenarios.
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use openfeo_net::dhcp4::DriverError;
-use openfeo_net::dns::{DnsDriver, DnsDriverConfig};
+use openfeo_net::dns::{DnsDriver, DnsDriverConfig, Listener};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_proto_dns::Name;
 use openfeo_proto_dns::forwarder::Event;
@@ -59,8 +58,21 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
         .iter()
         .map(|listener| listener.ifname.clone())
         .collect();
+    let mut sockets = Vec::new();
+    for listener in &current.listeners {
+        sockets.push(Listener {
+            ifname: listener.ifname.clone(),
+            v6: false,
+        });
+        if listener.address6.is_some() {
+            sockets.push(Listener {
+                ifname: listener.ifname.clone(),
+                v6: true,
+            });
+        }
+    }
     let mut driver = DnsDriver::new(DnsDriverConfig {
-        listeners: listeners.clone(),
+        listeners: sockets,
         loopback: true,
         forwarder: config,
         seed: seed(SEED_SALT),
@@ -135,7 +147,7 @@ fn upstreams_line(desired: &DesiredDns) -> String {
     if desired.upstreams.is_empty() {
         return "dns no upstreams: only local names resolve".to_owned();
     }
-    let addrs: Vec<String> = desired.upstreams.iter().map(Ipv4Addr::to_string).collect();
+    let addrs: Vec<String> = desired.upstreams.iter().map(ToString::to_string).collect();
     let mut sources = Vec::new();
     if desired
         .upstreams
@@ -182,6 +194,7 @@ mod tests {
     use super::*;
     use openfeo_config::{PortMap, PortMapEntry, file};
     use openfeo_world::World;
+    use std::net::Ipv4Addr;
 
     const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
 
@@ -208,13 +221,13 @@ mod tests {
             upstreams_line(&d),
             "dns upstreams 203.0.113.1 (learned from wan0)"
         );
-        d.upstreams.insert(0, Ipv4Addr::new(9, 9, 9, 9));
+        d.upstreams.insert(0, Ipv4Addr::new(9, 9, 9, 9).into());
         assert_eq!(
             upstreams_line(&d),
             "dns upstreams 9.9.9.9 203.0.113.1 (configured, learned from wan0)"
         );
         d.learned_from = None;
-        d.upstreams = vec![Ipv4Addr::new(9, 9, 9, 9)];
+        d.upstreams = vec![Ipv4Addr::new(9, 9, 9, 9).into()];
         assert_eq!(upstreams_line(&d), "dns upstreams 9.9.9.9 (configured)");
         d.upstreams.clear();
         assert_eq!(
@@ -226,18 +239,18 @@ mod tests {
     #[test]
     fn event_lines_follow_the_contract() {
         assert_eq!(
-            event_line(&Event::UpstreamDown(Ipv4Addr::new(9, 9, 9, 9))),
+            event_line(&Event::UpstreamDown(Ipv4Addr::new(9, 9, 9, 9).into())),
             Some("dns upstream 9.9.9.9 down".into())
         );
         assert_eq!(
-            event_line(&Event::UpstreamUp(Ipv4Addr::new(9, 9, 9, 9))),
+            event_line(&Event::UpstreamUp(Ipv4Addr::new(9, 9, 9, 9).into())),
             Some("dns upstream 9.9.9.9 up".into())
         );
         assert_eq!(
             event_line(&Event::RebindDropped {
                 name: "evil.isp.example".parse().unwrap(),
                 addr: Ipv4Addr::new(192, 168, 1, 5).into(),
-                client: Ipv4Addr::new(192, 168, 1, 50),
+                client: Ipv4Addr::new(192, 168, 1, 50).into(),
             }),
             Some("dns rebind dropped evil.isp.example -> 192.168.1.5 for 192.168.1.50".into())
         );
