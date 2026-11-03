@@ -193,10 +193,12 @@ fn send_all(socket: &NdpSocket, outputs: Vec<Output>, sends: &mut Throttle, ifna
     }
 }
 
+/// The core's configuration: the bridge's MAC as the World knows it, or the one the link had
+/// when the task started.
 fn server_config(ra: &DesiredRa, mac: [u8; 6]) -> Config {
     Config {
         prefix: ra.prefix,
-        mac,
+        mac: ra.mac.map_or(mac, |mac| mac.0),
         router: ra.router,
         mtu: ra.mtu,
         domain: ra.domain.clone(),
@@ -236,6 +238,7 @@ mod tests {
             wan: "wan0".to_owned(),
             prefix: "2001:db8:1:222::/64".parse().unwrap(),
             router: "2001:db8:1:222::1".parse().unwrap(),
+            mac: None,
             mtu: Some(1500),
             domain: "home.arpa".to_owned(),
             router_lifetime: lifetime,

@@ -670,6 +670,10 @@ fn bridge_with_vlan_filtering_enslave_rename(_lab: &mut Lab) -> anyhow::Result<(
         .await?;
         let details = netns::ip(&["-d", "link", "show", "br-t0"])?;
         ensure!(details.contains("vlan_filtering 1"), "{details}");
+        // Born down: the applier sets the MAC before it brings the bridge up, so the kernel
+        // derives the link-local from the MAC the LAN will know, not from the random one.
+        let born_up = rx.borrow().link_by_name("br-t0").context("br-t0")?.up;
+        ensure!(!born_up, "a new bridge came up by itself");
         let br = rx.borrow().link_by_name("br-t0").context("br-t0")?.index;
         let bv0 = rx.borrow().link_by_name("bv0").context("bv0")?.index;
         nl.link_set_master(bv0, Some(br)).await?;

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Andrew Newton
 
 //! What each LAN's router-advertisement server says (SPEC §7.3, §6.2's `reconcile::ra`): the
-//! LAN's /64 and the router's address in it, the bridge's MTU, the search domain, and the router
+//! LAN's /64 and the router's address in it, the bridge's MAC and MTU, the search domain, and the router
 //! lifetime, which is 1800 only while the WAN that provides the prefix has carrier and an IPv6
 //! default route in the kernel (ADR-0019) and 0 otherwise, so hosts fall back to IPv4 the moment
 //! the WAN's IPv6 is gone.
@@ -11,7 +11,7 @@ use std::net::Ipv6Addr;
 
 use ipnet::Ipv6Net;
 use openfeo_config::load::DEFAULT_DOMAIN;
-use openfeo_world::World;
+use openfeo_world::{MacAddr, World};
 use serde::Serialize;
 
 use crate::{bridge_name, wan_ifname};
@@ -30,6 +30,8 @@ pub struct DesiredRa {
     pub prefix: Ipv6Net,
     /// The router's address in the LAN: the resolver hosts are pointed at.
     pub router: Ipv6Addr,
+    /// The bridge's MAC, the source link-layer address option, once the bridge exists.
+    pub mac: Option<MacAddr>,
     /// The bridge's MTU, once the bridge exists.
     pub mtu: Option<u32>,
     /// The search domain.
@@ -72,6 +74,7 @@ pub fn desired(world: &World) -> Vec<DesiredRa> {
             let net = lan.ipv6.parse::<Ipv6Net>().ok()?;
             let bridge = bridge_name(&lan.name);
             Some(DesiredRa {
+                mac: world.links.get(&bridge).and_then(|link| link.mac),
                 mtu: world.links.get(&bridge).map(|link| link.mtu),
                 ifname: bridge,
                 wan: wan.name.clone(),
@@ -88,6 +91,7 @@ pub fn desired(world: &World) -> Vec<DesiredRa> {
 mod tests {
     use super::*;
     use crate::fixtures;
+    use openfeo_world::MacAddr;
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
@@ -155,6 +159,25 @@ mod tests {
             desired(&world)[0].mtu,
             None,
             "unknown until the bridge exists"
+        );
+    }
+
+    #[test]
+    fn the_advertisement_carries_the_bridges_mac_and_follows_it() {
+        let world = fixtures::ipv6_world();
+        assert_eq!(
+            desired(&world)[0].mac,
+            Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x02]))
+        );
+        let mut world = world;
+        let mut links = (*world.links).clone();
+        let changed = MacAddr([0x02, 0x00, 0x00, 0xfe, 0x00, 0x09]);
+        links.get_mut("br-lan0").expect("br-lan0 is known").mac = Some(changed);
+        world.links = Arc::new(links);
+        assert_eq!(
+            desired(&world)[0].mac,
+            Some(changed),
+            "the server follows the bridge's MAC"
         );
     }
 
