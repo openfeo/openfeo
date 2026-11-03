@@ -402,6 +402,13 @@ fn names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked(lab: &mut Lab) -> anyho
 
 fn local_names_resolve_authoritatively_and_never_leave(lab: &mut Lab) -> anyhow::Result<()> {
     let rig = Rig::create(lab)?;
+    // The lab's resolver is the ISP's: authoritative for its zone and nothing else. A host's
+    // own dnsmasq configuration (its `server=` lines) must not reach it.
+    ensure!(
+        rig.upstream_queries("using nameserver")? == 0,
+        "the lab's dnsmasq read a host configuration: {:?}",
+        rig.dnsmasq.log.tail(12)
+    );
     let rt = runtime()?;
     let mut driver = Rig::driver(&rt, Rig::config()?)?;
     let (_, nas) = lookup(&rt, &mut driver, &rig, "nas.home.arpa", "A", &[])?;

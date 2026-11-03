@@ -106,29 +106,24 @@ pub fn kea_dhcp4(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     Daemon::spawn("kea-dhcp4", cmd)
 }
 
-/// A static HTTP target in `ns`: `python3 -m http.server <port>` bound to `bind`, serving `dir`
-/// whose `index.html` is `body`. Its log shows one line per request, with the client address
-/// the server saw (`203.0.113.10 - - [...] "GET / HTTP/1.0" 200 -`), which is how scenarios
-/// prove NAT and hairpin SNAT happened. Unbuffered, so `Serving HTTP on` appears at once.
+/// An HTTP target in `ns` serving `body` as `index.html` from `dir` on `bind:port`, either
+/// family (`harness/fixtures/http-server.py`: the standard library's server without the reverse
+/// lookup of its own address, which from a LAN namespace waits out the host's resolvers). Ready
+/// when it logs `Serving HTTP on`; each request is logged as `<client> - - [<date>] "GET / …`.
 ///
 /// # Errors
 ///
-/// When `index.html` cannot be written or python3 cannot be spawned.
+/// When the directory cannot be written or python3 cannot be spawned.
 pub fn http_server(ns: &NetNs, bind: &str, port: u16, dir: &Path, body: &str) -> Result<Daemon> {
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let index = dir.join("index.html");
     std::fs::write(&index, body).with_context(|| format!("write {}", index.display()))?;
+    let script = crate::lab::workspace_root().join("harness/fixtures/http-server.py");
     let mut cmd = ns.command("python3")?;
-    cmd.args([
-        "-u",
-        "-m",
-        "http.server",
-        &port.to_string(),
-        "--bind",
-        bind,
-        "--directory",
-    ])
-    .arg(dir);
+    cmd.args(["-I", "-u"])
+        .arg(&script)
+        .args(["--bind", bind, "--port", &port.to_string(), "--directory"])
+        .arg(dir);
     Daemon::spawn(&format!("http-{}-{port}", ns.name), cmd)
 }
 
@@ -150,8 +145,9 @@ pub const ISP_TXT_LEN: usize = 250;
 
 /// dnsmasq as the ISP's resolver on `iface` inside `ns`: authoritative for [`ISP_DNS_ZONE`]
 /// alone (names outside it are refused, so it never forwards), logging every query as
-/// `auth[A] www.isp.example from 203.0.113.10`. It stays root: the sandbox maps one user, so
-/// there is no `nobody` to drop to.
+/// `auth[A] www.isp.example from 203.0.113.10`. It reads no configuration file, so a host's own
+/// `/etc/dnsmasq.conf` (its `server=` lines) stays out of the lab. It stays root: the sandbox
+/// maps one user, so there is no `nobody` to drop to.
 ///
 /// # Errors
 ///
@@ -159,6 +155,7 @@ pub const ISP_TXT_LEN: usize = 250;
 pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     let mut cmd = ns.command("dnsmasq")?;
     cmd.args([
+        "--conf-file=/dev/null",
         "--no-daemon",
         "--log-queries",
         "--log-facility=-",
