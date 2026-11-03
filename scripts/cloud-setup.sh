@@ -57,7 +57,7 @@ $SUDO apt-get update -qq
 $SUDO apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl git xz-utils kmod procps rsync \
   musl-tools pkg-config bison flex bc libelf-dev libssl-dev ccache zstd cpio e2fsprogs \
-  qemu-system-x86 kea-dhcp4-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate \
+  qemu-system-x86 kea-dhcp4-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate radvd ndisc6 \
   iproute2 iputils-ping python3
 
 log "Rust toolchain (rust-toolchain.toml: stable, musl target, clippy, rustfmt)"

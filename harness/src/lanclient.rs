@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead as _, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -993,5 +993,121 @@ mod dns_client_tests {
                 "192.168.1.10".into()
             )]
         );
+    }
+}
+
+/// What `rdisc6` printed for one router advertisement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rdisc6Report {
+    /// The advertising router's link-local address (the `from` line).
+    pub router: Option<Ipv6Addr>,
+    /// `Router lifetime`, seconds.
+    pub lifetime: Option<u32>,
+    /// Every prefix information option's prefix.
+    pub prefixes: Vec<String>,
+    /// The MTU option.
+    pub mtu: Option<u32>,
+    /// RDNSS resolvers.
+    pub rdnss: Vec<Ipv6Addr>,
+    /// DNSSL search names.
+    pub dnssl: Vec<String>,
+}
+
+/// `rdisc6 -1 -n -w <ms> -r 3 <ifname>` inside `ns` (package `ndisc6`): solicit the routers on
+/// the link and read the first advertisement's options, which the kernel's own autoconfiguration
+/// does not expose (RDNSS, DNSSL, the lifetime).
+///
+/// # Errors
+///
+/// When `rdisc6` is not installed (a [`Skip`](crate::scenario::Skip)-worthy reason the caller
+/// decides on), cannot be run, outlives `timeout`, or prints no advertisement.
+pub fn rdisc6(ns: &NetNs, ifname: &str, timeout: Duration) -> Result<Rdisc6Report> {
+    let wait = timeout.as_millis().clamp(100, 10_000);
+    let mut cmd = ns.command("rdisc6")?;
+    cmd.args(["-1", "-n", "-w", &wait.to_string(), "-r", "3", ifname]);
+    let output = run_with_timeout(&mut cmd, timeout + Duration::from_secs(2))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report = parse_rdisc6(&stdout);
+    ensure!(
+        report.router.is_some() || report.lifetime.is_some(),
+        "rdisc6 on {ifname} saw no advertisement: {} {}",
+        stdout.trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(report)
+}
+
+/// rdisc6's verbose output: `<label> : <value>` lines, the prefix and option blocks indented,
+/// and `from <address>` last.
+#[must_use]
+pub fn parse_rdisc6(stdout: &str) -> Rdisc6Report {
+    let mut report = Rdisc6Report::default();
+    let leading_number = |value: &str| {
+        value
+            .split_whitespace()
+            .next()
+            .and_then(|first| first.parse::<u32>().ok())
+    };
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(from) = line.strip_prefix("from ") {
+            report.router = from.trim().parse().ok();
+            continue;
+        }
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (label, value) = (label.trim(), value.trim());
+        match label {
+            "Router lifetime" => report.lifetime = leading_number(value),
+            "Prefix" => report.prefixes.push(value.to_owned()),
+            "MTU" => report.mtu = leading_number(value),
+            "Recursive DNS server" => report.rdnss.extend(value.parse::<Ipv6Addr>().ok()),
+            "DNS search list" => report.dnssl.push(value.to_owned()),
+            _ => {}
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod rdisc6_tests {
+    use super::*;
+
+    #[test]
+    fn rdisc6_output_parses_into_the_options_a_scenario_asserts_on() {
+        let sample = "Soliciting ff02::2 (ff02::2) on l1...\n\n\
+Hop limit                 :           64 (      0x40)\n\
+Stateful address conf.    :           No\n\
+Stateful other conf.      :           No\n\
+Mobile home agent         :           No\n\
+Router preference         :       medium\n\
+Neighbor discovery proxy  :           No\n\
+Router lifetime           :         1800 (0x00000708) seconds\n\
+Reachable time            :  unspecified (0x00000000)\n\
+Retransmit time           :  unspecified (0x00000000)\n\
+ Prefix                   : 2001:db8:1:222::/64\n\
+  On-link                 :          Yes\n\
+  Autonomous address conf.:          Yes\n\
+  Valid time              :      2592000 (0x00278d00) seconds\n\
+  Pref. time              :       604800 (0x00093a80) seconds\n\
+ MTU                      :         1500 bytes (valid)\n\
+ Recursive DNS server     : 2001:db8:1:222::1\n\
+  DNS server lifetime     :         1800 (0x00000708) seconds\n\
+ DNS search list          : home.arpa\n\
+  DNS search list lifetime:         1800 (0x00000708) seconds\n\
+ Source link-layer address: 52:54:00:FE:00:02\n\
+ from fe80::5054:ff:fefe:2\n";
+        let report = parse_rdisc6(sample);
+        assert_eq!(report.lifetime, Some(1800));
+        assert_eq!(report.prefixes, vec!["2001:db8:1:222::/64".to_owned()]);
+        assert_eq!(report.mtu, Some(1500));
+        assert_eq!(
+            report.rdnss,
+            vec!["2001:db8:1:222::1".parse::<Ipv6Addr>().unwrap()]
+        );
+        assert_eq!(report.dnssl, vec!["home.arpa".to_owned()]);
+        assert_eq!(report.router, Some("fe80::5054:ff:fefe:2".parse().unwrap()));
+        assert_eq!(parse_rdisc6("Timed out.\n"), Rdisc6Report::default());
     }
 }

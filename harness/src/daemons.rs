@@ -4,6 +4,8 @@
 //! Reference daemons on the ISP side (SPEC §11): started inside a namespace, their output
 //! captured, killed when the lab goes.
 
+use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -185,6 +187,106 @@ pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     }
     cmd.current_dir(run_dir);
     Daemon::spawn("dnsmasq", cmd)
+}
+
+/// What the lab's radvd advertises on one interface (SPEC §11): the ISP side of the WAN link.
+#[derive(Debug, Clone)]
+pub struct RadvdConfig {
+    /// The interface in the ISP namespace.
+    pub iface: String,
+    /// `AdvDefaultLifetime`, seconds (at least `max_interval`); 0 advertises no default router.
+    pub lifetime: u16,
+    /// A prefix for the link itself, with the A and L flags, when the ISP numbers the link.
+    pub prefix: Option<String>,
+    /// RDNSS resolvers.
+    pub rdnss: Vec<String>,
+    /// DNSSL search names.
+    pub dnssl: Vec<String>,
+    /// `MinRtrAdvInterval`, seconds: radvd's floor is 3.
+    pub min_interval: u16,
+    /// `MaxRtrAdvInterval`, seconds.
+    pub max_interval: u16,
+}
+
+impl RadvdConfig {
+    /// The ISP's usual advertisement: lifetime 1800, the lab's resolver and search domain, no
+    /// link prefix, as fast as radvd allows so a scenario sees several.
+    #[must_use]
+    pub fn isp(iface: &str) -> Self {
+        RadvdConfig {
+            iface: iface.to_owned(),
+            lifetime: 1800,
+            prefix: None,
+            rdnss: vec![ISP_RESOLVER6.to_owned()],
+            dnssl: vec![ISP_DNS_ZONE.to_owned()],
+            min_interval: 3,
+            max_interval: 4,
+        }
+    }
+
+    /// `radvd.conf` for this configuration.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut text = format!(
+            "interface {}\n{{\n    AdvSendAdvert on;\n    MinRtrAdvInterval {};\n    MaxRtrAdvInterval {};\n    AdvDefaultLifetime {};\n    AdvLinkMTU 1500;\n",
+            self.iface, self.min_interval, self.max_interval, self.lifetime
+        );
+        // Writing to a `String` cannot fail; the results are dropped on purpose.
+        if let Some(prefix) = &self.prefix {
+            let _ = write!(
+                text,
+                "    prefix {prefix}\n    {{\n        AdvOnLink on;\n        AdvAutonomous on;\n    }};\n"
+            );
+        }
+        for rdnss in &self.rdnss {
+            let _ = write!(
+                text,
+                "    RDNSS {rdnss}\n    {{\n        AdvRDNSSLifetime 1800;\n    }};\n"
+            );
+        }
+        for dnssl in &self.dnssl {
+            let _ = write!(
+                text,
+                "    DNSSL {dnssl}\n    {{\n        AdvDNSSLLifetime 1800;\n    }};\n"
+            );
+        }
+        text.push_str("};\n");
+        text
+    }
+}
+
+/// The ISP's IPv6 resolver and router address on the WAN link, the lab's `2001:db8:ffff::1`.
+pub const ISP_RESOLVER6: &str = "2001:db8:ffff::1";
+
+/// radvd on `config.iface` inside `ns`, in the foreground with its log on stderr at debug
+/// level 3 (every advertisement is logged as `sending RA on <iface>`); ready when it logs its
+/// version. Stopping it (SIGTERM on drop) makes it send its final advertisements with lifetime
+/// 0, as the ISP's router would.
+///
+/// # Errors
+///
+/// When the config cannot be written or radvd cannot be spawned.
+pub fn radvd(ns: &NetNs, config: &RadvdConfig, run_dir: &Path) -> Result<Daemon> {
+    std::fs::create_dir_all(run_dir).with_context(|| format!("mkdir {}", run_dir.display()))?;
+    let conf = run_dir.join(format!("radvd-{}.conf", config.iface));
+    std::fs::write(&conf, config.render()).with_context(|| format!("write {}", conf.display()))?;
+    std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod {}", conf.display()))?;
+    let pid = run_dir.join(format!("radvd-{}.pid", config.iface));
+    let _ = std::fs::remove_file(&pid);
+    let mut cmd = ns.command("radvd")?;
+    cmd.args([
+        "--nodaemon",
+        "--debug",
+        "3",
+        "--logmethod",
+        "stderr",
+        "--config",
+    ])
+    .arg(&conf)
+    .arg("--pidfile")
+    .arg(&pid);
+    Daemon::spawn(&format!("radvd-{}", config.iface), cmd)
 }
 
 /// The lab's SNTP server (`harness/fixtures/sntp-server.py`) on `bind:123` inside `ns`: every
