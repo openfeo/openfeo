@@ -11,6 +11,7 @@
 
 pub mod iid;
 pub mod sha256;
+pub mod wire;
 
 /// Milliseconds on the driver's monotonic clock, as the other cores count time.
 pub type Timestamp = u64;

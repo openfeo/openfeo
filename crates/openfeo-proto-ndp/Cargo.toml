@@ -13,5 +13,9 @@ publish = false
 ipnet.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The test oracle for the codec's header and RFC 4861 options (ADR-0018); never shipped.
+smoltcp = { version = "0.14", default-features = false, features = ["proto-ipv6", "medium-ethernet", "socket-udp"] }
+
 [lints]
 workspace = true
