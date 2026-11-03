@@ -129,7 +129,7 @@ Blueprint: router7's architecture, odhcp6c's WAN IPv6 model, mwan3's multi-WAN m
 | Mount | Device | Contents |
 |---|---|---|
 | `/boot` (mounted read-write only while updating or blessing) | ESP, FAT32 | systemd-boot, `loader/`, `EFI/openfeo/slot-{a,b}.efi`, update staging |
-| `/state` | `openfeo-state`, ext4, `noatime,nodev,nosuid,noexec` | `config.toml`, `config.pending.toml`, `config.toml.bak.<version>`, `identity/` (DUID, IAIDs, DHCPv4 client-id, ULA prefix, port map), `leases/`, `tls/` (key, cert), `log/` (ring persisted at shutdown), `update/` (last manifest, health record), `boot-attempts` |
+| `/state` | `openfeo-state`, ext4, `noatime,nodev,nosuid,noexec` | `config.toml`, `config.pending.toml`, `config.toml.bak.<version>`, `identity/` (DUID, IAIDs, DHCPv4 client-id, the IPv6 stable-privacy secret, ULA prefix, port map), `leases/`, `tls/` (key, cert), `log/` (ring persisted at shutdown), `update/` (last manifest, health record), `boot-attempts` |
 | `/run` | tmpfs | sockets, live state |
 
 Every write of durable state MUST be temp-file + `fsync` + `rename` + directory `fsync`. Lease-database writes are debounced to at most once per 5 s. Files are mode 0600.
@@ -261,20 +261,25 @@ What the reconcilers and protocol cores must do. Kernel names: physical ports `p
 
 ### 7.3 IPv6
 
-**WAN IPv6 client** — one core per WAN in the odhcp6c mould, running on the WAN netdev (Ethernet or PPP), with kernel autoconfiguration disabled on WANs (`accept_ra=0`, `autoconf=0`; `addr_gen_mode` stable-privacy on Ethernet, the IPV6CP identifier on PPP):
+**Two ways a prefix reaches the router.** The first-class path (M2 part 2) is a prefix the ISP routes to the router statically: `[wans.ipv6].prefix` names it, nothing on the wire announces it, and each LAN names its own /64 inside it (`ipv6 = "2001:db8:222::1/64"`: the router's address with the LAN's prefix, /64 only, validated inside the routed prefix and disjoint from the other LANs). The second (M2 part 3) is a delegated prefix (DHCPv6 IA_PD), cut per LAN by an assignment index. Both feed the same RA server and the same firewall. At most one WAN carries `[wans.ipv6]` until M6 says what two mean.
 
-- *RS/RA processing*: default router and lifetime; PIO (A flag → SLAAC address with an RFC 7217 stable IID; L flag → on-link route); MTU option; RDNSS/DNSSL; route-information options. Publishes the default router with its lifetime; the routing reconciler installs it in the WAN's table and expires it on lifetime.
+**WAN IPv6 client** — one core per WAN with `[wans.ipv6]` (`mode = "auto"`; `"disabled"` runs nothing and may not sit beside a prefix or a LAN `ipv6`), in the odhcp6c mould, running on the WAN netdev (Ethernet or PPP), with kernel autoconfiguration disabled on that WAN (`accept_ra=0`, `autoconf=0`; `addr_gen_mode` stable-privacy on Ethernet with a secret generated once and persisted in `identity/`, written by the links applier before the port comes up; the IPV6CP identifier on PPP). A WAN without `[wans.ipv6]` is left to the kernel's defaults and boots exactly as before:
+
+- *RS/RA processing*: solicitations three times four seconds apart, then RFC 7559 backoff capped at an hour; an advertisement counts only with hop limit 255 from a link-local source. Default router and lifetime (several routers rank by RFC 4191 preference, then recency); PIO (A flag → SLAAC address with an RFC 7217 stable IID, for /64 prefixes only, valid lifetimes under the two-hour rule of RFC 4862 §5.5.3; L flag → on-link route); MTU option, applied as the WAN's IPv6 MTU and never above the link MTU, which DHCPv4 or PPP sets; RDNSS/DNSSL (a link-local resolver is dropped with a console line); route-information options. Publishes one fact per WAN (router, with `None` once its lifetime lapses; addresses; on-link prefixes; routes; resolvers; search names; MTU) that changes only when its content does and leaves with the WAN's carrier. The routing reconciler installs the default route and withdraws it with the fact.
+- *Typed default*: `[wans.ipv6].gateway` (link-local or global) replaces the advertised router for routing; the client still runs for the link address and the resolvers, and keeps soliciting at the RFC 7559 cap when the ISP never advertises. A global gateway outside every on-link prefix first gets a host route on the port, as IPv4 does.
+- *The router's own address*: with a routed prefix, `::1` of the prefix's first /64 sits on loopback as the router's IPv6 address and the preferred source of the IPv6 default route; that /64 is reserved, so no LAN may use it and the prefix is at most a /63. The whole prefix gets a blackhole route (§7.4).
+- *Learned facts wait for their route* (ADR-0019): the netlink monitor publishes the kernel's default routes as a fact. Resolvers a WAN learned (DHCPv4, RDNSS; IPCP and DHCPv6 later) join the forwarder's upstreams only while a default route of their family exists through that WAN, and the RA server's router lifetime follows the same route. Typed configuration is never gated.
 - *DHCPv6*: Solicit with IA_PD (hint length configurable, default 56) and optional IA_NA; Rapid Commit; Reconfigure unsupported; options DNS servers, domain list, SOL_MAX_RT; T1/T2 renew and rebind; Confirm/Rebind after a link flap; publishes delegated prefixes with preferred and valid lifetimes, and addresses.
 - *Identity*: one DUID per router (DUID-UUID, or DUID-LL from the lowest physical port MAC), generated once and persisted in `identity/`, never derived from a PPP interface; IAIDs derived deterministically from the WAN name.
 
 **LAN IPv6**:
 
-- Each LAN is assigned one /64 from every delegated prefix (assignment index per LAN, stable across reboots) plus one /64 from a per-router **ULA** /48 (RFC 4193, generated once, persisted). The router takes `::1` in each.
-- **RA server** per LAN: a PIO per assigned prefix (A=1, L=1) with lifetimes derived from the delegation (capped), RDNSS and DNSSL pointing at the router, MTU option, O=1 and M=0, router lifetime 1800 while at least one WAN has a usable IPv6 default route and **0 when none does**, so hosts fall back to IPv4 cleanly. Unsolicited RAs on change plus the periodic interval; replies to RS.
+- Each LAN carries the /64 its `ipv6` names inside the routed prefix (part 2) and, from part 3, one /64 from every delegated prefix (assignment index per LAN, stable across reboots) plus one /64 from a per-router **ULA** /48 (RFC 4193, generated once, persisted). The router takes `::1` in each.
+- **RA server** per LAN with a prefix, unless the LAN says `ra = false` (hosts placed by hand, a DMZ): a PIO per prefix (A=1, L=1; the RFC 4861 default lifetimes of 2592000 valid and 604800 preferred for a routed prefix, lifetimes derived from the delegation and capped for a delegated one), RDNSS and DNSSL pointing at the router, the MTU option with the LAN bridge's MTU, M=0 and O=0 until the stateless DHCPv6 responder exists (then O=1), router lifetime 1800 while the WAN that provides the prefix has carrier and a usable IPv6 default route in the kernel and **0 when it does not**, so hosts fall back to IPv4 cleanly. Timing per RFC 4861 §6.2: unsolicited every 200 to 600 s, the first three within 16 s, any change advertised at once under the 3 s floor, a solicitation answered within 500 ms; final advertisements with lifetime 0 when a LAN's advertising is switched off. Advertisements never leave on a WAN port, and the router accepts none from a LAN.
 - **Stateless DHCPv6** responder (Information-Request → DNS, domain) for clients that ignore RDNSS.
 - A prefix that disappears, or whose WAN goes down, is advertised with preferred lifetime 0 and valid lifetime 7200 for two hours, then dropped. Hosts cannot shorten a valid lifetime below two hours from an unauthenticated RA (RFC 4862 §5.5.3), so this is the fastest correct deprecation.
 - **Source-based routing**: for every delegated prefix, `ip -6 rule from <prefix> lookup <wan-table>`, so traffic from a prefix leaves via the WAN that delegated it. A down WAN's table gets `unreachable default`, so traffic from its deprecated prefix fails fast instead of timing out.
-- ICMPv6 follows RFC 4890: NDP, MLD, PMTUD messages and rate-limited echo are allowed where required; everything else follows zone policy. IPv6 MUST NOT be broken by the default ruleset.
+- ICMPv6 follows RFC 4890: input from a WAN accepts destination unreachable, packet too big, time exceeded and parameter problem (types 1 to 4), neighbour solicitation and advertisement, router advertisement, MLD (130 to 132, 143) and, with `wan_ping`, echo under the same limit as IPv4; everything else from a WAN, redirects included, is dropped. A LAN reaches the router with any ICMPv6. Forwarded ICMPv6 errors travel as `related` with the flow they belong to; NDP and MLD are link-scoped and never forwarded; echo through the router follows zone policy. Link-local sources skip the WAN's loose reverse-path check (§7.4), which has no interface to resolve them against. IPv6 MUST NOT be broken by the default ruleset.
 
 ### 7.4 Routing and multi-WAN
 
@@ -284,10 +289,11 @@ What the reconcilers and protocol cores must do. Kernel names: physical ports `p
 - Failover: the highest-priority `up` WAN is active. On change: main default routes (v4 and v6) are swapped, conntrack entries carrying the dead WAN's mark are deleted via ctnetlink (mark-filtered flush), RA and DNS upstreams are reconciled, an event is emitted. Fail-back is immediate when a higher-priority WAN returns, subject to a configurable hold-down.
 - Reverse-path filtering in nft, not sysctl: strict on LAN zones (`fib saddr . iif oif missing drop`), loose on WAN zones (`fib saddr oif missing drop`). Kernel `rp_filter` stays 0.
 - Public IPv4 blocks (`[[public_ipv4]]`, §7.5): every declared block gets a blackhole route in `main` (protocol 200, metric 1000), so an address nobody answers for is dropped at the router and never sent back out the default route; a LAN's connected route inside the block wins while its bridge is up. A block belongs to the ISP account that routes it; M6 pins its egress to the WANs of that account. Until then it follows the active WAN.
+- IPv6 (§7.3): the default route of a WAN with `[wans.ipv6]` goes via the advertised router or the typed gateway, metric the WAN's priority, with the router's loopback address as preferred source; the on-link prefixes and route-information routes the client learned follow it; the routed prefix gets the same blackhole as a public IPv4 block, so a /64 no LAN uses is dropped here. Link-local IPv6 sources are exempt from the WAN's loose reverse-path check.
 
 ### 7.5 Firewall and NAT
 
-- Zones: one per WAN, one per LAN, `router` (local input/output), and a reserved `vpn`. A LAN whose subnet lies inside a declared `[[public_ipv4]]` block is a **public LAN** (a DMZ of hosts with their own public addresses); a LAN in global unicast space that no block declares is a configuration error, never a silently translated LAN. Policies form a zone-pair matrix, written per source LAN as `reaches` (zone names: `"wan"`, other LAN names, or `"none"` for a LAN that initiates into nothing; absent means `["wan"]`): LAN→WAN accept by default; WAN→LAN drop; within one LAN always accept; LAN→LAN only when listed; a flow a port forward translated is accepted from a WAN, and from a LAN only when that LAN reaches the destination LAN (hairpin follows the policy). **Rules** (`[[firewall.rules]]`: `from` a zone, `to` an address, `a-b` range or CIDR inside one LAN, `proto` tcp/udp/icmp/any, `ports` as strings including `"a-b"` ranges) open single holes before the policy and never translate; they are how a DMZ host's ports are opened from the WAN and how one LAN reaches one host in another. Two rules from one zone whose targets and ports partly overlap are refused by validation, since the kernel refuses such interval elements (identical holes merge). WAN→router drop except the DHCPv6 client (UDP 546), ICMPv6 per §7.3 and optional ping, rate limited at 50/second with a burst of 100; LAN→router: DHCP, DNS, HTTPS, NTP, ICMP for a private LAN; a public LAN gets ICMP, and DHCP, DNS and NTP only when it runs the DHCP server, never HTTPS.
+- Zones: one per WAN, one per LAN, `router` (local input/output), and a reserved `vpn`. A LAN whose subnet lies inside a declared `[[public_ipv4]]` block is a **public LAN** (a DMZ of hosts with their own public addresses); a LAN in global unicast space that no block declares is a configuration error, never a silently translated LAN. Policies form a zone-pair matrix, written per source LAN as `reaches` (zone names: `"wan"`, other LAN names, or `"none"` for a LAN that initiates into nothing; absent means `["wan"]`): LAN→WAN accept by default; WAN→LAN drop; within one LAN always accept; LAN→LAN only when listed; a flow a port forward translated is accepted from a WAN, and from a LAN only when that LAN reaches the destination LAN (hairpin follows the policy). **Rules** (`[[firewall.rules]]`: `from` a zone, `to` an address, `a-b` range or CIDR inside one LAN, `proto` tcp/udp/icmp/any, `ports` as strings including `"a-b"` ranges) open single holes before the policy and never translate; they are how a DMZ host's ports are opened from the WAN and how one LAN reaches one host in another. Two rules from one zone whose targets and ports partly overlap are refused by validation, since the kernel refuses such interval elements (identical holes merge). A rule's `to` may be IPv6 (an address, range or CIDR inside one LAN's /64); the rule's family is its target's, `proto = "icmp"` means ICMPv6 for an IPv6 target, and overlap is judged within a family. WAN→router drop except the DHCPv6 client (UDP 546), ICMPv6 per §7.3 and optional ping, rate limited at 50/second with a burst of 100; LAN→router: DHCP, DNS, HTTPS, NTP, ICMP and ICMPv6 for a private LAN on both families; a public LAN gets ICMP and ICMPv6 always, DHCP, DNS and NTP over IPv4 only when it runs the DHCP server, DNS over IPv6 only when it advertises, never HTTPS.
 - The ruleset is one `table inet openfeo` regenerated from the World and applied as a single libnftables batch: `add table inet openfeo; delete table inet openfeo;` followed by the full definition in the same buffer (the add/delete pair makes the replace idempotent and the batch makes it atomic). Named sets and maps hold zone pairs, port-forward targets, the translated subnets, the rules (concatenated interval sets per protocol), blocklists and WAN address sets; rule counts never grow with list sizes.
 - NAT: IPv4 masquerade per WAN for the private LANs' subnets only (a public LAN leaves with its own addresses); port forwards as `dnat` maps keyed on the router's own addresses, or on a public-block address the forward names (`address`), with **hairpin** (LAN clients reaching a forwarded port via that address are DNATed and SNATed to the router); no IPv6 NAT.
 - Flowtable `ft` over the physical LAN and WAN ports with software offload for established flows (kernel ≥ 5.13 handles PPPoE and VLAN encapsulation); verified in the harness. Hardware offload is a per-WAN choice that disables CAKE on that WAN.
@@ -301,9 +307,9 @@ Per LAN: pool range, lease time, static leases (by MAC, optionally client-id) wi
 ### 7.7 DNS forwarder
 
 - Listens on every LAN address (v4 and v6), UDP and TCP 53; caches by TTL with negative caching (RFC 2308); EDNS0 with a 1232-byte UDP buffer; truncation → TCP retry; no recursion; DNSSEC bits passed through, no validation in MVP. Cache size scales with RAM.
-- Upstreams: learned per WAN (IPCP, DHCPv4, RDNSS, DHCPv6) for the active WAN, or user-configured; DNS-over-TLS upstreams SHOULD be supported since rustls is already linked.
-- Local zone: `<hostname>.<domain>` A records from leases, PTR reverse zones for the private LANs' subnets and for public LANs that run the DHCP server (the router names their hosts; a public LAN without it leaves its reverse zone to the ISP), the router's own name; static leases resolve even before they are active.
-- **Rebinding protection**: upstream answers containing RFC 1918, shared (100.64/10), link-local, ULA, loopback, broadcast, the private LANs' subnets or the router's own addresses (LAN and WAN) are dropped unless the name is on a configured allow-list. A public LAN's addresses are valid answers.
+- Upstreams: user-configured (IPv4 or IPv6 addresses), then the active WAN's learned ones (IPCP, DHCPv4, RDNSS, DHCPv6), each learned family joining only once its default route exists (§7.3); DNS-over-TLS upstreams SHOULD be supported since rustls is already linked.
+- Local zone: `<hostname>.<domain>` A records from leases, `[[dns.records]]` typed by the owner (`name` a label under the domain or a full name, `address` IPv4 or IPv6, so A or AAAA; unique per name and family), PTR reverse zones for the private LANs' subnets and for public LANs that run the DHCP server (the router names their hosts; a public LAN without it leaves its reverse zone to the ISP), PTR for the router's own IPv6 addresses and for records inside a LAN's /64, the router's own name with A and AAAA (its LAN addresses and its loopback address); static leases resolve even before they are active. Nothing is learned about LAN hosts' IPv6 addresses: a client that must resolve over IPv6 gets a record.
+- **Rebinding protection**: upstream answers containing RFC 1918, shared (100.64/10), link-local, ULA, loopback, broadcast, the private LANs' subnets or the router's own addresses (LAN and WAN, both families) are dropped unless the name is on a configured allow-list. A public LAN's addresses, and a LAN's /64 from a routed prefix, are valid answers.
 - Blocklists (the Rustik Block design) slot in as named sets consulted before forwarding, answering NXDOMAIN or `0.0.0.0`/`::`.
 - Implementation MAY use `hickory-proto` for wire format or an in-tree parser; either way the parser has a fuzz target.
 
@@ -359,8 +365,10 @@ password = "..."
 # [wans.static]            # a static WAN instead: address = "203.0.113.10/24", gateway = "203.0.113.1", dns = ["203.0.113.1"]
 # [wans.dhcp]              # a DHCP WAN instead; optional hostname = "myrouter", vendor_class = "OpenFeO" (sent only when set)
 [wans.ipv6]
-mode = "auto"              # auto | disabled
-pd_hint = 48
+mode = "auto"              # auto | disabled; absent = auto
+prefix = "2001:db8::/48"   # the block the ISP routes to this router (§7.3); each LAN names its /64 inside it
+# gateway = "fe80::1"      # a typed default; absent = learned from the ISP's advertisements
+pd_hint = 48               # M2 part 3
 [wans.probe]
 targets = ["1.1.1.1", "9.9.9.9"]
 interval_secs = 5
@@ -377,6 +385,7 @@ prefix = "192.0.2.248/29"  # addresses for port forwards
 name = "lan0"
 ports = ["p1", "p2", "p3"]
 ipv4 = "192.168.1.1/24"
+ipv6 = "2001:db8:222::1/64" # the router's address and the LAN's /64, inside [wans.ipv6].prefix; advertised unless ra = false
 reaches = ["wan", "guest"] # zones this LAN may initiate into: "wan", LAN names, or "none"; absent = ["wan"]
 [lans.dhcp]
 range = ["192.168.1.100", "192.168.1.250"]
@@ -395,6 +404,8 @@ ipv4 = "192.168.2.1/24"
 name = "dmz"
 ports = ["p4"]
 ipv4 = "192.0.2.233/29"    # inside a declared block: a public LAN
+ipv6 = "2001:db8:232::1/64"
+ra = false                 # hosts placed by hand: no advertisements on this LAN
 
 [firewall]
 wan_ping = false           # answer ICMP echo on WAN zones (rate limited)
@@ -411,10 +422,19 @@ from = "wan"               # "wan" or a LAN name
 to = "192.0.2.234-192.0.2.238"  # an address, an a-b range or a CIDR inside one LAN
 proto = "tcp"              # tcp | udp | icmp | any
 ports = ["80", "443"]      # tcp/udp only; "1000-1010" is a range
+[[firewall.rules]]
+name = "dmz-web6"
+from = "wan"
+to = "2001:db8:232::10"    # an IPv6 target: the rule's family is its target's
+proto = "tcp"
+ports = ["80", "443"]
 
 [dns]
-upstreams = []             # empty = learned from the active WAN
+upstreams = []             # empty = learned from the active WAN; IPv4 or IPv6 addresses
 blocklists = []
+[[dns.records]]            # a typed name: A or AAAA by the address (§7.7)
+name = "www"               # a label under [system] domain, or a full name
+address = "2001:db8:232::10"
 
 [updates]
 channel = "stable"
@@ -458,7 +478,7 @@ Vue 3 + TypeScript, built with Vite, embedded into the binary at build time. Pag
 - Updates: manifest and image signatures verified before anything is written; a verification failure is an event, never a silent retry loop.
 - Backups are encrypted (Argon2id-derived key, XChaCha20-Poly1305, or `age`); the export dialog refuses an empty passphrase.
 - Secrets are never logged; the support bundle redacts them.
-- Memory safety: `#![forbid(unsafe_code)]` in every crate except `openfeo-init`, `openfeo-nft` and `openfeo-net` (ADR-0013: AF_PACKET addresses), where `unsafe` is confined to small modules with `// SAFETY:` comments; every parser is fuzzed in CI.
+- Memory safety: `#![forbid(unsafe_code)]` in every crate except `openfeo-init`, `openfeo-nft` and `openfeo-net` (ADR-0013: AF_PACKET addresses and the ICMPv6 socket options of the NDP driver), where `unsafe` is confined to small modules with `// SAFETY:` comments; every parser is fuzzed in CI.
 
 ## 10. Observability and diagnostics
 
@@ -471,7 +491,7 @@ Vue 3 + TypeScript, built with Vite, embedded into the binary at build time. Pag
 
 - **Unit**: sans-IO cores against synthesised and recorded packets (`tests/fixtures/*.pcap`; no credentials committed); property tests (`proptest`) on parsers; reconcilers against World fixtures with `insta` snapshots of desired state (ruleset JSON, route sets, RA contents).
 - **Fuzzing**: `cargo fuzz` targets for every parser (DHCPv4, DHCPv6, ND/RA, PPPoE, LCP/IPCP/IPV6CP/PAP/CHAP, DNS, config TOML), run in a nightly CI job with a checked-in corpus.
-- **Harness** (`harness/`): the router runs in QEMU (KVM when the runner has it, TCG otherwise; i6300esb watchdog; virtio-net ports `p0` = WAN A, `p1` = WAN B, `p2` = LAN, and `p3` = a second LAN namespace `lan1` for the scenarios that ask for two LANs) attached through tap devices to network namespaces on the CI host. ISP namespaces run **reference daemons**: Kea (DHCPv4; DHCPv6 IA_NA and IA_PD), radvd, `pppoe-server` + pppd (PAP/CHAP, IPCP, IPV6CP, RFC 4638) with odhcpd or Kea for PD over PPP, plus HTTP and DNS targets. The LAN namespace runs a Rust test client (DHCPv4, SLAAC/DHCPv6, DNS, HTTP). Scenarios: link flap, lease expiry, prefix change, PADT, ISP down/up, power cut during update, broken-image rollback.
+- **Harness** (`harness/`): the router runs in QEMU (KVM when the runner has it, TCG otherwise; i6300esb watchdog; virtio-net ports `p0` = WAN A, `p1` = WAN B, `p2` = LAN, and `p3` = a second LAN namespace `lan1` for the scenarios that ask for two LANs) attached through tap devices to network namespaces on the CI host. ISP namespaces run **reference daemons**: Kea (DHCPv4; DHCPv6 IA_NA and IA_PD), radvd, `pppoe-server` + pppd (PAP/CHAP, IPCP, IPV6CP, RFC 4638) with odhcpd or Kea for PD over PPP, plus HTTP and DNS targets. The LAN namespace runs a Rust test client (DHCPv4, SLAAC/DHCPv6, DNS, HTTP); for SLAAC the namespace's own kernel is the reference client and `rdisc6` (ndisc6) reads the advertisements' options, while radvd advertises on the ISP side. Scenarios: link flap, lease expiry, prefix change, PADT, ISP down/up, power cut during update, broken-image rollback.
 - **Panel**: Playwright end-to-end tests against the harness VM.
 - **CI matrix**: `cargo test`, `cargo clippy -D warnings`, `cargo deny check`, `buf lint` and `buf breaking`, kernel build (cached), image build, harness scenarios for every completed milestone, nightly fuzz.
 
@@ -506,7 +526,7 @@ openfeo/
     openfeo-runtime            World publisher, health tracker, task supervisor, log ring (tokio; ADR-0009)
     openfeo-proto-dhcp4        sans-IO client + server cores and wire format
     openfeo-proto-dhcp6        sans-IO client (NA/PD) + stateless server
-    openfeo-proto-ndp          sans-IO RA client + RA server
+    openfeo-proto-ndp          sans-IO RS/RA codec, RA client + RA server, RFC 7217 identifiers (fuzz: ndp_wire, ndp_differential against smoltcp, ndp_client, ndp_server; ADR-0018)
     openfeo-proto-ppp          sans-IO PPPoE discovery, LCP, PAP, CHAP, IPCP, IPV6CP
     openfeo-proto-dns          wire format + cache (or hickory-proto wrapper)
     openfeo-net                socket/timer drivers for the cores, raw sockets, ppp plumbing
@@ -555,6 +575,7 @@ Coding rules (repeated in `CLAUDE.md`):
 - [x] Write `CLAUDE.md` and the first ADRs from §2.
 - [ ] Decide release signing-key custody (offline key; CI holds only a dev key) before M5.
 - [x] M1: `hickory-proto` vs in-tree DNS parser: in-tree, hickory-proto as the test oracle (ADR-0015, 31 October 2026).
+- [x] M2: NDP codec in-tree, smoltcp as the test oracle (ADR-0018, 3 November 2026); learned WAN facts act only once the kernel shows their route (ADR-0019, 3 November 2026).
 - [ ] M3: record a sanitised AAISP PPPoE session pcap for fixtures (credentials stripped).
 - [ ] M7: RB5009 boot/update ADR after studying OpenWrt's mvebu MikroTik sysupgrade path.
 - [ ] Harness: confirm Kea or odhcpd for DHCPv6-PD over PPP.
