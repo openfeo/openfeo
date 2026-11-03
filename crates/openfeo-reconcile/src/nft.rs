@@ -963,10 +963,62 @@ mod tests {
             .iter()
             .find(|rule| mentions(rule, "echo-request"))
             .unwrap();
-        assert!(
-            mentions(echo, "\"limit\"") && mentions(echo, "\"rate\":50"),
-            "{echo}"
+        let limit = echo["expr"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|expr| expr.get("limit").is_some())
+            .unwrap_or_else(|| panic!("no limit: {echo}"));
+        assert_eq!(
+            *limit,
+            json!({"limit": {"rate": 50, "per": "second", "burst": 100}}),
+            "SPEC §7.5: 50 echo requests a second, a burst of 100"
         );
+    }
+
+    /// A tagged WAN's zone is its VLAN sub-interface: the bare port carries no WAN traffic.
+    #[test]
+    fn a_tagged_wan_zone_holds_the_sub_interface_not_the_port() {
+        let d = nft(&fixtures::vlans_world());
+        assert_eq!(d.wan_if, BTreeSet::from(["p0.101".to_owned()]));
+        assert_eq!(set_elements(&d.ruleset, "set", "wan_if"), json!(["p0.101"]));
+    }
+
+    /// `proto = "icmp"` lands in `rules_other` as interface . target . `icmp`, `proto = "any"`
+    /// in `rules_any` as interface . target; neither touches the port sets.
+    #[test]
+    fn icmp_and_any_rules_land_in_their_sets() {
+        let mut world = fixtures::public_world();
+        let mut config = (*world.config).clone();
+        let firewall = config.firewall.as_mut().unwrap();
+        firewall.rules = vec![
+            openfeo_config::Rule {
+                name: "dmz-ping".into(),
+                from: "wan".into(),
+                to: "192.0.2.234".into(),
+                proto: "icmp".into(),
+                ports: Vec::new(),
+            },
+            openfeo_config::Rule {
+                name: "lan-to-dmz".into(),
+                from: "lan0".into(),
+                to: "192.0.2.232/29".into(),
+                proto: "any".into(),
+                ports: Vec::new(),
+            },
+        ];
+        world.config = std::sync::Arc::new(config);
+        let d = nft(&world);
+        assert_eq!(
+            set_elements(&d.ruleset, "set", "rules_other"),
+            json!([{"concat": ["p0", "192.0.2.234", "icmp"]}])
+        );
+        assert_eq!(
+            set_elements(&d.ruleset, "set", "rules_any"),
+            json!([{"concat": ["br-lan0", {"prefix": {"addr": "192.0.2.232", "len": 29}}]}])
+        );
+        assert_eq!(set_elements(&d.ruleset, "set", "rules_tcp"), Value::Null);
+        assert_eq!(set_elements(&d.ruleset, "set", "rules_udp"), Value::Null);
     }
 
     #[test]
