@@ -107,4 +107,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ndp_server"
+path = "fuzz_targets/ndp_server.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

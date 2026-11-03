@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod iid;
+pub mod server;
 pub mod sha256;
 pub mod wire;
 
