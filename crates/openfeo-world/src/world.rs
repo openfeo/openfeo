@@ -26,6 +26,8 @@ pub struct LinkFact {
     pub mac: Option<MacAddr>,
     /// MTU in bytes.
     pub mtu: u32,
+    /// The kernel's link-local IPv6 address on the link, once it has made one.
+    pub link_local6: Option<std::net::Ipv6Addr>,
 }
 
 /// One immutable snapshot. Reconcilers are `fn(&World) -> Desired`.

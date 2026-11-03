@@ -46,6 +46,7 @@ pub fn link_facts() -> BTreeMap<String, LinkFact> {
                     carrier: false,
                     mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, i])),
                     mtu: 1500,
+                    link_local6: None,
                 },
             )
         })
@@ -163,6 +164,7 @@ pub fn link_facts4() -> BTreeMap<String, LinkFact> {
             carrier: false,
             mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x03])),
             mtu: 1500,
+            link_local6: None,
         },
     );
     facts
@@ -220,6 +222,7 @@ pub fn ipv6_world_without_route() -> World {
                 carrier: true,
                 mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x02])),
                 mtu: 1500,
+                link_local6: None,
             },
         );
     }

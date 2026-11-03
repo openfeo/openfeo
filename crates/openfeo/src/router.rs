@@ -165,6 +165,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         });
     }
     crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
+    crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
     crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
     crate::dns::spawn(&supervisor, &publisher, &world_rx);
     crate::ra::spawn(&supervisor, &publisher, &world_rx);
@@ -403,6 +404,15 @@ fn link_facts(cache: &Cache) -> std::collections::BTreeMap<String, LinkFact> {
                     carrier: link.carrier,
                     mac: link.mac.map(MacAddr),
                     mtu: link.mtu,
+                    link_local6: cache.addrs.iter().find_map(|addr| match addr.net {
+                        ipnet::IpNet::V6(net)
+                            if addr.ifindex == link.index
+                                && net.addr().segments()[0] & 0xffc0 == 0xfe80 =>
+                        {
+                            Some(net.addr())
+                        }
+                        _ => None,
+                    }),
                 },
             )
         })

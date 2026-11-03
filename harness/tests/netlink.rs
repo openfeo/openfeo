@@ -840,6 +840,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
                     carrier: l.carrier,
                     mac: l.mac.map(MacAddr),
                     mtu: l.mtu,
+                    link_local6: None,
                 },
             )
         })
