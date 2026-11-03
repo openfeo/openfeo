@@ -1,5 +1,6 @@
 ---
 source: crates/openfeo-reconcile/src/links.rs
+assertion_line: 329
 expression: desired
 ---
 bridges:
@@ -32,6 +33,7 @@ ports:
     up: true
     master: ~
     mtu: ~
+    ipv6_stable_privacy: false
   p0.101:
     name: p0.101
     kind:
@@ -41,18 +43,21 @@ ports:
     up: true
     master: ~
     mtu: 1500
+    ipv6_stable_privacy: false
   p1:
     name: p1
     kind: Physical
     up: false
     master: ~
     mtu: ~
+    ipv6_stable_privacy: false
   p2:
     name: p2
     kind: Physical
     up: true
     master: br-lan0
     mtu: ~
+    ipv6_stable_privacy: false
   p2.223:
     name: p2.223
     kind:
@@ -62,6 +67,7 @@ ports:
     up: true
     master: br-guest
     mtu: ~
+    ipv6_stable_privacy: false
   p2.224:
     name: p2.224
     kind:
@@ -71,9 +77,11 @@ ports:
     up: true
     master: br-trusted
     mtu: ~
+    ipv6_stable_privacy: false
   p3:
     name: p3
     kind: Physical
     up: true
     master: br-trusted
     mtu: ~
+    ipv6_stable_privacy: false

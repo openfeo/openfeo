@@ -9,12 +9,15 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap, PortMapEntry};
-use openfeo_world::{Dhcp4Fact, LeaseFact, LinkFact, MacAddr, TimeFact, World};
+use openfeo_world::{
+    DefaultRoute, Dhcp4Fact, LeaseFact, LinkFact, MacAddr, TimeFact, WanIpv6Fact, World,
+};
 
 pub const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
 pub const VM_DHCP: &str = include_str!("../../../harness/fixtures/vm-dhcp.toml");
 pub const VM_VLANS: &str = include_str!("../../../harness/fixtures/vm-vlans.toml");
 pub const VM_PUBLIC: &str = include_str!("../../../harness/fixtures/vm-public.toml");
+pub const VM_IPV6: &str = include_str!("../../../harness/fixtures/vm-ipv6.toml");
 
 pub fn portmap() -> PortMap {
     PortMap {
@@ -176,5 +179,62 @@ fn world4(toml: &str) -> World {
     let mut world = world(openfeo_config::file::parse(toml).expect("fixture parses"));
     world.ports = Arc::new(portmap4());
     world.links = Arc::new(link_facts4());
+    world
+}
+
+/// What the ISP's advertisements taught `wan0` in the IPv6 lab: the router at `fe80::1`, the
+/// resolver and search domain, an MTU of 1500, no link prefix.
+pub fn ipv6_fact() -> WanIpv6Fact {
+    WanIpv6Fact {
+        router: Some("fe80::1".parse().expect("an address")),
+        addresses: Vec::new(),
+        on_link: Vec::new(),
+        routes: Vec::new(),
+        dns: vec!["2001:db8:ffff::1".parse().expect("an address")],
+        search: vec!["isp.example".to_owned()],
+        mtu: Some(1500),
+    }
+}
+
+/// `vm-ipv6.toml` on the four-port lab: p0 up with carrier and the facts of [`ipv6_fact`], the
+/// bridges `br-lan0` and `br-dmz` known with MTU 1500, and no default route in the kernel yet.
+pub fn ipv6_world_without_route() -> World {
+    let mut world = world4(VM_IPV6);
+    let mut links = link_facts4();
+    if let Some(p0) = links.get_mut("p0") {
+        p0.up = true;
+        p0.carrier = true;
+    }
+    for (name, index) in [("br-lan0", 10), ("br-dmz", 11)] {
+        links.insert(
+            name.to_owned(),
+            LinkFact {
+                index,
+                name: name.to_owned(),
+                up: true,
+                carrier: true,
+                mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x02])),
+                mtu: 1500,
+            },
+        );
+    }
+    world.links = Arc::new(links);
+    world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), ipv6_fact())]));
+    world
+}
+
+/// [`ipv6_world_without_route`] once the kernel holds both of `wan0`'s default routes.
+pub fn ipv6_world() -> World {
+    let mut world = ipv6_world_without_route();
+    world.routes = Arc::new(std::collections::BTreeSet::from([
+        DefaultRoute {
+            v6: false,
+            ifname: "p0".to_owned(),
+        },
+        DefaultRoute {
+            v6: true,
+            ifname: "p0".to_owned(),
+        },
+    ]));
     world
 }

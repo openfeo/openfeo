@@ -2,12 +2,12 @@
 // Copyright (C) 2026 Andrew Newton
 
 //! The routing applier: addresses on managed interfaces and routes with `RTPROT_OPENFEO`. Adds
-//! what is missing; deletes IPv4 global-scope addresses on managed interfaces and protocol-200
-//! routes that are no longer desired; touches nothing else (IPv6 addresses, whose ownership M2
-//! defines and which the kernel autoconfigures from router advertisements; link-local addresses;
-//! connected routes; anything on other interfaces; routes with other protocols). A pass is
-//! best-effort: a refused operation or a missing interface is reported at the end, after
-//! everything else was attempted.
+//! what is missing; deletes IPv4 global-scope addresses on managed interfaces, IPv6 global-scope
+//! addresses on the interfaces whose IPv6 the router owns (`DesiredRouting::ipv6_owned`), and
+//! protocol-200 routes that are no longer desired; touches nothing else (IPv6 on any other
+//! interface, which stays the kernel's; link-local addresses; connected routes; anything on
+//! other interfaces; routes with other protocols). A pass is best-effort: a refused operation
+//! or a missing interface is reported at the end, after everything else was attempted.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -73,8 +73,11 @@ impl RoutingApplier {
             let Some(link) = observed.links.get(&addr.ifindex) else {
                 continue;
             };
-            if !matches!(addr.net, IpNet::V4(_))
-                || !is_managed(&link.name)
+            let ours = match addr.net {
+                IpNet::V4(_) => is_managed(&link.name),
+                IpNet::V6(_) => desired.ipv6_owned.contains(&link.name),
+            };
+            if !ours
                 || addr.scope != SCOPE_UNIVERSE
                 || wanted_addrs.contains(&(addr.ifindex, addr.net))
             {
@@ -119,6 +122,7 @@ impl RoutingApplier {
                     DesiredKind::Unicast => RouteKind::Unicast,
                     DesiredKind::Blackhole => RouteKind::Blackhole,
                 },
+                pref_src: desired_route.pref_src,
             };
             wanted_routes.insert(route.clone());
             if !observed.routes.contains(&route) {
@@ -160,6 +164,9 @@ fn describe(route: &Route, ifname: &str) -> String {
     }
     if route.kind == RouteKind::Unicast {
         let _ = write!(text, " dev {ifname}");
+    }
+    if let Some(src) = route.pref_src {
+        let _ = write!(text, " src {src}");
     }
     let _ = write!(text, " proto {} metric {}", route.protocol, route.priority);
     if route.table != openfeo_netlink::TABLE_MAIN {

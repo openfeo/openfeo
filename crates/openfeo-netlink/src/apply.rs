@@ -286,6 +286,9 @@ pub fn describe(route: &Route) -> String {
     if let Some(oif) = route.oif {
         let _ = write!(text, " dev {oif}");
     }
+    if let Some(src) = route.pref_src {
+        let _ = write!(text, " src {src}");
+    }
     let _ = write!(
         text,
         " proto {} metric {} table {}",
@@ -327,6 +330,9 @@ fn route_message_builder(route: &Route) -> RouteMessage {
         if let Some(oif) = route.oif {
             builder = builder.output_interface(oif);
         }
+        if let Some(IpAddr::V6(src)) = route.pref_src {
+            builder = builder.pref_source(src);
+        }
         builder.build()
     } else {
         let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
@@ -342,6 +348,9 @@ fn route_message_builder(route: &Route) -> RouteMessage {
         }
         if let Some(oif) = route.oif {
             builder = builder.output_interface(oif);
+        }
+        if let Some(IpAddr::V4(src)) = route.pref_src {
+            builder = builder.pref_source(src);
         }
         builder.build()
     }

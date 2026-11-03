@@ -220,9 +220,12 @@ fn apply_route(cache: &mut Cache, msg: &RouteMessage, present: bool) -> bool {
         return false;
     };
     if present {
+        // A re-announcement of a route may carry fields its predecessor lacked (the preferred
+        // source): one entry per route identity.
+        cache.remove_route(&route);
         cache.routes.insert(route)
     } else {
-        cache.routes.remove(&route)
+        cache.remove_route(&route)
     }
 }
 
@@ -318,6 +321,7 @@ fn route_from(msg: &RouteMessage) -> Option<Route> {
             RouteType::BlackHole => RouteKind::Blackhole,
             _ => RouteKind::Unicast,
         },
+        pref_src: None,
     };
     for attr in &msg.attributes {
         match attr {
@@ -329,8 +333,14 @@ fn route_from(msg: &RouteMessage) -> Option<Route> {
             RouteAttribute::Oif(index) => route.oif = Some(*index),
             RouteAttribute::Priority(metric) => route.priority = *metric,
             RouteAttribute::Table(table) => route.table = *table,
+            RouteAttribute::PrefSource(a) => route.pref_src = ip_of(a),
             _ => {}
         }
+    }
+    // The kernel reports an IPv6 blackhole with `lo` as its device where the IPv4 one has none
+    // (ADR-0020); a blackhole has no interface either way.
+    if route.kind == RouteKind::Blackhole {
+        route.oif = None;
     }
     Some(route)
 }

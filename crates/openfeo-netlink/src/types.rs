@@ -97,6 +97,9 @@ pub struct Route {
     pub priority: u32,
     /// Unicast, or a blackhole (which has no `oif`).
     pub kind: RouteKind,
+    /// `RTA_PREFSRC`: the source address the kernel picks for locally generated traffic over
+    /// the route (the router's loopback address on the IPv6 default, SPEC §7.4).
+    pub pref_src: Option<IpAddr>,
 }
 
 /// Everything the monitor has seen, as of its last notification.
@@ -115,5 +118,63 @@ impl Cache {
     #[must_use]
     pub fn link_by_name(&self, name: &str) -> Option<&Link> {
         self.links.values().find(|link| link.name == name)
+    }
+
+    /// Drop the cached route a delete notification names. The kernel's notification carries
+    /// the fields that identify the route (family, table, destination, gateway, interface,
+    /// protocol, metric, kind) but not always the preferred source an IPv6 route was added
+    /// with, so that field is not compared. `true` when something was removed.
+    pub fn remove_route(&mut self, deleted: &Route) -> bool {
+        let before = self.routes.len();
+        self.routes.retain(|route| {
+            route.v6 != deleted.v6
+                || route.table != deleted.table
+                || route.dst != deleted.dst
+                || route.gateway != deleted.gateway
+                || route.oif != deleted.oif
+                || route.protocol != deleted.protocol
+                || route.priority != deleted.priority
+                || route.kind != deleted.kind
+        });
+        self.routes.len() != before
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    fn default6(pref_src: Option<IpAddr>) -> Route {
+        Route {
+            v6: true,
+            table: TABLE_MAIN,
+            dst: None,
+            gateway: Some("fe80::1".parse().unwrap()),
+            oif: Some(3),
+            protocol: RTPROT_OPENFEO,
+            priority: 10,
+            kind: RouteKind::Unicast,
+            pref_src,
+        }
+    }
+
+    /// The kernel's delete notification for an IPv6 route does not carry the preferred source
+    /// the route was added with; the cache drops the route by the fields that identify it.
+    #[test]
+    fn a_delete_without_the_preferred_source_removes_the_route_that_had_one() {
+        let mut cache = Cache::default();
+        cache
+            .routes
+            .insert(default6(Some("2001:db8:1::1".parse().unwrap())));
+        assert!(cache.remove_route(&default6(None)));
+        assert!(cache.routes.is_empty());
+        cache.routes.insert(default6(None));
+        let mut other = default6(None);
+        other.priority = 20;
+        assert!(
+            !cache.remove_route(&other),
+            "a different metric is another route"
+        );
+        assert_eq!(cache.routes.len(), 1);
     }
 }

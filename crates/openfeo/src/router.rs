@@ -133,7 +133,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     let config = load_config(&portmap);
     // The IPv6 stable-privacy secret (SPEC §5.2, §7.3): the links applier writes it to a WAN
     // port before the port comes up, so it is settled before the World exists.
-    let _ipv6_secret: Option<[u8; 16]> = match crate::ipv6::load_or_create_ipv6_secret(
+    let ipv6_secret: Option<[u8; 16]> = match crate::ipv6::load_or_create_ipv6_secret(
         std::path::Path::new(crate::ipv6::IPV6_SECRET_PATH),
     ) {
         Ok((secret, created)) => {
@@ -176,6 +176,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
                 cache_rx.clone(),
                 nl.clone(),
                 health.clone(),
+                ipv6_secret,
             )
         });
     }
@@ -476,9 +477,9 @@ struct Appliers {
 }
 
 impl Appliers {
-    fn new() -> Result<Self, TaskError> {
+    fn new(ipv6_secret: Option<[u8; 16]>) -> Result<Self, TaskError> {
         Ok(Appliers {
-            links: LinksApplier::new(),
+            links: ipv6_secret.map_or_else(LinksApplier::new, LinksApplier::with_ipv6_secret),
             routing: RoutingApplier::new(),
             nft: NftApplier::new(
                 Nft::new().map_err(|err| TaskError::from(format!("libnftables context: {err}")))?,
@@ -527,8 +528,9 @@ async fn apply_task(
     mut cache_rx: watch::Receiver<Arc<Cache>>,
     nl: Netlink,
     health: HealthTracker,
+    ipv6_secret: Option<[u8; 16]>,
 ) -> Result<(), TaskError> {
-    let mut appliers = Appliers::new()?;
+    let mut appliers = Appliers::new(ipv6_secret)?;
     let mut backoff = Duration::from_secs(1);
     let mut announced = false;
     loop {
@@ -628,6 +630,7 @@ mod tests {
             protocol: 3,
             priority: 10,
             kind,
+            pref_src: None,
         };
         cache
             .routes

@@ -8,20 +8,36 @@
 //! MAC. A pass is best-effort: a bridge the kernel refuses (or cannot be found) is reported at
 //! the end, after every other LAN was dealt with.
 
+use std::net::Ipv6Addr;
+
 use openfeo_netlink::{Cache, Error as NetlinkError, Link, LinkKind, Netlink};
+use openfeo_platform::sysctl;
 use openfeo_reconcile::links::{DesiredLinks, PortKind};
 
 use crate::{ApplyError, Pass, Report, is_vlan_port_name, resolve};
 
 /// Makes the kernel's links match [`DesiredLinks`].
 #[derive(Debug, Default)]
-pub struct LinksApplier;
+pub struct LinksApplier {
+    /// The persisted stable-privacy secret (SPEC §7.3), written to an IPv6 WAN's port before it
+    /// comes up; `None` leaves every port's link-local address to the kernel's default.
+    ipv6_secret: Option<[u8; 16]>,
+}
 
 impl LinksApplier {
-    /// A fresh applier (it keeps no state: the cache is the state).
+    /// A fresh applier (it keeps no state: the cache is the state) with no secret.
     #[must_use]
     pub fn new() -> Self {
-        LinksApplier
+        LinksApplier { ipv6_secret: None }
+    }
+
+    /// A fresh applier that gives IPv6 WAN ports stable-privacy link-local addresses from
+    /// `secret`.
+    #[must_use]
+    pub fn with_ipv6_secret(secret: [u8; 16]) -> Self {
+        LinksApplier {
+            ipv6_secret: Some(secret),
+        }
     }
 
     /// One pass over every bridge and port.
@@ -42,10 +58,26 @@ impl LinksApplier {
         vlans(&mut pass, desired, observed, nl).await;
         bridge_macs(&mut pass, desired, observed, nl).await;
         membership(&mut pass, desired, observed, nl).await;
-        up_down(&mut pass, desired, observed, nl).await;
+        up_down(&mut pass, desired, observed, nl, self.ipv6_secret).await;
         mtus(&mut pass, desired, observed, nl).await;
         pass.finish()
     }
+}
+
+/// `addr_gen_mode = 2` (stable-privacy) and the secret, as the kernel wants it, on one port.
+/// The kernel generates the link-local address when the port comes up, in the mode set then.
+fn stable_privacy(port: &str, secret: [u8; 16]) -> std::io::Result<()> {
+    sysctl::write(
+        &format!("net/ipv6/conf/{port}/stable_secret"),
+        &Ipv6Addr::from(secret).to_string(),
+    )?;
+    sysctl::write(&format!("net/ipv6/conf/{port}/addr_gen_mode"), "2")
+}
+
+/// Whether the port already generates stable-privacy addresses.
+fn has_stable_privacy(port: &str) -> bool {
+    sysctl::read(&format!("net/ipv6/conf/{port}/addr_gen_mode"))
+        .is_ok_and(|mode| mode.trim() == "2")
 }
 
 /// Ports with a desired MTU (a DHCP WAN's lease) that the kernel does not have yet.
@@ -190,11 +222,44 @@ async fn membership(pass: &mut Pass, desired: &DesiredLinks, observed: &Cache, n
 }
 
 /// Ports up iff they have a role; bridges up.
-async fn up_down(pass: &mut Pass, desired: &DesiredLinks, observed: &Cache, nl: &Netlink) {
+async fn up_down(
+    pass: &mut Pass,
+    desired: &DesiredLinks,
+    observed: &Cache,
+    nl: &Netlink,
+    ipv6_secret: Option<[u8; 16]>,
+) {
     for (port_name, port) in &desired.ports {
         let Some(link) = observed.link_by_name(port_name) else {
             continue;
         };
+        // An IPv6 WAN port gets its stable-privacy secret before it comes up; a port that is
+        // already up without it (a configuration change while running) is bounced once.
+        if let Some(secret) = ipv6_secret
+            && port.ipv6_stable_privacy
+            && port.up
+            && !has_stable_privacy(port_name)
+        {
+            if link.up {
+                pass.op(
+                    &format!("set {port_name} down (ipv6 stable-privacy)"),
+                    nl.link_set_up(link.index, false).await,
+                    |_| false,
+                );
+            }
+            match stable_privacy(port_name, secret) {
+                Ok(()) => pass.op(
+                    &format!("set {port_name} up (ipv6 stable-privacy)"),
+                    nl.link_set_up(link.index, true).await,
+                    |_| false,
+                ),
+                Err(source) => pass.fail(ApplyError::Io {
+                    path: format!("net/ipv6/conf/{port_name}/stable_secret"),
+                    source,
+                }),
+            }
+            continue;
+        }
         if link.up != port.up {
             let state = if port.up { "up" } else { "down" };
             pass.op(
