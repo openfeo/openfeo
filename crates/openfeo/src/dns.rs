@@ -113,13 +113,12 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
                 if next.listeners != current.listeners {
                     return Err("dns: the LANs changed; restarting".into());
                 }
-                let config = forwarder_config(&next);
-                let local_names = config.local.len();
-                for event in driver.configure(config) {
+                for event in driver.configure(forwarder_config(&next)) {
                     log_event(&event, &mut rebind);
                 }
-                info!("{}", upstreams_line(&next));
-                info!("dns local names {local_names}");
+                for line in change_lines(&current, &next) {
+                    info!("{line}");
+                }
                 current = next;
             }
         }
@@ -139,6 +138,25 @@ fn log_event(event: &Event, rebind: &mut Throttle) {
     } else {
         debug!("{line}");
     }
+}
+
+/// What a change of the desired state says on the console: the upstreams line when the
+/// upstreams or where they came from changed, the local-names line when their number did. A
+/// change to anything else (a lease's address arriving before the route that lets its server
+/// in, ADR-0019) says nothing, so "no upstreams" is announced once, not once per change.
+fn change_lines(current: &DesiredDns, next: &DesiredDns) -> Vec<String> {
+    let mut lines = Vec::new();
+    if next.upstreams != current.upstreams
+        || next.learned_from != current.learned_from
+        || next.wan_upstreams != current.wan_upstreams
+    {
+        lines.push(upstreams_line(next));
+    }
+    let local_names = forwarder_config(next).local.len();
+    if local_names != forwarder_config(current).local.len() {
+        lines.push(format!("dns local names {local_names}"));
+    }
+    lines
 }
 
 /// `dns upstreams 9.9.9.9 203.0.113.1 (configured, learned from wan0)`, or
@@ -234,6 +252,32 @@ mod tests {
             upstreams_line(&d),
             "dns no upstreams: only local names resolve"
         );
+    }
+
+    /// A lease's address joins the desired state before its route lets the learned server in:
+    /// that change says nothing about upstreams, and nothing about local names either.
+    #[test]
+    fn a_change_that_leaves_the_upstreams_alone_does_not_announce_them_again() {
+        let before = desired(&static_world());
+        let mut after = before.clone();
+        after.wan_addrs.push(Ipv4Addr::new(203, 0, 113, 100).into());
+        assert_eq!(change_lines(&before, &after), Vec::<String>::new());
+        let mut learned = before.clone();
+        learned
+            .upstreams
+            .insert(0, Ipv4Addr::new(9, 9, 9, 9).into());
+        assert_eq!(
+            change_lines(&before, &learned),
+            vec!["dns upstreams 9.9.9.9 203.0.113.1 (configured, learned from wan0)".to_owned()]
+        );
+        let mut named = before.clone();
+        named.local.push(openfeo_reconcile::dns::DesiredLocalName {
+            name: "nas".to_owned(),
+            addr: Ipv4Addr::new(192, 168, 1, 10).into(),
+        });
+        let lines = change_lines(&before, &named);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("dns local names "), "{lines:?}");
     }
 
     #[test]
