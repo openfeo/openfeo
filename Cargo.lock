@@ -1058,6 +1058,7 @@ dependencies = [
  "nix",
  "openfeo-proto-dhcp4",
  "openfeo-proto-dns",
+ "openfeo-proto-ndp",
  "openfeo-proto-sntp",
  "thiserror",
  "tokio",

@@ -1,17 +1,116 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-//! The one unsafe module of this crate (ADR-0013): addresses for `AF_PACKET` sockets, and the
-//! registration of an owned descriptor with tokio. nix offers no safe way to build a
-//! `sockaddr_ll`, and a packet socket not bound to its interface would copy every IPv4 frame of
-//! every port to userspace; tokio makes the caller vouch that a registered descriptor stays
+//! The one unsafe module of this crate (ADR-0013): addresses for `AF_PACKET` sockets, the
+//! registration of an owned descriptor with tokio, `adjtimex`, and the three calls the ICMPv6
+//! neighbour-discovery socket needs that nix does not name: the raw ICMPv6 socket itself, the
+//! `ICMP6_FILTER` option and the interface-scoped multicast join. nix offers no safe way to build
+//! a `sockaddr_ll`, and a packet socket not bound to its interface would copy every IPv4 frame
+//! of every port to userspace; tokio makes the caller vouch that a registered descriptor stays
 //! open, which an `OwnedFd` guarantees.
 
+use std::io;
 use std::mem::size_of;
-use std::os::fd::OwnedFd;
+use std::net::Ipv6Addr;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd as _, OwnedFd};
 
 use nix::sys::socket::{LinkAddr, SockaddrLike};
 use tokio::io::unix::AsyncFd;
+
+/// `ICMP6_FILTER` (RFC 3542 §3.2): the option number from `linux/icmpv6.h`, which libc lacks.
+const ICMP6_FILTER: libc::c_int = 1;
+
+/// `struct icmp6_filter`: 256 bits, one per ICMPv6 type; a set bit blocks the type.
+#[repr(C)]
+struct Icmp6Filter {
+    words: [u32; 8],
+}
+
+/// `socket(AF_INET6, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMPV6)`: nix names no
+/// ICMPv6 protocol. The kernel computes and checks the ICMPv6 checksum on such a socket.
+///
+/// # Errors
+///
+/// When the kernel refuses (no `CAP_NET_RAW`).
+pub fn icmpv6_raw_socket() -> io::Result<OwnedFd> {
+    // SAFETY: socket(2) takes three integers and returns a descriptor or -1.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_INET6,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_ICMPV6,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned open by the kernel and nothing else owns or closes it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The `ICMP6_FILTER` bitmap that passes exactly the types in `pass`: every bit set (blocked)
+/// but theirs.
+#[must_use]
+pub fn icmp6_filter_words(pass: &[u8]) -> [u32; 8] {
+    let mut words = [u32::MAX; 8];
+    for &kind in pass {
+        words[usize::from(kind >> 5)] &= !(1u32 << (kind & 31));
+    }
+    words
+}
+
+/// Have the socket deliver only the ICMPv6 types in `pass` (RFC 3542 §3.2).
+///
+/// # Errors
+///
+/// When the kernel refuses the option.
+pub fn icmp6_filter(fd: BorrowedFd<'_>, pass: &[u8]) -> io::Result<()> {
+    let filter = Icmp6Filter {
+        words: icmp6_filter_words(pass),
+    };
+    setsockopt_raw(fd, libc::IPPROTO_ICMPV6, ICMP6_FILTER, &filter)
+}
+
+/// Join `group` on interface `ifindex` (`IPV6_ADD_MEMBERSHIP`). nix's request names only the
+/// group, and the kernel then picks the interface by route rather than by the socket's device.
+///
+/// # Errors
+///
+/// When the kernel refuses: no such interface, or the group is already joined.
+pub fn join_multicast_v6(fd: BorrowedFd<'_>, group: Ipv6Addr, ifindex: u32) -> io::Result<()> {
+    let request = libc::ipv6_mreq {
+        ipv6mr_multiaddr: libc::in6_addr {
+            s6_addr: group.octets(),
+        },
+        ipv6mr_interface: ifindex,
+    };
+    setsockopt_raw(fd, libc::IPPROTO_IPV6, libc::IPV6_ADD_MEMBERSHIP, &request)
+}
+
+fn setsockopt_raw<T>(
+    fd: BorrowedFd<'_>,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: &T,
+) -> io::Result<()> {
+    let len = libc::socklen_t::try_from(size_of::<T>())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `value` is a plain C struct that lives for the whole call and `len` is exactly its
+    // size; the kernel copies the bytes and keeps no pointer to them.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            level,
+            name,
+            std::ptr::from_ref(value).cast::<libc::c_void>(),
+            len,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 /// Register `fd` with the tokio reactor for readiness.
 ///
@@ -140,5 +239,26 @@ mod tests {
         let dest = link_addr(7, 0x0800, Some([0xff; 6])).unwrap();
         assert_eq!(dest.addr(), Some([0xff; 6]));
         assert_eq!(dest.halen(), 6);
+    }
+}
+
+#[cfg(test)]
+mod icmp6_tests {
+    use super::*;
+
+    #[test]
+    fn icmp6_filter_bitmap_blocks_everything_but_the_passed_types() {
+        let words = icmp6_filter_words(&[134]);
+        assert_eq!(words[4], !(1u32 << 6), "134 = 4 * 32 + 6");
+        for (i, word) in words.iter().enumerate() {
+            if i != 4 {
+                assert_eq!(*word, u32::MAX, "word {i} blocks all");
+            }
+        }
+        let words = icmp6_filter_words(&[133, 134]);
+        assert_eq!(words[4], !(1u32 << 5 | 1u32 << 6));
+        assert_eq!(icmp6_filter_words(&[]), [u32::MAX; 8], "nothing passes");
+        assert_eq!(icmp6_filter_words(&[0])[0], !1u32);
+        assert_eq!(icmp6_filter_words(&[255])[7], !(1u32 << 31));
     }
 }
