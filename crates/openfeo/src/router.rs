@@ -32,7 +32,7 @@ use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{HealthTracker, Publisher, Supervisor};
 use openfeo_world::health::{Status, Subsystem};
 use openfeo_world::portmap::{PresentPort, assign};
-use openfeo_world::{LinkFact, MacAddr, World, rename};
+use openfeo_world::{DefaultRoute, LinkFact, MacAddr, World, rename};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -151,13 +151,17 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
 
     let (publisher, world_rx) = Publisher::new(World::new(config, portmap));
     let publisher = Arc::new(publisher);
-    publisher.update(|world| world.links = Arc::new(link_facts(&cache_rx.borrow())));
+    publisher.update(|world| {
+        let cache = cache_rx.borrow();
+        world.links = Arc::new(link_facts(&cache));
+        world.routes = Arc::new(default_routes(&cache));
+    });
 
     {
         let publisher = publisher.clone();
         let cache_rx = cache_rx.clone();
-        supervisor.spawn("link-facts", move || {
-            link_facts_task(publisher.clone(), cache_rx.clone())
+        supervisor.spawn("netlink-facts", move || {
+            netlink_facts_task(publisher.clone(), cache_rx.clone())
         });
     }
     crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
@@ -403,18 +407,51 @@ fn link_facts(cache: &Cache) -> std::collections::BTreeMap<String, LinkFact> {
         .collect()
 }
 
-/// Publish a new World whenever the link facts change; log carrier transitions of our ports.
-async fn link_facts_task(
+/// The default routes the kernel holds in the main table, by family and output interface,
+/// whoever installed them (ADR-0019). A blackhole has no interface and is no default.
+fn default_routes(cache: &Cache) -> std::collections::BTreeSet<DefaultRoute> {
+    cache
+        .routes
+        .iter()
+        .filter(|route| {
+            route.table == openfeo_netlink::TABLE_MAIN
+                && route.dst.is_none()
+                && route.kind == openfeo_netlink::RouteKind::Unicast
+        })
+        .filter_map(|route| {
+            let link = cache.links.get(&route.oif?)?;
+            Some(DefaultRoute {
+                v6: route.v6,
+                ifname: link.name.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Publish a new World whenever the link facts or the kernel's default routes change; log
+/// carrier transitions of our ports.
+async fn netlink_facts_task(
     publisher: Arc<Publisher>,
     mut cache_rx: watch::Receiver<Arc<Cache>>,
 ) -> Result<(), TaskError> {
     loop {
         cache_rx.changed().await.map_err(|_| "netlink cache gone")?;
-        let facts = link_facts(&cache_rx.borrow_and_update());
-        if *publisher.current().links == facts {
+        let (facts, routes) = {
+            let cache = cache_rx.borrow_and_update();
+            (link_facts(&cache), default_routes(&cache))
+        };
+        let current = publisher.current();
+        if *current.links == facts && *current.routes == routes {
             continue;
         }
+        drop(current);
         publisher.update(|world| {
+            if *world.routes != routes {
+                world.routes = Arc::new(routes);
+            }
+            if *world.links == facts {
+                return;
+            }
             for (name, fact) in &facts {
                 if !world.ports.names().any(|port| port == name) {
                     continue;
@@ -560,6 +597,68 @@ async fn apply_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_routes_from_the_cache_name_their_interface_and_skip_other_tables() {
+        use openfeo_netlink::{Link, Route, RouteKind, TABLE_MAIN};
+        let mut cache = Cache::default();
+        for (index, name) in [(2, "p0"), (3, "p1")] {
+            cache.links.insert(
+                index,
+                Link {
+                    index,
+                    name: name.to_owned(),
+                    kind: None,
+                    master: None,
+                    parent: None,
+                    vlan_id: None,
+                    up: true,
+                    carrier: true,
+                    mac: None,
+                    mtu: 1500,
+                },
+            );
+        }
+        let route = |v6: bool, table: u32, oif: Option<u32>, kind: RouteKind| Route {
+            v6,
+            table,
+            dst: None,
+            gateway: None,
+            oif,
+            protocol: 3,
+            priority: 10,
+            kind,
+        };
+        cache
+            .routes
+            .insert(route(false, TABLE_MAIN, Some(2), RouteKind::Unicast));
+        cache
+            .routes
+            .insert(route(true, TABLE_MAIN, Some(2), RouteKind::Unicast));
+        cache
+            .routes
+            .insert(route(true, 100, Some(3), RouteKind::Unicast));
+        cache
+            .routes
+            .insert(route(true, TABLE_MAIN, None, RouteKind::Blackhole));
+        cache
+            .routes
+            .insert(route(false, TABLE_MAIN, Some(9), RouteKind::Unicast));
+        let facts = default_routes(&cache);
+        assert_eq!(
+            facts,
+            std::collections::BTreeSet::from([
+                DefaultRoute {
+                    v6: false,
+                    ifname: "p0".to_owned()
+                },
+                DefaultRoute {
+                    v6: true,
+                    ifname: "p0".to_owned()
+                },
+            ])
+        );
+    }
 
     #[test]
     fn sysctl_waits_for_nft() {

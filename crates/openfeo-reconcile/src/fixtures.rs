@@ -58,6 +58,8 @@ fn world(config: Config) -> World {
         dhcp4: Arc::new(BTreeMap::new()),
         leases: Arc::new(BTreeMap::new()),
         time: TimeFact::default(),
+        ipv6: Arc::new(BTreeMap::new()),
+        routes: Arc::new(std::collections::BTreeSet::new()),
     }
 }
 
