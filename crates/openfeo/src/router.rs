@@ -131,6 +131,23 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
 
     let portmap = name_ports(&nl, &cache_rx).await?;
     let config = load_config(&portmap);
+    // The IPv6 stable-privacy secret (SPEC §5.2, §7.3): the links applier writes it to a WAN
+    // port before the port comes up, so it is settled before the World exists.
+    let _ipv6_secret: Option<[u8; 16]> = match crate::ipv6::load_or_create_ipv6_secret(
+        std::path::Path::new(crate::ipv6::IPV6_SECRET_PATH),
+    ) {
+        Ok((secret, created)) => {
+            info!(
+                "identity: ipv6 secret {}",
+                if created { "created" } else { "loaded" }
+            );
+            Some(secret)
+        }
+        Err(err) => {
+            warn!("identity: ipv6 secret: {err}; stable-privacy addressing is off");
+            None
+        }
+    };
 
     let (publisher, world_rx) = Publisher::new(World::new(config, portmap));
     let publisher = Arc::new(publisher);
