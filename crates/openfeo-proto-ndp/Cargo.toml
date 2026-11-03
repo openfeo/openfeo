@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-proto-ndp"
+description = "OpenFeO neighbour discovery without sockets or clocks: the RS/RA codec, the WAN router-advertisement client, the LAN router-advertisement server and RFC 7217 identifiers (SPEC §7.3, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ipnet.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
