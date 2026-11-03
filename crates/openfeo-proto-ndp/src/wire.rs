@@ -25,7 +25,7 @@ const DNSSL: u8 = 31;
 
 /// RFC 4191 router preference, two bits in the advertisement's flags and in a route
 /// information option. The reserved value `10` reads as medium (RFC 4191 §2.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Preference {
     Low,
     #[default]

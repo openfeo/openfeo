@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod iid;
 pub mod sha256;
 pub mod wire;
