@@ -111,7 +111,7 @@ priority = 10
 address = "203.0.113.10/24"
 gateway = "203.0.113.1"
 [wans.ipv6]
-prefix = "2001:db8::/48"             # the block the ISP routes to this router
+prefix = "2001:db8:1::/48"             # the block the ISP routes to this router
 # gateway = "fe80::1"                # a typed default; absent = learned from the ISP's advertisements
 # mode = "auto"                      # auto | disabled (SPEC §8.2); absent = auto
 
@@ -119,25 +119,25 @@ prefix = "2001:db8::/48"             # the block the ISP routes to this router
 name = "lan0"
 ports = ["p2"]
 ipv4 = "192.168.1.1/24"
-ipv6 = "2001:db8:222::1/64"          # the router's address and the LAN's /64, inside the prefix
+ipv6 = "2001:db8:1:222::1/64"          # the router's address and the LAN's /64, inside the prefix
 
 [[lans]]
 name = "dmz"
 ports = ["p3"]
 ipv4 = "192.0.2.233/29"
-ipv6 = "2001:db8:232::1/64"
+ipv6 = "2001:db8:1:232::1/64"
 ra = false                           # hosts here are placed by hand; absent = true
 
 [dns]
 upstreams = ["203.0.113.1", "2001:db8:ffff::53"]
 [[dns.records]]                      # typed names, v4 or v6
 name = "www"                         # a label under the system domain, or a full name
-address = "2001:db8:232::10"
+address = "2001:db8:1:232::10"
 
 [[firewall.rules]]
 name = "dmz-web6"
 from = "wan"
-to = "2001:db8:232::10"              # an address, an a-b range or a CIDR inside one LAN's /64
+to = "2001:db8:1:232::10"              # an address, an a-b range or a CIDR inside one LAN's /64
 proto = "tcp"
 ports = ["80", "443"]
 ```
@@ -432,7 +432,7 @@ cache, which the driver needs only to log it.
 `MinRtrAdvInterval 3` and `MaxRtrAdvInterval 4` (radvd's floor, so a scenario sees several
 advertisements), RDNSS pointing at dnsmasq's IPv6 address, DNSSL `isp.example`, and in the
 scenarios that want it a prefix for the link (`2001:db8:ffff::/64`, the ISP router at
-`2001:db8:ffff::1` and `fe80::1`). The ISP side routes the prefix (`2001:db8::/48`) via the
+`2001:db8:ffff::1` and `fe80::1`). The ISP side routes the prefix (`2001:db8:1::/48`) via the
 router's WAN link-local address, which the harness reads from the console line the router
 prints, or via the router's link address in the prefix scenario (`Lab::isp_route_block6`).
 dnsmasq serves AAAA for `isp.example` names and listens on IPv6; the HTTP target binds an IPv6
@@ -443,20 +443,20 @@ advertisement's options for the assertions on RDNSS and DNSSL. A DMZ host is pla
 setup script and `check-env`.
 
 **Fixtures.** `harness/fixtures/vm-ipv6.toml`: the static IPv4 WAN of `vm-static.toml` plus
-`[wans.ipv6]` with the prefix and no gateway, `lan0` with `2001:db8:222::1/64`, a DMZ on `p3`
-with `2001:db8:232::1/64` and `ra = false`, a rule opening tcp 80 to the DMZ host, a typed AAAA
+`[wans.ipv6]` with the prefix and no gateway, `lan0` with `2001:db8:1:222::1/64`, a DMZ on `p3`
+with `2001:db8:1:232::1/64` and `ra = false`, a rule opening tcp 80 to the DMZ host, a typed AAAA
 record for it, one typed IPv6 upstream. A second fixture, or the same one with a `gateway`
 line switched in by the scenario, covers the typed default.
 
 **QEMU scenarios** (`harness/tests/m2.rs` or a sibling file):
 
 - `lan_client_configures_itself_from_the_lan_prefix_and_reaches_the_isp_over_ipv6`: the LAN
-  host gets an address in `2001:db8:222::/64`, its default router is the bridge's link-local,
+  host gets an address in `2001:db8:1:222::/64`, its default router is the bridge's link-local,
   and it fetches the ISP's IPv6 HTTP target; `rdisc6` shows the router as RDNSS and
   `home.arpa` as DNSSL.
 - `the_router_learns_its_default_from_the_isp_and_sources_from_its_loopback_address`: the
   console shows the learned router; a query from the router to the ISP's resolver arrives from
-  `2001:db8::1` (dnsmasq's log shows the client address).
+  `2001:db8:1::1` (dnsmasq's log shows the client address).
 - `a_typed_gateway_replaces_the_learned_default`: with `gateway` set the console names it, the
   LAN host still reaches the ISP, and radvd's router lifetime is not what decides the route.
 - `a_link_prefix_from_the_isp_gives_the_wan_a_stable_address`: with the link prefix advertised,

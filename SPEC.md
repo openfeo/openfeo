@@ -261,7 +261,7 @@ What the reconcilers and protocol cores must do. Kernel names: physical ports `p
 
 ### 7.3 IPv6
 
-**Two ways a prefix reaches the router.** The first-class path (M2 part 2) is a prefix the ISP routes to the router statically: `[wans.ipv6].prefix` names it, nothing on the wire announces it, and each LAN names its own /64 inside it (`ipv6 = "2001:db8:222::1/64"`: the router's address with the LAN's prefix, /64 only, validated inside the routed prefix and disjoint from the other LANs). The second (M2 part 3) is a delegated prefix (DHCPv6 IA_PD), cut per LAN by an assignment index. Both feed the same RA server and the same firewall. At most one WAN carries `[wans.ipv6]` until M6 says what two mean.
+**Two ways a prefix reaches the router.** The first-class path (M2 part 2) is a prefix the ISP routes to the router statically: `[wans.ipv6].prefix` names it, nothing on the wire announces it, and each LAN names its own /64 inside it (`ipv6 = "2001:db8:1:222::1/64"`: the router's address with the LAN's prefix, /64 only, validated inside the routed prefix and disjoint from the other LANs). The second (M2 part 3) is a delegated prefix (DHCPv6 IA_PD), cut per LAN by an assignment index. Both feed the same RA server and the same firewall. At most one WAN carries `[wans.ipv6]` until M6 says what two mean.
 
 **WAN IPv6 client** — one core per WAN with `[wans.ipv6]` (`mode = "auto"`; `"disabled"` runs nothing and may not sit beside a prefix or a LAN `ipv6`), in the odhcp6c mould, running on the WAN netdev (Ethernet or PPP), with kernel autoconfiguration disabled on that WAN (`accept_ra=0`, `autoconf=0`; `addr_gen_mode` stable-privacy on Ethernet with a secret generated once and persisted in `identity/`, written by the links applier before the port comes up; the IPV6CP identifier on PPP). A WAN without `[wans.ipv6]` is left to the kernel's defaults and boots exactly as before:
 
@@ -366,7 +366,7 @@ password = "..."
 # [wans.dhcp]              # a DHCP WAN instead; optional hostname = "myrouter", vendor_class = "OpenFeO" (sent only when set)
 [wans.ipv6]
 mode = "auto"              # auto | disabled; absent = auto
-prefix = "2001:db8::/48"   # the block the ISP routes to this router (§7.3); each LAN names its /64 inside it
+prefix = "2001:db8:1::/48"   # the block the ISP routes to this router (§7.3); each LAN names its /64 inside it
 # gateway = "fe80::1"      # a typed default; absent = learned from the ISP's advertisements
 pd_hint = 48               # M2 part 3
 [wans.probe]
@@ -385,7 +385,7 @@ prefix = "192.0.2.248/29"  # addresses for port forwards
 name = "lan0"
 ports = ["p1", "p2", "p3"]
 ipv4 = "192.168.1.1/24"
-ipv6 = "2001:db8:222::1/64" # the router's address and the LAN's /64, inside [wans.ipv6].prefix; advertised unless ra = false
+ipv6 = "2001:db8:1:222::1/64" # the router's address and the LAN's /64, inside [wans.ipv6].prefix; advertised unless ra = false
 reaches = ["wan", "guest"] # zones this LAN may initiate into: "wan", LAN names, or "none"; absent = ["wan"]
 [lans.dhcp]
 range = ["192.168.1.100", "192.168.1.250"]
@@ -404,7 +404,7 @@ ipv4 = "192.168.2.1/24"
 name = "dmz"
 ports = ["p4"]
 ipv4 = "192.0.2.233/29"    # inside a declared block: a public LAN
-ipv6 = "2001:db8:232::1/64"
+ipv6 = "2001:db8:1:232::1/64"
 ra = false                 # hosts placed by hand: no advertisements on this LAN
 
 [firewall]
@@ -425,7 +425,7 @@ ports = ["80", "443"]      # tcp/udp only; "1000-1010" is a range
 [[firewall.rules]]
 name = "dmz-web6"
 from = "wan"
-to = "2001:db8:232::10"    # an IPv6 target: the rule's family is its target's
+to = "2001:db8:1:232::10"    # an IPv6 target: the rule's family is its target's
 proto = "tcp"
 ports = ["80", "443"]
 
@@ -434,7 +434,7 @@ upstreams = []             # empty = learned from the active WAN; IPv4 or IPv6 a
 blocklists = []
 [[dns.records]]            # a typed name: A or AAAA by the address (§7.7)
 name = "www"               # a label under [system] domain, or a full name
-address = "2001:db8:232::10"
+address = "2001:db8:1:232::10"
 
 [updates]
 channel = "stable"
@@ -503,7 +503,7 @@ MVP = M0–M6 green in CI plus 30 days of dogfooding on the AAISP line. A milest
 |---|---|---|
 | **M0 Harness and skeleton** | Workspace, CI, `required.config`, x86 kernel build, initramfs, PID 1 (mounts, watchdog, supervisor, console log), harness with one ISP namespace and a LAN namespace, `openfeo.mode=vm` | VM boots to PID 1 in CI, logs version and port map; child restart observed after kill; watchdog reboot observed when heartbeats stop |
 | **M1 IPv4 router** | Port identity and roles, LAN bridge, DHCPv4 client, static WAN, World/reconcile/apply loop, netlink monitor, libnftables ruleset (zones, masquerade, port forwards, hairpin), DHCPv4 server with static leases, DNS forwarder with local names and rebinding protection, SNTP, config load/validate/migrate, kernel-option check | LAN client gets a lease, resolves `nas.home.arpa`, fetches HTTP from the ISP side through NAT; port forward reachable from WAN and via hairpin; WAN lease renews; WAN link flap recovers; a child crash does not interrupt forwarding |
-| **M2 IPv6** | Part 1 (IPv4 groundwork): LAN VLANs (`pN.V` members), 802.1Q WAN, routed public IPv4 blocks with public LANs, per-LAN `reaches`, firewall rules. Part 2 (a statically routed prefix, first class): WAN IPv6 link (RA, SLAAC, DUID persistence), the ISP's routed prefix (`2001:db8::/48` in the examples) cut into per-LAN /64s chosen in config, RA server switchable per LAN, DNS AAAA records and IPv6 upstreams, the v6 firewall mirroring the v4 zones, `reaches` and rules, ICMPv6 policy. Part 3 (other ISPs): DHCPv6 NA/PD, ULA, stateless DHCPv6, source-based rules, deprecation | Part 1: a tagged client leases from its own LAN and reaches only what its LAN reaches; a DMZ host with a public address is reached from the ISP side only through a rule and leaves untranslated; a forward on a public address reaches a LAN host. Part 2: a LAN client gets a GUA from its LAN's /64 and reaches an ISP-side v6 server through the routed prefix; a DMZ host's AAAA resolves and the host is reached from the ISP side only through a rule; WAN v6 loss → router lifetime 0 within one RA interval. Part 3: a LAN client gets a GUA from the delegation; ISP changes the prefix → LAN renumbered within 10 s, old prefix deprecated, traffic from it receives ICMPv6 unreachable |
+| **M2 IPv6** | Part 1 (IPv4 groundwork): LAN VLANs (`pN.V` members), 802.1Q WAN, routed public IPv4 blocks with public LANs, per-LAN `reaches`, firewall rules. Part 2 (a statically routed prefix, first class): WAN IPv6 link (RA, SLAAC, DUID persistence), the ISP's routed prefix (`2001:db8:1::/48` in the examples) cut into per-LAN /64s chosen in config, RA server switchable per LAN, DNS AAAA records and IPv6 upstreams, the v6 firewall mirroring the v4 zones, `reaches` and rules, ICMPv6 policy. Part 3 (other ISPs): DHCPv6 NA/PD, ULA, stateless DHCPv6, source-based rules, deprecation | Part 1: a tagged client leases from its own LAN and reaches only what its LAN reaches; a DMZ host with a public address is reached from the ISP side only through a rule and leaves untranslated; a forward on a public address reaches a LAN host. Part 2: a LAN client gets a GUA from its LAN's /64 and reaches an ISP-side v6 server through the routed prefix; a DMZ host's AAAA resolves and the host is reached from the ISP side only through a rule; WAN v6 loss → router lifetime 0 within one RA interval. Part 3: a LAN client gets a GUA from the delegation; ISP changes the prefix → LAN renumbered within 10 s, old prefix deprecated, traffic from it receives ICMPv6 unreachable |
 | **M3 PPPoE** | Discovery, LCP, PAP/CHAP, IPCP, IPV6CP, kernel plumbing, keepalive, reconnect, RFC 4638, MSS clamp (the 802.1Q WAN landed in M2 part 1) | v4 and v6 over PPP against `pppoe-server`/pppd at MTU 1492 and 1500; AC-initiated PADT and LCP echo failure both recover; a wrong password backs off and is reported; prefix delegation over PPP works |
 | **M4 API and panel** | Proto/pbjson/protobuf-es pipeline, HTTPS, auth, WebSocket envelope and subscriptions, gRPC, Vue panel pages, first-boot wizard, commit-confirm, logs and diagnostics views, packet capture | Playwright: wizard → routing; LAN subnet changed without confirming → reverted at 60 s; capture stream opens in Wireshark; a WS upgrade with a foreign `Origin` is refused |
 | **M5 Install, update, recovery** | USB installer, GPT layout, systemd-boot and entries, signed manifest and image, A/B write and bless, health protocol, console menu, triple power-cycle, encrypted backup/restore, factory reset | Install to a virtual disk and boot; update to a deliberately broken image → three failed boots → old slot boots and reports the rollback; update to a good image → blessed after health; power cut mid-download leaves the running slot intact |

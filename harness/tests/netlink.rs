@@ -788,6 +788,8 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
             ipv4: "192.168.9.1/24".into(),
             dhcp: None,
             reaches: Vec::new(),
+            ipv6: String::new(),
+            ra: None,
         });
         let mut rig = Rig::connect().await?;
         let cache = rig.rx.borrow_and_update().clone();

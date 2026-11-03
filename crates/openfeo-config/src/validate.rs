@@ -7,13 +7,14 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 
 use crate::rules;
 use crate::{
-    Config, DhcpWan, Dns, Firewall, LanDhcp, PortMap, StaticLease, System, Wan, portname, wan,
+    Config, DhcpWan, Dns, Firewall, Ipv6Wan, LanDhcp, PortMap, Record, StaticLease, StaticWan,
+    System, Wan, portname, wan,
 };
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
@@ -93,6 +94,27 @@ pub enum Code {
     /// Two rules from one zone in the same set whose targets and ports partly overlap (the
     /// kernel refuses such interval elements, in an order-dependent way).
     OverlappingRules,
+    /// A `[wans.ipv6] prefix` that is not global unicast space, has host bits set, or is longer
+    /// than a /63 (its first /64 is the router's own).
+    InvalidIpv6Prefix,
+    /// `[wans.ipv6]` on a second WAN (one WAN carries IPv6 until M6).
+    Ipv6WanTwice,
+    /// A `[wans.ipv6] mode` other than `auto` or `disabled`.
+    InvalidIpv6Mode,
+    /// `mode = "disabled"` beside a prefix or a LAN `ipv6`, which would then describe nothing.
+    Ipv6Disabled,
+    /// A LAN `ipv6` outside the routed prefix.
+    LanPrefixOutsideRouted,
+    /// A LAN `ipv6` in the routed prefix's first /64, the router's own.
+    LanPrefixReserved,
+    /// A LAN `ipv6` with no routed prefix to lie in.
+    LanPrefixWithoutRouted,
+    /// `ra` on a LAN without `ipv6`.
+    RaWithoutIpv6,
+    /// Two `[[dns.records]]` with the same name and address family.
+    DuplicateRecord,
+    /// A `[[dns.records]]` name the router already answers for.
+    RecordNameTaken,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -194,6 +216,16 @@ impl Code {
             Code::InvalidRuleTarget => "invalid_rule_target",
             Code::InvalidRulePorts => "invalid_rule_ports",
             Code::OverlappingRules => "overlapping_rules",
+            Code::InvalidIpv6Prefix => "invalid_ipv6_prefix",
+            Code::Ipv6WanTwice => "ipv6_wan_twice",
+            Code::InvalidIpv6Mode => "invalid_ipv6_mode",
+            Code::Ipv6Disabled => "ipv6_disabled",
+            Code::LanPrefixOutsideRouted => "lan_prefix_outside_routed",
+            Code::LanPrefixReserved => "lan_prefix_reserved",
+            Code::LanPrefixWithoutRouted => "lan_prefix_without_routed",
+            Code::RaWithoutIpv6 => "ra_without_ipv6",
+            Code::DuplicateRecord => "duplicate_record",
+            Code::RecordNameTaken => "record_name_taken",
         }
     }
 }
@@ -232,6 +264,8 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     let mut names: BTreeSet<&str> = BTreeSet::new();
     let mut owners = PortOwners::default();
     let mut pools = Pools::default();
+    let mut ipv6_wans = false;
+    let lans_have_ipv6 = config.lans.iter().any(|lan| !lan.ipv6.is_empty());
 
     if let Some(system_config) = &config.system {
         system(&mut report, system_config);
@@ -259,6 +293,16 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
         let path = format!("wans[{i}]");
         report.name(&mut names, &format!("{path}.name"), &wan.name, MAX_WAN_NAME);
         wan_port(&mut report, &mut owners, ports, &path, wan);
+        if let Some(ipv6) = &wan.ipv6 {
+            ipv6_wan(
+                &mut report,
+                &mut pools,
+                &path,
+                ipv6,
+                &mut ipv6_wans,
+                lans_have_ipv6,
+            );
+        }
         match &wan.kind {
             None => report.push(
                 format!("{path}.kind"),
@@ -266,31 +310,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
                 "a WAN needs exactly one of [wans.static], [wans.dhcp]".to_owned(),
             ),
             Some(wan::Kind::Dhcp(dhcp)) => dhcp_wan(&mut report, &path, dhcp),
-            Some(wan::Kind::Static(s)) => {
-                let net = report.cidr(&format!("{path}.static.address"), &s.address);
-                let gateway = report.addr4(&format!("{path}.static.gateway"), &s.gateway);
-                if let (Some(net), Some(gateway)) = (net, gateway)
-                    && !net.contains(&gateway)
-                {
-                    report.push(
-                        format!("{path}.static.gateway"),
-                        Code::GatewayOutsideSubnet,
-                        format!("{gateway} is not inside {}", net.trunc()),
-                    );
-                }
-                for (j, dns) in s.dns.iter().enumerate() {
-                    if dns.parse::<IpAddr>().is_err() {
-                        report.push(
-                            format!("{path}.static.dns[{j}]"),
-                            Code::InvalidAddress,
-                            format!("{dns:?} is not an IP address"),
-                        );
-                    }
-                }
-                if let Some(net) = net {
-                    pools.subnets.push((format!("{path}.static.address"), net));
-                }
-            }
+            Some(wan::Kind::Static(s)) => static_wan(&mut report, &mut pools, &path, s),
         }
     }
 
@@ -311,7 +331,7 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     }
 
     if let Some(dns_config) = &config.dns {
-        dns(&mut report, dns_config, &pools.lan_subnets);
+        dns(&mut report, dns_config, &pools, config.system.as_ref());
     }
 
     let subnets = &pools.subnets;
@@ -336,6 +356,14 @@ struct Pools<'c> {
     lan_subnets: Vec<Ipv4Net>,
     /// Every LAN as a zone, for `reaches` and the rules.
     lans: Vec<LanZone<'c>>,
+    /// The one routed IPv6 prefix, when a WAN declares it (SPEC §7.3).
+    ipv6_prefix: Option<Ipv6Net>,
+    /// Every LAN `ipv6` as written, with its path, for the overlap check.
+    lan_prefixes6: Vec<(String, Ipv6Net)>,
+    /// Every LAN's IPv6 router address, for the upstream check.
+    lan_addrs6: Vec<Ipv6Addr>,
+    /// Every reservation hostname, lowercase, for the record check.
+    hostnames: BTreeSet<String>,
 }
 
 /// One LAN as the firewall sees it.
@@ -343,6 +371,8 @@ struct LanZone<'c> {
     name: &'c str,
     /// The subnet, when `ipv4` parsed.
     net: Option<Ipv4Net>,
+    /// The /64, when `ipv6` is set and parsed.
+    net6: Option<Ipv6Net>,
 }
 
 /// `[[public_ipv4]]` (SPEC §7.4, §7.5): every block global unicast space, disjoint from the
@@ -433,9 +463,25 @@ fn lans<'c>(
             }
         }
         reaches(report, &path, lan, &lan_names);
+        let net6 = lan_ipv6(report, &path, lan, pools);
+        if lan.ra.is_some() && lan.ipv6.is_empty() {
+            report.push(
+                format!("{path}.ra"),
+                Code::RaWithoutIpv6,
+                "ra applies to a LAN with ipv6; set the LAN's /64 or drop ra".to_owned(),
+            );
+        }
+        for reservation in lan.dhcp.iter().flat_map(|dhcp| &dhcp.r#static) {
+            if !reservation.hostname.is_empty() {
+                pools
+                    .hostnames
+                    .insert(reservation.hostname.to_ascii_lowercase());
+            }
+        }
         pools.lans.push(LanZone {
             name: &lan.name,
             net,
+            net6,
         });
     }
 }
@@ -547,7 +593,8 @@ struct Hole<'c> {
     name: &'c str,
     from: &'c str,
     proto: &'c str,
-    target: (Ipv4Addr, Ipv4Addr),
+    /// The target's bounds; both ends of one family, so the sets of each family stay apart.
+    target: (IpAddr, IpAddr),
     ports: Option<(u16, u16)>,
 }
 
@@ -555,7 +602,9 @@ impl Hole<'_> {
     /// Partly overlapping: same zone and set, intersecting targets and ports, not identical.
     /// Identical holes merge in the kernel; partial overlaps are refused there.
     fn clashes_with(&self, other: &Self) -> bool {
-        let same_set = self.from == other.from && self.proto == other.proto;
+        let same_set = self.from == other.from
+            && self.proto == other.proto
+            && self.target.0.is_ipv6() == other.target.0.is_ipv6();
         let targets_meet = self.target.0 <= other.target.1 && other.target.0 <= self.target.1;
         let ports_meet = match (self.ports, other.ports) {
             (Some(a), Some(b)) => a.0 <= b.1 && b.0 <= a.1,
@@ -576,7 +625,13 @@ fn overlapping_rules<'c>(
     rule: &'c crate::Rule,
     holes: &mut Vec<Hole<'c>>,
 ) {
-    let Some(target) = rules::parse_target(&rule.to) else {
+    let target = if let Some(target) = rules::parse_target(&rule.to) {
+        let (first, last) = target.bounds();
+        (IpAddr::V4(first), IpAddr::V4(last))
+    } else if let Some(target) = rules::parse_target6(&rule.to) {
+        let (first, last) = target.bounds();
+        (IpAddr::V6(first), IpAddr::V6(last))
+    } else {
         return;
     };
     let ports: Vec<Option<(u16, u16)>> = match rule.proto.as_str() {
@@ -593,7 +648,7 @@ fn overlapping_rules<'c>(
             name: &rule.name,
             from: &rule.from,
             proto: &rule.proto,
-            target: target.bounds(),
+            target,
             ports,
         })
         .collect();
@@ -618,7 +673,13 @@ fn overlapping_rules<'c>(
 /// zone the rule comes from.
 fn rule_target(report: &mut Report, path: &str, from: &str, to: &str, lans: &[LanZone<'_>]) {
     let path = format!("{path}.to");
-    let Some(target) = rules::parse_target(to) else {
+    let inside = if let Some(target) = rules::parse_target(to) {
+        lans.iter()
+            .find(|lan| lan.net.is_some_and(|net| target.within(net.trunc())))
+    } else if let Some(target) = rules::parse_target6(to) {
+        lans.iter()
+            .find(|lan| lan.net6.is_some_and(|net| target.within(net.trunc())))
+    } else {
         report.push(
             path,
             Code::InvalidRuleTarget,
@@ -626,9 +687,6 @@ fn rule_target(report: &mut Report, path: &str, from: &str, to: &str, lans: &[La
         );
         return;
     };
-    let inside = lans
-        .iter()
-        .find(|lan| lan.net.is_some_and(|net| target.within(net.trunc())));
     match inside {
         None => report.push(
             path,
@@ -642,6 +700,182 @@ fn rule_target(report: &mut Report, path: &str, from: &str, to: &str, lans: &[La
         ),
         Some(_) => {}
     }
+}
+
+/// `[wans.static]` (SPEC §7.2): the address a CIDR, the gateway inside it, the resolvers IP
+/// addresses; the subnet joins the overlap check.
+fn static_wan(report: &mut Report, pools: &mut Pools<'_>, path: &str, s: &StaticWan) {
+    let net = report.cidr(&format!("{path}.static.address"), &s.address);
+    let gateway = report.addr4(&format!("{path}.static.gateway"), &s.gateway);
+    if let (Some(net), Some(gateway)) = (net, gateway)
+        && !net.contains(&gateway)
+    {
+        report.push(
+            format!("{path}.static.gateway"),
+            Code::GatewayOutsideSubnet,
+            format!("{gateway} is not inside {}", net.trunc()),
+        );
+    }
+    for (j, dns) in s.dns.iter().enumerate() {
+        if dns.parse::<IpAddr>().is_err() {
+            report.push(
+                format!("{path}.static.dns[{j}]"),
+                Code::InvalidAddress,
+                format!("{dns:?} is not an IP address"),
+            );
+        }
+    }
+    if let Some(net) = net {
+        pools.subnets.push((format!("{path}.static.address"), net));
+    }
+}
+
+/// `[wans.ipv6]` (SPEC §7.3): one WAN at most, `mode` auto or disabled, the routed prefix global
+/// unicast with no host bits and at most a /63, a typed gateway an IPv6 address. A prefix that
+/// passes is the one the LANs' `ipv6` must lie in.
+fn ipv6_wan(
+    report: &mut Report,
+    pools: &mut Pools<'_>,
+    path: &str,
+    ipv6: &Ipv6Wan,
+    seen: &mut bool,
+    lans_have_ipv6: bool,
+) {
+    let path = format!("{path}.ipv6");
+    if ipv6.mode == "disabled" && (!ipv6.prefix.is_empty() || lans_have_ipv6) {
+        report.push(
+            format!("{path}.mode"),
+            Code::Ipv6Disabled,
+            "\"disabled\" runs no IPv6 on this WAN, so a routed prefix or a LAN ipv6 would describe \
+             nothing; set mode = \"auto\" or drop them"
+                .to_owned(),
+        );
+    }
+    if std::mem::replace(seen, true) {
+        report.push(
+            path.clone(),
+            Code::Ipv6WanTwice,
+            "IPv6 runs on one WAN until multi-WAN IPv6 (M6); drop [wans.ipv6] from the others"
+                .to_owned(),
+        );
+    }
+    match ipv6.mode.as_str() {
+        "" | "auto" | "disabled" => {}
+        other => report.push(
+            format!("{path}.mode"),
+            Code::InvalidIpv6Mode,
+            format!("{other:?} is not \"auto\" or \"disabled\""),
+        ),
+    }
+    if !ipv6.prefix.is_empty()
+        && let Some(net) = report.cidr6(&format!("{path}.prefix"), &ipv6.prefix)
+    {
+        if net.addr() != net.network() {
+            report.push(
+                format!("{path}.prefix"),
+                Code::InvalidIpv6Prefix,
+                format!(
+                    "{} has host bits set; write the prefix as {}",
+                    ipv6.prefix,
+                    net.trunc()
+                ),
+            );
+        } else if !rules::is_global_unicast_v6(net) {
+            report.push(
+                format!("{path}.prefix"),
+                Code::InvalidIpv6Prefix,
+                format!("{net} is not global unicast space (2000::/3)"),
+            );
+        } else if net.prefix_len() > 63 {
+            report.push(
+                format!("{path}.prefix"),
+                Code::InvalidIpv6Prefix,
+                format!(
+                    "{net} leaves no /64 for a LAN: the prefix's first /64 is the router's own, so a \
+                     routed prefix is at most a /63"
+                ),
+            );
+        } else {
+            pools.ipv6_prefix = Some(net);
+        }
+    }
+    if !ipv6.gateway.is_empty() {
+        report.addr6(&format!("{path}.gateway"), &ipv6.gateway);
+    }
+}
+
+/// A LAN's `ipv6` (SPEC §7.3): a host address with a /64 prefix, inside the routed prefix, not
+/// its first /64, and no other LAN's. Returns the /64 that passed.
+fn lan_ipv6(
+    report: &mut Report,
+    path: &str,
+    lan: &crate::Lan,
+    pools: &mut Pools<'_>,
+) -> Option<Ipv6Net> {
+    if lan.ipv6.is_empty() {
+        return None;
+    }
+    let path = format!("{path}.ipv6");
+    let net = match lan.ipv6.parse::<Ipv6Net>() {
+        Ok(net) if net.prefix_len() == 64 && net.addr() != net.network() => net,
+        _ => {
+            report.push(
+                path,
+                Code::InvalidCidr,
+                format!(
+                    "{:?} is not the router's IPv6 address with the LAN's /64, like \"2001:db8:1:222::1/64\"",
+                    lan.ipv6
+                ),
+            );
+            return None;
+        }
+    };
+    let block = net.trunc();
+    let Some(routed) = pools.ipv6_prefix else {
+        report.push(
+            path,
+            Code::LanPrefixWithoutRouted,
+            format!(
+                "{block} has no routed prefix to lie in; declare the prefix the ISP routes to this \
+                 router under [wans.ipv6].prefix"
+            ),
+        );
+        return None;
+    };
+    if !routed.contains(&block) {
+        report.push(
+            path,
+            Code::LanPrefixOutsideRouted,
+            format!("{block} is outside the routed prefix {routed}"),
+        );
+        return None;
+    }
+    if block == Ipv6Net::new_assert(routed.network(), 64) {
+        report.push(
+            path,
+            Code::LanPrefixReserved,
+            format!(
+                "{block} is the first /64 of {routed}, reserved for the router's own address; use \
+                 another /64"
+            ),
+        );
+        return None;
+    }
+    if let Some((other_path, _)) = pools
+        .lan_prefixes6
+        .iter()
+        .find(|(_, other)| other.trunc() == block)
+    {
+        report.push(
+            path,
+            Code::Overlap,
+            format!("{block} is already {other_path}'s"),
+        );
+        return None;
+    }
+    pools.lan_prefixes6.push((path, net));
+    pools.lan_addrs6.push(net.addr());
+    Some(net)
 }
 
 /// `[system]`: the hostname is one DNS label and the domain a host name (together they are the
@@ -1046,11 +1280,46 @@ fn forward_address(
 /// `[dns]` (SPEC §7.7): upstreams that are IPv4 addresses a resolver could answer from (not
 /// loopback, multicast, broadcast, `0.0.0.0/8` or the router's own LAN address, which would be
 /// the forwarder asking itself), no block lists yet, allow-listed names that are host names.
-fn dns(report: &mut Report, dns: &Dns, lan_subnets: &[Ipv4Net]) {
+fn dns(report: &mut Report, dns: &Dns, pools: &Pools<'_>, system: Option<&System>) {
+    let lan_subnets = &pools.lan_subnets;
     for (i, upstream) in dns.upstreams.iter().enumerate() {
         let path = format!("dns.upstreams[{i}]");
-        let Some(addr) = report.addr4(&path, upstream) else {
-            continue;
+        let addr = match upstream.parse::<IpAddr>() {
+            Ok(IpAddr::V4(addr)) => addr,
+            Ok(IpAddr::V6(addr)) => {
+                let loopback6 = pools.ipv6_prefix.map(|prefix| {
+                    let mut segments = prefix.network().segments();
+                    segments[7] = 1;
+                    Ipv6Addr::from(segments)
+                });
+                let why = if addr.is_loopback() {
+                    Some("a loopback address")
+                } else if addr.is_multicast() {
+                    Some("a multicast address")
+                } else if addr.is_unspecified() {
+                    Some("the unspecified address")
+                } else if pools.lan_addrs6.contains(&addr) || loopback6 == Some(addr) {
+                    Some("the router's own address, so the forwarder would be asking itself")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    report.push(
+                        path,
+                        Code::InvalidAddress,
+                        format!("{upstream} is {why}, not a resolver"),
+                    );
+                }
+                continue;
+            }
+            Err(_) => {
+                report.push(
+                    path,
+                    Code::InvalidAddress,
+                    format!("{upstream:?} is not an IP address"),
+                );
+                continue;
+            }
         };
         let [first, ..] = addr.octets();
         let why = if addr.is_loopback() {
@@ -1081,6 +1350,7 @@ fn dns(report: &mut Report, dns: &Dns, lan_subnets: &[Ipv4Net]) {
             "block lists are not supported yet; leave the list empty".to_owned(),
         );
     }
+    records(report, &dns.records, system, &pools.hostnames);
     for (i, name) in dns.rebind_allow.iter().enumerate() {
         if !is_valid_hostname(name) {
             report.push(
@@ -1088,6 +1358,88 @@ fn dns(report: &mut Report, dns: &Dns, lan_subnets: &[Ipv4Net]) {
                 Code::InvalidHostname,
                 format!(
                     "{name:?} is not a host name: labels of [A-Za-z0-9-] up to 63 bytes, not starting or ending with a hyphen, {MAX_HOSTNAME} bytes in all"
+                ),
+            );
+        }
+    }
+}
+
+/// `[[dns.records]]` (SPEC §7.7): a host name (a label under the domain or a full name) and a
+/// unicast address, unique per name and family, and never a name the router already answers
+/// for: its own, or a reservation's.
+fn records(
+    report: &mut Report,
+    records: &[Record],
+    system: Option<&System>,
+    hostnames: &BTreeSet<String>,
+) {
+    let domain = system
+        .map(|system| system.domain.as_str())
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or("home.arpa")
+        .to_ascii_lowercase();
+    let hostname = system
+        .map(|system| system.hostname.as_str())
+        .filter(|hostname| !hostname.is_empty())
+        .unwrap_or("openfeo")
+        .to_ascii_lowercase();
+    let mut seen: BTreeSet<(String, bool)> = BTreeSet::new();
+    for (i, record) in records.iter().enumerate() {
+        let path = format!("dns.records[{i}]");
+        if !is_valid_hostname(&record.name) {
+            report.push(
+                path,
+                Code::InvalidHostname,
+                format!(
+                    "{:?} is not a host name: labels of [A-Za-z0-9-] up to 63 bytes, not starting or ending with a hyphen, {MAX_HOSTNAME} bytes in all",
+                    record.name
+                ),
+            );
+            continue;
+        }
+        let Ok(address) = record.address.parse::<IpAddr>() else {
+            report.push(
+                path,
+                Code::InvalidAddress,
+                format!("{:?} is not an IP address", record.address),
+            );
+            continue;
+        };
+        let unicast = match address {
+            IpAddr::V4(a) => !(a.is_multicast() || a.is_broadcast() || a.is_unspecified()),
+            IpAddr::V6(a) => !(a.is_multicast() || a.is_unspecified()),
+        };
+        if !unicast {
+            report.push(
+                path,
+                Code::InvalidAddress,
+                format!("{address} is not a unicast address"),
+            );
+            continue;
+        }
+        let name = record.name.trim_end_matches('.').to_ascii_lowercase();
+        let short = name
+            .strip_suffix(&format!(".{domain}"))
+            .unwrap_or(&name)
+            .to_owned();
+        if short == hostname || hostnames.contains(&short) {
+            report.push(
+                path,
+                Code::RecordNameTaken,
+                format!(
+                    "{:?} is a name the router already answers for (its own, or a reservation's)",
+                    record.name
+                ),
+            );
+            continue;
+        }
+        if !seen.insert((name.clone(), address.is_ipv6())) {
+            report.push(
+                path,
+                Code::DuplicateRecord,
+                format!(
+                    "{:?} already has a record of this family; a name may have one A and one AAAA",
+                    record.name
                 ),
             );
         }
@@ -1273,6 +1625,30 @@ impl Report {
         None
     }
 
+    fn cidr6(&mut self, path: &str, text: &str) -> Option<Ipv6Net> {
+        if let Ok(net) = text.parse::<Ipv6Net>() {
+            return Some(net);
+        }
+        self.push(
+            path.to_owned(),
+            Code::InvalidCidr,
+            format!("{text:?} is not an IPv6 address/prefix"),
+        );
+        None
+    }
+
+    fn addr6(&mut self, path: &str, text: &str) -> Option<Ipv6Addr> {
+        if let Ok(addr) = text.parse::<Ipv6Addr>() {
+            return Some(addr);
+        }
+        self.push(
+            path.to_owned(),
+            Code::InvalidAddress,
+            format!("{text:?} is not an IPv6 address"),
+        );
+        None
+    }
+
     fn addr4(&mut self, path: &str, text: &str) -> Option<Ipv4Addr> {
         if let Ok(addr) = text.parse::<Ipv4Addr>() {
             return Some(addr);
@@ -1322,6 +1698,7 @@ mod tests {
                 gateway: gateway.into(),
                 dns: dns.iter().map(|s| (*s).to_owned()).collect(),
             })),
+            ipv6: None,
         }
     }
 
@@ -1335,6 +1712,7 @@ mod tests {
                 hostname: hostname.into(),
                 vendor_class: vendor_class.into(),
             })),
+            ipv6: None,
         }
     }
 
@@ -1345,6 +1723,8 @@ mod tests {
             ipv4: ipv4.into(),
             dhcp: None,
             reaches: Vec::new(),
+            ipv6: String::new(),
+            ra: None,
         }
     }
 
@@ -2350,5 +2730,333 @@ mod dns_tests {
             vec![],
             "a resolver on the LAN is fine; the router itself is not"
         );
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::*;
+    use crate::{PortMap, PortMapEntry};
+
+    const VM_IPV6: &str = include_str!("../../../harness/fixtures/vm-ipv6.toml");
+
+    fn live4() -> PortMap {
+        PortMap {
+            ports: [
+                "pci-0000:00:03.0",
+                "pci-0000:00:04.0",
+                "pci-0000:00:05.0",
+                "pci-0000:00:06.0",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| PortMapEntry {
+                id: (*id).to_owned(),
+                name: format!("p{i}"),
+            })
+            .collect(),
+        }
+    }
+
+    /// A static IPv4 WAN with `[wans.ipv6]` holding `wan_ipv6`, lan0 on p2 with the `lan0`
+    /// lines (its `ipv6` among them) and a `nas` reservation, then `tail`.
+    fn config(wan_ipv6: &str, lan0: &str, tail: &str) -> Config {
+        crate::file::parse(&format!(
+            "config_version = 1\n[system]\nhostname = \"openfeo\"\ndomain = \"home.arpa\"\n\
+             [[wans]]\nname = \"wan0\"\nport = \"p0\"\n[wans.static]\naddress = \"203.0.113.10/24\"\n\
+             gateway = \"203.0.113.1\"\n{wan_ipv6}\n\
+             [[lans]]\nname = \"lan0\"\nports = [\"p2\"]\nipv4 = \"192.168.1.1/24\"\n{lan0}\n\
+             [lans.dhcp]\nrange = [\"192.168.1.100\", \"192.168.1.200\"]\n\
+             [[lans.dhcp.static]]\nmac = \"52:54:00:fe:10:10\"\nip = \"192.168.1.10\"\nhostname = \"nas\"\n\
+             {tail}\n"
+        ))
+        .expect("test config parses")
+    }
+
+    const ROUTED: &str = "[wans.ipv6]\nprefix = \"2001:db8:1::/48\"\n";
+    const LAN0_V6: &str = "ipv6 = \"2001:db8:1:222::1/64\"\n";
+
+    fn found(cfg: &Config) -> Vec<(String, Code)> {
+        validate(cfg, &live4())
+            .into_iter()
+            .map(|v| (v.path, v.code))
+            .collect()
+    }
+
+    #[test]
+    fn the_ipv6_fixture_validates() {
+        let cfg = crate::file::parse(VM_IPV6).expect("fixture parses");
+        assert_eq!(validate(&cfg, &live4()), vec![]);
+    }
+
+    #[test]
+    fn a_second_ipv6_wan_is_refused() {
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[wans]]\nname = \"wan1\"\nport = \"p1\"\npriority = 20\n[wans.static]\n\
+             address = \"198.51.100.10/24\"\ngateway = \"198.51.100.1\"\n[wans.ipv6]\n",
+        );
+        assert!(
+            found(&cfg).contains(&("wans[1].ipv6".to_owned(), Code::Ipv6WanTwice)),
+            "{:?}",
+            found(&cfg)
+        );
+    }
+
+    #[test]
+    fn an_ipv6_prefix_must_be_global_unicast_and_at_most_63_bits() {
+        for prefix in [
+            "fd00::/48",
+            "2001:db8:1::/64",
+            "fe80::/48",
+            "2001:db8:1::1/48",
+        ] {
+            let cfg = config(&format!("[wans.ipv6]\nprefix = \"{prefix}\"\n"), "", "");
+            assert!(
+                found(&cfg).contains(&("wans[0].ipv6.prefix".to_owned(), Code::InvalidIpv6Prefix)),
+                "{prefix}: {:?}",
+                found(&cfg)
+            );
+        }
+        assert_eq!(
+            found(&config("[wans.ipv6]\nprefix = \"2001:db8::/56\"\n", "", "")),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_typed_gateway_must_be_an_ipv6_address() {
+        let cfg = config("[wans.ipv6]\ngateway = \"203.0.113.1\"\n", "", "");
+        assert_eq!(
+            found(&cfg),
+            vec![("wans[0].ipv6.gateway".to_owned(), Code::InvalidAddress)]
+        );
+        for gateway in ["fe80::1", "2001:db8:ffff::1"] {
+            let cfg = config(&format!("[wans.ipv6]\ngateway = \"{gateway}\"\n"), "", "");
+            assert_eq!(found(&cfg), vec![], "{gateway}");
+        }
+    }
+
+    #[test]
+    fn mode_disabled_beside_a_prefix_or_a_lan_prefix_is_refused() {
+        let cfg = config(
+            "[wans.ipv6]\nmode = \"disabled\"\nprefix = \"2001:db8:1::/48\"\n",
+            "",
+            "",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("wans[0].ipv6.mode".to_owned(), Code::Ipv6Disabled)]
+        );
+        let cfg = config("[wans.ipv6]\nmode = \"disabled\"\n", "", "");
+        assert_eq!(found(&cfg), vec![], "disabled alone is fine");
+        let cfg = config("[wans.ipv6]\nmode = \"sometimes\"\n", "", "");
+        assert_eq!(
+            found(&cfg),
+            vec![("wans[0].ipv6.mode".to_owned(), Code::InvalidIpv6Mode)]
+        );
+    }
+
+    #[test]
+    fn a_lan_prefix_outside_the_routed_prefix_is_refused() {
+        let cfg = config(ROUTED, "ipv6 = \"2001:db8:2:222::1/64\"\n", "");
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[0].ipv6".to_owned(), Code::LanPrefixOutsideRouted)]
+        );
+    }
+
+    #[test]
+    fn a_lan_may_not_take_the_prefixs_first_slash_64() {
+        let cfg = config(ROUTED, "ipv6 = \"2001:db8:1::1/64\"\n", "");
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[0].ipv6".to_owned(), Code::LanPrefixReserved)]
+        );
+    }
+
+    #[test]
+    fn a_lan_prefix_must_be_a_slash_64_with_a_host_address() {
+        for ipv6 in [
+            "2001:db8:1:222::1/56",
+            "2001:db8:1:222::/64",
+            "2001:db8:1:222::1",
+            "192.168.1.1/24",
+        ] {
+            let cfg = config(ROUTED, &format!("ipv6 = \"{ipv6}\"\n"), "");
+            assert_eq!(
+                found(&cfg),
+                vec![("lans[0].ipv6".to_owned(), Code::InvalidCidr)],
+                "{ipv6}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lan_prefix_needs_a_routed_prefix() {
+        for wan_ipv6 in ["", "[wans.ipv6]\n"] {
+            let cfg = config(wan_ipv6, LAN0_V6, "");
+            assert_eq!(
+                found(&cfg),
+                vec![("lans[0].ipv6".to_owned(), Code::LanPrefixWithoutRouted)],
+                "{wan_ipv6:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_lans_may_not_share_a_slash_64() {
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[lans]]\nname = \"guest\"\nports = [\"p3\"]\nipv4 = \"192.168.2.1/24\"\n\
+             ipv6 = \"2001:db8:1:222::2/64\"\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[1].ipv6".to_owned(), Code::Overlap)]
+        );
+    }
+
+    #[test]
+    fn ra_without_ipv6_is_refused() {
+        let cfg = config(ROUTED, "ra = false\n", "");
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[0].ra".to_owned(), Code::RaWithoutIpv6)]
+        );
+        assert_eq!(
+            found(&config(
+                ROUTED,
+                "ipv6 = \"2001:db8:1:222::1/64\"\nra = false\n",
+                ""
+            )),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn records_are_unique_per_name_and_family() {
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[dns.records]]\nname = \"www\"\naddress = \"2001:db8:1:222::10\"\n\
+             [[dns.records]]\nname = \"WWW\"\naddress = \"2001:db8:1:222::11\"\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("dns.records[1]".to_owned(), Code::DuplicateRecord)]
+        );
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[dns.records]]\nname = \"www\"\naddress = \"192.168.1.20\"\n\
+             [[dns.records]]\nname = \"www\"\naddress = \"2001:db8:1:222::10\"\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![],
+            "one A and one AAAA for a dual-stack name"
+        );
+    }
+
+    #[test]
+    fn a_record_may_not_name_the_router_or_a_reservation() {
+        for name in ["openfeo", "openfeo.home.arpa", "nas", "Nas.home.arpa"] {
+            let cfg = config(
+                ROUTED,
+                LAN0_V6,
+                &format!("[[dns.records]]\nname = \"{name}\"\naddress = \"2001:db8:1:222::10\"\n"),
+            );
+            assert_eq!(
+                found(&cfg),
+                vec![("dns.records[0]".to_owned(), Code::RecordNameTaken)],
+                "{name}"
+            );
+        }
+        for (name, address) in [
+            ("bad name", "2001:db8:1:222::10"),
+            ("www", "ff02::1"),
+            ("www", "::"),
+        ] {
+            let cfg = config(
+                ROUTED,
+                LAN0_V6,
+                &format!("[[dns.records]]\nname = \"{name}\"\naddress = \"{address}\"\n"),
+            );
+            assert_eq!(found(&cfg).len(), 1, "{name} {address}: {:?}", found(&cfg));
+        }
+    }
+
+    #[test]
+    fn an_ipv6_upstream_is_accepted_and_the_routers_own_lan_address_is_not() {
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[dns]\nupstreams = [\"2001:db8:ffff::1\"]\n",
+        );
+        assert_eq!(found(&cfg), vec![]);
+        for upstream in ["2001:db8:1:222::1", "::1", "ff02::1", "2001:db8:1::1"] {
+            let cfg = config(
+                ROUTED,
+                LAN0_V6,
+                &format!("[dns]\nupstreams = [\"{upstream}\"]\n"),
+            );
+            assert_eq!(
+                found(&cfg),
+                vec![("dns.upstreams[0]".to_owned(), Code::InvalidAddress)],
+                "{upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ipv6_rule_target_lies_inside_one_lans_slash_64() {
+        let rule = |to: &str| {
+            config(
+                ROUTED,
+                LAN0_V6,
+                &format!(
+                    "[[firewall.rules]]\nname = \"r\"\nfrom = \"wan\"\nto = \"{to}\"\nproto = \"tcp\"\nports = [\"80\"]\n"
+                ),
+            )
+        };
+        assert_eq!(
+            found(&rule("2001:db8:1:5::10")),
+            vec![("firewall.rules[0].to".to_owned(), Code::InvalidRuleTarget)]
+        );
+        assert_eq!(
+            found(&rule("2001:db8:1:222::10-2001:db8:1:222::20")),
+            vec![]
+        );
+        assert_eq!(found(&rule("2001:db8:1:222::/64")), vec![]);
+        assert_eq!(
+            found(&rule("2001:db8:1:222::20-2001:db8:1:222::10")),
+            vec![("firewall.rules[0].to".to_owned(), Code::InvalidRuleTarget)],
+            "a backwards range"
+        );
+    }
+
+    #[test]
+    fn ipv6_rules_overlap_within_their_family_only() {
+        let rules = |a: &str, b: &str| {
+            config(
+                ROUTED,
+                LAN0_V6,
+                &format!(
+                    "[[firewall.rules]]\nname = \"a\"\nfrom = \"wan\"\nto = \"{a}\"\nproto = \"tcp\"\nports = [\"80\"]\n\
+                     [[firewall.rules]]\nname = \"b\"\nfrom = \"wan\"\nto = \"{b}\"\nproto = \"tcp\"\nports = [\"80\"]\n"
+                ),
+            )
+        };
+        assert_eq!(
+            found(&rules(
+                "2001:db8:1:222::10-2001:db8:1:222::20",
+                "2001:db8:1:222::15"
+            )),
+            vec![("firewall.rules[1]".to_owned(), Code::OverlappingRules)]
+        );
+        assert_eq!(found(&rules("192.168.1.10", "2001:db8:1:222::10")), vec![]);
     }
 }

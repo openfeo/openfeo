@@ -16,7 +16,7 @@
 - `openfeo-proto-ndp`, `openfeo-reconcile` and `openfeo-world` stay pure: no tokio, libc, nix, socket2, rtnetlink, netlink-sys or netlink-proto in their dependency trees (`scripts/check-deps.sh` enforces it). The one hash in the binary is in-tree SHA-256; no `sha2`, no `ring`.
 - Every parser gets a fuzz target in this PR: `ndp_wire`, `ndp_differential`, `ndp_client`, `ndp_server`; the config target already drives validation.
 - Routes and addresses the router owns carry `RTPROT_OPENFEO = 200`; the ruleset stays one `table inet openfeo` applied as one batch; nothing kernel-originated is ever deleted.
-- Documentation ranges only in repo text: `2001:db8::/48` is the routed prefix, `2001:db8:ffff::/64` the ISP link, `2001:db8:222::/64` lan0, `2001:db8:232::/64` the DMZ, `203.0.113.0/24` and `192.0.2.0/24` as before.
+- Documentation ranges only in repo text: `2001:db8:1::/48` is the routed prefix, `2001:db8:ffff::/64` the ISP link, `2001:db8:1:222::/64` lan0, `2001:db8:1:232::/64` the DMZ, `203.0.113.0/24` and `192.0.2.0/24` as before.
 - Existing behaviour for a configuration without IPv6 does not change: every existing `insta` snapshot stays byte-identical, every M0, M1 and M2 part 1 scenario keeps passing.
 - Nothing is pushed and no PR is opened without Andy's word; the branch is `m2-2` from `main` `112d813`, design committed as `c6817b8`.
 
@@ -98,28 +98,28 @@ git commit -s -m "docs: SPEC amendments and ADRs for M2 part 2 (IPv6, routed pre
 
 ```toml
 [wans.ipv6]
-prefix = "2001:db8::/48"
+prefix = "2001:db8:1::/48"
 ```
-under the WAN, `ipv6 = "2001:db8:222::1/64"` on `lan0`, a second LAN `dmz` on `p3` with `ipv4 = "192.0.2.233/29"` inside a declared `[[public_ipv4]] prefix = "192.0.2.232/29"`, `ipv6 = "2001:db8:232::1/64"`, `ra = false`; `[dns] upstreams = ["203.0.113.1", "2001:db8:ffff::1"]`; `[[dns.records]] name = "www" address = "2001:db8:232::10"`; `[[firewall.rules]] name = "dmz-web6" from = "wan" to = "2001:db8:232::10" proto = "tcp" ports = ["80"]`; keep `wan_ping = true` and the `lan-http` forward. Header comment as the other fixtures.
+under the WAN, `ipv6 = "2001:db8:1:222::1/64"` on `lan0`, a second LAN `dmz` on `p3` with `ipv4 = "192.0.2.233/29"` inside a declared `[[public_ipv4]] prefix = "192.0.2.232/29"`, `ipv6 = "2001:db8:1:232::1/64"`, `ra = false`; `[dns] upstreams = ["203.0.113.1", "2001:db8:ffff::1"]`; `[[dns.records]] name = "www" address = "2001:db8:1:232::10"`; `[[firewall.rules]] name = "dmz-web6" from = "wan" to = "2001:db8:1:232::10" proto = "tcp" ports = ["80"]`; keep `wan_ping = true` and the `lan-http` forward. Header comment as the other fixtures.
 
 - [ ] **Step 3: Write the failing validation tests** in `validate.rs`'s tests module, each loading a TOML string through the existing test helper and asserting on `Violation { path, code, .. }`:
 
 ```rust
 #[test] fn the_ipv6_fixture_validates()                         // vm-ipv6.toml → no violations
 #[test] fn a_second_ipv6_wan_is_refused()                       // wans[1].ipv6 → Ipv6WanTwice
-#[test] fn an_ipv6_prefix_must_be_global_unicast_and_at_most_63_bits() // "fd00::/48" and "2001:db8::/64" → InvalidIpv6Prefix at wans[0].ipv6.prefix
+#[test] fn an_ipv6_prefix_must_be_global_unicast_and_at_most_63_bits() // "fd00::/48" and "2001:db8:1::/64" → InvalidIpv6Prefix at wans[0].ipv6.prefix
 #[test] fn a_typed_gateway_must_be_an_ipv6_address()            // "203.0.113.1" → InvalidAddress at wans[0].ipv6.gateway
 #[test] fn mode_disabled_beside_a_prefix_or_a_lan_prefix_is_refused() // Ipv6Disabled at wans[0].ipv6.mode
-#[test] fn a_lan_prefix_outside_the_routed_prefix_is_refused()  // "2001:db8:1:222::1/64" → LanPrefixOutsideRouted at lans[0].ipv6
-#[test] fn a_lan_may_not_take_the_prefixs_first_slash_64()      // "2001:db8::1/64" → LanPrefixReserved
-#[test] fn a_lan_prefix_must_be_a_slash_64_with_a_host_address() // "/56" and "2001:db8:222::/64" → InvalidCidr
+#[test] fn a_lan_prefix_outside_the_routed_prefix_is_refused()  // "2001:db8:2:222::1/64" → LanPrefixOutsideRouted at lans[0].ipv6
+#[test] fn a_lan_may_not_take_the_prefixs_first_slash_64()      // "2001:db8:1::1/64" → LanPrefixReserved
+#[test] fn a_lan_prefix_must_be_a_slash_64_with_a_host_address() // "/56" and "2001:db8:1:222::/64" → InvalidCidr
 #[test] fn a_lan_prefix_needs_a_routed_prefix()                 // no [wans.ipv6].prefix → LanPrefixWithoutRouted
 #[test] fn two_lans_may_not_share_a_slash_64()                  // → Overlap at lans[1].ipv6
 #[test] fn ra_without_ipv6_is_refused()                         // RaWithoutIpv6 at lans[0].ra
 #[test] fn records_are_unique_per_name_and_family()             // two AAAA "www" → DuplicateRecord; "www" A + AAAA → ok
 #[test] fn a_record_may_not_name_the_router_or_a_reservation()  // "openfeo" and "nas" → RecordNameTaken
-#[test] fn an_ipv6_upstream_is_accepted_and_the_routers_own_lan_address_is_not() // "2001:db8:222::1" → InvalidAddress
-#[test] fn an_ipv6_rule_target_lies_inside_one_lans_slash_64()  // "2001:db8:5::10" → InvalidRuleTarget; "2001:db8:232::10-2001:db8:232::20" ok
+#[test] fn an_ipv6_upstream_is_accepted_and_the_routers_own_lan_address_is_not() // "2001:db8:1:222::1" → InvalidAddress
+#[test] fn an_ipv6_rule_target_lies_inside_one_lans_slash_64()  // "2001:db8:1:5::10" → InvalidRuleTarget; "2001:db8:1:232::10-2001:db8:1:232::20" ok
 #[test] fn ipv6_rules_overlap_within_their_family_only()        // two overlapping v6 tcp 80 rules → OverlappingRules; a v4 and a v6 rule on port 80 → ok
 ```
 
@@ -449,7 +449,7 @@ Expected: both build; 30 s of fuzzing without a crash (a panic is a finding to f
 - [ ] **Step 2: Run** `cargo test -p openfeo-proto-dns -p openfeo-reconcile dns 2>&1 | tail -n 12` — Expected: FAIL (type errors first).
 - [ ] **Step 3: Implement** core, reconciler, driver (listeners per family on each bridge through `bound_socket`; `client_v4` becomes `client_ip`), the console line; update the `dns_forwarder` fuzz target and the `dns` sandbox suite for the type changes.
 - [ ] **Step 4: Run** `cargo test -p openfeo-proto-dns -p openfeo-reconcile -p openfeo-net -p openfeo 2>&1 | tail -n 6`, `cargo check --manifest-path fuzz/Cargo.toml --bins` — Expected: PASS.
-- [ ] **Step 5: Sandbox**: in `harness/tests/dns.rs` add `names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked` (the rig's veths get `2001:db8:222::1/64` on the near LAN end and `2001:db8:ffff::1/64` on dnsmasq's end; dnsmasq already binds every address of its interface; `dig @2001:db8:222::1 AAAA www.isp.example` answers the AAAA dnsmasq serves after Task 15's host record, and `dig … nas.home.arpa AAAA` answers the record typed in the suite's config). Until Task 15 lands, use `--host-record=www.isp.example,198.51.100.10,2001:db8:ffff::10` added here to `daemons::dnsmasq`.
+- [ ] **Step 5: Sandbox**: in `harness/tests/dns.rs` add `names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked` (the rig's veths get `2001:db8:1:222::1/64` on the near LAN end and `2001:db8:ffff::1/64` on dnsmasq's end; dnsmasq already binds every address of its interface; `dig @2001:db8:1:222::1 AAAA www.isp.example` answers the AAAA dnsmasq serves after Task 15's host record, and `dig … nas.home.arpa AAAA` answers the record typed in the suite's config). Until Task 15 lands, use `--host-record=www.isp.example,198.51.100.10,2001:db8:ffff::10` added here to `daemons::dnsmasq`.
 - [ ] **Step 6: Run** `make test-harness FILTER=over_ipv6 2>&1 | tail -n 8` — Expected: PASS.
 - [ ] **Step 7: Commit** `git commit -s -m "dns: AAAA for the router and typed records, IPv6 listeners and upstreams, the route gate"`
 
@@ -465,7 +465,7 @@ Expected: both build; 30 s of fuzzing without a crash (a panic is a finding to f
 **Interfaces:**
 - Consumes: Task 7's `server::{Server, Config, Input, Output}`, Task 8's `NdpSocket`, Task 9's facts.
 - Produces: `reconcile::ra::DesiredRa { ifname: String, prefix: Ipv6Net, router: Ipv6Addr, mtu: Option<u32>, domain: String, router_lifetime: u16 }` and `reconcile::ra::desired(world: &World) -> Vec<DesiredRa>`: one per LAN with `ipv6` and `ra` not `Some(false)`, `mtu` from `world.links[br-<lan>].mtu` (`None` until the bridge is known), `router_lifetime` 1800 when the WAN that declares the prefix has carrier (`links[wan].carrier`) and `world.has_default(true, wan_ifname)`, else 0.
-- The task (`crates/openfeo/src/ra.rs`, `pub fn spawn(...)` after `dns.rs`'s pattern): one supervised task `ra` that, per `DesiredRa`, waits for the bridge (`wait_for_link`), opens `NdpSocket::open(index, ifname, Role::Server)`, runs a `Server` with the bridge's MAC, and on each World change reconfigures (`Input::Configure`) or stops a server whose LAN left (`Input::Stop`, its three final advertisements sent, then the socket closed); console lines `ra br-lan0 advertising 2001:db8:222::/64 lifetime 1800`, `ra br-lan0 lifetime 0 (wan0 has no ipv6 route)`, `ra br-lan0 lifetime 1800`, `ra br-lan0 stopped`.
+- The task (`crates/openfeo/src/ra.rs`, `pub fn spawn(...)` after `dns.rs`'s pattern): one supervised task `ra` that, per `DesiredRa`, waits for the bridge (`wait_for_link`), opens `NdpSocket::open(index, ifname, Role::Server)`, runs a `Server` with the bridge's MAC, and on each World change reconfigures (`Input::Configure`) or stops a server whose LAN left (`Input::Stop`, its three final advertisements sent, then the socket closed); console lines `ra br-lan0 advertising 2001:db8:1:222::/64 lifetime 1800`, `ra br-lan0 lifetime 0 (wan0 has no ipv6 route)`, `ra br-lan0 lifetime 1800`, `ra br-lan0 stopped`.
 
 - [ ] **Step 1: Failing tests**
 
@@ -514,7 +514,7 @@ Expected: both build; 30 s of fuzzing without a crash (a panic is a finding to f
 - `harness/tests/ndp.rs` (`harness = false`, the `dns` suite's shape, two veth pairs in namespaces): scenarios
   - `the_client_learns_router_prefix_mtu_rdnss_and_dnssl_from_radvd`: the driver on the near end runs a `Client`; within 10 s `Learned` carries router `fe80::…` of the far end, an address in `2001:db8:ffff::/64`, the RDNSS and DNSSL;
   - `the_client_drops_the_router_when_radvd_stops_and_on_lifetime_expiry` (`lifetime: 4`, radvd stopped: router `None` within 5 s);
-  - `the_server_configures_a_kernel_host_and_rdisc6_reads_its_options`: the driver runs a `Server` for `2001:db8:222::/64`; the far namespace's kernel gets a global address in the prefix and a default via the near end's link-local; `rdisc6` shows RDNSS = the router's address and DNSSL `home.arpa`;
+  - `the_server_configures_a_kernel_host_and_rdisc6_reads_its_options`: the driver runs a `Server` for `2001:db8:1:222::/64`; the far namespace's kernel gets a global address in the prefix and a default via the near end's link-local; `rdisc6` shows RDNSS = the router's address and DNSSL `home.arpa`;
   - `a_solicitation_is_answered_within_a_second`;
   - `a_lifetime_change_goes_out_at_once` (reconfigure to 0: `rdisc6` reports lifetime 0 within 4 s and the far kernel's default route is gone).
 
@@ -534,16 +534,16 @@ Expected: the three scenarios that need `rdisc6` skip on this host with `rdisc6 
 
 **Interfaces:**
 - Consumes: everything above; the console lines of Tasks 13 and 14; `Lab::start_radvd`, `host6`, `isp_route_block6`, `rdisc6`.
-- `boot_ipv6(lab, radvd: RadvdConfig, gateway: Option<&str>) -> Result<Cursor>`: `add_lan1`, dnsmasq, radvd, the fixture (with `gateway = "…"` spliced in when given), boot, wait for `ready`, `host` on lan0 (v4) and let the kernel autoconfigure v6 there (`sysctl net.ipv6.conf.lan0.accept_ra=1` in the namespace), `host6` the DMZ on lan1 (`2001:db8:232::10/64` via `2001:db8:232::1`), then read `wan0 ipv6 link-local fe80::…` from the console and `isp_route_block6("2001:db8::/48", that address)`; an IPv6 HTTP target on `isp0` at `[2001:db8:ffff::1]:8080`.
+- `boot_ipv6(lab, radvd: RadvdConfig, gateway: Option<&str>) -> Result<Cursor>`: `add_lan1`, dnsmasq, radvd, the fixture (with `gateway = "…"` spliced in when given), boot, wait for `ready`, `host` on lan0 (v4) and let the kernel autoconfigure v6 there (`sysctl net.ipv6.conf.lan0.accept_ra=1` in the namespace), `host6` the DMZ on lan1 (`2001:db8:1:232::10/64` via `2001:db8:1:232::1`), then read `wan0 ipv6 link-local fe80::…` from the console and `isp_route_block6("2001:db8:1::/48", that address)`; an IPv6 HTTP target on `isp0` at `[2001:db8:ffff::1]:8080`.
 
 - [ ] **Step 1: Write the scenarios** named in the design, with these assertions:
-  - `lan_client_configures_itself_from_the_lan_prefix_and_reaches_the_isp_over_ipv6`: within 10 s `ip -6 addr show lan0` in lan0 has `2001:db8:222:` scope global; `ip -6 route` has a default via `fe80::` on lan0; `http_get` to `[2001:db8:ffff::1]:8080` returns the ISP body; `rdisc6` (skipped if absent) shows RDNSS `2001:db8:222::1` and DNSSL `home.arpa`.
-  - `the_router_learns_its_default_from_the_isp_and_sources_from_its_loopback_address`: console `wan0 ipv6 router fe80::1 lifetime 1800 (learned)`; a `dig AAAA www.isp.example` from lan0 at `2001:db8:222::1` answers `2001:db8:ffff::10`, and dnsmasq's log shows `from 2001:db8::1`.
+  - `lan_client_configures_itself_from_the_lan_prefix_and_reaches_the_isp_over_ipv6`: within 10 s `ip -6 addr show lan0` in lan0 has `2001:db8:222:` scope global; `ip -6 route` has a default via `fe80::` on lan0; `http_get` to `[2001:db8:ffff::1]:8080` returns the ISP body; `rdisc6` (skipped if absent) shows RDNSS `2001:db8:1:222::1` and DNSSL `home.arpa`.
+  - `the_router_learns_its_default_from_the_isp_and_sources_from_its_loopback_address`: console `wan0 ipv6 router fe80::1 lifetime 1800 (learned)`; a `dig AAAA www.isp.example` from lan0 at `2001:db8:1:222::1` answers `2001:db8:ffff::10`, and dnsmasq's log shows `from 2001:db8:1::1`.
   - `a_typed_gateway_replaces_the_learned_default`: with `gateway = "fe80::1"` the console says `wan0 ipv6 gateway fe80::1 (configured)`; radvd started with `lifetime: 0`; the LAN host still reaches the ISP over v6.
   - `a_link_prefix_from_the_isp_gives_the_wan_a_stable_address`: console `wan0 ipv6 address 2001:db8:ffff:0:…/64`; `ping -6` from isp0 to it answers; after `qmp system_reset` and a second `ready`, the same address line appears.
-  - `dmz_host_ipv6_is_reached_from_the_isp_only_through_a_rule`: from isp0, `http_get` to `[2001:db8:232::10]:80` works, port 81 and `ping -6` do not; `dig AAAA www.home.arpa` at the router answers `2001:db8:232::10`; `rdisc6` on lan1 times out (no advertisements on the DMZ).
+  - `dmz_host_ipv6_is_reached_from_the_isp_only_through_a_rule`: from isp0, `http_get` to `[2001:db8:1:232::10]:80` works, port 81 and `ping -6` do not; `dig AAAA www.home.arpa` at the router answers `2001:db8:1:232::10`; `rdisc6` on lan1 times out (no advertisements on the DMZ).
   - `wan_ipv6_loss_zeroes_the_router_lifetime_within_one_interval`: stop radvd; console `ra br-lan0 lifetime 0 (wan0 has no ipv6 route)` within 10 s; within 5 s more lan0's kernel has no v6 default route while `http_get` over v4 still works; start radvd again: console `ra br-lan0 lifetime 1800` and the default returns within 10 s.
-  - `an_unused_ipv6_subnet_is_blackholed`: console shows `add route blackhole 2001:db8::/48`; `ping -6 2001:db8:5::1` from isp0 gets no reply and no error within 3 s.
+  - `an_unused_ipv6_subnet_is_blackholed`: console shows `add route blackhole 2001:db8:1::/48`; `ping -6 2001:db8:1:5::1` from isp0 gets no reply and no error within 3 s.
   - `isp_names_resolve_to_aaaa_through_a_learned_ipv6_upstream`: fixture with `upstreams = []`; console `dns upstreams … 2001:db8:ffff::1 (learned from wan0)` appears only after `apply routing` of the generation carrying the v6 default (assert order by cursor); `dig AAAA www.isp.example` over v6 answers.
 - [ ] **Step 2: Run** `make test-harness FILTER=ipv6 2>&1 | tail -n 20` then the whole `make test-harness 2>&1 | tail -n 30` — Expected: the new scenarios pass (rdisc6 assertions skipped here, run in CI); every existing scenario still passes; the VLAN and nft-module skips are this host's usual ones.
 - [ ] **Step 3: Progress entry**: `docs/progress.md` M2 row → `parts 1 and 2 done, 2026-11-0N; part 3 to come | #10, #<this PR>; follow-up #20`, and a paragraph after the #20 entry in the existing style naming what landed.
