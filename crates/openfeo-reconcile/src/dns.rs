@@ -243,12 +243,13 @@ fn wan_dns(world: &World, wan: &Wan) -> Vec<IpAddr> {
             .filter_map(|text| text.parse().ok())
             .collect(),
     };
-    if wan
-        .ipv6
-        .as_ref()
-        .is_some_and(|ipv6| ipv6.mode != "disabled")
+    // A learned resolver joins once the kernel has the IPv6 default route (ADR-0019) and the
+    // router has a global source to ask from: the routed prefix's loopback address, or an
+    // address from a prefix the ISP advertised.
+    if let Some(ipv6) = wan.ipv6.as_ref().filter(|ipv6| ipv6.mode != "disabled")
         && world.has_default(true, &ifname)
         && let Some(fact) = world.ipv6.get(&wan.name)
+        && (!ipv6.prefix.is_empty() || !fact.addresses.is_empty())
     {
         servers.extend(fact.dns.iter().copied().map(IpAddr::V6));
     }
@@ -398,6 +399,36 @@ mod tests {
         assert!(
             !d.wan_upstreams.is_empty(),
             "with the route, the lease's servers are used"
+        );
+    }
+
+    /// RDNSS resolvers need a global source as well as a route: a `[wans.ipv6]` without a
+    /// prefix (IPv6 for the router alone) whose ISP advertises no address prefix cannot reach
+    /// them, and asking anyway costs every query a timeout.
+    #[test]
+    fn ipv6_resolvers_wait_for_a_global_source_address() {
+        let v6 = ip("2001:db8:ffff::1");
+        let mut world = fixtures::ipv6_world();
+        let mut config = (*world.config).clone();
+        config.wans[0].ipv6.as_mut().expect("[wans.ipv6]").prefix = String::new();
+        world.config = std::sync::Arc::new(config);
+        assert!(
+            !desired(&world).wan_upstreams.contains(&v6),
+            "no prefix and no address: nothing to send from"
+        );
+        let mut fact = fixtures::ipv6_fact();
+        fact.addresses = vec!["2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap()];
+        world.ipv6 = std::sync::Arc::new(std::collections::BTreeMap::from([(
+            "wan0".to_owned(),
+            fact,
+        )]));
+        assert!(
+            desired(&world).wan_upstreams.contains(&v6),
+            "an address from the ISP's prefix is a source"
+        );
+        assert!(
+            desired(&fixtures::ipv6_world()).wan_upstreams.contains(&v6),
+            "the routed prefix's loopback address is a source"
         );
     }
 
