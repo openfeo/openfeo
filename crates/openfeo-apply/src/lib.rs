@@ -78,9 +78,9 @@ async fn resolve(
 }
 
 /// One best-effort pass: every operation is attempted, tolerated kernel answers (already there,
-/// already gone) count as done, and the first real failure is returned at the end, so one refused
-/// operation never starves the rest of the subsystem (a LAN stays reachable when another LAN's
-/// bridge cannot be created).
+/// already gone) are success that changed nothing, and the first real failure is returned at the
+/// end, so one refused operation never starves the rest of the subsystem (a LAN stays reachable
+/// when another LAN's bridge cannot be created).
 #[derive(Debug, Default)]
 pub(crate) struct Pass {
     ops: usize,
@@ -88,7 +88,9 @@ pub(crate) struct Pass {
 }
 
 impl Pass {
-    /// Record one operation's outcome. `tolerated` answers are success.
+    /// Record one operation's outcome. `tolerated` answers are success, but the kernel already
+    /// matched (a reconcile ran between an add and the kernel's echo of it, say), so they are
+    /// neither announced on the console nor counted: the console says what changed.
     pub(crate) fn op(
         &mut self,
         op: &str,
@@ -101,8 +103,7 @@ impl Pass {
                 self.ops += 1;
             }
             Err(err) if tolerated(&err) => {
-                tracing::info!("{op}");
-                self.ops += 1;
+                tracing::debug!("{op}: already so");
             }
             Err(err) => {
                 tracing::warn!("{op}: {err}");
@@ -180,5 +181,63 @@ mod tests {
         for name in ["p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6"] {
             assert!(!is_managed(name), "{name}");
         }
+    }
+
+    /// The messages of every event at `INFO` or above: what the console shows.
+    struct Announced(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Announced {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            if *event.metadata().level() <= tracing::Level::INFO {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+    }
+
+    /// A tolerated answer (`EEXIST` for an add the kernel already holds, say because a reconcile
+    /// ran between the add and the kernel's echo of it) is success, but it changed nothing: it
+    /// is not announced on the console and not counted as an operation.
+    #[test]
+    fn a_tolerated_answer_is_neither_announced_nor_counted() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Announced(seen.clone())),
+        );
+        let mut pass = Pass::default();
+        pass.op(
+            "add route default via 203.0.113.1 dev p0 proto 200 metric 10",
+            Ok(()),
+            |_| false,
+        );
+        pass.op(
+            "add route 198.51.100.0/24 via 203.0.113.1 dev p0 proto 200 metric 10",
+            Err(openfeo_netlink::Error::Closed),
+            |_| true,
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["add route default via 203.0.113.1 dev p0 proto 200 metric 10"]
+        );
+        assert_eq!(pass.finish().unwrap(), Report { ops: 1 });
     }
 }
