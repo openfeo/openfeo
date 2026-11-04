@@ -407,7 +407,9 @@ async fn save_lease(path: &Path, wan: &str, mac: [u8; 6], lease: &Lease) {
     }
 }
 
-/// Log the contract line, publish the fact, keep the file.
+/// Keep the file, log the contract line, publish the fact: `bound` promises the lease is on disk
+/// for INIT-REBOOT (SPEC §5.2), so the save comes first, and a reset the moment the line shows
+/// finds the lease.
 async fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publisher, event: Event) {
     let wan = &task.wan;
     match event {
@@ -416,6 +418,7 @@ async fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publishe
         Event::Request(address) => info!("wan {wan} dhcp request {address}"),
         Event::Rebooting(address) => info!("wan {wan} dhcp init-reboot {address}"),
         Event::Bound { lease, renewed } => {
+            save_lease(path, wan, mac, &lease).await;
             if renewed {
                 info!(
                     "wan {wan} dhcp renewed {}/{} lease={}s",
@@ -429,7 +432,6 @@ async fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publishe
             publisher.update(|world| {
                 Arc::make_mut(&mut world.dhcp4).insert(wan.clone(), fact);
             });
-            save_lease(path, wan, mac, &lease).await;
         }
         Event::Unbound(why) => {
             match &why {
@@ -595,6 +597,53 @@ mod tests {
         assert_eq!(
             options_line("wan0", &bare),
             "wan wan0 dhcp options dns=none domain=none mtu=none routes=0"
+        );
+    }
+
+    /// `bound` is the contract that the lease is kept for INIT-REBOOT (SPEC §5.2): the file is
+    /// on disk before the line is logged, so a reset the moment the line appears finds it.
+    #[tokio::test]
+    async fn the_bound_line_follows_the_saved_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dhcp4-wan0.toml");
+        let ring = Arc::new(openfeo_runtime::log::Ring::new(64 * 1024));
+        let _guard = tracing::subscriber::set_default(openfeo_runtime::log::subscriber(
+            "openfeo",
+            ring.clone(),
+            Some(Box::new(std::io::sink())),
+        ));
+        let task = WanTask {
+            wan: "wan0".to_owned(),
+            port: "p0".to_owned(),
+            hostname: None,
+            vendor_class: None,
+        };
+        let (publisher, _rx) = Publisher::new(World::new(
+            openfeo_config::Config::default(),
+            openfeo_config::PortMap::default(),
+        ));
+        publish(
+            &task,
+            MAC,
+            &path,
+            &publisher,
+            Event::Bound {
+                lease: sample_lease(),
+                renewed: false,
+            },
+        )
+        .await;
+        let lines = ring.tail(16);
+        let position = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no line with {needle:?}: {lines:?}"))
+        };
+        assert!(path.exists(), "the lease was not saved");
+        assert!(
+            position("dhcp lease saved") < position("dhcp bound "),
+            "the bound line came before the lease was saved: {lines:?}"
         );
     }
 }
