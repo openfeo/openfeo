@@ -1,3 +1,5 @@
 /target
 /build
 /.superpowers
+# insta writes a pending snapshot beside the real one when an assertion fails; it is reviewed, never committed
+*.snap.new
