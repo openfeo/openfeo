@@ -23,6 +23,9 @@ pub const ISP0_ADDR: &str = "203.0.113.1/24";
 pub const ISP0_ADDR6: &str = "2001:db8:ffff::1/64";
 /// The prefix the lab's ISP routes to the router (`vm-ipv6.toml`).
 pub const ROUTED_PREFIX6: &str = "2001:db8:1::/48";
+/// ISP A's only link-local on `wan0`, the source of its advertisements: what the router learns
+/// as its default router, and what a typed `gateway` names.
+pub const ISP0_LINK_LOCAL6: &str = "fe80::1/64";
 /// ISP B's side of the WAN B link (TEST-NET-2).
 pub const ISP1_ADDR: &str = "198.51.100.1/24";
 /// The LAN host's address (the LAN namespace's end of the LAN tap) on the router's LAN subnet.
@@ -214,9 +217,10 @@ impl Lab {
         Ok(())
     }
 
-    /// Give ISP A its IPv6 on `wan0` ([`ISP0_ADDR6`], without DAD so it is usable at once) and
-    /// IPv6 forwarding, then start radvd there with `config` (`daemons::radvd`); returns once it
-    /// announces itself. The daemon joins [`Lab::daemons`], named `radvd-wan0`.
+    /// Give ISP A its IPv6 on `wan0` ([`ISP0_ADDR6`] and [`ISP0_LINK_LOCAL6`] as its only
+    /// link-local, without DAD so they are usable at once) and IPv6 forwarding, then start radvd
+    /// there with `config` (`daemons::radvd`); returns once it announces itself. The daemon joins
+    /// [`Lab::daemons`], named `radvd-wan0`.
     ///
     /// # Errors
     ///
@@ -225,6 +229,27 @@ impl Lab {
     pub fn start_radvd(&mut self, config: &daemons::RadvdConfig) -> Result<()> {
         self.isp0
             .ip(&["-6", "addr", "replace", ISP0_ADDR6, "dev", "wan0", "nodad"])?;
+        if !self
+            .isp0
+            .ip(&["-6", "addr", "show", "dev", "wan0", "scope", "link"])?
+            .contains(ISP0_LINK_LOCAL6)
+        {
+            // No EUI-64 link-local comes back after the flush: the kernel makes none by itself.
+            let mut gen_mode = self.isp0.command("sh")?;
+            gen_mode.args(["-c", "echo 1 > /proc/sys/net/ipv6/conf/wan0/addr_gen_mode"]);
+            let _ = netns::run(&mut gen_mode);
+            self.isp0
+                .ip(&["-6", "addr", "flush", "dev", "wan0", "scope", "link"])?;
+            self.isp0.ip(&[
+                "-6",
+                "addr",
+                "replace",
+                ISP0_LINK_LOCAL6,
+                "dev",
+                "wan0",
+                "nodad",
+            ])?;
+        }
         let mut forwarding = self.isp0.command("sh")?;
         forwarding.args(["-c", "echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"]);
         let _ = netns::run(&mut forwarding);
