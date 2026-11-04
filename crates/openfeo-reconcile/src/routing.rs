@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use openfeo_config::rules::is_global_unicast_v6;
 use openfeo_config::{Ipv6Wan, Wan, wan};
 use openfeo_world::World;
 use serde::Serialize;
@@ -79,6 +80,19 @@ pub fn router_address(prefix: Ipv6Net) -> Ipv6Addr {
     let mut segments = prefix.network().segments();
     segments[7] = 1;
     Ipv6Addr::from(segments)
+}
+
+/// A learned prefix the router may act on: global unicast, not `::/0`, and overlapping neither
+/// the routed prefix nor a LAN's /64. An ISP advertising the customer's prefix back, or a
+/// neighbour on the WAN link, must not pull the router's own prefixes onto the WAN port, and a
+/// `::/0` route information option (the default's preference, RFC 4191 §2.3) is not a route.
+fn learned_prefix_is_usable(net: Ipv6Net, routed: Option<Ipv6Net>, lans: &[Ipv6Net]) -> bool {
+    let net = net.trunc();
+    let overlaps = |other: Ipv6Net| other.contains(&net) || net.contains(&other);
+    net.prefix_len() > 0
+        && is_global_unicast_v6(net)
+        && !routed.is_some_and(overlaps)
+        && !lans.iter().any(|lan| overlaps(*lan))
 }
 
 fn is_link_local(addr: Ipv6Addr) -> bool {
@@ -241,17 +255,25 @@ fn ipv6_routing(
             kind: RouteKind::Unicast,
             pref_src: src.map(IpAddr::V6),
         };
+    let lan_nets: Vec<Ipv6Net> = world
+        .config
+        .lans
+        .iter()
+        .filter_map(|lan| lan.ipv6.parse::<Ipv6Net>().ok())
+        .map(|net| net.trunc())
+        .collect();
+    let usable = |net: &Ipv6Net| learned_prefix_is_usable(*net, prefix, &lan_nets);
     if let Some(fact) = fact {
-        for addr in &fact.addresses {
+        for addr in fact.addresses.iter().filter(|addr| usable(addr)) {
             desired.addrs.insert(DesiredAddr {
                 ifname: ifname.to_owned(),
                 net: IpNet::V6(*addr),
             });
         }
-        for on_link in &fact.on_link {
+        for on_link in fact.on_link.iter().filter(|net| usable(net)) {
             desired.routes.insert(route(Some(*on_link), None, None));
         }
-        for (dst, via, _) in &fact.routes {
+        for (dst, via, _) in fact.routes.iter().filter(|(dst, _, _)| usable(dst)) {
             desired.routes.insert(route(Some(*dst), Some(*via), None));
         }
     }
@@ -262,6 +284,7 @@ fn ipv6_routing(
                 f.on_link
                     .iter()
                     .chain(&f.addresses)
+                    .filter(|net| usable(net))
                     .any(|net| net.contains(&via))
             });
         if !on_link {
@@ -536,6 +559,81 @@ mod tests {
             routes.contains(&"2001:db8:2::/48 via fe80::1 dev p0 proto 200 metric 10".to_owned()),
             "{routes:?}"
         );
+    }
+
+    /// A learned prefix that is not global unicast, that is `::/0`, or that overlaps the routed
+    /// prefix or a LAN's /64 is never installed: an ISP advertising the customer's prefix back,
+    /// or a neighbour on the WAN link, must not pull the router's own prefixes onto the WAN port.
+    #[test]
+    fn learned_prefixes_that_are_not_global_or_are_the_routers_own_are_ignored() {
+        let mut world = fixtures::ipv6_world();
+        let mut fact = fixtures::ipv6_fact();
+        fact.addresses = vec![
+            "2001:db8:1:222::abcd/64".parse().unwrap(),
+            "2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap(),
+        ];
+        fact.on_link = vec![
+            "2001:db8:1::/48".parse().unwrap(),
+            "fe80::/64".parse().unwrap(),
+            "2001:db8:ffff::/64".parse().unwrap(),
+        ];
+        let via: Ipv6Addr = "fe80::1".parse().unwrap();
+        fact.routes = vec![
+            (
+                "::/0".parse().unwrap(),
+                via,
+                openfeo_world::Preference::High,
+            ),
+            (
+                "2001:db8:1:5::/64".parse().unwrap(),
+                via,
+                openfeo_world::Preference::Medium,
+            ),
+            (
+                "ff00::/8".parse().unwrap(),
+                via,
+                openfeo_world::Preference::Medium,
+            ),
+            (
+                "2001:db8:2::/48".parse().unwrap(),
+                via,
+                openfeo_world::Preference::High,
+            ),
+        ];
+        world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        let desired = routing(&world);
+        let addrs = addrs_of(&desired);
+        assert!(
+            addrs.contains(&"p0 2001:db8:ffff:0:1234:5678:9abc:def0/64".to_owned()),
+            "{addrs:?}"
+        );
+        assert!(
+            !addrs.iter().any(|a| a.starts_with("p0 2001:db8:1:222:")),
+            "a LAN's /64 on the WAN port: {addrs:?}"
+        );
+        let routes = routes_of(&desired);
+        for kept in [
+            "2001:db8:ffff::/64 via - dev p0 proto 200 metric 10",
+            "2001:db8:2::/48 via fe80::1 dev p0 proto 200 metric 10",
+        ] {
+            assert!(
+                routes.contains(&kept.to_owned()),
+                "{kept} missing: {routes:?}"
+            );
+        }
+        // The routed prefix keeps its blackhole; nothing learned lands on the WAN port.
+        for dropped in [
+            "2001:db8:1::/48 via - dev p0",
+            "fe80::/64 via - dev p0",
+            "::/0 via fe80::1",
+            "2001:db8:1:5::/64 via fe80::1",
+            "ff00::/8 via fe80::1",
+        ] {
+            assert!(
+                !routes.iter().any(|r| r.starts_with(dropped)),
+                "{dropped} was installed: {routes:?}"
+            );
+        }
     }
 
     #[test]
