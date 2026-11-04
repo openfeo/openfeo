@@ -115,6 +115,8 @@ pub enum Code {
     DuplicateRecord,
     /// A `[[dns.records]]` name the router already answers for.
     RecordNameTaken,
+    /// A `[[dns.records]]` full name outside `[system] domain`, which the forwarder never answers.
+    RecordOutsideDomain,
 }
 
 /// Ports the router's own services use on the WAN side (DNS, DHCP, HTTP, NTP, HTTPS): a forward
@@ -226,6 +228,7 @@ impl Code {
             Code::RaWithoutIpv6 => "ra_without_ipv6",
             Code::DuplicateRecord => "duplicate_record",
             Code::RecordNameTaken => "record_name_taken",
+            Code::RecordOutsideDomain => "record_outside_domain",
         }
     }
 }
@@ -1364,9 +1367,9 @@ fn dns(report: &mut Report, dns: &Dns, pools: &Pools<'_>, system: Option<&System
     }
 }
 
-/// `[[dns.records]]` (SPEC §7.7): a host name (a label under the domain or a full name) and a
-/// unicast address, unique per name and family, and never a name the router already answers
-/// for: its own, or a reservation's.
+/// `[[dns.records]]` (SPEC §7.7): a host name (a label under the domain, or a full name ending
+/// in it: the forwarder answers names in its own domain only) and a unicast address, unique per
+/// name and family, and never a name the router already answers for: its own, or a reservation's.
 fn records(
     report: &mut Report,
     records: &[Record],
@@ -1418,6 +1421,17 @@ fn records(
             continue;
         }
         let name = record.name.trim_end_matches('.').to_ascii_lowercase();
+        if name.contains('.') && !name.ends_with(&format!(".{domain}")) {
+            report.push(
+                path,
+                Code::RecordOutsideDomain,
+                format!(
+                    "{:?} is not under the domain {domain:?}: the router answers names in its own domain only; use a label, or a full name ending in .{domain}",
+                    record.name
+                ),
+            );
+            continue;
+        }
         let short = name
             .strip_suffix(&format!(".{domain}"))
             .unwrap_or(&name)
@@ -2959,6 +2973,27 @@ mod ipv6_tests {
             vec![],
             "one A and one AAAA for a dual-stack name"
         );
+    }
+
+    /// The forwarder answers names in its own domain only: a full name elsewhere would be typed
+    /// and never answered.
+    #[test]
+    fn a_record_name_outside_the_domain_is_refused() {
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[dns.records]]\nname = \"printer.office.example\"\naddress = \"2001:db8:1:222::10\"\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("dns.records[0]".to_owned(), Code::RecordOutsideDomain)]
+        );
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[dns.records]]\nname = \"printer.home.arpa\"\naddress = \"2001:db8:1:222::10\"\n",
+        );
+        assert_eq!(found(&cfg), vec![], "a full name under the domain");
     }
 
     #[test]

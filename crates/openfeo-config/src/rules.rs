@@ -251,7 +251,7 @@ mod ipv6_tests {
     fn is_global_unicast_v6_excludes_ula_link_local_and_loopback() {
         let net = |text: &str| text.parse::<ipnet::Ipv6Net>().unwrap();
         assert!(is_global_unicast_v6(net("2001:db8::/48")));
-        assert!(is_global_unicast_v6(net("2a00::/16")));
+        assert!(is_global_unicast_v6(net("3fff::/20")));
         for not in [
             "fd00::/48",
             "fc00::/7",

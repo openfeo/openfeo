@@ -49,7 +49,7 @@ message Dns {
 
 // One typed local name (SPEC §7.7).
 message Record {
-  // A label under `[system] domain`, or a full name.
+  // A label under `[system] domain`, or a full name ending in it.
   string name = 1;
   // An IPv4 or IPv6 unicast address.
   string address = 2;
