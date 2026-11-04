@@ -26,6 +26,14 @@ pub const RS_BACKOFF_MAX: Timestamp = 3_600_000;
 pub const TWO_HOURS: u32 = 7_200;
 /// RFC 8200 §5: an MTU option below the IPv6 minimum is ignored.
 const MIN_MTU: u32 = 1280;
+/// How many default routers are kept (RFC 4861 §5.1 asks for at least two).
+pub const MAX_ROUTERS: usize = 16;
+/// How many route information entries are kept.
+pub const MAX_ROUTES: usize = 64;
+/// How many resolvers are kept (RFC 8106 §5.3.1 suggests a small number).
+pub const MAX_RESOLVERS: usize = 8;
+/// How many search domains are kept.
+pub const MAX_SEARCH: usize = 8;
 
 /// What one WAN's client is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,14 +207,18 @@ impl Client {
                 // An answer: solicitations stop (RFC 4861 §6.3.7).
                 self.solicit_at = None;
                 if ra.router_lifetime > 0 {
-                    self.routers.insert(
-                        from,
-                        RouterEntry {
-                            preference: ra.preference,
-                            expires: now + Timestamp::from(ra.router_lifetime) * 1000,
-                            seen: now,
-                        },
-                    );
+                    // Every list is bounded: a neighbour on the link may send any number of
+                    // advertisements, and each list keeps what it first saw up to its cap.
+                    if self.routers.contains_key(&from) || self.routers.len() < MAX_ROUTERS {
+                        self.routers.insert(
+                            from,
+                            RouterEntry {
+                                preference: ra.preference,
+                                expires: now + Timestamp::from(ra.router_lifetime) * 1000,
+                                seen: now,
+                            },
+                        );
+                    }
                 } else {
                     self.routers.remove(&from);
                 }
@@ -312,7 +324,9 @@ impl Client {
             } => {
                 if lifetime == 0 {
                     self.routes.remove(&(prefix, from));
-                } else {
+                } else if self.routes.contains_key(&(prefix, from))
+                    || self.routes.len() < MAX_ROUTES
+                {
                     self.routes
                         .insert((prefix, from), (preference, expiry(now, lifetime)));
                 }
@@ -322,13 +336,13 @@ impl Client {
                     if is_link_local(addr) {
                         out.push(Output::Note(Note::LinkLocalResolverDropped(addr)));
                     } else {
-                        set_listed(&mut self.dns, addr, lifetime, now);
+                        set_listed(&mut self.dns, addr, lifetime, now, MAX_RESOLVERS);
                     }
                 }
             }
             NdOption::Dnssl { lifetime, names } => {
                 for name in names {
-                    set_listed(&mut self.search, name, lifetime, now);
+                    set_listed(&mut self.search, name, lifetime, now, MAX_SEARCH);
                 }
             }
             NdOption::SourceLinkLayer(_) | NdOption::Unknown { .. } => {}
@@ -431,12 +445,18 @@ fn set_lifetime<K: Ord>(map: &mut BTreeMap<K, Expiry>, key: K, lifetime: u32, no
 
 /// An ordered list entry: a lifetime of 0 removes it, otherwise it is added or refreshed in
 /// place, keeping the order it was first seen in.
-fn set_listed<T: PartialEq>(list: &mut Vec<(T, Expiry)>, item: T, lifetime: u32, now: Timestamp) {
+fn set_listed<T: PartialEq>(
+    list: &mut Vec<(T, Expiry)>,
+    item: T,
+    lifetime: u32,
+    now: Timestamp,
+    cap: usize,
+) {
     if lifetime == 0 {
         list.retain(|(i, _)| *i != item);
     } else if let Some(entry) = list.iter_mut().find(|(i, _)| *i == item) {
         entry.1 = expiry(now, lifetime);
-    } else {
+    } else if list.len() < cap {
         list.push((item, expiry(now, lifetime)));
     }
 }
@@ -717,6 +737,44 @@ mod tests {
         // The address goes when its lifetime does.
         let out = c.handle(Input::Timeout, 3_000 + 7_200_000);
         assert_eq!(learned(&out).unwrap().addresses, vec![]);
+    }
+
+    /// Every learned list is bounded: a neighbour on the WAN link may send any number of
+    /// advertisements, and each list keeps what it first saw up to its cap.
+    #[test]
+    fn learned_lists_are_capped() {
+        let mut c = client();
+        up(&mut c);
+        let addrs: Vec<Ipv6Addr> = (1..=MAX_RESOLVERS + 4)
+            .map(|i| Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, u16::try_from(i).unwrap()))
+            .collect();
+        let names: Vec<String> = (1..=MAX_SEARCH + 4)
+            .map(|i| format!("d{i}.example"))
+            .collect();
+        let mut options = vec![
+            NdOption::Rdnss {
+                lifetime: 600,
+                addrs: addrs.clone(),
+            },
+            NdOption::Dnssl {
+                lifetime: 600,
+                names: names.clone(),
+            },
+        ];
+        options.extend((1..=MAX_ROUTES + 10).map(|i| NdOption::RouteInformation {
+            prefix: net(&format!("2001:db8:{i:x}::/48")),
+            preference: Preference::Medium,
+            lifetime: 600,
+        }));
+        let out = c.handle(advert(ll(1), &ra(1800, options)), 0);
+        let l = learned(&out).unwrap();
+        assert_eq!(l.dns, addrs[..MAX_RESOLVERS].to_vec());
+        assert_eq!(l.search, names[..MAX_SEARCH].to_vec());
+        assert_eq!(l.routes.len(), MAX_ROUTES);
+        for i in 2..=MAX_ROUTERS + 4 {
+            c.handle(advert(ll(u16::try_from(i).unwrap()), &ra(1800, vec![])), 0);
+        }
+        assert_eq!(c.routers.len(), MAX_ROUTERS);
     }
 
     #[test]
