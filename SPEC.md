@@ -562,7 +562,7 @@ Coding rules (repeated in `CLAUDE.md`):
 ## 14. Licensing
 
 - Project code: GPL-2.0-or-later. No CLA; DCO sign-off.
-- Because libnftables is GPL-2.0-only, the shipped binary is a GPLv2 work: `cargo deny` MUST reject GPL-3.0*, LGPL-3.0*, AGPL-* and any licence incompatible with GPL-2.0. Allowed: MIT, Apache-2.0, BSD-2/3-Clause, ISC, MPL-2.0, Zlib, Unicode, LGPL-2.1+, GPL-2.0(-or-later), CC0, Unlicense.
+- Because libnftables is GPL-2.0-only, the shipped binary is a GPLv2 work: `cargo deny` MUST reject GPL-3.0*, LGPL-3.0*, AGPL-* and any licence the project has not accepted for the binary. Accepted: MIT, Apache-2.0 (accepted knowingly against the FSF's reading that it is GPLv2-incompatible; ADR-0021), BSD-2/3-Clause, ISC, MPL-2.0, Zlib, Unicode, LGPL-2.1+, GPL-2.0(-or-later), CC0, Unlicense.
 - The kernel's GPLv2 does not affect a userspace binary (syscall exception); uapi headers are fine. systemd-boot (LGPL-2.1+) ships as a separate EFI binary. Harness tooling may use anything.
 - Trademark, GitHub organisation and domains for "OpenFeO" to be checked (§15). Not legal advice.
 

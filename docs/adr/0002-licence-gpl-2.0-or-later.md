@@ -1,6 +1,6 @@
 # 0002 — Licence: GPL-2.0-or-later, DCO, no CLA
 
-Status: Accepted
+Status: Accepted; amended by ADR-0021 (Apache-2.0 is accepted knowingly, not as GPLv2-compatible)
 Date: 2026-10-29
 
 ## Context

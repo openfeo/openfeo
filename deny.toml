@@ -2,7 +2,7 @@
 all-features = true
 
 [licenses]
-# SPEC §14: the shipped binary is a GPLv2 work, so only GPL-2.0-compatible licences may be linked.
+# SPEC §14 and ADR-0021: the licences the project accepts in the shipped GPLv2 binary; Apache-2.0 is accepted knowingly.
 allow = [
     "MIT",
     "Apache-2.0",
