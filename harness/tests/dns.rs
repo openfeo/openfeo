@@ -7,7 +7,7 @@
 //! the lab's `[dns]` settings. `harness = false`: this binary is its own runner; an optional
 //! first argument filters scenarios by substring.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
@@ -21,7 +21,7 @@ use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::netns::{self, NetNs};
 use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
-use openfeo_net::dns::{DnsDriver, DnsDriverConfig};
+use openfeo_net::dns::{DnsDriver, DnsDriverConfig, Listener};
 use openfeo_proto_dns::forwarder::{Config, Event, LocalRecord};
 use tokio::runtime::Runtime;
 
@@ -66,6 +66,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "the_box_can_use_its_own_resolver_on_loopback",
         run: the_box_can_use_its_own_resolver_on_loopback,
     },
+    Scenario {
+        name: "names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked",
+        run: names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -93,6 +97,13 @@ const LAN_HOST: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 50);
 const WAN: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
 const UPSTREAM: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 1);
 const DEAD_UPSTREAM: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 99);
+/// The IPv6 side of the rig: the router's LAN address, the LAN host, the upstream.
+const ROUTER6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 1, 0x222, 0, 0, 0, 1);
+const LAN_HOST6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 1, 0x222, 0, 0, 0, 2);
+const WAN6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 2);
+const UPSTREAM6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1);
+/// A typed AAAA record for the `nas` reservation's name.
+const NAS6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 1, 0x222, 0, 0, 0, 0x10);
 /// How long one `dig` may take in all, its own retries included.
 const LOOKUP: Duration = Duration::from_secs(5);
 /// How long a scenario's serving loop may run.
@@ -137,12 +148,37 @@ impl Rig {
         netns::ip(&["link", "set", LAN_HOST_IF, "netns", &lan_host.name])?;
         netns::ip(&["link", "set", UPSTREAM_IF, "netns", &upstream.name])?;
         netns::ip(&["addr", "add", &format!("{ROUTER}/24"), "dev", LAN_IF])?;
+        netns::ip(&[
+            "addr",
+            "add",
+            &format!("{ROUTER6}/64"),
+            "dev",
+            LAN_IF,
+            "nodad",
+        ])?;
         netns::ip(&["link", "set", LAN_IF, "up"])?;
         netns::ip(&["addr", "add", &format!("{WAN}/24"), "dev", WAN_IF])?;
+        netns::ip(&["addr", "add", &format!("{WAN6}/64"), "dev", WAN_IF, "nodad"])?;
         netns::ip(&["link", "set", WAN_IF, "up"])?;
         lan_host.ip(&["addr", "add", &format!("{LAN_HOST}/24"), "dev", LAN_HOST_IF])?;
+        lan_host.ip(&[
+            "addr",
+            "add",
+            &format!("{LAN_HOST6}/64"),
+            "dev",
+            LAN_HOST_IF,
+            "nodad",
+        ])?;
         lan_host.ip(&["link", "set", LAN_HOST_IF, "up"])?;
         upstream.ip(&["addr", "add", &format!("{UPSTREAM}/24"), "dev", UPSTREAM_IF])?;
+        upstream.ip(&[
+            "addr",
+            "add",
+            &format!("{UPSTREAM6}/64"),
+            "dev",
+            UPSTREAM_IF,
+            "nodad",
+        ])?;
         upstream.ip(&["link", "set", UPSTREAM_IF, "up"])?;
         let dnsmasq = daemons::dnsmasq(&upstream, UPSTREAM_IF, &lab.run_dir)?;
         dnsmasq.log.wait_for(
@@ -161,20 +197,20 @@ impl Rig {
     /// a `pc` lease.
     fn config() -> anyhow::Result<Config> {
         Ok(Config {
-            upstreams: vec![UPSTREAM],
+            upstreams: vec![UPSTREAM.into()],
             domain: "home.arpa".parse().context("a name")?,
             router_name: Some("openfeo.home.arpa".parse().context("a name")?),
-            router_addrs: vec![ROUTER],
+            router_addrs: vec![ROUTER.into(), ROUTER6.into()],
             lan_subnets: vec!["192.168.1.0/24".parse().context("a subnet")?],
             guard_subnets: vec!["192.168.1.0/24".parse().context("a subnet")?],
             local: vec![
                 LocalRecord {
                     name: "nas.home.arpa".parse().context("a name")?,
-                    addr: Ipv4Addr::new(192, 168, 1, 10),
+                    addr: Ipv4Addr::new(192, 168, 1, 10).into(),
                 },
                 LocalRecord {
                     name: "pc.home.arpa".parse().context("a name")?,
-                    addr: Ipv4Addr::new(192, 168, 1, 120),
+                    addr: Ipv4Addr::new(192, 168, 1, 120).into(),
                 },
             ],
             rebind_allow: vec!["allowed.isp.example".parse().context("a name")?],
@@ -186,7 +222,16 @@ impl Rig {
     fn driver(rt: &Runtime, config: Config) -> anyhow::Result<DnsDriver> {
         rt.block_on(async {
             DnsDriver::new(DnsDriverConfig {
-                listeners: vec![LAN_IF.to_owned()],
+                listeners: vec![
+                    Listener {
+                        ifname: LAN_IF.to_owned(),
+                        v6: false,
+                    },
+                    Listener {
+                        ifname: LAN_IF.to_owned(),
+                        v6: true,
+                    },
+                ],
                 loopback: true,
                 forwarder: config,
                 seed: 0x5eed,
@@ -197,7 +242,12 @@ impl Rig {
 
     /// `dig <name> <qtype>` at the router from the LAN host.
     fn dig(&self, name: &str, qtype: &str, extra: &[&str]) -> anyhow::Result<DigAnswer> {
-        lanclient::dig(&self.lan_host, ROUTER, name, qtype, extra, LOOKUP)
+        lanclient::dig(&self.lan_host, ROUTER.into(), name, qtype, extra, LOOKUP)
+    }
+
+    /// As [`Rig::dig`], at the router's IPv6 address.
+    fn dig6(&self, name: &str, qtype: &str) -> anyhow::Result<DigAnswer> {
+        lanclient::dig(&self.lan_host, ROUTER6.into(), name, qtype, &[], LOOKUP)
     }
 
     /// How many queries dnsmasq has logged matching `pattern`.
@@ -297,8 +347,68 @@ fn has_flag(answer: &DigAnswer, flag: &str) -> bool {
     answer.flags.iter().any(|f| f == flag)
 }
 
+/// A lookup that must come back `NOERROR` with exactly one AAAA record of `addr`.
+fn expect_aaaa(answer: &DigAnswer, name: &str, addr: &str) -> anyhow::Result<()> {
+    ensure!(
+        answer.status == "NOERROR",
+        "{name}: status {} in {answer:?}",
+        answer.status
+    );
+    let addrs: Vec<&str> = answer
+        .answers
+        .iter()
+        .filter(|row| row.2 == "AAAA")
+        .map(|row| row.3.as_str())
+        .collect();
+    ensure!(addrs == [addr], "{name}: answers {:?}", answer.answers);
+    Ok(())
+}
+
+/// SPEC §7.7 over IPv6: the LAN host asks the router's IPv6 address; a typed AAAA record is
+/// answered authoritatively, an ISP name's AAAA comes through an IPv6 upstream, and the
+/// router's own name has an AAAA.
+fn names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked(lab: &mut Lab) -> anyhow::Result<()> {
+    let rig = Rig::create(lab)?;
+    let rt = runtime()?;
+    let mut config = Rig::config()?;
+    config.upstreams = vec![UPSTREAM6.into()];
+    config.local.push(LocalRecord {
+        name: "nas.home.arpa".parse().context("a name")?,
+        addr: NAS6.into(),
+    });
+    let mut driver = Rig::driver(&rt, config)?;
+    let (events, answer) = serve_while(&rt, &mut driver, || rig.dig6("nas.home.arpa", "AAAA"))?;
+    expect_aaaa(&answer, "nas.home.arpa", &NAS6.to_string())?;
+    ensure!(has_flag(&answer, "aa"), "authoritative: {answer:?}");
+    let (_, v4) = serve_while(&rt, &mut driver, || rig.dig6("nas.home.arpa", "A"))?;
+    expect_a(&v4, "nas.home.arpa", "192.168.1.10")?;
+    let (_, router) = serve_while(&rt, &mut driver, || rig.dig6("openfeo.home.arpa", "AAAA"))?;
+    expect_aaaa(&router, "openfeo.home.arpa", &ROUTER6.to_string())?;
+    let (events2, www) = serve_while(&rt, &mut driver, || rig.dig6("www.isp.example", "AAAA"))?;
+    expect_aaaa(&www, "www.isp.example", daemons::ISP_WWW_ADDR6)?;
+    ensure!(
+        !events
+            .iter()
+            .chain(&events2)
+            .any(|e| matches!(e, Event::UpstreamDown(_))),
+        "the IPv6 upstream answered: {events:?} {events2:?}"
+    );
+    ensure!(
+        rig.dnsmasq.log.count(&Regex::new(&format!("from {WAN6}"))?) > 0,
+        "dnsmasq saw the query arrive over IPv6"
+    );
+    Ok(())
+}
+
 fn local_names_resolve_authoritatively_and_never_leave(lab: &mut Lab) -> anyhow::Result<()> {
     let rig = Rig::create(lab)?;
+    // The lab's resolver is the ISP's: authoritative for its zone and nothing else. A host's
+    // own dnsmasq configuration (its `server=` lines) must not reach it.
+    ensure!(
+        rig.upstream_queries("using nameserver")? == 0,
+        "the lab's dnsmasq read a host configuration: {:?}",
+        rig.dnsmasq.log.tail(12)
+    );
     let rt = runtime()?;
     let mut driver = Rig::driver(&rt, Rig::config()?)?;
     let (_, nas) = lookup(&rt, &mut driver, &rig, "nas.home.arpa", "A", &[])?;
@@ -458,7 +568,7 @@ fn a_dead_upstream_is_skipped_after_one_timeout(lab: &mut Lab) -> anyhow::Result
     let mut driver = Rig::driver(
         &rt,
         Config {
-            upstreams: vec![DEAD_UPSTREAM, UPSTREAM],
+            upstreams: vec![DEAD_UPSTREAM.into(), UPSTREAM.into()],
             ..Rig::config()?
         },
     )?;
@@ -472,7 +582,7 @@ fn a_dead_upstream_is_skipped_after_one_timeout(lab: &mut Lab) -> anyhow::Result
         "the first lookup took {took:?}"
     );
     ensure!(
-        events.contains(&Event::UpstreamDown(DEAD_UPSTREAM)),
+        events.contains(&Event::UpstreamDown(DEAD_UPSTREAM.into())),
         "events: {events:?}"
     );
     let started = Instant::now();
@@ -492,7 +602,7 @@ fn reconfiguration_takes_effect_live(lab: &mut Lab) -> anyhow::Result<()> {
     let mut driver = Rig::driver(
         &rt,
         Config {
-            upstreams: vec![DEAD_UPSTREAM],
+            upstreams: vec![DEAD_UPSTREAM.into()],
             ..Rig::config()?
         },
     )?;
@@ -525,7 +635,7 @@ fn the_wan_side_is_not_served(lab: &mut Lab) -> anyhow::Result<()> {
     let (_, from_wan) = serve_while(&rt, &mut driver, || {
         Ok(lanclient::dig(
             &rig.upstream,
-            WAN,
+            WAN.into(),
             "www.isp.example",
             "A",
             &[],

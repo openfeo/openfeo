@@ -33,14 +33,38 @@ pub fn sysctl(world: &World, forwarding: bool) -> DesiredSysctl {
     entries.insert(IP_FORWARD.to_owned(), on_off.to_owned());
     entries.insert(IP6_FORWARDING.to_owned(), on_off.to_owned());
     for wan in &world.config.wans {
-        if world.ports.id_of(&wan.port).is_some() {
-            entries.insert(send_redirects(&crate::wan_ifname(wan)), "0".to_owned());
+        if world.ports.id_of(&wan.port).is_none() {
+            continue;
+        }
+        let ifname = crate::wan_ifname(wan);
+        entries.insert(send_redirects(&ifname), "0".to_owned());
+        if let Some(ipv6) = &wan.ipv6
+            && ipv6.mode != "disabled"
+        {
+            for key in ["accept_ra", "autoconf", "accept_redirects"] {
+                entries.insert(ipv6_conf(&ifname, key), "0".to_owned());
+            }
+            if let Some(mtu) = world.ipv6.get(&wan.name).and_then(|fact| fact.mtu) {
+                let link_mtu = world.links.get(&ifname).map_or(mtu, |link| link.mtu);
+                entries.insert(ipv6_conf(&ifname, "mtu"), mtu.min(link_mtu).to_string());
+            }
         }
     }
     for lan in &world.config.lans {
-        entries.insert(send_redirects(&bridge_name(&lan.name)), "0".to_owned());
+        let bridge = bridge_name(&lan.name);
+        entries.insert(send_redirects(&bridge), "0".to_owned());
+        if !lan.ipv6.is_empty() {
+            for key in ["accept_ra", "accept_redirects"] {
+                entries.insert(ipv6_conf(&bridge, key), "0".to_owned());
+            }
+        }
     }
     DesiredSysctl { entries }
+}
+
+/// `net/ipv6/conf/<ifname>/<key>`.
+fn ipv6_conf(ifname: &str, key: &str) -> String {
+    format!("net/ipv6/conf/{ifname}/{key}")
 }
 
 /// `net/ipv4/conf/<ifname>/send_redirects`.
@@ -52,6 +76,81 @@ pub fn send_redirects(ifname: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ipv6_wan_gets_its_knobs_and_the_advertised_mtu_capped_at_the_link() {
+        let entries = sysctl(&crate::fixtures::ipv6_world(), true).entries;
+        for key in ["accept_ra", "autoconf", "accept_redirects"] {
+            assert_eq!(
+                entries
+                    .get(&format!("net/ipv6/conf/p0/{key}"))
+                    .map(String::as_str),
+                Some("0"),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            entries.get("net/ipv6/conf/p0/mtu").map(String::as_str),
+            Some("1500")
+        );
+        let mut world = crate::fixtures::ipv6_world();
+        let mut fact = crate::fixtures::ipv6_fact();
+        fact.mtu = Some(9000);
+        world.ipv6 = std::sync::Arc::new(BTreeMap::from([("wan0".to_owned(), fact.clone())]));
+        assert_eq!(
+            sysctl(&world, true)
+                .entries
+                .get("net/ipv6/conf/p0/mtu")
+                .map(String::as_str),
+            Some("1500"),
+            "capped at the link"
+        );
+        fact.mtu = Some(1280);
+        world.ipv6 = std::sync::Arc::new(BTreeMap::from([("wan0".to_owned(), fact.clone())]));
+        assert_eq!(
+            sysctl(&world, true)
+                .entries
+                .get("net/ipv6/conf/p0/mtu")
+                .map(String::as_str),
+            Some("1280")
+        );
+        fact.mtu = None;
+        world.ipv6 = std::sync::Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        assert!(
+            !sysctl(&world, true)
+                .entries
+                .contains_key("net/ipv6/conf/p0/mtu"),
+            "no option, no key"
+        );
+        let static_entries = sysctl(&crate::fixtures::static_world(), true).entries;
+        assert!(
+            static_entries
+                .keys()
+                .all(|k| !k.starts_with("net/ipv6/conf/p0")),
+            "{static_entries:?}"
+        );
+    }
+
+    #[test]
+    fn lans_with_ipv6_refuse_advertisements() {
+        let entries = sysctl(&crate::fixtures::ipv6_world(), true).entries;
+        for bridge in ["br-lan0", "br-dmz"] {
+            assert_eq!(
+                entries
+                    .get(&format!("net/ipv6/conf/{bridge}/accept_ra"))
+                    .map(String::as_str),
+                Some("0")
+            );
+            assert_eq!(
+                entries
+                    .get(&format!("net/ipv6/conf/{bridge}/accept_redirects"))
+                    .map(String::as_str),
+                Some("0")
+            );
+        }
+        let static_entries = sysctl(&crate::fixtures::static_world(), true).entries;
+        assert!(!static_entries.contains_key("net/ipv6/conf/br-lan0/accept_ra"));
+    }
     use crate::fixtures;
 
     #[test]

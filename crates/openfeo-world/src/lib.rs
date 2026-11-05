@@ -11,6 +11,7 @@
 
 pub mod dhcp4;
 pub mod health;
+pub mod ipv6;
 pub mod leases;
 pub mod mac;
 pub mod portmap;
@@ -19,6 +20,7 @@ pub mod time;
 pub mod world;
 
 pub use dhcp4::Dhcp4Fact;
+pub use ipv6::{DefaultRoute, Preference, WanIpv6Fact};
 pub use leases::LeaseFact;
 pub use mac::MacAddr;
 pub use time::TimeFact;

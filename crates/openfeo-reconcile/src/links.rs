@@ -58,6 +58,9 @@ pub struct DesiredPort {
     /// A DHCP WAN's lease MTU (SPEC §7.2), or [`DEFAULT_MTU`] once the lease is gone; `None`
     /// leaves the kernel's alone (static WANs, LAN members, parents of tagged WANs).
     pub mtu: Option<u32>,
+    /// The port of a WAN with `[wans.ipv6]`: its link-local address is a stable-privacy one
+    /// from the persisted secret, written before the port comes up (SPEC §7.3).
+    pub ipv6_stable_privacy: bool,
 }
 
 /// The MTU a DHCP WAN port returns to when its lease (and the MTU it carried) is gone.
@@ -118,6 +121,18 @@ pub fn links(world: &World) -> DesiredLinks {
         );
     }
     let wans = wan_interfaces(world, &known, &mut vlans);
+    let ipv6_ports: BTreeSet<String> = world
+        .config
+        .wans
+        .iter()
+        .filter(|wan| known.contains(wan.port.as_str()))
+        .filter(|wan| {
+            wan.ipv6
+                .as_ref()
+                .is_some_and(|ipv6| ipv6.mode != "disabled")
+        })
+        .map(crate::wan_ifname)
+        .collect();
     for port in world.ports.names() {
         let master = master_of.get(port).cloned();
         let has_upper = vlans.values().any(|(parent, _)| parent == port);
@@ -129,12 +144,14 @@ pub fn links(world: &World) -> DesiredLinks {
                 up: master.is_some() || wans.contains_key(port) || has_upper,
                 master,
                 mtu: wans.get(port).copied().flatten(),
+                ipv6_stable_privacy: ipv6_ports.contains(port),
             },
         );
     }
     for (ifname, (parent, id)) in vlans {
         let master = master_of.get(&ifname).cloned();
         let mtu = wans.get(ifname.as_str()).copied().flatten();
+        let ipv6_stable_privacy = ipv6_ports.contains(&ifname);
         desired.ports.insert(
             ifname.clone(),
             DesiredPort {
@@ -143,6 +160,7 @@ pub fn links(world: &World) -> DesiredLinks {
                 up: true,
                 master,
                 mtu,
+                ipv6_stable_privacy,
             },
         );
     }
@@ -184,6 +202,21 @@ fn wan_interfaces(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_ipv6_wan_port_asks_for_stable_privacy() {
+        let desired = links(&crate::fixtures::ipv6_world());
+        assert!(desired.ports["p0"].ipv6_stable_privacy);
+        assert!(!desired.ports["p2"].ipv6_stable_privacy);
+        assert!(!desired.ports["p3"].ipv6_stable_privacy);
+        let desired = links(&crate::fixtures::static_world());
+        assert!(desired.ports.values().all(|p| !p.ipv6_stable_privacy));
+        let desired = links(&crate::fixtures::vlans_world());
+        assert!(
+            desired.ports.values().all(|p| !p.ipv6_stable_privacy),
+            "a tagged WAN without [wans.ipv6]"
+        );
+    }
     use crate::fixtures;
     use openfeo_world::MacAddr;
     use std::collections::BTreeMap;

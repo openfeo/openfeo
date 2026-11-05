@@ -39,23 +39,23 @@ pub const MAX_PENDING: usize = 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRecord {
     pub name: Name,
-    pub addr: Ipv4Addr,
+    pub addr: IpAddr,
 }
 
 /// The forwarder's settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// In order of preference.
-    pub upstreams: Vec<Ipv4Addr>,
+    pub upstreams: Vec<IpAddr>,
     /// The local zone, `home.arpa` by default.
     pub domain: Name,
     /// `<hostname>.<domain>`.
     pub router_name: Option<Name>,
     /// The LAN addresses: the router's A records, and never a valid upstream answer.
-    pub router_addrs: Vec<Ipv4Addr>,
+    pub router_addrs: Vec<IpAddr>,
     /// The router's other addresses (the WAN's): never a valid upstream answer either, but not
     /// A records of the router's name.
-    pub wan_addrs: Vec<Ipv4Addr>,
+    pub wan_addrs: Vec<IpAddr>,
     /// Reverse zones the forwarder is authoritative for: the private LANs, and public LANs whose
     /// hosts the router names (SPEC §7.7).
     pub lan_subnets: Vec<Ipv4Net>,
@@ -84,12 +84,12 @@ pub type QueryId = u64;
 pub enum Input {
     Query {
         id: QueryId,
-        client: Ipv4Addr,
+        client: IpAddr,
         transport: Transport,
         bytes: Vec<u8>,
     },
     UpstreamReply {
-        upstream: Ipv4Addr,
+        upstream: IpAddr,
         transport: Transport,
         bytes: Vec<u8>,
     },
@@ -97,7 +97,7 @@ pub enum Input {
     /// exist, a full socket buffer): `bytes` as the forward carried them. The upstream never
     /// saw the query, so it is not a silence; the query is sent again after [`FORWARD_RETRY`].
     ForwardFailed {
-        upstream: Ipv4Addr,
+        upstream: IpAddr,
         transport: Transport,
         bytes: Vec<u8>,
     },
@@ -114,7 +114,7 @@ pub enum Output {
         bytes: Vec<u8>,
     },
     Forward {
-        upstream: Ipv4Addr,
+        upstream: IpAddr,
         transport: Transport,
         bytes: Vec<u8>,
     },
@@ -135,17 +135,17 @@ pub enum Event {
     },
     /// Once per configuration that leaves none.
     NoUpstreams,
-    UpstreamDown(Ipv4Addr),
-    UpstreamUp(Ipv4Addr),
+    UpstreamDown(IpAddr),
+    UpstreamUp(IpAddr),
     RebindDropped {
         name: Name,
         addr: IpAddr,
-        client: Ipv4Addr,
+        client: IpAddr,
     },
     /// Reserved for the policy; never emitted in M1.
     Blocked {
         name: Name,
-        client: Ipv4Addr,
+        client: IpAddr,
     },
 }
 
@@ -163,7 +163,7 @@ pub struct Policy;
 
 impl Policy {
     #[must_use]
-    pub fn decide(&self, _name: &Name, _qtype: u16, _client: Ipv4Addr) -> Verdict {
+    pub fn decide(&self, _name: &Name, _qtype: u16, _client: IpAddr) -> Verdict {
         Verdict::Allow
     }
 }
@@ -172,11 +172,11 @@ impl Policy {
 #[derive(Debug, Clone)]
 struct Pending {
     client: QueryId,
-    client_addr: Ipv4Addr,
+    client_addr: IpAddr,
     transport: Transport,
     /// The client's query, for the reply's header and the OPT decision.
     query: Message,
-    upstream: Ipv4Addr,
+    upstream: IpAddr,
     upstream_transport: Transport,
     deadline: Timestamp,
     /// Upstreams tried so far, this one included.
@@ -205,7 +205,7 @@ pub struct Forwarder {
     /// By the id of the query sent upstream.
     pending: BTreeMap<u16, Pending>,
     /// Upstreams marked down, and until when.
-    down: BTreeMap<Ipv4Addr, Timestamp>,
+    down: BTreeMap<IpAddr, Timestamp>,
     cursor: usize,
     rng: u64,
     no_upstreams_told: bool,
@@ -277,7 +277,7 @@ impl Forwarder {
     fn query(
         &mut self,
         id: QueryId,
-        client: Ipv4Addr,
+        client: IpAddr,
         transport: Transport,
         bytes: &[u8],
         now: Timestamp,
@@ -336,7 +336,7 @@ impl Forwarder {
     fn forward(
         &mut self,
         id: QueryId,
-        client: Ipv4Addr,
+        client: IpAddr,
         transport: Transport,
         msg: Message,
         now: Timestamp,
@@ -407,7 +407,7 @@ impl Forwarder {
 
     fn upstream_reply(
         &mut self,
-        upstream: Ipv4Addr,
+        upstream: IpAddr,
         transport: Transport,
         bytes: &[u8],
         now: Timestamp,
@@ -498,7 +498,7 @@ impl Forwarder {
     /// longer pending (answered meanwhile) changes nothing.
     fn forward_failed(
         &mut self,
-        upstream: Ipv4Addr,
+        upstream: IpAddr,
         transport: Transport,
         bytes: &[u8],
         now: Timestamp,
@@ -603,7 +603,7 @@ impl Forwarder {
 
     /// The next upstream in turn that is not marked down, skipping `except`; when all are down,
     /// the next one anyway. `None` when nothing but `except` is left, or there is none at all.
-    fn pick_upstream(&mut self, now: Timestamp, except: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    fn pick_upstream(&mut self, now: Timestamp, except: Option<IpAddr>) -> Option<IpAddr> {
         let n = self.config.upstreams.len();
         if n == 0 {
             return None;
@@ -625,7 +625,7 @@ impl Forwarder {
         Some(self.config.upstreams[index])
     }
 
-    fn is_down(&self, upstream: Ipv4Addr, now: Timestamp) -> bool {
+    fn is_down(&self, upstream: IpAddr, now: Timestamp) -> bool {
         self.down.get(&upstream).is_some_and(|until| *until > now)
     }
 
@@ -664,17 +664,20 @@ impl Forwarder {
                 .guard_subnets
                 .iter()
                 .any(|subnet| subnet.contains(&addr))
-            || self.config.router_addrs.contains(&addr)
-            || self.config.wan_addrs.contains(&addr)
+            || self.config.router_addrs.contains(&IpAddr::V4(addr))
+            || self.config.wan_addrs.contains(&IpAddr::V4(addr))
     }
 
-    /// ULA, link-local, loopback, or an IPv4-mapped address that [`Forwarder::is_internal_v4`]
-    /// rejects.
+    /// ULA, link-local, loopback, one of the router's own addresses, or an IPv4-mapped address
+    /// that [`Forwarder::is_internal_v4`] rejects. A LAN's /64 from a routed prefix is global
+    /// space and a valid answer (SPEC §7.7).
     fn is_internal_v6(&self, addr: Ipv6Addr) -> bool {
         addr.is_unique_local()
             || addr.is_unicast_link_local()
             || addr.is_loopback()
             || addr.is_unspecified()
+            || self.config.router_addrs.contains(&IpAddr::V6(addr))
+            || self.config.wan_addrs.contains(&IpAddr::V6(addr))
             || addr
                 .to_ipv4_mapped()
                 .is_some_and(|mapped| self.is_internal_v4(mapped))
@@ -697,6 +700,23 @@ impl Forwarder {
     /// zone; `None` when it is for the upstreams.
     fn local_answer(&self, msg: &Message) -> Option<Message> {
         let question = &msg.questions[0];
+        if let Some(addr) = reverse_addr6(&question.name) {
+            // No `ip6.arpa` zone is ours: an address the router knows a name for is answered,
+            // everything else goes upstream.
+            let name = self.name_for(IpAddr::V6(addr))?;
+            let mut reply = Message::reply_to(msg, rcode::NOERROR);
+            reply.header.authoritative = true;
+            if matches!(question.qtype, rtype::PTR | rtype::ANY) {
+                reply.answers.push(Record {
+                    name: question.name.clone(),
+                    rtype: rtype::PTR,
+                    class: CLASS_IN,
+                    ttl: LOCAL_TTL,
+                    rdata: RData::Ptr(name),
+                });
+            }
+            return Some(reply);
+        }
         if let Some(addr) = reverse_addr(&question.name) {
             let subnet = self
                 .config
@@ -706,7 +726,7 @@ impl Forwarder {
             let zone = reverse_zone(*subnet);
             let mut reply = Message::reply_to(msg, rcode::NOERROR);
             reply.header.authoritative = true;
-            match (self.name_for(addr), question.qtype) {
+            match (self.name_for(IpAddr::V4(addr)), question.qtype) {
                 (Some(name), rtype::PTR | rtype::ANY) => reply.answers.push(Record {
                     name: question.name.clone(),
                     rtype: rtype::PTR,
@@ -735,15 +755,28 @@ impl Forwarder {
             return Some(reply);
         }
         match question.qtype {
-            rtype::A | rtype::ANY if !addrs.is_empty() => {
+            rtype::A | rtype::AAAA | rtype::ANY if !addrs.is_empty() => {
                 for addr in addrs {
+                    let rdata = match (addr, question.qtype) {
+                        (IpAddr::V4(addr), rtype::A | rtype::ANY) => RData::A(addr),
+                        (IpAddr::V6(addr), rtype::AAAA | rtype::ANY) => RData::Aaaa(addr),
+                        _ => continue,
+                    };
                     reply.answers.push(Record {
                         name: question.name.clone(),
-                        rtype: rtype::A,
+                        rtype: if addr.is_ipv4() {
+                            rtype::A
+                        } else {
+                            rtype::AAAA
+                        },
                         class: CLASS_IN,
                         ttl: LOCAL_TTL,
-                        rdata: RData::A(addr),
+                        rdata,
                     });
+                }
+                if reply.answers.is_empty() {
+                    // The name exists in the other family only: no data, not no name.
+                    reply.authorities.push(self.soa(&self.config.domain));
                 }
             }
             rtype::SOA if is_apex => reply.answers.push(self.soa(&self.config.domain)),
@@ -752,21 +785,22 @@ impl Forwarder {
         Some(reply)
     }
 
-    /// The addresses `name` resolves to locally: the router's, or the first local record's.
-    fn addrs_for(&self, name: &Name) -> Vec<Ipv4Addr> {
+    /// The addresses `name` resolves to locally: the router's, or the local records' (one per
+    /// family for a dual-stack name).
+    fn addrs_for(&self, name: &Name) -> Vec<IpAddr> {
         if self.config.router_name.as_ref() == Some(name) {
             return self.config.router_addrs.clone();
         }
         self.config
             .local
             .iter()
-            .find(|record| &record.name == name)
-            .map(|record| vec![record.addr])
-            .unwrap_or_default()
+            .filter(|record| &record.name == name)
+            .map(|record| record.addr)
+            .collect()
     }
 
     /// The name `addr` resolves to locally.
-    fn name_for(&self, addr: Ipv4Addr) -> Option<Name> {
+    fn name_for(&self, addr: IpAddr) -> Option<Name> {
         if self.config.router_addrs.contains(&addr) {
             return self.config.router_name.clone();
         }
@@ -860,6 +894,28 @@ fn opt_record(dnssec_ok: bool) -> Record {
     }
 }
 
+/// The address an `ip6.arpa` name stands for: 32 nibbles, least significant first.
+fn reverse_addr6(name: &Name) -> Option<Ipv6Addr> {
+    let labels = name.labels();
+    let (nibbles, zone) = labels.split_at_checked(32)?;
+    if zone.len() != 2
+        || !zone[0].eq_ignore_ascii_case(b"ip6")
+        || !zone[1].eq_ignore_ascii_case(b"arpa")
+    {
+        return None;
+    }
+    let mut octets = [0u8; 16];
+    for (i, label) in nibbles.iter().rev().enumerate() {
+        let [digit] = label[..] else {
+            return None;
+        };
+        let value = char::from(digit).to_digit(16)?;
+        let value = u8::try_from(value).ok()?;
+        octets[i / 2] |= if i % 2 == 0 { value << 4 } else { value };
+    }
+    Some(Ipv6Addr::from(octets))
+}
+
 /// The `in-addr.arpa` zone covering `subnet`: the first whole octets of its prefix (a /24 is
 /// `1.168.192.in-addr.arpa`, a /20 is `168.192.in-addr.arpa`).
 fn reverse_zone(subnet: Ipv4Net) -> Name {
@@ -878,27 +934,31 @@ mod tests {
         text.parse().unwrap()
     }
 
+    fn ipa(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
     fn name(text: &str) -> Name {
         text.parse().unwrap()
     }
 
     fn config() -> Config {
         Config {
-            upstreams: vec![ip("203.0.113.1")],
+            upstreams: vec![ipa("203.0.113.1")],
             domain: name("home.arpa"),
             router_name: Some(name("openfeo.home.arpa")),
-            router_addrs: vec![ip("192.168.1.1")],
+            router_addrs: vec![ipa("192.168.1.1")],
             wan_addrs: Vec::new(),
             lan_subnets: vec!["192.168.1.0/24".parse().unwrap()],
             guard_subnets: vec!["192.168.1.0/24".parse().unwrap()],
             local: vec![
                 LocalRecord {
                     name: name("nas.home.arpa"),
-                    addr: ip("192.168.1.10"),
+                    addr: ipa("192.168.1.10"),
                 },
                 LocalRecord {
                     name: name("pc.home.arpa"),
-                    addr: ip("192.168.1.120"),
+                    addr: ipa("192.168.1.120"),
                 },
             ],
             rebind_allow: vec![name("allowed.isp.example")],
@@ -946,7 +1006,7 @@ mod tests {
     fn client(id: QueryId, transport: Transport, bytes: Vec<u8>) -> Input {
         Input::Query {
             id,
-            client: ip("192.168.1.50"),
+            client: ipa("192.168.1.50"),
             transport,
             bytes,
         }
@@ -965,7 +1025,7 @@ mod tests {
         Message::decode(replies[0]).unwrap()
     }
 
-    fn forwards(outputs: &[Output]) -> Vec<(Ipv4Addr, Transport, Message)> {
+    fn forwards(outputs: &[Output]) -> Vec<(IpAddr, Transport, Message)> {
         outputs
             .iter()
             .filter_map(|o| match o {
@@ -1186,7 +1246,7 @@ mod tests {
         let mut f = Forwarder::new(config(), 1);
         let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
         let (upstream, transport, fwd) = forwards(&out).remove(0);
-        assert_eq!((upstream, transport), (ip("203.0.113.1"), Transport::Udp));
+        assert_eq!((upstream, transport), (ipa("203.0.113.1"), Transport::Udp));
         assert_ne!(fwd.header.id, 7, "a fresh id");
         assert_eq!(fwd.edns().map(|e| e.udp_payload), Some(EDNS_UDP_PAYLOAD));
         assert!(fwd.header.recursion_desired);
@@ -1283,10 +1343,10 @@ mod tests {
             10,
         );
         let mut changed = config();
-        changed.upstreams = vec![ip("9.9.9.9")];
+        changed.upstreams = vec![ipa("9.9.9.9")];
         changed.local.push(LocalRecord {
             name: name("tv.home.arpa"),
-            addr: ip("192.168.1.130"),
+            addr: ipa("192.168.1.130"),
         });
         let out = f.handle(Input::Configure(changed), 20);
         assert_eq!(
@@ -1318,12 +1378,12 @@ mod tests {
     #[test]
     fn a_silent_upstream_is_retried_on_the_next_and_marked_down() {
         let mut cfg = config();
-        cfg.upstreams = vec![ip("203.0.113.99"), ip("203.0.113.1")];
+        cfg.upstreams = vec![ipa("203.0.113.99"), ipa("203.0.113.1")];
         let mut f = Forwarder::new(cfg, 1);
         let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
         assert_eq!(forwards(&out)[0].0, ip("203.0.113.99"));
         let out = f.handle(Input::Timeout, UPSTREAM_TIMEOUT);
-        assert!(out.contains(&Output::Event(Event::UpstreamDown(ip("203.0.113.99")))));
+        assert!(out.contains(&Output::Event(Event::UpstreamDown(ipa("203.0.113.99")))));
         let (upstream, transport, fwd) = forwards(&out).remove(0);
         assert_eq!(upstream, ip("203.0.113.1"));
         assert_eq!(
@@ -1608,7 +1668,7 @@ mod tests {
         assert!(out.contains(&Output::Event(Event::RebindDropped {
             name: name("evil.isp.example"),
             addr: ip("192.168.1.5").into(),
-            client: ip("192.168.1.50"),
+            client: ipa("192.168.1.50"),
         })));
         assert_eq!(f.cache_stats().stores, 0);
         for (qname, addr) in [
@@ -1678,7 +1738,7 @@ mod tests {
         let (upstream, transport, fwd) = forwards(&out).remove(0);
         let spoofed_source = f.handle(
             Input::UpstreamReply {
-                upstream: ip("203.0.113.66"),
+                upstream: ipa("203.0.113.66"),
                 transport,
                 bytes: upstream_answer(&fwd, &[a("www.isp.example", 60, "6.6.6.6")]),
             },
@@ -1762,7 +1822,7 @@ mod tests {
         let mut f = Forwarder::new(config(), 1);
         f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
         let mut cfg = config();
-        cfg.upstreams = vec![ip("9.9.9.9")];
+        cfg.upstreams = vec![ipa("9.9.9.9")];
         let out = f.handle(Input::Configure(cfg), 1);
         assert_eq!(reply(&out).header.rcode, rcode::SERVFAIL);
         assert_eq!(f.pending(), 0);
@@ -1910,12 +1970,151 @@ mod tests {
     }
 
     #[test]
+    fn the_router_name_answers_a_and_aaaa_from_its_addresses() {
+        let mut cfg = config();
+        cfg.router_addrs = vec![
+            ipa("192.168.1.1"),
+            ipa("2001:db8:1:222::1"),
+            ipa("2001:db8:1::1"),
+        ];
+        let mut f = Forwarder::new(cfg, 1);
+        let r = reply(&f.handle(
+            client(1, Transport::Udp, q("openfeo.home.arpa", rtype::AAAA)),
+            0,
+        ));
+        assert_eq!(r.header.rcode, rcode::NOERROR);
+        assert!(r.header.authoritative);
+        let answers: Vec<RData> = r.answers.iter().map(|a| a.rdata.clone()).collect();
+        assert_eq!(
+            answers,
+            vec![
+                RData::Aaaa("2001:db8:1:222::1".parse().unwrap()),
+                RData::Aaaa("2001:db8:1::1".parse().unwrap())
+            ]
+        );
+        let r = reply(&f.handle(
+            client(2, Transport::Udp, q("openfeo.home.arpa", rtype::A)),
+            0,
+        ));
+        assert_eq!(r.answers.len(), 1);
+        assert_eq!(r.answers[0].rdata, RData::A(ip("192.168.1.1")));
+    }
+
+    #[test]
+    fn a_record_answers_aaaa_and_its_ptr() {
+        let mut cfg = config();
+        cfg.local.push(LocalRecord {
+            name: name("www.home.arpa"),
+            addr: ipa("2001:db8:1:232::10"),
+        });
+        let mut f = Forwarder::new(cfg, 1);
+        let r = reply(&f.handle(
+            client(1, Transport::Udp, q("www.home.arpa", rtype::AAAA)),
+            0,
+        ));
+        assert_eq!(r.header.rcode, rcode::NOERROR);
+        assert_eq!(
+            r.answers[0].rdata,
+            RData::Aaaa("2001:db8:1:232::10".parse().unwrap())
+        );
+        let r = reply(&f.handle(client(2, Transport::Udp, q("www.home.arpa", rtype::A)), 0));
+        assert_eq!(r.header.rcode, rcode::NOERROR, "the name exists");
+        assert!(
+            r.answers.is_empty() && r.authorities[0].rtype == rtype::SOA,
+            "no A: no data, not no name: {r:?}"
+        );
+        let ptr = "0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.3.2.0.1.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa";
+        let r = reply(&f.handle(client(3, Transport::Udp, q(ptr, rtype::PTR)), 0));
+        assert_eq!(r.header.rcode, rcode::NOERROR);
+        assert!(r.header.authoritative);
+        assert_eq!(r.answers[0].rdata, RData::Ptr(name("www.home.arpa")));
+        let unknown = "1.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.2.3.2.0.1.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa";
+        let out = f.handle(client(4, Transport::Udp, q(unknown, rtype::PTR)), 0);
+        assert_eq!(
+            forwards(&out).len(),
+            1,
+            "an unknown IPv6 address goes upstream: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_upstream_is_forwarded_to_and_failed_over_like_a_v4_one() {
+        let mut cfg = config();
+        cfg.upstreams = vec![ipa("2001:db8:ffff::1"), ipa("203.0.113.1")];
+        let mut f = Forwarder::new(cfg, 1);
+        let out = f.handle(
+            client(1, Transport::Udp, q("www.isp.example", rtype::AAAA)),
+            0,
+        );
+        assert_eq!(forwards(&out)[0].0, ipa("2001:db8:ffff::1"));
+        let out = f.handle(Input::Timeout, UPSTREAM_TIMEOUT);
+        assert!(
+            out.contains(&Output::Event(Event::UpstreamDown(ipa("2001:db8:ffff::1")))),
+            "{out:?}"
+        );
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        assert_eq!(upstream, ipa("203.0.113.1"));
+        let answer = Record {
+            name: name("www.isp.example"),
+            rtype: rtype::AAAA,
+            class: CLASS_IN,
+            ttl: 60,
+            rdata: RData::Aaaa("2001:db8:ffff::10".parse().unwrap()),
+        };
+        let r = reply(&f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport,
+                bytes: upstream_answer(&fwd, &[answer]),
+            },
+            2_100,
+        ));
+        assert_eq!(r.header.rcode, rcode::NOERROR);
+        assert_eq!(r.answers[0].rtype, rtype::AAAA);
+    }
+
+    #[test]
+    fn an_answer_with_the_routers_own_ipv6_address_is_rebinding() {
+        let mut cfg = config();
+        cfg.router_addrs.push(ipa("2001:db8:1:222::1"));
+        let mut f = Forwarder::new(cfg, 1);
+        for (id, (qname, addr, rcode_wanted)) in [
+            ("evil.isp.example", "2001:db8:1:222::1", rcode::REFUSED),
+            ("ula.isp.example", "fd00::1", rcode::REFUSED),
+            ("dmz.isp.example", "2001:db8:1:232::10", rcode::NOERROR),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = QueryId::try_from(id).unwrap() + 1;
+            let out = f.handle(client(id, Transport::Udp, q(qname, rtype::AAAA)), 0);
+            let (upstream, transport, fwd) = forwards(&out).remove(0);
+            let answer = Record {
+                name: name(qname),
+                rtype: rtype::AAAA,
+                class: CLASS_IN,
+                ttl: 60,
+                rdata: RData::Aaaa(addr.parse().unwrap()),
+            };
+            let r = reply(&f.handle(
+                Input::UpstreamReply {
+                    upstream,
+                    transport,
+                    bytes: upstream_answer(&fwd, &[answer]),
+                },
+                1,
+            ));
+            assert_eq!(r.header.rcode, rcode_wanted, "{qname} -> {addr}");
+        }
+    }
+
+    #[test]
     fn rebinding_covers_shared_space_broadcast_lan_subnets_and_the_wan_address() {
         let mut cfg = config();
         // A private LAN numbered outside RFC 1918, and the WAN address as the reconciler
         // supplies it.
         cfg.guard_subnets.push("198.18.0.0/15".parse().unwrap());
-        cfg.wan_addrs.push(ip("203.0.113.10"));
+        cfg.wan_addrs.push(ipa("203.0.113.10"));
         let mut f = Forwarder::new(cfg, 1);
         let cases = [
             ("cgnat.isp.example", "100.64.1.2"),
@@ -1942,7 +2141,7 @@ mod tests {
     #[test]
     fn an_upstream_error_fails_over_to_the_next_before_the_client_hears_it() {
         let mut cfg = config();
-        cfg.upstreams = vec![ip("203.0.113.1"), ip("203.0.113.2")];
+        cfg.upstreams = vec![ipa("203.0.113.1"), ipa("203.0.113.2")];
         let mut f = Forwarder::new(cfg, 1);
         let out = f.handle(client(1, Transport::Udp, q("www.isp.example", rtype::A)), 0);
         let (upstream, transport, fwd) = forwards(&out).remove(0);
@@ -2107,7 +2306,7 @@ mod tests {
     #[test]
     fn the_routers_name_resolves_to_its_lan_addresses_only() {
         let mut cfg = config();
-        cfg.wan_addrs.push(ip("203.0.113.10"));
+        cfg.wan_addrs.push(ipa("203.0.113.10"));
         let mut f = Forwarder::new(cfg, 1);
         let r = reply(&f.handle(
             client(1, Transport::Udp, q("openfeo.home.arpa", rtype::A)),

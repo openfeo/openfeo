@@ -4,6 +4,8 @@
 //! Reference daemons on the ISP side (SPEC §11): started inside a namespace, their output
 //! captured, killed when the lab goes.
 
+use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -104,29 +106,24 @@ pub fn kea_dhcp4(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     Daemon::spawn("kea-dhcp4", cmd)
 }
 
-/// A static HTTP target in `ns`: `python3 -m http.server <port>` bound to `bind`, serving `dir`
-/// whose `index.html` is `body`. Its log shows one line per request, with the client address
-/// the server saw (`203.0.113.10 - - [...] "GET / HTTP/1.0" 200 -`), which is how scenarios
-/// prove NAT and hairpin SNAT happened. Unbuffered, so `Serving HTTP on` appears at once.
+/// An HTTP target in `ns` serving `body` as `index.html` from `dir` on `bind:port`, either
+/// family (`harness/fixtures/http-server.py`: the standard library's server without the reverse
+/// lookup of its own address, which from a LAN namespace waits out the host's resolvers). Ready
+/// when it logs `Serving HTTP on`; each request is logged as `<client> - - [<date>] "GET / …`.
 ///
 /// # Errors
 ///
-/// When `index.html` cannot be written or python3 cannot be spawned.
+/// When the directory cannot be written or python3 cannot be spawned.
 pub fn http_server(ns: &NetNs, bind: &str, port: u16, dir: &Path, body: &str) -> Result<Daemon> {
     std::fs::create_dir_all(dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let index = dir.join("index.html");
     std::fs::write(&index, body).with_context(|| format!("write {}", index.display()))?;
+    let script = crate::lab::workspace_root().join("harness/fixtures/http-server.py");
     let mut cmd = ns.command("python3")?;
-    cmd.args([
-        "-u",
-        "-m",
-        "http.server",
-        &port.to_string(),
-        "--bind",
-        bind,
-        "--directory",
-    ])
-    .arg(dir);
+    cmd.args(["-I", "-u"])
+        .arg(&script)
+        .args(["--bind", bind, "--port", &port.to_string(), "--directory"])
+        .arg(dir);
     Daemon::spawn(&format!("http-{}-{port}", ns.name), cmd)
 }
 
@@ -134,6 +131,8 @@ pub fn http_server(ns: &NetNs, bind: &str, port: u16, dir: &Path, body: &str) ->
 pub const ISP_DNS_ZONE: &str = "isp.example";
 /// `www.isp.example`: an ordinary public answer.
 pub const ISP_WWW_ADDR: &str = "198.51.100.10";
+/// `www.isp.example`'s AAAA: on the ISP's IPv6 link.
+pub const ISP_WWW_ADDR6: &str = "2001:db8:ffff::10";
 /// `evil.isp.example`: a public name answering with a LAN address, the rebinding attack.
 pub const ISP_EVIL_ADDR: &str = "192.168.1.5";
 /// `allowed.isp.example`: private too, but allow-listed by the scenarios.
@@ -146,8 +145,9 @@ pub const ISP_TXT_LEN: usize = 250;
 
 /// dnsmasq as the ISP's resolver on `iface` inside `ns`: authoritative for [`ISP_DNS_ZONE`]
 /// alone (names outside it are refused, so it never forwards), logging every query as
-/// `auth[A] www.isp.example from 203.0.113.10`. It stays root: the sandbox maps one user, so
-/// there is no `nobody` to drop to.
+/// `auth[A] www.isp.example from 203.0.113.10`. It reads no configuration file, so a host's own
+/// `/etc/dnsmasq.conf` (its `server=` lines) stays out of the lab. It stays root: the sandbox
+/// maps one user, so there is no `nobody` to drop to.
 ///
 /// # Errors
 ///
@@ -155,6 +155,7 @@ pub const ISP_TXT_LEN: usize = 250;
 pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     let mut cmd = ns.command("dnsmasq")?;
     cmd.args([
+        "--conf-file=/dev/null",
         "--no-daemon",
         "--log-queries",
         "--log-facility=-",
@@ -172,7 +173,7 @@ pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
         "--auth-ttl=60",
         &format!("--host-record=ns.{ISP_DNS_ZONE},203.0.113.1"),
         &format!("--host-record=ntp.{ISP_DNS_ZONE},203.0.113.1"),
-        &format!("--host-record=www.{ISP_DNS_ZONE},{ISP_WWW_ADDR}"),
+        &format!("--host-record=www.{ISP_DNS_ZONE},{ISP_WWW_ADDR},{ISP_WWW_ADDR6}"),
         &format!("--host-record=evil.{ISP_DNS_ZONE},{ISP_EVIL_ADDR}"),
         &format!("--host-record=allowed.{ISP_DNS_ZONE},{ISP_ALLOWED_ADDR}"),
     ]);
@@ -183,6 +184,106 @@ pub fn dnsmasq(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
     }
     cmd.current_dir(run_dir);
     Daemon::spawn("dnsmasq", cmd)
+}
+
+/// What the lab's radvd advertises on one interface (SPEC §11): the ISP side of the WAN link.
+#[derive(Debug, Clone)]
+pub struct RadvdConfig {
+    /// The interface in the ISP namespace.
+    pub iface: String,
+    /// `AdvDefaultLifetime`, seconds (at least `max_interval`); 0 advertises no default router.
+    pub lifetime: u16,
+    /// A prefix for the link itself, with the A and L flags, when the ISP numbers the link.
+    pub prefix: Option<String>,
+    /// RDNSS resolvers.
+    pub rdnss: Vec<String>,
+    /// DNSSL search names.
+    pub dnssl: Vec<String>,
+    /// `MinRtrAdvInterval`, seconds: radvd's floor is 3.
+    pub min_interval: u16,
+    /// `MaxRtrAdvInterval`, seconds.
+    pub max_interval: u16,
+}
+
+impl RadvdConfig {
+    /// The ISP's usual advertisement: lifetime 1800, the lab's resolver and search domain, no
+    /// link prefix, as fast as radvd allows so a scenario sees several.
+    #[must_use]
+    pub fn isp(iface: &str) -> Self {
+        RadvdConfig {
+            iface: iface.to_owned(),
+            lifetime: 1800,
+            prefix: None,
+            rdnss: vec![ISP_RESOLVER6.to_owned()],
+            dnssl: vec![ISP_DNS_ZONE.to_owned()],
+            min_interval: 3,
+            max_interval: 4,
+        }
+    }
+
+    /// `radvd.conf` for this configuration.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut text = format!(
+            "interface {}\n{{\n    AdvSendAdvert on;\n    MinRtrAdvInterval {};\n    MaxRtrAdvInterval {};\n    AdvDefaultLifetime {};\n    AdvLinkMTU 1500;\n",
+            self.iface, self.min_interval, self.max_interval, self.lifetime
+        );
+        // Writing to a `String` cannot fail; the results are dropped on purpose.
+        if let Some(prefix) = &self.prefix {
+            let _ = write!(
+                text,
+                "    prefix {prefix}\n    {{\n        AdvOnLink on;\n        AdvAutonomous on;\n    }};\n"
+            );
+        }
+        for rdnss in &self.rdnss {
+            let _ = write!(
+                text,
+                "    RDNSS {rdnss}\n    {{\n        AdvRDNSSLifetime 1800;\n    }};\n"
+            );
+        }
+        for dnssl in &self.dnssl {
+            let _ = write!(
+                text,
+                "    DNSSL {dnssl}\n    {{\n        AdvDNSSLLifetime 1800;\n    }};\n"
+            );
+        }
+        text.push_str("};\n");
+        text
+    }
+}
+
+/// The ISP's IPv6 resolver and router address on the WAN link, the lab's `2001:db8:ffff::1`.
+pub const ISP_RESOLVER6: &str = "2001:db8:ffff::1";
+
+/// radvd on `config.iface` inside `ns`, in the foreground with its log on stderr at debug
+/// level 3 (every advertisement is logged as `sending RA on <iface>`); ready when it logs its
+/// version. Stopping it (SIGTERM on drop) makes it send its final advertisements with lifetime
+/// 0, as the ISP's router would.
+///
+/// # Errors
+///
+/// When the config cannot be written or radvd cannot be spawned.
+pub fn radvd(ns: &NetNs, config: &RadvdConfig, run_dir: &Path) -> Result<Daemon> {
+    std::fs::create_dir_all(run_dir).with_context(|| format!("mkdir {}", run_dir.display()))?;
+    let conf = run_dir.join(format!("radvd-{}.conf", config.iface));
+    std::fs::write(&conf, config.render()).with_context(|| format!("write {}", conf.display()))?;
+    std::fs::set_permissions(&conf, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod {}", conf.display()))?;
+    let pid = run_dir.join(format!("radvd-{}.pid", config.iface));
+    let _ = std::fs::remove_file(&pid);
+    let mut cmd = ns.command("radvd")?;
+    cmd.args([
+        "--nodaemon",
+        "--debug",
+        "3",
+        "--logmethod",
+        "stderr",
+        "--config",
+    ])
+    .arg(&conf)
+    .arg("--pidfile")
+    .arg(&pid);
+    Daemon::spawn(&format!("radvd-{}", config.iface), cmd)
 }
 
 /// The lab's SNTP server (`harness/fixtures/sntp-server.py`) on `bind:123` inside `ns`: every

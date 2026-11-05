@@ -1,5 +1,6 @@
 ---
 source: crates/openfeo-reconcile/src/nft.rs
+assertion_line: 1366
 expression: desired
 ---
 ruleset:
@@ -41,6 +42,12 @@ ruleset:
       set:
         family: inet
         name: lan_pub_dhcp_if
+        table: openfeo
+        type: ifname
+  - add:
+      set:
+        family: inet
+        name: lan_pub_ra_if
         table: openfeo
         type: ifname
   - add:
@@ -171,6 +178,49 @@ ruleset:
           - ifname
           - ipv4_addr
   - add:
+      set:
+        family: inet
+        flags:
+          - interval
+        name: rules6_tcp
+        table: openfeo
+        type:
+          - ifname
+          - ipv6_addr
+          - inet_service
+  - add:
+      set:
+        family: inet
+        flags:
+          - interval
+        name: rules6_udp
+        table: openfeo
+        type:
+          - ifname
+          - ipv6_addr
+          - inet_service
+  - add:
+      set:
+        family: inet
+        flags:
+          - interval
+        name: rules6_other
+        table: openfeo
+        type:
+          - ifname
+          - ipv6_addr
+          - inet_proto
+  - add:
+      set:
+        family: inet
+        flags:
+          - interval
+        name: rules6_any
+        table: openfeo
+        type:
+          - ifname
+          - ipv6_addr
+  - add:
       chain:
         family: inet
         hook: prerouting
@@ -224,6 +274,23 @@ ruleset:
               op: "=="
               right: false
           - drop: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: rpfilter
+        expr:
+          - match:
+              left:
+                payload:
+                  field: saddr
+                  protocol: ip6
+              op: "=="
+              right:
+                prefix:
+                  addr: "fe80::"
+                  len: 10
+          - accept: ~
         family: inet
         table: openfeo
   - add:
@@ -333,6 +400,12 @@ ruleset:
               right: "@lan_pub_dhcp_if"
           - match:
               left:
+                meta:
+                  key: nfproto
+              op: "=="
+              right: ipv4
+          - match:
+              left:
                 payload:
                   field: dport
                   protocol: udp
@@ -379,6 +452,64 @@ ruleset:
                   key: iifname
               op: "=="
               right: "@lan_pub_dhcp_if"
+          - match:
+              left:
+                meta:
+                  key: nfproto
+              op: "=="
+              right: ipv4
+          - match:
+              left:
+                payload:
+                  field: dport
+                  protocol: tcp
+              op: "=="
+              right: 53
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_pub_ra_if"
+          - match:
+              left:
+                meta:
+                  key: nfproto
+              op: "=="
+              right: ipv6
+          - match:
+              left:
+                payload:
+                  field: dport
+                  protocol: udp
+              op: "=="
+              right: 53
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@lan_pub_ra_if"
+          - match:
+              left:
+                meta:
+                  key: nfproto
+              op: "=="
+              right: ipv6
           - match:
               left:
                 payload:
@@ -435,6 +566,38 @@ ruleset:
                   protocol: udp
               op: "=="
               right: 68
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: type
+                  protocol: icmpv6
+              op: "=="
+              right:
+                set:
+                  - destination-unreachable
+                  - packet-too-big
+                  - time-exceeded
+                  - parameter-problem
+                  - nd-router-advert
+                  - nd-neighbor-solicit
+                  - nd-neighbor-advert
+                  - mld-listener-query
+                  - mld-listener-report
+                  - mld-listener-done
+                  - mld2-listener-report
           - accept: ~
         family: inet
         table: openfeo
@@ -589,6 +752,82 @@ ruleset:
                       protocol: ip
               op: "=="
               right: "@rules_any"
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                concat:
+                  - meta:
+                      key: iifname
+                  - payload:
+                      field: daddr
+                      protocol: ip6
+                  - payload:
+                      field: dport
+                      protocol: tcp
+              op: "=="
+              right: "@rules6_tcp"
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                concat:
+                  - meta:
+                      key: iifname
+                  - payload:
+                      field: daddr
+                      protocol: ip6
+                  - payload:
+                      field: dport
+                      protocol: udp
+              op: "=="
+              right: "@rules6_udp"
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                concat:
+                  - meta:
+                      key: iifname
+                  - payload:
+                      field: daddr
+                      protocol: ip6
+                  - meta:
+                      key: l4proto
+              op: "=="
+              right: "@rules6_other"
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                concat:
+                  - meta:
+                      key: iifname
+                  - payload:
+                      field: daddr
+                      protocol: ip6
+              op: "=="
+              right: "@rules6_any"
           - accept: ~
         family: inet
         table: openfeo

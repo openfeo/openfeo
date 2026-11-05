@@ -7,25 +7,31 @@
 //! same port needs the option on both.
 
 use std::ffi::OsString;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use nix::sys::socket::{
-    AddressFamily, SockFlag, SockProtocol, SockType, SockaddrIn, bind, setsockopt, socket, sockopt,
+    AddressFamily, SockFlag, SockProtocol, SockType, SockaddrIn, SockaddrIn6, bind, setsockopt,
+    socket, sockopt,
 };
 
 use crate::dhcp4::{DriverError, socket_err};
 
-/// A non-blocking socket bound to `addr:port`, on `device` when given.
+/// A non-blocking socket bound to `addr:port`, on `device` when given; an IPv6 address gets a
+/// v6-only socket, so the two families on one port never collide.
 pub(crate) fn bound_socket(
     device: Option<&str>,
-    addr: Ipv4Addr,
+    addr: IpAddr,
     port: u16,
     kind: SockType,
     protocol: SockProtocol,
 ) -> Result<OwnedFd, DriverError> {
+    let family = match addr {
+        IpAddr::V4(_) => AddressFamily::Inet,
+        IpAddr::V6(_) => AddressFamily::Inet6,
+    };
     let fd = socket(
-        AddressFamily::Inet,
+        family,
         kind,
         SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
         protocol,
@@ -36,19 +42,30 @@ pub(crate) fn bound_socket(
         setsockopt(&fd, sockopt::BindToDevice, &OsString::from(device))
             .map_err(socket_err("SO_BINDTODEVICE"))?;
     }
-    bind(
-        fd.as_raw_fd(),
-        &SockaddrIn::from(SocketAddrV4::new(addr, port)),
-    )
-    .map_err(|source| DriverError::Bind {
+    let bind_err = |source| DriverError::Bind {
         kind: if kind == SockType::Stream {
             "TCP"
         } else {
             "UDP"
         },
-        addr: SocketAddrV4::new(addr, port),
+        addr: SocketAddr::new(addr, port),
         device: device.map(str::to_owned),
         source,
-    })?;
+    };
+    match addr {
+        IpAddr::V4(addr) => bind(
+            fd.as_raw_fd(),
+            &SockaddrIn::from(SocketAddrV4::new(addr, port)),
+        )
+        .map_err(bind_err)?,
+        IpAddr::V6(addr) => {
+            setsockopt(&fd, sockopt::Ipv6V6Only, &true).map_err(socket_err("IPV6_V6ONLY"))?;
+            bind(
+                fd.as_raw_fd(),
+                &SockaddrIn6::from(SocketAddrV6::new(addr, port, 0, 0)),
+            )
+            .map_err(bind_err)?;
+        }
+    }
     Ok(fd)
 }

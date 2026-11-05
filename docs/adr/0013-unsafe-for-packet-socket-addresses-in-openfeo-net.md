@@ -40,3 +40,12 @@ raw-address constructors are unsafe too.
   a WAN without an address carries next to no traffic. INIT-REBOOT after a link flap, when the
   address is still configured and traffic may be flowing, stays on the UDP socket and asks for
   a unicast reply; the packet socket returns only once the lease is gone.
+
+## Amended 3 November 2026 (M2 part 2, ADR-0018)
+
+`sys.rs` also holds the two socket options the neighbour-discovery driver needs and nix 0.30
+does not offer safely: `ICMP6_FILTER` (so a raw ICMPv6 socket receives only the types its
+core wants) and the interface-scoped IPv6 multicast join (`IPV6_JOIN_GROUP` with an
+`ipv6_mreq` naming the interface, where nix's `Ipv6MembershipRequest` names only the group).
+The packet-info and hop-limit control messages the driver reads are decoded by nix. The
+review rule above applies to these additions.

@@ -64,12 +64,18 @@ impl Error {
 
 impl Netlink {
     /// `ip link add <name> type bridge` with `vlan_filtering` as given (SPEC §7.1 wants it on).
+    /// The bridge is born down: the applier sets its MAC before bringing it up, so the kernel
+    /// derives the bridge's link-local from that MAC. A bridge born up takes an EUI-64 of the
+    /// random MAC it was created with and keeps it when the MAC changes.
     ///
     /// # Errors
     ///
     /// [`Error::Request`] when the kernel refuses (`EEXIST` when the name is taken).
     pub async fn link_add_bridge(&self, name: &str, vlan_filtering: bool) -> Result<(), Error> {
-        let message = LinkBridge::new(name).vlan_filtering(vlan_filtering).build();
+        let message = LinkBridge::new(name)
+            .vlan_filtering(vlan_filtering)
+            .down()
+            .build();
         self.handle
             .link()
             .add(message)
@@ -286,6 +292,9 @@ pub fn describe(route: &Route) -> String {
     if let Some(oif) = route.oif {
         let _ = write!(text, " dev {oif}");
     }
+    if let Some(src) = route.pref_src {
+        let _ = write!(text, " src {src}");
+    }
     let _ = write!(
         text,
         " proto {} metric {} table {}",
@@ -327,6 +336,9 @@ fn route_message_builder(route: &Route) -> RouteMessage {
         if let Some(oif) = route.oif {
             builder = builder.output_interface(oif);
         }
+        if let Some(IpAddr::V6(src)) = route.pref_src {
+            builder = builder.pref_source(src);
+        }
         builder.build()
     } else {
         let mut builder = RouteMessageBuilder::<Ipv4Addr>::new()
@@ -342,6 +354,9 @@ fn route_message_builder(route: &Route) -> RouteMessage {
         }
         if let Some(oif) = route.oif {
             builder = builder.output_interface(oif);
+        }
+        if let Some(IpAddr::V4(src)) = route.pref_src {
+            builder = builder.pref_source(src);
         }
         builder.build()
     }

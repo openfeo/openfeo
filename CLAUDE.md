@@ -65,7 +65,11 @@ authoritative mode for `isp.example` (the same dnsmasq serves as the upstream on
 scenarios); the `sntp` suite runs the time driver on a recording clock between a LAN host (`ntpdate -q`
 and raw queries) and the lab's Python SNTP server (`harness/fixtures/sntp-server.py`), whose
 clock offset each scenario dials (the same server sits on isp0 at 203.0.113.1 in the QEMU
-scenarios, and `Lab::set_rtc_base` starts the VM with a wrong clock); `make bin` bakes
+scenarios, and `Lab::set_rtc_base` starts the VM with a wrong clock); the `ndp` suite runs the
+router-advertisement client driver against `radvd` and the server driver against a namespace's
+own kernel (the SLAAC reference client) with `rdisc6` (package `ndisc6`) reading the
+advertised options, both over veth pairs (the same radvd advertises on isp0's `wan0` in the
+IPv6 QEMU scenarios, where `Lab::isp_route_block6` routes `2001:db8:1::/48` to the router); `make bin` bakes
 `OPENFEO_BUILD_EPOCH` (the commit's time, or `SOURCE_DATE_EPOCH`) into the binary as its clock
 floor; Kea's one template serves 60-second leases
 renewing at 20 s to every lab run, so a renewal is observable within a scenario. CI runs Ubuntu 24.04's Kea

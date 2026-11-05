@@ -4,12 +4,12 @@
 //! The snapshot every reconciler reads (SPEC §6.2): config, the live port map and link facts,
 //! behind `Arc`s so a new generation is cheap to make and share.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap};
 
-use crate::{Dhcp4Fact, LeaseFact, MacAddr, TimeFact};
+use crate::{DefaultRoute, Dhcp4Fact, LeaseFact, MacAddr, TimeFact, WanIpv6Fact};
 
 /// What the netlink monitor knows about one interface (SPEC §7.1: link state is a fact).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub struct LinkFact {
     pub mac: Option<MacAddr>,
     /// MTU in bytes.
     pub mtu: u32,
+    /// The kernel's link-local IPv6 address on the link, once it has made one.
+    pub link_local6: Option<std::net::Ipv6Addr>,
 }
 
 /// One immutable snapshot. Reconcilers are `fn(&World) -> Desired`.
@@ -46,6 +48,10 @@ pub struct World {
     pub leases: Arc<BTreeMap<String, Vec<LeaseFact>>>,
     /// The clock's state (SPEC §7.10).
     pub time: TimeFact,
+    /// What each WAN's router-advertisement client learned, keyed by WAN name (SPEC §7.3).
+    pub ipv6: Arc<BTreeMap<String, WanIpv6Fact>>,
+    /// The default routes the kernel holds in the main table (ADR-0019).
+    pub routes: Arc<BTreeSet<DefaultRoute>>,
 }
 
 impl World {
@@ -60,7 +66,18 @@ impl World {
             dhcp4: Arc::new(BTreeMap::new()),
             leases: Arc::new(BTreeMap::new()),
             time: TimeFact::default(),
+            ipv6: Arc::new(BTreeMap::new()),
+            routes: Arc::new(BTreeSet::new()),
         }
+    }
+
+    /// Whether the kernel holds a default route of the family through `ifname`: the gate a
+    /// learned fact waits behind (ADR-0019).
+    #[must_use]
+    pub fn has_default(&self, v6: bool, ifname: &str) -> bool {
+        self.routes
+            .iter()
+            .any(|route| route.v6 == v6 && route.ifname == ifname)
     }
 
     /// The MAC of the named link, if the monitor has reported one.
@@ -74,6 +91,27 @@ impl World {
 mod tests {
     use super::*;
     use openfeo_config::{Config, PortMap};
+
+    #[test]
+    fn has_default_matches_family_and_interface() {
+        let mut w = World::new(Config::default(), PortMap::default());
+        assert!(!w.has_default(true, "p0"));
+        w.routes = Arc::new(BTreeSet::from([
+            DefaultRoute {
+                v6: true,
+                ifname: "p0".to_owned(),
+            },
+            DefaultRoute {
+                v6: false,
+                ifname: "p1".to_owned(),
+            },
+        ]));
+        assert!(w.has_default(true, "p0"));
+        assert!(!w.has_default(false, "p0"), "the family matters");
+        assert!(!w.has_default(true, "p1"), "the interface matters");
+        assert!(w.has_default(false, "p1"));
+        assert!(w.ipv6.is_empty(), "no WAN IPv6 facts yet");
+    }
 
     #[test]
     fn world_new_starts_at_generation_zero_with_no_links() {

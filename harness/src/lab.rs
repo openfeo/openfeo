@@ -12,13 +12,20 @@ use anyhow::{Context, Result, ensure};
 
 use crate::daemons::{self, Daemon};
 use crate::lines::{Cursor, Lines, Regex};
-use crate::netns::NetNs;
+use crate::netns::{self, NetNs};
 use crate::qemu::{BASE_CMDLINE, ConsoleMode, Nic, Vm, VmSpec};
 use crate::qmp::Qmp;
 use crate::statedisk;
 
 /// ISP A's side of the WAN A link (TEST-NET-3).
 pub const ISP0_ADDR: &str = "203.0.113.1/24";
+/// ISP A's IPv6 address on `wan0`: the ISP's router and resolver on the link (SPEC §11).
+pub const ISP0_ADDR6: &str = "2001:db8:ffff::1/64";
+/// The prefix the lab's ISP routes to the router (`vm-ipv6.toml`).
+pub const ROUTED_PREFIX6: &str = "2001:db8:1::/48";
+/// ISP A's only link-local on `wan0`, the source of its advertisements: what the router learns
+/// as its default router, and what a typed `gateway` names.
+pub const ISP0_LINK_LOCAL6: &str = "fe80::1/64";
 /// ISP B's side of the WAN B link (TEST-NET-2).
 pub const ISP1_ADDR: &str = "198.51.100.1/24";
 /// The LAN host's address (the LAN namespace's end of the LAN tap) on the router's LAN subnet.
@@ -195,6 +202,87 @@ impl Lab {
     pub fn isp_route_block(&self, block: &str) -> Result<()> {
         self.isp0
             .ip(&["route", "replace", block, "via", WAN_ADDR])?;
+        Ok(())
+    }
+
+    /// ISP A routes the IPv6 `block` to the router via `via` (the router's link-local or link
+    /// address) on `wan0`, as the ISP of a statically routed prefix does (SPEC §7.3).
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn isp_route_block6(&self, block: &str, via: &str) -> Result<()> {
+        self.isp0
+            .ip(&["-6", "route", "replace", block, "via", via, "dev", "wan0"])?;
+        Ok(())
+    }
+
+    /// Give ISP A its IPv6 on `wan0` ([`ISP0_ADDR6`] and [`ISP0_LINK_LOCAL6`] as its only
+    /// link-local, without DAD so they are usable at once) and IPv6 forwarding, then start radvd
+    /// there with `config` (`daemons::radvd`); returns once it announces itself. The daemon joins
+    /// [`Lab::daemons`], named `radvd-wan0`.
+    ///
+    /// # Errors
+    ///
+    /// When the addresses cannot be set or radvd cannot be started or does not come up within
+    /// 10 s.
+    pub fn start_radvd(&mut self, config: &daemons::RadvdConfig) -> Result<()> {
+        self.isp0
+            .ip(&["-6", "addr", "replace", ISP0_ADDR6, "dev", "wan0", "nodad"])?;
+        if !self
+            .isp0
+            .ip(&["-6", "addr", "show", "dev", "wan0", "scope", "link"])?
+            .contains(ISP0_LINK_LOCAL6)
+        {
+            // No EUI-64 link-local comes back after the flush: the kernel makes none by itself.
+            let mut gen_mode = self.isp0.command("sh")?;
+            gen_mode.args(["-c", "echo 1 > /proc/sys/net/ipv6/conf/wan0/addr_gen_mode"]);
+            let _ = netns::run(&mut gen_mode);
+            self.isp0
+                .ip(&["-6", "addr", "flush", "dev", "wan0", "scope", "link"])?;
+            self.isp0.ip(&[
+                "-6",
+                "addr",
+                "replace",
+                ISP0_LINK_LOCAL6,
+                "dev",
+                "wan0",
+                "nodad",
+            ])?;
+        }
+        let mut forwarding = self.isp0.command("sh")?;
+        forwarding.args(["-c", "echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"]);
+        let _ = netns::run(&mut forwarding);
+        let radvd = daemons::radvd(&self.isp0, config, &self.run_dir)?;
+        radvd.log.wait_for(
+            &mut Cursor::default(),
+            &Regex::new("version .* started").context("regex")?,
+            Duration::from_secs(10),
+        )?;
+        self.daemons.push(radvd);
+        Ok(())
+    }
+
+    /// Stop the lab's radvd (its final advertisements carry lifetime 0, as a router going away
+    /// sends them); `true` when one was running.
+    pub fn stop_radvd(&mut self) -> bool {
+        let before = self.daemons.len();
+        self.daemons.retain(|daemon| daemon.name != "radvd-wan0");
+        self.daemons.len() != before
+    }
+
+    /// A host placed by hand on an IPv6 LAN: `addr_cidr` on `ifname` (no DAD, so it is usable
+    /// at once) and the router's address as default gateway, as a DMZ server is configured.
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn host6(ns: &NetNs, ifname: &str, addr_cidr: &str, gateway: &str) -> Result<()> {
+        ns.ip(&["link", "set", ifname, "up"])?;
+        ns.ip(&["-6", "addr", "replace", addr_cidr, "dev", ifname, "nodad"])?;
+        ns.ip(&[
+            "-6", "route", "replace", "default", "via", gateway, "dev", ifname,
+        ])?;
         Ok(())
     }
 

@@ -193,6 +193,8 @@ fn check() -> Result<ExitCode> {
         "dnsmasq",
         "dig",
         "ntpdate",
+        "radvd",
+        "rdisc6",
         "mkfs.ext4",
         "ping",
         "python3",

@@ -71,6 +71,8 @@ impl Config {
                     ..crate::LanDhcp::default()
                 }),
                 reaches: Vec::new(),
+                ipv6: String::new(),
+                ra: None,
             }],
             firewall: None,
             dns: None,

@@ -6,11 +6,10 @@
 //! learned servers and the LAN leases change. Every line logged here is a contract with the
 //! harness scenarios.
 
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use openfeo_net::dhcp4::DriverError;
-use openfeo_net::dns::{DnsDriver, DnsDriverConfig};
+use openfeo_net::dns::{DnsDriver, DnsDriverConfig, Listener};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_proto_dns::Name;
 use openfeo_proto_dns::forwarder::Event;
@@ -59,8 +58,21 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
         .iter()
         .map(|listener| listener.ifname.clone())
         .collect();
+    let mut sockets = Vec::new();
+    for listener in &current.listeners {
+        sockets.push(Listener {
+            ifname: listener.ifname.clone(),
+            v6: false,
+        });
+        if listener.address6.is_some() {
+            sockets.push(Listener {
+                ifname: listener.ifname.clone(),
+                v6: true,
+            });
+        }
+    }
     let mut driver = DnsDriver::new(DnsDriverConfig {
-        listeners: listeners.clone(),
+        listeners: sockets,
         loopback: true,
         forwarder: config,
         seed: seed(SEED_SALT),
@@ -101,13 +113,12 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
                 if next.listeners != current.listeners {
                     return Err("dns: the LANs changed; restarting".into());
                 }
-                let config = forwarder_config(&next);
-                let local_names = config.local.len();
-                for event in driver.configure(config) {
+                for event in driver.configure(forwarder_config(&next)) {
                     log_event(&event, &mut rebind);
                 }
-                info!("{}", upstreams_line(&next));
-                info!("dns local names {local_names}");
+                for line in change_lines(&current, &next) {
+                    info!("{line}");
+                }
                 current = next;
             }
         }
@@ -129,13 +140,32 @@ fn log_event(event: &Event, rebind: &mut Throttle) {
     }
 }
 
+/// What a change of the desired state says on the console: the upstreams line when the
+/// upstreams or where they came from changed, the local-names line when their number did. A
+/// change to anything else (a lease's address arriving before the route that lets its server
+/// in, ADR-0019) says nothing, so "no upstreams" is announced once, not once per change.
+fn change_lines(current: &DesiredDns, next: &DesiredDns) -> Vec<String> {
+    let mut lines = Vec::new();
+    if next.upstreams != current.upstreams
+        || next.learned_from != current.learned_from
+        || next.wan_upstreams != current.wan_upstreams
+    {
+        lines.push(upstreams_line(next));
+    }
+    let local_names = forwarder_config(next).local.len();
+    if local_names != forwarder_config(current).local.len() {
+        lines.push(format!("dns local names {local_names}"));
+    }
+    lines
+}
+
 /// `dns upstreams 9.9.9.9 203.0.113.1 (configured, learned from wan0)`, or
 /// `dns no upstreams: only local names resolve`.
 fn upstreams_line(desired: &DesiredDns) -> String {
     if desired.upstreams.is_empty() {
         return "dns no upstreams: only local names resolve".to_owned();
     }
-    let addrs: Vec<String> = desired.upstreams.iter().map(Ipv4Addr::to_string).collect();
+    let addrs: Vec<String> = desired.upstreams.iter().map(ToString::to_string).collect();
     let mut sources = Vec::new();
     if desired
         .upstreams
@@ -182,6 +212,7 @@ mod tests {
     use super::*;
     use openfeo_config::{PortMap, PortMapEntry, file};
     use openfeo_world::World;
+    use std::net::Ipv4Addr;
 
     const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
 
@@ -208,13 +239,13 @@ mod tests {
             upstreams_line(&d),
             "dns upstreams 203.0.113.1 (learned from wan0)"
         );
-        d.upstreams.insert(0, Ipv4Addr::new(9, 9, 9, 9));
+        d.upstreams.insert(0, Ipv4Addr::new(9, 9, 9, 9).into());
         assert_eq!(
             upstreams_line(&d),
             "dns upstreams 9.9.9.9 203.0.113.1 (configured, learned from wan0)"
         );
         d.learned_from = None;
-        d.upstreams = vec![Ipv4Addr::new(9, 9, 9, 9)];
+        d.upstreams = vec![Ipv4Addr::new(9, 9, 9, 9).into()];
         assert_eq!(upstreams_line(&d), "dns upstreams 9.9.9.9 (configured)");
         d.upstreams.clear();
         assert_eq!(
@@ -223,21 +254,47 @@ mod tests {
         );
     }
 
+    /// A lease's address joins the desired state before its route lets the learned server in:
+    /// that change says nothing about upstreams, and nothing about local names either.
+    #[test]
+    fn a_change_that_leaves_the_upstreams_alone_does_not_announce_them_again() {
+        let before = desired(&static_world());
+        let mut after = before.clone();
+        after.wan_addrs.push(Ipv4Addr::new(203, 0, 113, 100).into());
+        assert_eq!(change_lines(&before, &after), Vec::<String>::new());
+        let mut learned = before.clone();
+        learned
+            .upstreams
+            .insert(0, Ipv4Addr::new(9, 9, 9, 9).into());
+        assert_eq!(
+            change_lines(&before, &learned),
+            vec!["dns upstreams 9.9.9.9 203.0.113.1 (configured, learned from wan0)".to_owned()]
+        );
+        let mut named = before.clone();
+        named.local.push(openfeo_reconcile::dns::DesiredLocalName {
+            name: "nas".to_owned(),
+            addr: Ipv4Addr::new(192, 168, 1, 10).into(),
+        });
+        let lines = change_lines(&before, &named);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("dns local names "), "{lines:?}");
+    }
+
     #[test]
     fn event_lines_follow_the_contract() {
         assert_eq!(
-            event_line(&Event::UpstreamDown(Ipv4Addr::new(9, 9, 9, 9))),
+            event_line(&Event::UpstreamDown(Ipv4Addr::new(9, 9, 9, 9).into())),
             Some("dns upstream 9.9.9.9 down".into())
         );
         assert_eq!(
-            event_line(&Event::UpstreamUp(Ipv4Addr::new(9, 9, 9, 9))),
+            event_line(&Event::UpstreamUp(Ipv4Addr::new(9, 9, 9, 9).into())),
             Some("dns upstream 9.9.9.9 up".into())
         );
         assert_eq!(
             event_line(&Event::RebindDropped {
                 name: "evil.isp.example".parse().unwrap(),
                 addr: Ipv4Addr::new(192, 168, 1, 5).into(),
-                client: Ipv4Addr::new(192, 168, 1, 50),
+                client: Ipv4Addr::new(192, 168, 1, 50).into(),
             }),
             Some("dns rebind dropped evil.isp.example -> 192.168.1.5 for 192.168.1.50".into())
         );

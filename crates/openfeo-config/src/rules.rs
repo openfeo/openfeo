@@ -5,9 +5,9 @@
 //! validation and the ruleset generator: a rule's target (an address, an `a-b` range or a CIDR),
 //! its ports (`"443"` or `"1000-1010"`), its protocol, and what counts as global unicast space.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 
 /// The protocols a rule may name.
 pub const PROTOS: [&str; 4] = ["tcp", "udp", "icmp", "any"];
@@ -40,6 +40,57 @@ impl Target {
             Target::Net(n) => (n.network(), n.broadcast()),
         }
     }
+}
+
+/// A rule's IPv6 destination hosts (SPEC §7.5): the family of a rule is its target's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target6 {
+    /// One address.
+    Addr(Ipv6Addr),
+    /// An inclusive range, first not above last.
+    Range(Ipv6Addr, Ipv6Addr),
+    /// A whole prefix.
+    Net(Ipv6Net),
+}
+
+impl Target6 {
+    /// Whether every address of the target lies inside `net`.
+    #[must_use]
+    pub fn within(&self, net: Ipv6Net) -> bool {
+        let (first, last) = self.bounds();
+        net.contains(&first) && net.contains(&last)
+    }
+
+    /// The first and last address of the target.
+    #[must_use]
+    pub fn bounds(&self) -> (Ipv6Addr, Ipv6Addr) {
+        match *self {
+            Target6::Addr(a) => (a, a),
+            Target6::Range(a, b) => (a, b),
+            Target6::Net(n) => (n.network(), n.broadcast()),
+        }
+    }
+}
+
+/// `a`, `a-b` (with `a <= b`) or `a/n` in IPv6; `None` for anything else, IPv4 included.
+#[must_use]
+pub fn parse_target6(text: &str) -> Option<Target6> {
+    if let Some((a, b)) = text.split_once('-') {
+        let (a, b) = (a.parse::<Ipv6Addr>().ok()?, b.parse::<Ipv6Addr>().ok()?);
+        return (a <= b).then_some(Target6::Range(a, b));
+    }
+    if text.contains('/') {
+        return text.parse::<Ipv6Net>().ok().map(Target6::Net);
+    }
+    text.parse::<Ipv6Addr>().ok().map(Target6::Addr)
+}
+
+/// Whether `net` lies entirely in IPv6 global unicast space, `2000::/3`: not ULA, link-local,
+/// loopback, multicast, IPv4-mapped or unspecified.
+#[must_use]
+pub fn is_global_unicast_v6(net: Ipv6Net) -> bool {
+    let global = Ipv6Net::new_assert(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3);
+    global.contains(&net.network()) && global.contains(&net.broadcast())
 }
 
 /// `a`, `a-b` (with `a <= b`) or `a/n`; `None` for anything else.
@@ -163,6 +214,54 @@ mod tests {
             "0.0.0.0/8",
         ] {
             assert!(!is_global_unicast_v4(private.parse().unwrap()), "{private}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::*;
+
+    #[test]
+    fn parse_target6_accepts_address_range_and_cidr() {
+        assert!(matches!(
+            parse_target6("2001:db8:232::10"),
+            Some(Target6::Addr(_))
+        ));
+        assert!(matches!(
+            parse_target6("2001:db8:232::10-2001:db8:232::20"),
+            Some(Target6::Range(_, _))
+        ));
+        assert!(matches!(
+            parse_target6("2001:db8:232::/64"),
+            Some(Target6::Net(_))
+        ));
+        assert_eq!(parse_target6("2001:db8:232::20-2001:db8:232::10"), None);
+        assert_eq!(parse_target6("192.0.2.234"), None);
+        let lan: ipnet::Ipv6Net = "2001:db8:232::/64".parse().unwrap();
+        assert!(
+            parse_target6("2001:db8:232::10-2001:db8:232::20")
+                .unwrap()
+                .within(lan)
+        );
+        assert!(!parse_target6("2001:db8:233::10").unwrap().within(lan));
+    }
+
+    #[test]
+    fn is_global_unicast_v6_excludes_ula_link_local_and_loopback() {
+        let net = |text: &str| text.parse::<ipnet::Ipv6Net>().unwrap();
+        assert!(is_global_unicast_v6(net("2001:db8::/48")));
+        assert!(is_global_unicast_v6(net("3fff::/20")));
+        for not in [
+            "fd00::/48",
+            "fc00::/7",
+            "fe80::/64",
+            "::1/128",
+            "ff02::/16",
+            "::/0",
+            "::ffff:0:0/96",
+        ] {
+            assert!(!is_global_unicast_v6(net(not)), "{not}");
         }
     }
 }

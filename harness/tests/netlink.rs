@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,10 +31,22 @@ use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
 use openfeo_reconcile::nft::nft;
 use openfeo_reconcile::sysctl::DesiredSysctl;
-use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, TimeFact, World};
+use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, TimeFact, WanIpv6Fact, World};
 use tokio::sync::watch;
 
 const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_removed",
+        run: ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_removed,
+    },
+    Scenario {
+        name: "an_ipv6_blackhole_route_round_trips_through_the_cache",
+        run: an_ipv6_blackhole_route_round_trips_through_the_cache,
+    },
+    Scenario {
+        name: "a_stable_privacy_link_local_is_the_same_across_two_bounces",
+        run: a_stable_privacy_link_local_is_the_same_across_two_bounces,
+    },
     Scenario {
         name: "monitor_sees_veth_addr_and_route",
         run: monitor_sees_veth_addr_and_route,
@@ -245,6 +257,7 @@ fn blackhole_route_primitive_and_facts(_lab: &mut Lab) -> anyhow::Result<()> {
             protocol: RTPROT_OPENFEO,
             priority: 1000,
             kind: RouteKind::Blackhole,
+            pref_src: None,
         };
         let _ = nl.route_del(&route).await; // left by an interrupted run
         nl.route_add(&route).await?;
@@ -257,6 +270,278 @@ fn blackhole_route_primitive_and_facts(_lab: &mut Lab) -> anyhow::Result<()> {
         );
         nl.route_del(&route).await?;
         wait_until(&mut rx, "blackhole gone", |c| !c.routes.contains(&route)).await?;
+        anyhow::Ok(())
+    })?
+}
+
+/// The IPv6 lab configuration (`harness/fixtures/vm-ipv6.toml`) on the three fake ports: the
+/// DMZ on p3 and the public block are dropped.
+fn ipv6_config() -> anyhow::Result<Config> {
+    let mut config = openfeo_config::file::parse(include_str!("../fixtures/vm-ipv6.toml"))?;
+    config.lans.retain(|lan| lan.name == "lan0");
+    config.public_ipv4.clear(); // its blackhole has no device and would outlive the fake ports
+    if let Some(firewall) = &mut config.firewall {
+        firewall.rules.clear();
+    }
+    Ok(config)
+}
+
+/// What the ISP's advertisements would have taught wan0: a router at `fe80::1` and an MTU.
+fn ipv6_fact() -> WanIpv6Fact {
+    WanIpv6Fact {
+        router: Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+        addresses: Vec::new(),
+        on_link: Vec::new(),
+        routes: Vec::new(),
+        dns: vec![Ipv6Addr::new(0x2001, 0xdb8, 0xffff, 0, 0, 0, 0, 1)],
+        search: Vec::new(),
+        mtu: Some(1500),
+    }
+}
+
+/// The IPv6 default the routing applier installs for the IPv6 lab: via the advertised router
+/// on p0, metric 10, the router's loopback address as preferred source.
+fn ipv6_default_via_router(p0: u32) -> Route {
+    Route {
+        v6: true,
+        table: TABLE_MAIN,
+        dst: None,
+        gateway: Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).into()),
+        oif: Some(p0),
+        protocol: RTPROT_OPENFEO,
+        priority: 10,
+        kind: RouteKind::Unicast,
+        pref_src: Some(Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1).into()),
+    }
+}
+
+/// The blackhole for the IPv6 lab's routed prefix.
+fn ipv6_blackhole() -> Route {
+    Route {
+        v6: true,
+        table: TABLE_MAIN,
+        dst: Some(IpNet::V6(ipnet::Ipv6Net::new_assert(
+            Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 0),
+            48,
+        ))),
+        gateway: None,
+        oif: None,
+        protocol: RTPROT_OPENFEO,
+        priority: 1000,
+        kind: RouteKind::Blackhole,
+        pref_src: None,
+    }
+}
+
+/// The link-local address of the named link in the cache, if the kernel has made one.
+fn link_local_of(cache: &Cache, name: &str) -> Option<Ipv6Addr> {
+    let link = cache.link_by_name(name)?;
+    cache.addrs.iter().find_map(|a| match a.net {
+        IpNet::V6(net)
+            if a.ifindex == link.index && net.addr().segments()[0] & 0xffc0 == 0xfe80 =>
+        {
+            Some(net.addr())
+        }
+        _ => None,
+    })
+}
+
+/// The IPv6 side of the routing applier (SPEC §7.3, §7.4) on fake ports: the LAN's /64 on its
+/// bridge, the router's /128 on lo, the default via the advertised router with the loopback
+/// address as preferred source, the blackhole for the routed prefix; a second pass does nothing
+/// (the IPv6 blackhole compares equal through the cache, ADR-0020); a LAN that loses its `ipv6`
+/// loses the bridge address, while lo and the default stay.
+fn ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_removed(
+    _lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    netns::ip(&["link", "set", "h0", "up"])?; // carrier for p0, so it gets a link-local address
+    block_on(async {
+        let mut config = ipv6_config()?;
+        let mut rig = Rig::connect().await?;
+        let links_pass = async |rig: &mut Rig, config: &Config| -> anyhow::Result<usize> {
+            let cache = rig.rx.borrow_and_update().clone();
+            let world = world_from(&cache, config);
+            Ok(rig
+                .links
+                .apply(&openfeo_reconcile::links::links(&world), &cache, &rig.nl)
+                .await?
+                .ops)
+        };
+        let routing_pass = async |rig: &mut Rig, config: &Config| -> anyhow::Result<usize> {
+            let cache = rig.rx.borrow_and_update().clone();
+            let mut world = world_from(&cache, config);
+            world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), ipv6_fact())]));
+            Ok(rig
+                .routing
+                .apply(
+                    &openfeo_reconcile::routing::routing(&world),
+                    &cache,
+                    &rig.nl,
+                )
+                .await?
+                .ops)
+        };
+        links_pass(&mut rig, &config).await?;
+        wait_until(&mut rig.rx, "p0 up with a link-local address", |c| {
+            c.link_by_name("p0").is_some_and(|l| l.up && l.carrier)
+                && link_local_of(c, "p0").is_some()
+        })
+        .await?;
+        let ops = routing_pass(&mut rig, &config).await?;
+        ensure!(ops >= 4, "the first routing pass did {ops} things");
+        let lan6: IpNet = "2001:db8:1:222::1/64".parse()?;
+        let lo6: IpNet = "2001:db8:1::1/128".parse()?;
+        wait_until(&mut rig.rx, "lan and loopback IPv6 addresses", |c| {
+            let on = |name: &str, net: IpNet| {
+                c.link_by_name(name)
+                    .is_some_and(|l| c.addrs.iter().any(|a| a.ifindex == l.index && a.net == net))
+            };
+            on("br-lan0", lan6) && on("lo", lo6)
+        })
+        .await?;
+        let p0 = rig.rx.borrow().link_by_name("p0").context("p0")?.index;
+        let default6 = ipv6_default_via_router(p0);
+        let blackhole6 = ipv6_blackhole();
+        wait_until(
+            &mut rig.rx,
+            "the IPv6 default with its source and the blackhole",
+            |c| c.routes.contains(&default6) && c.routes.contains(&blackhole6),
+        )
+        .await?;
+        let again = routing_pass(&mut rig, &config).await?;
+        ensure!(again == 0, "second routing pass changed {again} things");
+        config.lans[0].ipv6 = String::new();
+        let ops = routing_pass(&mut rig, &config).await?;
+        ensure!(
+            ops == 1,
+            "dropping the LAN's ipv6 removed {ops} things, not one"
+        );
+        wait_until(
+            &mut rig.rx,
+            "the bridge address gone, lo and the default kept",
+            |c| {
+                let gone = c.link_by_name("br-lan0").is_some_and(|l| {
+                    !c.addrs
+                        .iter()
+                        .any(|a| a.ifindex == l.index && a.net == lan6)
+                });
+                gone && c.routes.contains(&default6) && c.addrs.iter().any(|a| a.net == lo6)
+            },
+        )
+        .await?;
+        // A box that drops [wans.ipv6] loses the default, the blackhole and its loopback
+        // address: nothing of this scenario outlives it in the shared namespace.
+        config.wans[0].ipv6 = None;
+        let ops = routing_pass(&mut rig, &config).await?;
+        ensure!(
+            ops == 3,
+            "dropping [wans.ipv6] removed {ops} things, not three"
+        );
+        wait_until(&mut rig.rx, "no IPv6 of ours left", |c| {
+            !c.routes
+                .iter()
+                .any(|r| r.v6 && r.protocol == RTPROT_OPENFEO)
+                && !c.addrs.iter().any(|a| a.net == lo6)
+        })
+        .await?;
+        anyhow::Ok(())
+    })?
+}
+
+/// An IPv6 blackhole route comes back from the kernel with `lo` as its device (ADR-0020); the
+/// monitor drops it, so the cache holds the route exactly as added.
+fn an_ipv6_blackhole_route_round_trips_through_the_cache(_lab: &mut Lab) -> anyhow::Result<()> {
+    block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let route = ipv6_blackhole();
+        let _ = nl.route_del(&route).await; // left by an interrupted run
+        nl.route_add(&route).await?;
+        wait_until(&mut rx, "IPv6 blackhole cached as added", |c| {
+            c.routes.contains(&route)
+        })
+        .await?;
+        ensure!(
+            netns::ip(&["-6", "route", "show", "type", "blackhole"])?.contains("2001:db8:1::/48"),
+            "the kernel shows the blackhole"
+        );
+        nl.route_del(&route).await?;
+        wait_until(&mut rx, "IPv6 blackhole gone", |c| {
+            !c.routes.contains(&route)
+        })
+        .await?;
+        anyhow::Ok(())
+    })?
+}
+
+/// The links applier writes the stable-privacy secret to the IPv6 WAN's port before bringing
+/// it up (SPEC §7.3): the link-local address is not the EUI-64 of the port's MAC, a second pass
+/// does nothing, and the address is the same after the port is bounced.
+fn a_stable_privacy_link_local_is_the_same_across_two_bounces(
+    _lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let _ports = FakePorts::create()?;
+    netns::ip(&["link", "set", "h0", "up"])?;
+    block_on(async {
+        let config = ipv6_config()?;
+        let mut rig = Rig::connect().await?;
+        rig.links = LinksApplier::with_ipv6_secret([7; 16]);
+        let pass = async |rig: &mut Rig| -> anyhow::Result<usize> {
+            let cache = rig.rx.borrow_and_update().clone();
+            let world = world_from(&cache, &config);
+            Ok(rig
+                .links
+                .apply(&openfeo_reconcile::links::links(&world), &cache, &rig.nl)
+                .await?
+                .ops)
+        };
+        pass(&mut rig).await?;
+        wait_until(&mut rig.rx, "p0 up with a link-local address", |c| {
+            c.link_by_name("p0").is_some_and(|l| l.up) && link_local_of(c, "p0").is_some()
+        })
+        .await?;
+        let first = link_local_of(&rig.rx.borrow(), "p0").context("link-local")?;
+        let mac = rig
+            .rx
+            .borrow()
+            .link_by_name("p0")
+            .and_then(|l| l.mac)
+            .context("mac")?;
+        let eui64 = Ipv6Addr::new(
+            0xfe80,
+            0,
+            0,
+            0,
+            u16::from_be_bytes([mac[0] ^ 0x02, mac[1]]),
+            u16::from_be_bytes([mac[2], 0xff]),
+            u16::from_be_bytes([0xfe, mac[3]]),
+            u16::from_be_bytes([mac[4], mac[5]]),
+        );
+        ensure!(
+            first != eui64,
+            "{first} is the EUI-64 address, not a stable-privacy one"
+        );
+        ensure!(
+            sysctl::read("net/ipv6/conf/p0/addr_gen_mode")?.trim() == "2",
+            "addr_gen_mode is stable-privacy"
+        );
+        let again = pass(&mut rig).await?;
+        ensure!(again == 0, "second links pass changed {again} things");
+        let p0 = rig.rx.borrow().link_by_name("p0").context("p0")?.index;
+        rig.nl.link_set_up(p0, false).await?;
+        wait_until(&mut rig.rx, "p0 down without its link-local", |c| {
+            c.link_by_name("p0").is_some_and(|l| !l.up) && link_local_of(c, "p0").is_none()
+        })
+        .await?;
+        rig.nl.link_set_up(p0, true).await?;
+        wait_until(&mut rig.rx, "p0 up again with a link-local", |c| {
+            c.link_by_name("p0").is_some_and(|l| l.up) && link_local_of(c, "p0").is_some()
+        })
+        .await?;
+        let second = link_local_of(&rig.rx.borrow(), "p0").context("link-local")?;
+        ensure!(second == first, "{second} after the bounce, {first} before");
         anyhow::Ok(())
     })?
 }
@@ -385,6 +670,10 @@ fn bridge_with_vlan_filtering_enslave_rename(_lab: &mut Lab) -> anyhow::Result<(
         .await?;
         let details = netns::ip(&["-d", "link", "show", "br-t0"])?;
         ensure!(details.contains("vlan_filtering 1"), "{details}");
+        // Born down: the applier sets the MAC before it brings the bridge up, so the kernel
+        // derives the link-local from the MAC the LAN will know, not from the random one.
+        let born_up = rx.borrow().link_by_name("br-t0").context("br-t0")?.up;
+        ensure!(!born_up, "a new bridge came up by itself");
         let br = rx.borrow().link_by_name("br-t0").context("br-t0")?.index;
         let bv0 = rx.borrow().link_by_name("bv0").context("bv0")?.index;
         nl.link_set_master(bv0, Some(br)).await?;
@@ -456,6 +745,7 @@ fn addr_and_route_primitives(_lab: &mut Lab) -> anyhow::Result<()> {
             protocol: RTPROT_OPENFEO,
             priority: 10,
             kind: RouteKind::Unicast,
+            pref_src: None,
         };
         nl.route_add(&route).await?;
         wait_until(&mut rx, "default route", |c| c.routes.contains(&route)).await?;
@@ -554,6 +844,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
                     carrier: l.carrier,
                     mac: l.mac.map(MacAddr),
                     mtu: l.mtu,
+                    link_local6: None,
                 },
             )
         })
@@ -566,6 +857,8 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         dhcp4: Arc::new(BTreeMap::new()),
         leases: Arc::new(BTreeMap::new()),
         time: TimeFact::default(),
+        ipv6: Arc::new(BTreeMap::new()),
+        routes: Arc::new(std::collections::BTreeSet::new()),
     }
 }
 
@@ -788,6 +1081,8 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
             ipv4: "192.168.9.1/24".into(),
             dhcp: None,
             reaches: Vec::new(),
+            ipv6: String::new(),
+            ra: None,
         });
         let mut rig = Rig::connect().await?;
         let cache = rig.rx.borrow_and_update().clone();

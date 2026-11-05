@@ -12,7 +12,7 @@ use anyhow::{Context, ensure};
 use openfeo_config::{PortMap, PortMapEntry};
 use openfeo_harness::lab::Lab;
 use openfeo_harness::scenario::{Scenario, run_all};
-use openfeo_harness::{nftprobe, sandbox};
+use openfeo_harness::{nftlist, nftprobe, sandbox};
 use openfeo_nft::{Nft, NftError};
 use openfeo_reconcile::nft::nft;
 use openfeo_world::World;
@@ -42,12 +42,26 @@ const SCENARIOS: &[Scenario] = &[
         run: generated_ruleset_is_accepted_by_libnftables,
     },
     Scenario {
+        name: "the_ipv6_ruleset_applies_on_the_pinned_nftables",
+        run: the_ipv6_ruleset_applies_on_the_pinned_nftables,
+    },
+    Scenario {
         name: "generated_public_ruleset_is_accepted_by_libnftables",
         run: generated_public_ruleset_is_accepted_by_libnftables,
     },
 ];
 
 const VM_PUBLIC: &str = include_str!("../fixtures/vm-public.toml");
+const VM_IPV6: &str = include_str!("../fixtures/vm-ipv6.toml");
+
+/// The ICMPv6 types the WAN input accepts per RFC 4890, as a numeric listing gives them:
+/// destination-unreachable 1, packet-too-big 2, time-exceeded 3, parameter-problem 4,
+/// mld-listener-query 130, mld-listener-report 131, mld-listener-done 132, nd-router-advert 134,
+/// nd-neighbor-solicit 135, nd-neighbor-advert 136 and mld2-listener-report 143.
+const RFC_4890_WAN_TYPES: [u64; 11] = [1, 2, 3, 4, 130, 131, 132, 134, 135, 136, 143];
+
+/// `icmpv6 type echo-request`, accepted on its own behind the limit when `wan_ping = true`.
+const ICMPV6_ECHO_REQUEST: u64 = 128;
 
 /// The lab's four ports.
 fn lab_portmap4() -> PortMap {
@@ -99,6 +113,64 @@ fn generated_public_ruleset_is_accepted_by_libnftables(_lab: &mut Lab) -> anyhow
             "map {map} missing or duplicated: {ruleset}"
         );
     }
+    Ok(())
+}
+
+/// The IPv6-world ruleset (SPEC §7.3, §7.5): the IPv6 rule sets with their `ipv6_addr`
+/// concatenations, the advertising-LAN set, the ICMPv6 type rules on the WAN input and the
+/// link-local reverse-path exemption are accepted by the pinned libnftables and this kernel,
+/// every IPv6 set is listed, and the listing keeps the rules' shapes: `Nft` lists numerically,
+/// so the types are compared as numbers (`nftlist`), never as the names the generator wrote.
+fn the_ipv6_ruleset_applies_on_the_pinned_nftables(_lab: &mut Lab) -> anyhow::Result<()> {
+    nftprobe::require_expressions()?;
+    let config = openfeo_config::file::parse(VM_IPV6)?;
+    let world = World::new(config, lab_portmap4());
+    let desired = nft(&world);
+    let mut nft = Nft::new()?;
+    let applied = nft.apply(&desired.ruleset);
+    let listed_ruleset = nft.list_ruleset();
+    drop_table(&mut nft, "openfeo");
+    applied.context("apply the IPv6 ruleset")?;
+    let ruleset = listed_ruleset?;
+    for set in [
+        "lan_pub_ra_if",
+        "rules6_tcp",
+        "rules6_udp",
+        "rules6_other",
+        "rules6_any",
+        "rules_tcp",
+        "nat_nets",
+    ] {
+        ensure!(
+            listed(&ruleset, "set", set, Some("openfeo")).len() == 1,
+            "set {set} missing or duplicated: {ruleset}"
+        );
+    }
+    let icmpv6_type = json!({"payload": {"protocol": "icmpv6", "field": "type"}});
+    let rights = nftlist::match_rights(&ruleset, "input", &icmpv6_type);
+    let mut wan_types: Vec<u64> = rights
+        .iter()
+        .filter_map(|right| right.get("set").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect();
+    wan_types.sort_unstable();
+    ensure!(
+        wan_types == RFC_4890_WAN_TYPES,
+        "the WAN input accepts ICMPv6 types {wan_types:?}, not {RFC_4890_WAN_TYPES:?}: {ruleset}"
+    );
+    ensure!(
+        rights
+            .iter()
+            .any(|right| right.as_u64() == Some(ICMPV6_ECHO_REQUEST)),
+        "icmpv6 echo-request is not matched on its own in input: {ruleset}"
+    );
+    let ip6_saddr = json!({"payload": {"protocol": "ip6", "field": "saddr"}});
+    let link_local = json!({"prefix": {"addr": "fe80::", "len": 10}});
+    ensure!(
+        nftlist::match_rights(&ruleset, "rpfilter", &ip6_saddr).contains(&&link_local),
+        "link-local sources are not exempt from the reverse-path check: {ruleset}"
+    );
     Ok(())
 }
 

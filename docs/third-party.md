@@ -21,4 +21,7 @@ dev-dependency of `openfeo-proto-dhcp4` and a dependency of the fuzz crate, wher
 the second opinion our own DHCPv4 codec is checked against. It reaches no shipped artefact.
 Likewise [hickory-proto](https://github.com/hickory-dns/hickory-dns) (MIT or Apache-2.0) is a
 dev-dependency of `openfeo-proto-dns` and a dependency of the fuzz crate, the oracle for our DNS
-codec (ADR-0015), and reaches no shipped artefact either.
+codec (ADR-0015), and reaches no shipped artefact either. And
+[smoltcp](https://github.com/smoltcp-rs/smoltcp) (0BSD) is a dev-dependency of
+`openfeo-proto-ndp` and a dependency of the fuzz crate, the oracle for the neighbour-discovery
+codec's header and RFC 4861 options (ADR-0018); it reaches no shipped artefact.

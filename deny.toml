@@ -18,6 +18,8 @@ allow = [
     "GPL-2.0-or-later",
     "CC0-1.0",
     "Unlicense",
+    # smoltcp, the NDP test oracle (ADR-0018); a dev and fuzz dependency only.
+    "0BSD",
 ]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"

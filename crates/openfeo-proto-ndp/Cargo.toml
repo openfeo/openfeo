@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-proto-ndp"
+description = "OpenFeO neighbour discovery without sockets or clocks: the RS/RA codec, the WAN router-advertisement client, the LAN router-advertisement server and RFC 7217 identifiers (SPEC §7.3, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ipnet.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The test oracle for the codec's header and RFC 4861 options (ADR-0018); never shipped.
+smoltcp = { version = "0.14", default-features = false, features = ["proto-ipv6", "medium-ethernet", "socket-udp"] }
+
+[lints]
+workspace = true

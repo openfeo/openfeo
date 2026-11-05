@@ -10,7 +10,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 |---|---|---|
 | M0 Harness and skeleton | done, 2026-10-30 | commits on `main`, before the repository took pull requests |
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
-| M2 IPv6 | part 1 done, 2026-11-01; parts 2 and 3 to come | #10; follow-up #20 |
+| M2 IPv6 | parts 1 and 2 done, 2026-11-04; part 3 to come | #10, #22; follow-up #20 |
 | M3 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -88,8 +88,22 @@ route to the upstream yet) is sent again a quarter of a second later under the s
 counts as a silence, and an attempt in which a send failed marks no upstream down. The m1
 learned-upstream scenario passes under TCG, where it failed.
 
-Parts 2 and 3 are scoped in SPEC §12: a statically routed prefix as the first-class path, then
-DHCPv6 and the other-ISP cases.
+**2026-11-04, [#22](https://github.com/openfeo/openfeo/pull/22), part 2: IPv6 with a statically
+routed prefix.** `[wans.ipv6]` names the prefix the ISP routes to the router and, when the ISP
+does not advertise itself, the gateway; the WAN runs a router-advertisement client of its own
+(`openfeo-proto-ndp`, a pure codec and two cores, with smoltcp as the test oracle: ADR-0018),
+learns its default router and resolvers and, from a link prefix, a stable address (RFC 7217 from a
+secret under `/state/identity/`), and takes a stable-privacy link-local before the port comes up;
+each LAN names its /64 inside the prefix and advertises it, with router lifetime 0 the moment the
+WAN's IPv6 default is gone and `ra = false` for a LAN placed by hand; the router sources from
+`<prefix>::1` on `lo`, blackholes the prefix (ADR-0020 for what the kernel reports back), and acts
+on a learned resolver or advertises a lifetime only once the kernel shows the default route
+(ADR-0019); the `inet` ruleset mirrors the IPv4 zones for IPv6 with RFC 4890's ICMPv6 lists, and
+rules, records and upstreams take addresses of either family; the DNS forwarder listens, forwards
+and answers AAAA over IPv6 (§7.3, §7.5, §7.7). The lab gains radvd, rdisc6 and an `ndp` sandbox
+suite; eight QEMU scenarios prove the part.
+
+Part 3 is scoped in SPEC §12: DHCPv6 and the other-ISP cases.
 
 ## Tooling and process
 

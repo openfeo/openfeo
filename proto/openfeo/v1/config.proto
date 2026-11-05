@@ -42,6 +42,17 @@ message Dns {
   optional bool use_wan_dns = 3;
   // Names whose subdomains may resolve to private addresses (rebinding protection, SPEC §7.7).
   repeated string rebind_allow = 4;
+  // Names the forwarder answers itself, typed by the owner (SPEC §7.7): an A or AAAA record by
+  // the address's family. Unique per name and family.
+  repeated Record records = 5;
+}
+
+// One typed local name (SPEC §7.7).
+message Record {
+  // A label under `[system] domain`, or a full name ending in it.
+  string name = 1;
+  // An IPv4 or IPv6 unicast address.
+  string address = 2;
 }
 
 // Firewall settings beyond the zone defaults of SPEC §7.5 (which the panel exposes in M4).
@@ -79,7 +90,8 @@ message Rule {
   string name = 1;
   // "wan" or a LAN name.
   string from = 2;
-  // An address, an `a-b` range or a CIDR, inside one LAN that is not `from`.
+  // An address, an `a-b` range or a CIDR, IPv4 or IPv6, inside one LAN that is not `from`; the
+  // rule's family is the target's.
   string to = 3;
   // "tcp", "udp", "icmp" or "any".
   string proto = 4;
@@ -120,6 +132,21 @@ message Wan {
     StaticWan static = 5;
     DhcpWan dhcp = 6;
   }
+  // Present when the WAN carries IPv6 (SPEC §7.3); at most one WAN may, until M6.
+  Ipv6Wan ipv6 = 7;
+}
+
+// The IPv6 side of a WAN (SPEC §7.3, `[wans.ipv6]` in §8.2).
+message Ipv6Wan {
+  // "auto" (the default when empty) runs the router-advertisement client; "disabled" runs
+  // nothing and may not sit beside a prefix or a LAN `ipv6`.
+  string mode = 1;
+  // The prefix the ISP routes to this router, "2001:db8:1::/48": global unicast, at most a /63
+  // (its first /64 is the router's own). Empty means the router gets IPv6 for itself alone.
+  string prefix = 2;
+  // A typed default gateway on the WAN link, link-local or global; empty means the default
+  // router is learned from the ISP's advertisements.
+  string gateway = 3;
 }
 
 // Address, gateway and DNS from config (SPEC §7.2 "Static").
@@ -189,6 +216,12 @@ message Lan {
   // Zones this LAN may initiate into: "wan", other LAN names, or the one word "none". Absent or
   // empty means ["wan"] (SPEC §7.5).
   repeated string reaches = 5;
+  // The router's IPv6 address and the LAN's /64, "2001:db8:1:222::1/64", inside the routed
+  // prefix of `[wans.ipv6]` and not its first /64 (SPEC §7.3). Empty means no IPv6 on this LAN.
+  string ipv6 = 6;
+  // Whether the router advertises the LAN's prefix (SPEC §7.3). Absent means true; false is for
+  // hosts placed by hand. Only with `ipv6`.
+  optional bool ra = 7;
 }
 
 // The DHCPv4 server of one LAN (SPEC §7.6; `[lans.dhcp]` in §8.2).

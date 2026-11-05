@@ -1,0 +1,56 @@
+---
+source: crates/openfeo-reconcile/src/routing.rs
+assertion_line: 394
+expression: desired
+---
+addrs:
+  - ifname: br-dmz
+    net: 192.0.2.233/29
+  - ifname: br-dmz
+    net: "2001:db8:1:232::1/64"
+  - ifname: br-lan0
+    net: 192.168.1.1/24
+  - ifname: br-lan0
+    net: "2001:db8:1:222::1/64"
+  - ifname: lo
+    net: "2001:db8:1::1/128"
+  - ifname: p0
+    net: 203.0.113.10/24
+routes:
+  - ifname: ~
+    dst: 192.0.2.232/29
+    gateway: ~
+    table: 254
+    protocol: 200
+    priority: 1000
+    kind: Blackhole
+    pref_src: ~
+  - ifname: ~
+    dst: "2001:db8:1::/48"
+    gateway: ~
+    table: 254
+    protocol: 200
+    priority: 1000
+    kind: Blackhole
+    pref_src: ~
+  - ifname: p0
+    dst: ~
+    gateway: 203.0.113.1
+    table: 254
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: ~
+  - ifname: p0
+    dst: ~
+    gateway: "fe80::1"
+    table: 254
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: "2001:db8:1::1"
+ipv6_owned:
+  - br-dmz
+  - br-lan0
+  - lo
+  - p0

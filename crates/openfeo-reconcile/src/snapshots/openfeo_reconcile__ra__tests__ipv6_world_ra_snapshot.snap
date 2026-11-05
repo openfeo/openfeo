@@ -1,0 +1,13 @@
+---
+source: crates/openfeo-reconcile/src/ra.rs
+assertion_line: 189
+expression: "desired(&fixtures::ipv6_world())"
+---
+- ifname: br-lan0
+  wan: wan0
+  prefix: "2001:db8:1:222::/64"
+  router: "2001:db8:1:222::1"
+  mac: "52:54:00:fe:00:02"
+  mtu: 1500
+  domain: home.arpa
+  router_lifetime: 1800

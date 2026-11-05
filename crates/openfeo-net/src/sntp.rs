@@ -133,7 +133,7 @@ impl<C: Clock> SntpDriver<C> {
         for ifname in &config.listeners {
             let fd = bound_socket(
                 Some(ifname),
-                Ipv4Addr::UNSPECIFIED,
+                std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 SNTP_PORT,
                 SockType::Datagram,
                 SockProtocol::Udp,

@@ -22,9 +22,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
-use ipnet::Ipv4Net;
+use ipnet::{Ipv4Net, Ipv6Net};
 use openfeo_config::Firewall;
-use openfeo_config::rules::{self as rule_syntax, Target};
+use openfeo_config::rules::{self as rule_syntax, Target, Target6, parse_target6};
 use openfeo_world::World;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -71,6 +71,8 @@ struct Zones {
     lan_priv_if: BTreeSet<String>,
     /// Public LANs that run the DHCP server: DHCP, DNS and NTP from the router.
     lan_pub_dhcp_if: BTreeSet<String>,
+    /// Public LANs that advertise their IPv6 prefix: DNS over IPv6 from the router.
+    lan_pub_ra_if: BTreeSet<String>,
     /// LANs whose `reaches` includes the WAN.
     lan_to_wan: BTreeSet<String>,
     /// (source LAN, destination LAN) pairs a LAN may initiate into, itself included.
@@ -88,13 +90,18 @@ struct ForwardMaps {
     pub_udp: PubForwards,
 }
 
-/// The `[[firewall.rules]]` as set elements, by protocol.
+/// The `[[firewall.rules]]` as set elements, by protocol and family: a rule's family is its
+/// target's.
 #[derive(Default)]
 struct RuleSets {
     tcp: Vec<Value>,
     udp: Vec<Value>,
     other: Vec<Value>,
     any: Vec<Value>,
+    tcp6: Vec<Value>,
+    udp6: Vec<Value>,
+    other6: Vec<Value>,
+    any6: Vec<Value>,
 }
 
 /// The ruleset the World calls for. A WAN whose port the map does not know contributes no
@@ -116,6 +123,7 @@ pub fn nft(world: &World) -> DesiredNft {
         ifname_set("lan_if", &zones.lan_if),
         ifname_set("lan_priv_if", &zones.lan_priv_if),
         ifname_set("lan_pub_dhcp_if", &zones.lan_pub_dhcp_if),
+        ifname_set("lan_pub_ra_if", &zones.lan_pub_ra_if),
         ifname_set("lan_to_wan", &zones.lan_to_wan),
         ifname_pair_set("lan_same", &zones.lan_if),
         pair_set("lan_pairs", &zones.lan_pairs),
@@ -140,6 +148,22 @@ pub fn nft(world: &World) -> DesiredNft {
             rules.other,
         ),
         concat_set("rules_any", &["ifname", "ipv4_addr"], rules.any),
+        concat_set(
+            "rules6_tcp",
+            &["ifname", "ipv6_addr", "inet_service"],
+            rules.tcp6,
+        ),
+        concat_set(
+            "rules6_udp",
+            &["ifname", "ipv6_addr", "inet_service"],
+            rules.udp6,
+        ),
+        concat_set(
+            "rules6_other",
+            &["ifname", "ipv6_addr", "inet_proto"],
+            rules.other6,
+        ),
+        concat_set("rules6_any", &["ifname", "ipv6_addr"], rules.any6),
     ];
     ruleset.extend(rpfilter_chain());
     ruleset.extend(input_chain(wan_ping));
@@ -176,6 +200,9 @@ fn zones(world: &World) -> Zones {
         if public::lan_is_public(lan, &blocks) {
             if lan.dhcp.is_some() {
                 zones.lan_pub_dhcp_if.insert(bridge.clone());
+            }
+            if !lan.ipv6.is_empty() && lan.ra != Some(false) {
+                zones.lan_pub_ra_if.insert(bridge.clone());
             }
         } else {
             zones.lan_priv_if.insert(bridge.clone());
@@ -246,10 +273,13 @@ fn forwards(firewall: Option<&Firewall>) -> ForwardMaps {
 fn rule_sets(firewall: Option<&Firewall>, wan_if: &BTreeSet<String>) -> RuleSets {
     let mut sets = RuleSets::default();
     for rule in firewall.into_iter().flat_map(|f| &f.rules) {
-        let Some(target) = rule_syntax::parse_target(&rule.to) else {
+        let (target, v6) = if let Some(target) = rule_syntax::parse_target(&rule.to) {
+            (target_element(target), false)
+        } else if let Some(target) = parse_target6(&rule.to) {
+            (target_element6(target), true)
+        } else {
             continue;
         };
-        let target = target_element(target);
         let ifnames: Vec<String> = if rule.from == "wan" {
             wan_if.iter().cloned().collect()
         } else {
@@ -261,10 +291,11 @@ fn rule_sets(firewall: Option<&Firewall>, wan_if: &BTreeSet<String>) -> RuleSets
                     let Some(ports) = rule_syntax::parse_ports(&rule.ports) else {
                         continue;
                     };
-                    let bucket = if rule.proto == "tcp" {
-                        &mut sets.tcp
-                    } else {
-                        &mut sets.udp
+                    let bucket = match (rule.proto.as_str(), v6) {
+                        ("tcp", false) => &mut sets.tcp,
+                        ("tcp", true) => &mut sets.tcp6,
+                        (_, false) => &mut sets.udp,
+                        (_, true) => &mut sets.udp6,
                     };
                     for (first, last) in &ports {
                         let port = if first == last {
@@ -275,13 +306,31 @@ fn rule_sets(firewall: Option<&Firewall>, wan_if: &BTreeSet<String>) -> RuleSets
                         bucket.push(json!({"concat": [ifname, target, port]}));
                     }
                 }
+                "icmp" if v6 => sets
+                    .other6
+                    .push(json!({"concat": [ifname, target, "icmpv6"]})),
                 "icmp" => sets.other.push(json!({"concat": [ifname, target, "icmp"]})),
+                "any" if v6 => sets.any6.push(json!({"concat": [ifname, target]})),
                 "any" => sets.any.push(json!({"concat": [ifname, target]})),
                 _ => {}
             }
         }
     }
     sets
+}
+
+/// An IPv6 rule's target as a set element: an address, a `range`, or a `prefix`.
+fn target_element6(target: Target6) -> Value {
+    match target {
+        Target6::Addr(addr) => json!(addr.to_string()),
+        Target6::Range(first, last) => json!({"range": [first.to_string(), last.to_string()]}),
+        Target6::Net(net) => prefix_element6(net),
+    }
+}
+
+/// `{"prefix": {"addr": …, "len": …}}` for an IPv6 prefix.
+fn prefix_element6(net: Ipv6Net) -> Value {
+    json!({"prefix": {"addr": net.network().to_string(), "len": net.prefix_len()}})
 }
 
 /// A rule's target as a set element: an address, a `range`, or a `prefix`.
@@ -550,6 +599,11 @@ fn ipv4_only() -> Value {
     eq(meta("nfproto"), json!("ipv4"))
 }
 
+/// `meta nfproto ipv6`: the rule applies to IPv6 packets only.
+fn ipv6_only() -> Value {
+    eq(meta("nfproto"), json!("ipv6"))
+}
+
 fn accept() -> Value {
     json!({"accept": null})
 }
@@ -587,6 +641,18 @@ fn rpfilter_chain() -> Vec<Value> {
             "rpfilter",
             vec![iifname_in("lan_if"), fib_saddr_oif_missing(true), drop()],
         ),
+        // A link-local source (the ISP's advertisements and neighbour traffic) has no
+        // interface for the loose lookup to resolve it against (SPEC §7.4).
+        rule(
+            "rpfilter",
+            vec![
+                eq(
+                    payload("ip6", "saddr"),
+                    json!({"prefix": {"addr": "fe80::", "len": 10}}),
+                ),
+                accept(),
+            ],
+        ),
         rule(
             "rpfilter",
             vec![iifname_in("wan_if"), fib_saddr_oif_missing(false), drop()],
@@ -606,10 +672,17 @@ fn input_chain(wan_ping: bool) -> Vec<Value> {
         ),
         rule("input", vec![ct_state(json!("invalid")), drop()]),
         rule("input", vec![eq(meta("iif"), json!("lo")), accept()]),
-        service_rule("lan_priv_if", "udp", json!({"set": LAN_UDP_SERVICES})),
-        service_rule("lan_pub_dhcp_if", "udp", json!({"set": LAN_UDP_SERVICES})),
-        service_rule("lan_priv_if", "tcp", json!({"set": LAN_TCP_SERVICES})),
-        service_rule("lan_pub_dhcp_if", "tcp", json!(53)),
+        service_rule("lan_priv_if", None, "udp", json!({"set": LAN_UDP_SERVICES})),
+        service_rule(
+            "lan_pub_dhcp_if",
+            Some(ipv4_only()),
+            "udp",
+            json!({"set": LAN_UDP_SERVICES}),
+        ),
+        service_rule("lan_priv_if", None, "tcp", json!({"set": LAN_TCP_SERVICES})),
+        service_rule("lan_pub_dhcp_if", Some(ipv4_only()), "tcp", json!(53)),
+        service_rule("lan_pub_ra_if", Some(ipv6_only()), "udp", json!(53)),
+        service_rule("lan_pub_ra_if", Some(ipv6_only()), "tcp", json!(53)),
         rule(
             "input",
             vec![
@@ -627,6 +700,16 @@ fn input_chain(wan_ping: bool) -> Vec<Value> {
                 accept(),
             ],
         ),
+        // RFC 4890 on the WAN: the errors, neighbour discovery as a host sees it (never
+        // solicitations or redirects), and MLD. Everything else from a WAN stays dropped.
+        rule(
+            "input",
+            vec![
+                iifname_in("wan_if"),
+                eq(payload("icmpv6", "type"), json!({"set": WAN_ICMPV6_TYPES})),
+                accept(),
+            ],
+        ),
     ];
     if wan_ping {
         rules.push(rule(
@@ -638,27 +721,48 @@ fn input_chain(wan_ping: bool) -> Vec<Value> {
                 accept(),
             ],
         ));
+        rules.push(rule(
+            "input",
+            vec![
+                iifname_in("wan_if"),
+                eq(payload("icmpv6", "type"), json!("echo-request")),
+                limit(ECHO_RATE, ECHO_BURST),
+                accept(),
+            ],
+        ));
     }
     rules
 }
 
-/// `iifname @<set> <proto> dport <ports> accept`.
-fn service_rule(set: &str, protocol: &str, ports: Value) -> Value {
-    rule(
-        "input",
-        vec![
-            iifname_in(set),
-            eq(payload(protocol, "dport"), ports),
-            accept(),
-        ],
-    )
+/// The ICMPv6 types a WAN may send the router (RFC 4890 §4.4; SPEC §7.3).
+const WAN_ICMPV6_TYPES: [&str; 11] = [
+    "destination-unreachable",
+    "packet-too-big",
+    "time-exceeded",
+    "parameter-problem",
+    "nd-router-advert",
+    "nd-neighbor-solicit",
+    "nd-neighbor-advert",
+    "mld-listener-query",
+    "mld-listener-report",
+    "mld-listener-done",
+    "mld2-listener-report",
+];
+
+/// `iifname @<set> [meta nfproto <family>] <proto> dport <ports> accept`.
+fn service_rule(set: &str, family: Option<Value>, protocol: &str, ports: Value) -> Value {
+    let mut expr = vec![iifname_in(set)];
+    expr.extend(family);
+    expr.push(eq(payload(protocol, "dport"), ports));
+    expr.push(accept());
+    rule("input", expr)
 }
 
 /// Forwarded traffic: default drop. Translated flows from a WAN, and from a LAN only along an
 /// allowed pair; the rules; LAN→WAN for the LANs that reach it; the allowed LAN pairs (every LAN
 /// with itself, plus its `reaches`).
 fn forward_chain() -> Vec<Value> {
-    vec![
+    let mut rules = vec![
         chain("forward", "filter", "forward", 0, "drop"),
         rule(
             "forward",
@@ -673,57 +777,39 @@ fn forward_chain() -> Vec<Value> {
             "forward",
             vec![ct_status_dnat(), iif_oif_pair_in("lan_pairs"), accept()],
         ),
-        rule(
-            "forward",
-            vec![
-                concat_in(
-                    vec![
-                        meta("iifname"),
-                        payload("ip", "daddr"),
-                        payload("tcp", "dport"),
-                    ],
-                    "rules_tcp",
-                ),
-                accept(),
-            ],
-        ),
-        rule(
-            "forward",
-            vec![
-                concat_in(
-                    vec![
-                        meta("iifname"),
-                        payload("ip", "daddr"),
-                        payload("udp", "dport"),
-                    ],
-                    "rules_udp",
-                ),
-                accept(),
-            ],
-        ),
-        rule(
-            "forward",
-            vec![
-                concat_in(
-                    vec![meta("iifname"), payload("ip", "daddr"), meta("l4proto")],
-                    "rules_other",
-                ),
-                accept(),
-            ],
-        ),
-        rule(
-            "forward",
-            vec![
-                concat_in(vec![meta("iifname"), payload("ip", "daddr")], "rules_any"),
-                accept(),
-            ],
-        ),
+    ];
+    rules.extend(rules_set_rules());
+    rules.extend([
         rule(
             "forward",
             vec![iifname_in("lan_to_wan"), oifname_in("wan_if"), accept()],
         ),
         rule("forward", vec![iif_oif_pair_in("lan_pairs"), accept()]),
-    ]
+    ]);
+    rules
+}
+
+/// The eight rules that consult the `[[firewall.rules]]` sets, IPv4 then IPv6: `iifname .
+/// daddr . dport` for tcp and udp, `iifname . daddr . l4proto` for the rest, `iifname . daddr`
+/// for `any`.
+fn rules_set_rules() -> Vec<Value> {
+    let mut rules = Vec::new();
+    for (ip, suffix) in [("ip", "rules"), ("ip6", "rules6")] {
+        for (set, third) in [
+            ("tcp", Some(payload("tcp", "dport"))),
+            ("udp", Some(payload("udp", "dport"))),
+            ("other", Some(meta("l4proto"))),
+            ("any", None),
+        ] {
+            let mut key = vec![meta("iifname"), payload(ip, "daddr")];
+            key.extend(third);
+            rules.push(rule(
+                "forward",
+                vec![concat_in(key, &format!("{suffix}_{set}")), accept()],
+            ));
+        }
+    }
+    rules
 }
 
 /// Port forwards: on the router's own addresses (`fib daddr type local`, so a forward there
@@ -819,6 +905,185 @@ mod tests {
             .iter()
             .position(|rule| mentions(rule, text))
             .unwrap_or_else(|| panic!("no rule mentions {text}: {rules:?}"))
+    }
+
+    fn ipv6_world_with(edit: impl FnOnce(&mut openfeo_config::Config)) -> DesiredNft {
+        let mut world = fixtures::ipv6_world();
+        let mut config = (*world.config).clone();
+        edit(&mut config);
+        world.config = std::sync::Arc::new(config);
+        nft(&world)
+    }
+
+    #[test]
+    fn ipv6_rules_land_in_the_rules6_sets_by_family_and_icmp_becomes_icmpv6() {
+        let d = nft(&fixtures::ipv6_world());
+        assert_eq!(
+            set_elements(&d.ruleset, "set", "rules6_tcp"),
+            json!([{"concat": ["p0", "2001:db8:1:232::10", 80]}])
+        );
+        assert_eq!(
+            set_elements(&d.ruleset, "set", "rules_tcp"),
+            Value::Null,
+            "no IPv4 rule"
+        );
+        let forward = rules_of(&d.ruleset, "forward");
+        let rule6 = forward.iter().find(|r| mentions(r, "@rules6_tcp")).unwrap();
+        assert!(
+            mentions(rule6, "\"protocol\":\"ip6\"") && mentions(rule6, "\"daddr\""),
+            "{rule6}"
+        );
+        assert!(position(&forward, "@rules6_tcp") < position(&forward, "@lan_to_wan"));
+        assert!(position(&forward, "@rules_tcp") < position(&forward, "@rules6_tcp"));
+        let d = ipv6_world_with(|config| {
+            let firewall = config.firewall.as_mut().unwrap();
+            firewall.rules.push(openfeo_config::Rule {
+                name: "dmz-ping6".to_owned(),
+                from: "wan".to_owned(),
+                to: "2001:db8:1:232::/64".to_owned(),
+                proto: "icmp".to_owned(),
+                ports: Vec::new(),
+            });
+            firewall.rules.push(openfeo_config::Rule {
+                name: "lan-any6".to_owned(),
+                from: "lan0".to_owned(),
+                to: "2001:db8:1:232::10-2001:db8:1:232::20".to_owned(),
+                proto: "any".to_owned(),
+                ports: Vec::new(),
+            });
+        });
+        assert_eq!(
+            set_elements(&d.ruleset, "set", "rules6_other"),
+            json!([{"concat": ["p0", {"prefix": {"addr": "2001:db8:1:232::", "len": 64}}, "icmpv6"]}])
+        );
+        assert_eq!(
+            set_elements(&d.ruleset, "set", "rules6_any"),
+            json!([{"concat": ["br-lan0", {"range": ["2001:db8:1:232::10", "2001:db8:1:232::20"]}]}])
+        );
+    }
+
+    #[test]
+    fn the_wan_input_accepts_the_rfc_4890_icmpv6_types_and_echo_only_with_wan_ping() {
+        let d = nft(&fixtures::ipv6_world());
+        let input = rules_of(&d.ruleset, "input");
+        let nd = input
+            .iter()
+            .find(|r| mentions(r, "nd-router-advert"))
+            .unwrap();
+        for kind in [
+            "destination-unreachable",
+            "packet-too-big",
+            "time-exceeded",
+            "parameter-problem",
+            "nd-neighbor-solicit",
+            "nd-neighbor-advert",
+            "mld-listener-query",
+            "mld-listener-report",
+            "mld-listener-done",
+            "mld2-listener-report",
+        ] {
+            assert!(mentions(nd, kind), "{kind} missing from {nd}");
+        }
+        assert!(mentions(nd, "@wan_if") && mentions(nd, "\"accept\""));
+        assert!(
+            !mentions(nd, "nd-redirect") && !mentions(nd, "nd-router-solicit"),
+            "{nd}"
+        );
+        let echo6: Vec<_> = input
+            .iter()
+            .filter(|r| mentions(r, "echo-request") && mentions(r, "icmpv6"))
+            .collect();
+        assert_eq!(echo6.len(), 1, "{echo6:?}");
+        assert!(mentions(echo6[0], "\"limit\"") && mentions(echo6[0], "\"rate\":50"));
+        let quiet = ipv6_world_with(|config| config.firewall.as_mut().unwrap().wan_ping = false);
+        let input = rules_of(&quiet.ruleset, "input");
+        assert!(
+            !input.iter().any(|r| mentions(r, "echo-request")),
+            "no echo of either family"
+        );
+        assert!(
+            input.iter().any(|r| mentions(r, "nd-router-advert")),
+            "neighbour discovery stays"
+        );
+        let v4 = nft(&fixtures::static_world());
+        assert!(
+            rules_of(&v4.ruleset, "input")
+                .iter()
+                .any(|r| mentions(r, "nd-router-advert")),
+            "the WAN input list is static"
+        );
+    }
+
+    #[test]
+    fn public_lan_services_split_by_family_and_a_private_lan_keeps_both() {
+        let d = nft(&fixtures::ipv6_world());
+        assert_eq!(
+            set_elements(&d.ruleset, "set", "lan_pub_ra_if"),
+            Value::Null,
+            "the DMZ advertises nothing"
+        );
+        let advertising = ipv6_world_with(|config| config.lans[1].ra = None);
+        assert_eq!(
+            set_elements(&advertising.ruleset, "set", "lan_pub_ra_if"),
+            json!(["br-dmz"])
+        );
+        let input = rules_of(&d.ruleset, "input");
+        let pub_dhcp: Vec<_> = input
+            .iter()
+            .filter(|r| mentions(r, "@lan_pub_dhcp_if"))
+            .collect();
+        assert_eq!(pub_dhcp.len(), 2);
+        assert!(
+            pub_dhcp
+                .iter()
+                .all(|r| mentions(r, "\"nfproto\"") && mentions(r, "\"ipv4\"")),
+            "{pub_dhcp:?}"
+        );
+        let pub_ra: Vec<_> = input
+            .iter()
+            .filter(|r| mentions(r, "@lan_pub_ra_if"))
+            .collect();
+        assert_eq!(pub_ra.len(), 2);
+        assert!(
+            pub_ra.iter().all(|r| mentions(r, "\"nfproto\"")
+                && mentions(r, "\"ipv6\"")
+                && mentions(r, "\"dport\"")),
+            "{pub_ra:?}"
+        );
+        let private: Vec<_> = input
+            .iter()
+            .filter(|r| mentions(r, "@lan_priv_if") && mentions(r, "\"dport\""))
+            .collect();
+        assert_eq!(private.len(), 2);
+        assert!(
+            private.iter().all(|r| !mentions(r, "\"nfproto\"")),
+            "family-neutral: {private:?}"
+        );
+    }
+
+    #[test]
+    fn link_local_sources_skip_the_loose_reverse_path_check() {
+        let d = nft(&fixtures::static_world());
+        let rp = rules_of(&d.ruleset, "rpfilter");
+        assert!(position(&rp, "fe80::") < position(&rp, "@wan_if"), "{rp:?}");
+        let link_local = rp.iter().find(|r| mentions(r, "fe80::")).unwrap();
+        assert!(
+            mentions(link_local, "\"accept\"")
+                && mentions(link_local, "\"len\":10")
+                && mentions(link_local, "\"saddr\""),
+            "{link_local}"
+        );
+        assert!(
+            position(&rp, "@lan_if") < position(&rp, "fe80::"),
+            "the strict LAN check keeps its place"
+        );
+    }
+
+    #[test]
+    fn ipv6_world_ruleset_snapshot() {
+        let d = nft(&fixtures::ipv6_world());
+        assert!(d.forwarding);
+        insta::assert_yaml_snapshot!(d);
     }
 
     #[test]
