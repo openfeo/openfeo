@@ -12,6 +12,7 @@ pub mod bound;
 pub mod clock;
 pub mod dhcp4;
 pub mod dhcp4_server;
+pub mod dhcp6;
 pub mod dns;
 pub mod ndp;
 pub mod resolve;

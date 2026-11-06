@@ -11,6 +11,7 @@ publish = false
 
 [dependencies]
 openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
+openfeo-proto-dhcp6 = { path = "../openfeo-proto-dhcp6" }
 openfeo-proto-dns = { path = "../openfeo-proto-dns" }
 openfeo-proto-ndp = { path = "../openfeo-proto-ndp" }
 openfeo-proto-sntp = { path = "../openfeo-proto-sntp" }
