@@ -136,4 +136,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "dhcp6_server"
+path = "fuzz_targets/dhcp6_server.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
