@@ -1,6 +1,5 @@
 ---
 source: crates/openfeo-reconcile/src/nft.rs
-assertion_line: 1341
 expression: desired
 ---
 ruleset:
@@ -365,6 +364,29 @@ ruleset:
           - match:
               left:
                 meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: saddr
+                  protocol: ip6
+              op: "=="
+              right:
+                prefix:
+                  addr: "fc00::"
+                  len: 7
+          - drop: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
                   key: iif
               op: "=="
               right: lo
@@ -392,6 +414,7 @@ ruleset:
                   - 53
                   - 67
                   - 123
+                  - 547
           - accept: ~
         family: inet
         table: openfeo
@@ -422,6 +445,7 @@ ruleset:
                   - 53
                   - 67
                   - 123
+                  - 547
           - accept: ~
         family: inet
         table: openfeo
@@ -497,7 +521,10 @@ ruleset:
                   field: dport
                   protocol: udp
               op: "=="
-              right: 53
+              right:
+                set:
+                  - 53
+                  - 547
           - accept: ~
         family: inet
         table: openfeo
@@ -573,6 +600,26 @@ ruleset:
                   protocol: udp
               op: "=="
               right: 68
+          - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: input
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: dport
+                  protocol: udp
+              op: "=="
+              right: 546
           - accept: ~
         family: inet
         table: openfeo
@@ -690,6 +737,79 @@ ruleset:
                   key: state
               op: in
               right: invalid
+          - drop: ~
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                meta:
+                  key: oifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: saddr
+                  protocol: ip6
+              op: "=="
+              right:
+                prefix:
+                  addr: "fc00::"
+                  len: 7
+          - reject:
+              expr: no-route
+              type: icmpv6
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                meta:
+                  key: oifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: daddr
+                  protocol: ip6
+              op: "=="
+              right:
+                prefix:
+                  addr: "fc00::"
+                  len: 7
+          - reject:
+              expr: no-route
+              type: icmpv6
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: forward
+        expr:
+          - match:
+              left:
+                meta:
+                  key: iifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: saddr
+                  protocol: ip6
+              op: "=="
+              right:
+                prefix:
+                  addr: "fc00::"
+                  len: 7
           - drop: ~
         family: inet
         table: openfeo

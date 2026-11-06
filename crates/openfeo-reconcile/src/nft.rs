@@ -29,12 +29,13 @@ use openfeo_world::World;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::lan6;
 use crate::{TABLE, bridge_name, public, wan_ifname};
 
 /// The table's family: one ruleset for IPv4 and IPv6 (SPEC §9).
 pub const FAMILY: &str = "inet";
 /// LAN→router UDP services: DNS, DHCP, NTP.
-pub const LAN_UDP_SERVICES: [u16; 3] = [53, 67, 123];
+pub const LAN_UDP_SERVICES: [u16; 4] = [53, 67, 123, 547];
 /// LAN→router TCP services: DNS, HTTP, HTTPS.
 pub const LAN_TCP_SERVICES: [u16; 3] = [53, 80, 443];
 /// Echo requests accepted on the WAN per second, when `wan_ping` is on (SPEC §7.5).
@@ -194,6 +195,7 @@ fn zones(world: &World) -> Zones {
         ..Zones::default()
     };
     let blocks = public::blocks(config);
+    let lan6 = lan6::prefixes(world);
     for lan in &config.lans {
         let bridge = bridge_name(&lan.name);
         zones.lan_if.insert(bridge.clone());
@@ -201,7 +203,9 @@ fn zones(world: &World) -> Zones {
             if lan.dhcp.is_some() {
                 zones.lan_pub_dhcp_if.insert(bridge.clone());
             }
-            if !lan.ipv6.is_empty() && lan.ra != Some(false) {
+            let advertises =
+                lan.ra != Some(false) && lan6.prefixes.iter().any(|prefix| prefix.lan == lan.name);
+            if advertises {
                 zones.lan_pub_ra_if.insert(bridge.clone());
             }
         } else {
@@ -608,6 +612,19 @@ fn accept() -> Value {
     json!({"accept": null})
 }
 
+/// `ip6 <field> fc00::/7`: a unique local address (RFC 4193).
+fn ula(field: &str) -> Value {
+    eq(
+        payload("ip6", field),
+        json!({"prefix": {"addr": "fc00::", "len": 7}}),
+    )
+}
+
+/// `reject with icmpv6 type no-route`.
+fn reject_no_route() -> Value {
+    json!({"reject": {"type": "icmpv6", "expr": "no-route"}})
+}
+
 fn drop() -> Value {
     json!({"drop": null})
 }
@@ -671,6 +688,9 @@ fn input_chain(wan_ping: bool) -> Vec<Value> {
             vec![ct_state(json!(["established", "related"])), accept()],
         ),
         rule("input", vec![ct_state(json!("invalid")), drop()]),
+        // A unique local source has no business arriving on a WAN (RFC 4193 §4.3); the loose
+        // reverse-path check would pass it, since the router has routes to its own ULA.
+        rule("input", vec![iifname_in("wan_if"), ula("saddr"), drop()]),
         rule("input", vec![eq(meta("iif"), json!("lo")), accept()]),
         service_rule("lan_priv_if", None, "udp", json!({"set": LAN_UDP_SERVICES})),
         service_rule(
@@ -681,7 +701,12 @@ fn input_chain(wan_ping: bool) -> Vec<Value> {
         ),
         service_rule("lan_priv_if", None, "tcp", json!({"set": LAN_TCP_SERVICES})),
         service_rule("lan_pub_dhcp_if", Some(ipv4_only()), "tcp", json!(53)),
-        service_rule("lan_pub_ra_if", Some(ipv6_only()), "udp", json!(53)),
+        service_rule(
+            "lan_pub_ra_if",
+            Some(ipv6_only()),
+            "udp",
+            json!({"set": [53, 547]}),
+        ),
         service_rule("lan_pub_ra_if", Some(ipv6_only()), "tcp", json!(53)),
         rule(
             "input",
@@ -697,6 +722,16 @@ fn input_chain(wan_ping: bool) -> Vec<Value> {
                 iifname_in("wan_if"),
                 eq(payload("udp", "sport"), json!(67)),
                 eq(payload("udp", "dport"), json!(68)),
+                accept(),
+            ],
+        ),
+        // The DHCPv6 client's replies arrive unicast from the server's link-local address, which
+        // conntrack does not pair with the multicast Solicit (SPEC §7.5).
+        rule(
+            "input",
+            vec![
+                iifname_in("wan_if"),
+                eq(payload("udp", "dport"), json!(546)),
                 accept(),
             ],
         ),
@@ -769,6 +804,18 @@ fn forward_chain() -> Vec<Value> {
             vec![ct_state(json!(["established", "related"])), accept()],
         ),
         rule("forward", vec![ct_state(json!("invalid")), drop()]),
+        // ULA never crosses a WAN (RFC 4193 §4.3; SPEC §7.5): a host that picked a unique local
+        // source for a global destination is told at once, so it falls back, and nothing
+        // unique local arrives from a WAN.
+        rule(
+            "forward",
+            vec![oifname_in("wan_if"), ula("saddr"), reject_no_route()],
+        ),
+        rule(
+            "forward",
+            vec![oifname_in("wan_if"), ula("daddr"), reject_no_route()],
+        ),
+        rule("forward", vec![iifname_in("wan_if"), ula("saddr"), drop()]),
         rule(
             "forward",
             vec![ct_status_dnat(), iifname_in("wan_if"), accept()],
@@ -1082,6 +1129,129 @@ mod tests {
     #[test]
     fn ipv6_world_ruleset_snapshot() {
         let d = nft(&fixtures::ipv6_world());
+        assert!(d.forwarding);
+        insta::assert_yaml_snapshot!(d);
+    }
+
+    #[test]
+    fn ula_never_crosses_a_wan() {
+        let d = nft(&fixtures::pd_world());
+        let forward = rules_of(&d.ruleset, "forward");
+        let ula: Vec<_> = forward
+            .iter()
+            .filter(|r| mentions(r, "\"fc00::\"") && mentions(r, "\"len\":7"))
+            .collect();
+        assert_eq!(ula.len(), 3, "{forward:?}");
+        assert!(
+            ula.iter().take(2).all(|r| mentions(r, "@wan_if")
+                && mentions(r, "\"oifname\"")
+                && mentions(r, "\"reject\"")
+                && mentions(r, "\"no-route\"")
+                && mentions(r, "\"icmpv6\"")),
+            "out: rejected with no-route: {ula:?}"
+        );
+        assert!(mentions(ula[0], "\"saddr\"") && mentions(ula[1], "\"daddr\""));
+        assert!(
+            mentions(ula[2], "@wan_if")
+                && mentions(ula[2], "\"iifname\"")
+                && mentions(ula[2], "\"drop\""),
+            "in: dropped: {:?}",
+            ula[2]
+        );
+        assert!(
+            position(&forward, "fc00::") < position(&forward, "@lan_to_wan"),
+            "before the zone policy"
+        );
+        let input = rules_of(&d.ruleset, "input");
+        let dropped = input
+            .iter()
+            .find(|r| mentions(r, "fc00::"))
+            .expect("a ULA source from a WAN is dropped at the input too");
+        assert!(mentions(dropped, "@wan_if") && mentions(dropped, "\"drop\""));
+    }
+
+    #[test]
+    fn the_wan_accepts_dhcpv6_replies_on_546() {
+        let d = nft(&fixtures::pd_world());
+        let input = rules_of(&d.ruleset, "input");
+        let client = input
+            .iter()
+            .find(|r| mentions(r, "@wan_if") && mentions(r, "546"))
+            .expect("udp 546 on the WAN");
+        assert!(
+            mentions(client, "\"udp\"")
+                && mentions(client, "\"dport\"")
+                && mentions(client, "\"accept\""),
+            "{client}"
+        );
+    }
+
+    #[test]
+    fn advertising_lans_serve_547() {
+        let d = nft(&fixtures::pd_world());
+        let input = rules_of(&d.ruleset, "input");
+        let private = input
+            .iter()
+            .find(|r| mentions(r, "@lan_priv_if") && mentions(r, "\"udp\""))
+            .expect("the private LAN udp services");
+        assert!(
+            mentions(private, "547") && mentions(private, "53"),
+            "{private}"
+        );
+        // A public LAN that advertises serves 547 over IPv6 beside DNS.
+        let d = ipv6_world_with(|c| {
+            c.lans[1].ra = None;
+        });
+        let input = rules_of(&d.ruleset, "input");
+        let public = input
+            .iter()
+            .find(|r| mentions(r, "@lan_pub_ra_if") && mentions(r, "\"udp\""))
+            .expect("the public advertising LAN udp services");
+        assert!(
+            mentions(public, "547") && mentions(public, "\"ipv6\""),
+            "{public}"
+        );
+        assert!(
+            set_elements(&d.ruleset, "set", "lan_pub_ra_if")
+                .as_array()
+                .is_some_and(|members| members.contains(&json!("br-dmz"))),
+            "the DMZ advertises once ra is not false"
+        );
+        let d = nft(&fixtures::ipv6_world());
+        assert!(
+            set_elements(&d.ruleset, "set", "lan_pub_ra_if")
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "ra = false keeps the DMZ out"
+        );
+    }
+
+    #[test]
+    fn a_ula_rule_target_lands_in_the_rules6_sets() {
+        let d = ipv6_world_with(|c| {
+            c.firewall
+                .get_or_insert_default()
+                .rules
+                .push(openfeo_config::Rule {
+                    name: "ula-web".to_owned(),
+                    from: "wan".to_owned(),
+                    to: "fd12:3456:789a:1::10".to_owned(),
+                    proto: "tcp".to_owned(),
+                    ports: vec!["80".to_owned()],
+                });
+        });
+        let elements = set_elements(&d.ruleset, "set", "rules6_tcp");
+        assert!(
+            elements
+                .as_array()
+                .is_some_and(|e| e.contains(&json!({"concat": ["p0", "fd12:3456:789a:1::10", 80]}))),
+            "{elements}"
+        );
+    }
+
+    #[test]
+    fn pd_world_ruleset_snapshot() {
+        let d = nft(&fixtures::pd_world());
         assert!(d.forwarding);
         insta::assert_yaml_snapshot!(d);
     }
