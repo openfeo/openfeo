@@ -159,7 +159,11 @@ an ISP that routes a prefix statically has told the owner so, and an ISP that de
 
 **The index.** A LAN's /64 inside a prefix of length L is the prefix with subnet id
 `ipv6_index` in the 64 − L bits below it: index 1 of `2001:db8:100::/56` is
-`2001:db8:100:1::/64`, and of a ULA `fd12:3456:789a::/48` is `fd12:3456:789a:1::/64`. Index 0
+`2001:db8:100:1::/64`, and of a ULA `fd12:3456:789a::/48` is `fd12:3456:789a:1::/64`. A LAN's
+effective index is the typed one, or its 1-based position in `[[lans]]` counting every LAN,
+`none` ones included, so a position never moves because a neighbour opted out; validation
+computes the effective index of every LAN that carries IPv6 and refuses a clash, whether two
+typed indexes meet or a typed one lands on another LAN's position. Index 0
 is the router's: `<prefix>::1/128` sits on loopback for each delegated prefix and for the ULA,
 the delegated one being the preferred source of the IPv6 default route, as the routed prefix's
 is in part 2. A delegation that is a single /64 (an ISP that delegates no more) goes whole to
@@ -206,15 +210,19 @@ Elapsed Time; Advertise ranked by preference and taken after the first RT; Reque
 server's choice; 0 means the client's, 0.5 and 0.8 of the shortest preferred lifetime); Renew
 (IRT 10, MRT 600) at T1 to the server, Rebind (IRT 10, MRT 600) at T2 to the group; a Reply to
 either refreshes the binding. Status NoAddrsAvail in the IA_NA keeps the delegation and drops the
-address; NoPrefixAvail in the IA_PD is reported once and the client keeps soliciting at the
-SOL_MAX_RT pace; NoBinding on Renew or Rebind restarts with Request; UnspecFail or an unknown
+address; NoPrefixAvail in the IA_PD is reported once; with nothing bound the client keeps soliciting at
+the SOL_MAX_RT pace, and with an address bound it asks for the prefix again in every Renew and
+Rebind for the address (RFC 8415 §18.2.4 and §18.2.5 let a client include an IA it holds no lease
+for; Kea allocates on Renew), so there is one exchange schedule, never two; NoBinding on Renew or Rebind restarts with Request; UnspecFail or an unknown
 status restarts with Solicit; UseMulticast resends to the group. A prefix or address whose
 Reply carries valid lifetime 0, or whose valid lifetime runs out, leaves the binding.
 
 **Carrier.** Loss of carrier stops the timers and keeps the binding. Carrier back sends Rebind
-with every IA the binding holds (RFC 8415 §18.2.5 permits Rebind for an IA at any time after
-a link change; the Confirm of §18.2.12 would cover the address only and is not worth a second
-exchange). No answer within the Rebind retransmissions, or NoBinding, means Solicit.
+with every IA the binding holds, as RFC 8415 §18.2.12 asks for a prefix after a possible link
+change, with Confirm's retransmission parameters (IRT 1 s, MRT 4 s, MRD 10 s) so that a silent
+server costs ten seconds, not the lease; the Confirm message itself would cover the address
+only and is not worth a second exchange. A Reply refreshes the binding; silence keeps it with
+its timers as they were; NoBinding restarts with Request and any other failure with Solicit.
 
 **Reboot.** The last binding is persisted in `leases/dhcp6-<wan>.toml` (server DUID, IAIDs,
 the prefixes and addresses with their lifetimes, T1, T2, DNS, domains, the wall-clock moment it
@@ -231,11 +239,15 @@ keyed by WAN beside part 2's `WanIpv6Fact` and does not leave the World with the
 binding outlives a flap, and the RA server needs to know what to deprecate.
 
 **Deprecation is the task's.** When a prefix leaves the binding (lifetime 0, replaced, or
-expired) the task moves it to the fact's deprecated list with a deadline two hours away and
-removes it when the deadline passes; a prefix that comes back before then leaves the list. When
-the WAN has had no carrier for two hours the task drops the binding (SPEC §7.3's "then dropped")
-and the prefixes go through the same two-hour deprecation. The World sees lists; the task owns
-the clock.
+expired) the task moves it to the fact's deprecated list with a deadline: the lower of two hours
+and the prefix's own remaining valid lifetime (RFC 7084 L-13; a host already counts down the
+valid lifetime it was last given, so advertising longer would keep the address alive past the
+router's own drop), and removes it when the deadline passes; a prefix that comes back before
+then leaves the list. When the WAN has had no carrier for two hours the task drops the binding
+(SPEC §7.3's "then dropped") and the prefixes go through the same deprecation. The deprecated
+list is persisted with the binding, so a reboot inside the window restores it and the hosts'
+old addresses keep being answered rather than dropped by the reverse-path check. The World
+sees lists; the task owns the clock.
 
 ### LAN prefixes
 
@@ -296,19 +308,23 @@ as a prefix information option (A = 1, L = 1) with lifetimes by state:
 - ULA: the same two constants; it has no delegation to derive from and never goes away;
 - delegated, live: the remaining valid and preferred lifetimes of the delegation, capped at
   those two constants (RFC 7084 L-13 forbids advertising longer than the delegation);
-- delegated, stale (the WAN has no carrier or no IPv6 default route): preferred 0, valid 7200;
-- deprecated: preferred 0, valid 7200, until the deadline drops it from the list.
+- delegated, stale (the WAN has no carrier or no IPv6 default route): preferred 0, valid the
+  lower of the remaining valid lifetime and 7200;
+- deprecated: preferred 0, valid the time left to the deadline, counted down at every
+  advertisement (RFC 7084 L-13 and RFC 4862 §5.5.3: a host ignores an advertised valid lifetime
+  shorter than two hours only below its own remainder, so the countdown is what makes the host
+  and the router drop the prefix together), until the deadline drops it from the list.
 
-The World carries lifetimes as obtained-plus-seconds; `crates/openfeo/src/ra.rs` turns them into
-remainders with the wall clock at each advertisement, so a Reply that extends a lease changes
-the fact and the next advertisement, and nothing in `reconcile` reads a clock.
+The World carries lifetimes as the moment they were obtained plus seconds; `crates/openfeo/src/ra.rs`
+turns them into remainders at each advertisement, so a Reply that extends a lease changes the
+fact and the next advertisement, and nothing in `reconcile` reads a clock.
 
 Also in the advertisement: O = 1 now that the responder exists (M stays 0); RDNSS with the
 router's addresses in that LAN, ULA first because it survives renumbering; DNSSL as before; a
-route information option (RFC 4191) for the ULA /48 via this router, lifetime 1800, medium
-preference, so hosts that honour it (Windows, macOS; Linux only with
-`accept_ra_rt_info_max_plen` raised) reach the other LANs' ULA /64s even while the router
-lifetime is 0. The router lifetime keeps part 2's rule: 1800 while the WAN with `[wans.ipv6]`
+route information option (RFC 4191) for the ULA /48 and for every live delegated prefix via
+this router, lifetime 1800, medium preference, as RFC 7084 L-3 asks, so hosts that honour it
+(Windows, macOS; Linux only with `accept_ra_rt_info_max_plen` raised) reach the other LANs'
+/64s even while the router lifetime is 0. The router lifetime keeps part 2's rule: 1800 while the WAN with `[wans.ipv6]`
 has carrier and an IPv6 default route in the kernel, else 0; a LAN whose only live prefix is the
 ULA follows the same rule, since a host with a ULA address and a default route tries IPv6 to
 the world and the reject below fails it fast.
@@ -350,8 +366,9 @@ one, so a knob once set is restored.
 - **DHCPv6 on the WAN.** Input on the WAN port accepts UDP to port 546 (the client's replies
   arrive unicast from the server's link-local and conntrack does not pair them with the
   multicast Solicit), beside the DHCPv4 client's port 68 rule.
-- **The responder.** UDP 547 joins the LAN service rules on advertising LANs, family IPv6 only:
-  the private-LAN service set and the public-LAN `lan_pub_ra_if` set both gain it.
+- **The responder.** UDP 547 joins the LAN service rules: the private-LAN service list, which is
+  family-neutral (an IPv4 datagram to 547 reaches nothing and is harmless), and the public-LAN
+  `lan_pub_ra_if` rule, which is IPv6 only.
 - **Rule targets.** A rule whose `to` is a ULA address is placed on the LAN whose ULA /64 holds
   it, at run time, through `lan6::prefixes`; part 2's routed targets are unchanged.
 - The rest of the IPv6 ruleset (RFC 4890 input list, link-local reverse-path exemption, rule
@@ -375,7 +392,8 @@ one, so a knob once set is restored.
 One line each, in the existing styles: the DHCPv6 client's state changes (`dhcp6 wan0
 soliciting`, `dhcp6 wan0 bound prefix 2001:db8:100::/56 (valid 60 s) address 2001:db8:ffff::1a4
 from <server duid>`, `dhcp6 wan0 renewed`, `dhcp6 wan0 rebinding`, `dhcp6 wan0 prefix
-2001:db8:100::/56 gone: deprecated for 7200 s`, `dhcp6 wan0 no prefix available`, `dhcp6 wan0
+2001:db8:100::/56 gone: deprecated for 55 s` (the lower of two hours and its remaining valid
+lifetime), `dhcp6 wan0 no prefix available`, `dhcp6 wan0
 binding restored from disk`), the ULA identity, each LAN's /64s as they appear and leave
 (`lan0 ipv6 2001:db8:100:1::1/64 from wan0 delegation`, `lan0 ipv6 fd12:3456:789a:1::1/64
 ula`, `lan0 ipv6 2001:db8:100:1::/64 deprecated`), a LAN left out of a short delegation, the
@@ -388,7 +406,8 @@ asserts through these lines; the plan fixes the exact wording in the console con
 New fields: `Ipv6Wan.pd_hint` (`uint32`, 0 = absent = 56), `Lan.ipv6_index` (`uint32`, 0 =
 absent = position), `Lan.ipv6` accepts the word `none`. New message `Dhcp6Lease` for
 `leases/dhcp6-<wan>.toml` (wan, mac, server DUID as hex, the IA_PD and IA_NA bindings with
-lifetimes, T1, T2, DNS, domains, obtained wall-clock seconds). No existing field changes
+lifetimes, T1, T2, DNS, domains, obtained wall-clock seconds, and the deprecated prefixes with
+their wall-clock deadlines). No existing field changes
 meaning: a part 2 configuration loads and behaves as before, since without a delegation the
 only addition is the ULA /64 and the responder on each LAN, which is what SPEC §7.3 promised
 for part 3. `config_version` stays 1.
@@ -396,11 +415,17 @@ for part 3. `config_version` stays 1.
 ### Facts
 
 `World` gains `dhcp6: BTreeMap<String, WanDhcp6Fact>` (keyed by WAN) and `ula: Option<Ipv6Net>`.
-`WanDhcp6Fact` holds `prefixes: Vec<Delegated>` (`prefix: Ipv6Net`, `obtained_unix: u64`,
+`WanDhcp6Fact` holds `prefixes: Vec<Delegated>` (`prefix: Ipv6Net`, `obtained_ms: u64`,
 `preferred_secs: u32`, `valid_secs: u32`), `addresses: Vec<Delegated>` in the same shape for
-the IA_NA, `deprecated: Vec<Deprecated>` (`prefix`, `until_unix`), `dns: Vec<Ipv6Addr>`,
+the IA_NA, `deprecated: Vec<Deprecated>` (`prefix`, `until_ms`), `dns: Vec<Ipv6Addr>`,
 `search: Vec<String>` and `server: Vec<u8>` (the DUID, for the console). Content only; the
-task holds the timers.
+task holds the timers. The moments are milliseconds on the process's monotonic clock
+(`openfeo_runtime::clock::uptime_ms`, one `Instant` for the whole process), never the wall
+clock: an RTC-less board sits at the build-epoch floor until SNTP steps its clock by weeks,
+seconds after the first delegation binds, and a wall-clock remainder would then read as lapsed
+on every LAN until the next Renew. Only the persisted binding file uses wall-clock seconds, and
+a file obtained "in the future" (the clock went backwards: such a board after a reboot) is
+counted from now and settled by the Rebind that follows.
 
 ### Crates and drivers
 
@@ -471,9 +496,9 @@ with no prefix and `pd_hint = 56`; `lan0` on `p2` with `ipv6_index = 1`; `lan1` 
   `restart_kea6` with the second pool, within 10 s of the console's new-prefix line the LAN host
   holds an address in the new /64 and its old address is marked deprecated by the kernel; a
   ping from the old address to the ISP target is answered with destination unreachable from the
-  router; the console shows the deprecation line and the unreachable rule; after the old
-  prefix's two hours (shortened under the `harness` feature by a chaos knob to a few seconds)
-  the old /64 is gone from the host and the advertisement.
+  router; the console shows the deprecation line and the unreachable rule; once the old
+  prefix's remaining valid lifetime has run out (at most Kea's 60 s, which is the deprecation
+  deadline in the lab) the old /64 is gone from the host, the advertisement and the router.
 - `wan_ipv6_loss_deprecates_the_delegated_prefix_and_carrier_back_rebinds_it`: carrier off on
   the WAN tap; within one advertisement interval the LAN host has no IPv6 default route and its
   delegated address is deprecated while its ULA address stays preferred; carrier back; the
@@ -486,9 +511,10 @@ with no prefix and `pd_hint = 56`; `lan0` on `p2` with `ipv6_index = 1`; `lan1` 
 - `stateless_dhcpv6_hands_out_the_resolver_and_the_domain`: `udhcpc6 -l` in the LAN namespace
   receives the router's ULA address as DNS and `home.arpa` as the domain; the console shows the
   responder's line.
-- `a_rebooted_router_keeps_its_delegation`: the VM reboots with its state disk; the console
-  shows the binding restored from disk and `rebinding`, the prefix is the same, and the LAN
-  host's address never leaves the preferred state.
+- `a_rebooted_router_keeps_its_delegation`: with Kea's long-lived template variant (T1 10 s,
+  valid 600 s, so a reboot under TCG cannot outlast the binding) the VM reboots with its state
+  disk; the console shows the binding restored from disk and `rebinding`, the prefix is the
+  same, and the LAN host's address never leaves the preferred state.
 - `isp_resolvers_learned_over_dhcpv6_join_after_the_route`: with empty upstreams, `dig AAAA
   www.isp.example` over IPv6 at the router's ULA address answers, and the console shows the
   DHCPv6-learned upstream joining only once the IPv6 default route exists.
@@ -558,8 +584,6 @@ protocol in a dump.
 - How `crates/openfeo/src/ra.rs` turns obtained-plus-seconds into remainders without re-sending
   an advertisement every second: a lifetime is read at send time; a change in the fact, not in
   the clock, triggers an unscheduled advertisement.
-- The chaos knob that shortens the two-hour deprecation under the `harness` feature, after the
-  pattern of the existing `openfeo.chaos=` knobs.
 - Where the single-/64 delegation's bridge address and the console line for a short
   delegation are produced (`lan6::prefixes` is the natural place; the console needs the diff).
 - The Kea DHCPv6 template's exact knobs for the pinned 2.4.1 (CI) and the local 3.x, which the
@@ -590,10 +614,13 @@ Each with what it costs if wrong.
 7. **ULA never crosses a WAN: reject with no-route out, drop in.** Cost: none known.
 8. **A route information option for the ULA /48.** Cost: Linux hosts ignore it by default; it
    is one option and harmless.
-9. **Lifetimes as obtained-plus-seconds in facts; the RA task reads the wall clock.** Cost: a
-   clock step during a binding shifts the advertised remainder once; the next Reply corrects it.
-10. **Rebind for everything after a flap or a reboot; no Confirm, no Release, no Decline.**
-    Cost: an address kept across a move to a different link, which a router does not do.
+9. **Lifetimes in facts as moments on the process's monotonic clock plus seconds; only the
+   persisted file uses the wall clock, and a file from the future is counted from now.** Cost:
+   a binding restored on an RTC-less board may be trusted for up to its lifetime before the
+   Rebind corrects it, which the Rebind does within seconds of carrier.
+10. **Rebind for everything after a flap or a reboot, with Confirm's timing; no Confirm, no
+    Release, no Decline.** Cost: an address kept across a move to a different link, which a
+    router does not do.
 11. **The ULA is 40 random bits.** Cost: none in practice; RFC 4193's construction aims at the
     same randomness.
 12. **The IPv6 follow-ups #26, #27, #28, #29, #30, #31, #33 and #34 are fixed in this part;
@@ -602,3 +629,13 @@ Each with what it costs if wrong.
     advertisement says M = 0.
 14. **The DHCPv6 client starts on carrier without waiting for an advertisement's M or O flag.**
     Cost: a few Solicits an hour on a line that never delegates and never advertises the flags.
+15. **A deprecated prefix is advertised with its valid lifetime counting down to the lower of
+    two hours and its own remaining lifetime, and the deprecated list survives a reboot.** Cost:
+    none known; the constant SPEC §7.3 first described would have kept hosts' addresses up to
+    two hours past the router's drop.
+16. **The effective `ipv6_index` is the typed one or the LAN's position counting every LAN, and
+    any clash among LANs that carry IPv6 is refused.** Cost: an owner who pins an index that is
+    another LAN's position pins both.
+17. **With only the address bound, the prefix is asked for again in each Renew and Rebind; the
+    client keeps one exchange schedule.** Cost: a prefix that becomes available between renewals
+    is learned at the next T1 rather than within SOL_MAX_RT.
