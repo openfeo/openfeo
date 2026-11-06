@@ -1,0 +1,994 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andrew Newton
+
+//! The WAN's DHCPv6 task (SPEC §7.3): one supervised task per WAN with `[wans.ipv6]` and no
+//! typed prefix, running the `openfeo-proto-dhcp6` client core on the WAN port's DHCPv6
+//! socket, publishing what it binds as the WAN's fact, keeping the binding and the prefixes
+//! being deprecated in `/state/leases/dhcp6-<wan>.toml`, and owning the two clocks the World
+//! never sees: a prefix that left the binding is deprecated for the lower of two hours and
+//! its remaining valid lifetime, and a binding without carrier for two hours is dropped. Every
+//! line logged here is a contract with the harness scenarios.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ipnet::Ipv6Net;
+use openfeo_config::{Dhcp6Binding, Dhcp6Deprecated, Dhcp6Lease, file, rules};
+use openfeo_net::dhcp6::ClientSocket;
+use openfeo_net::ndp::{RESEND_AFTER, RESEND_TRIES, tentative_link_local};
+use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
+use openfeo_proto_dhcp4::identity::{duid_ll, from_hex, hex};
+use openfeo_proto_dhcp6::client::{Binding, Client, Config, Input, Lease6, Note, Output};
+use openfeo_proto_dhcp6::iaid;
+use openfeo_runtime::clock;
+use openfeo_runtime::supervise::TaskError;
+use openfeo_runtime::world::WorldRx;
+use openfeo_runtime::{Publisher, Supervisor};
+use openfeo_world::{Deprecated, Lifetimed, WanDhcp6Fact};
+use tokio::time::Instant;
+use tracing::{debug, info, warn};
+
+use crate::dhcp4::{
+    DUID_PATH, LEASES_DIR, load_or_create_duid, lowest_port_mac, mac_text, seed, wait_for_link,
+};
+use crate::state;
+
+/// The salt of the clock fallback of [`seed`].
+const SEED_SALT: u64 = 0x0044_4836;
+/// The DHCPv6 message buffer.
+const RECEIVE_BUFFER: usize = 1500;
+/// A prefix that left the binding is deprecated for at most this long (SPEC §7.3).
+pub const DEPRECATION_SECS: u64 = 7200;
+/// A binding whose WAN has had no carrier for this long is dropped (SPEC §7.3).
+pub const CARRIERLESS_DROP: Duration = Duration::from_secs(7200);
+const MS: u64 = 1000;
+
+/// `/state/leases/dhcp6-<wan>.toml`.
+#[must_use]
+pub fn lease_path(wan: &str) -> PathBuf {
+    Path::new(LEASES_DIR).join(format!("dhcp6-{wan}.toml"))
+}
+
+/// One task per WAN with `[wans.ipv6]` in mode `auto` and no typed prefix.
+pub fn spawn_all(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
+    let config = publisher.current().config.clone();
+    for wan in &config.wans {
+        let Some(ipv6) = &wan.ipv6 else {
+            continue;
+        };
+        if ipv6.mode == "disabled" || !ipv6.prefix.is_empty() {
+            continue;
+        }
+        let task = WanTask {
+            wan: wan.name.clone(),
+            port: openfeo_reconcile::wan_ifname(wan),
+            pd_hint: rules::pd_hint(ipv6),
+        };
+        let publisher = publisher.clone();
+        let world_rx = world_rx.clone();
+        supervisor.spawn(format!("dhcp6-{}", wan.name), move || {
+            let task = task.clone();
+            let publisher = publisher.clone();
+            let world_rx = world_rx.clone();
+            async move { run(&task, &publisher, world_rx).await }
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WanTask {
+    wan: String,
+    port: String,
+    pd_hint: u8,
+}
+
+/// The prefixes being deprecated, with their deadlines on the process clock.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Deprecations {
+    pub list: Vec<Deprecated>,
+}
+
+impl Deprecations {
+    /// Deprecate `net` until `until_ms`; a prefix already listed keeps its earlier deadline.
+    pub fn add(&mut self, net: Ipv6Net, until_ms: u64) {
+        if !self.list.iter().any(|gone| gone.net == net) {
+            self.list.push(Deprecated { net, until_ms });
+        }
+    }
+
+    /// Prefixes in `nets` came back: they are deprecated no more.
+    pub fn revive(&mut self, nets: &[Ipv6Net]) {
+        self.list.retain(|gone| !nets.contains(&gone.net));
+    }
+
+    /// Drop every entry whose deadline has passed, returning what went.
+    pub fn purge(&mut self, now_ms: u64) -> Vec<Ipv6Net> {
+        let (gone, kept): (Vec<_>, Vec<_>) = self
+            .list
+            .drain(..)
+            .partition(|entry| entry.until_ms <= now_ms);
+        self.list = kept;
+        gone.into_iter().map(|entry| entry.net).collect()
+    }
+
+    /// The earliest deadline, when any.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.list.iter().map(|entry| entry.until_ms).min()
+    }
+}
+
+/// When a prefix that left the binding stops being advertised: the lower of two hours and
+/// what was left of its valid lifetime (RFC 7084 L-13), from `now_ms`.
+#[must_use]
+pub fn deprecation_deadline(now_ms: u64, remaining_valid_ms: Option<u64>) -> u64 {
+    let window = remaining_valid_ms.map_or(DEPRECATION_SECS * MS, |left| {
+        left.min(DEPRECATION_SECS * MS)
+    });
+    now_ms.saturating_add(window)
+}
+
+/// What was left of `net`'s valid lifetime in `binding` at `now_ms`, or `None` when the
+/// binding did not hold it.
+fn remaining_valid_ms(binding: Option<&Binding>, net: Ipv6Net, now_ms: u64) -> Option<u64> {
+    let lease = binding?
+        .prefixes
+        .iter()
+        .chain(&binding?.addresses)
+        .find(|lease| lease.net == net)?;
+    if lease.valid == u32::MAX {
+        return None;
+    }
+    Some(
+        binding?
+            .bound_at
+            .saturating_add(u64::from(lease.valid) * MS)
+            .saturating_sub(now_ms),
+    )
+}
+
+/// The binding as the reconcilers see it, with the prefixes being deprecated.
+#[must_use]
+pub fn fact_from(binding: &Binding, deprecated: &[Deprecated]) -> WanDhcp6Fact {
+    let lifetimed = |lease: &Lease6| Lifetimed {
+        net: lease.net,
+        obtained_ms: binding.bound_at,
+        preferred_secs: lease.preferred,
+        valid_secs: lease.valid,
+    };
+    WanDhcp6Fact {
+        prefixes: binding.prefixes.iter().map(lifetimed).collect(),
+        addresses: binding.addresses.iter().map(lifetimed).collect(),
+        deprecated: deprecated.to_vec(),
+        dns: binding.dns.clone(),
+        search: binding.search.clone(),
+        server: binding.server.clone(),
+    }
+}
+
+/// The binding as its file keeps it: wall-clock seconds, so a reboot can judge what is left.
+#[must_use]
+pub fn binding_file(
+    wan: &str,
+    mac: [u8; 6],
+    binding: &Binding,
+    deprecated: &[Deprecated],
+    now_unix: u64,
+    now_ms: u64,
+) -> Dhcp6Lease {
+    let lease = |lease: &Lease6| Dhcp6Binding {
+        net: lease.net.to_string(),
+        preferred_secs: lease.preferred,
+        valid_secs: lease.valid,
+    };
+    let age_secs = now_ms.saturating_sub(binding.bound_at) / MS;
+    Dhcp6Lease {
+        wan: wan.to_owned(),
+        mac: mac_text(mac),
+        server_duid: hex(&binding.server),
+        prefixes: binding.prefixes.iter().map(lease).collect(),
+        addresses: binding.addresses.iter().map(lease).collect(),
+        t1_secs: binding.t1,
+        t2_secs: binding.t2,
+        dns: binding.dns.iter().map(ToString::to_string).collect(),
+        search: binding.search.clone(),
+        obtained_unix: now_unix.saturating_sub(age_secs),
+        deprecated: deprecated
+            .iter()
+            .map(|gone| Dhcp6Deprecated {
+                net: gone.net.to_string(),
+                until_unix: now_unix.saturating_add(gone.until_ms.saturating_sub(now_ms) / MS),
+            })
+            .collect(),
+    }
+}
+
+/// The binding a file holds, if it is this WAN's and this port's, parses, and has a lease whose
+/// valid lifetime has not lapsed by the wall clock; its `bound_at` is placed on the process
+/// clock so the core's timers come out right. A file obtained after `now_unix` (the clock went
+/// backwards: an RTC-less board after a reboot) is counted from now and left to the Rebind.
+/// Deprecations whose deadline is still ahead come back with it.
+#[must_use]
+pub fn binding_from_file(
+    file: &Dhcp6Lease,
+    wan: &str,
+    mac: [u8; 6],
+    now_unix: u64,
+    now_ms: u64,
+) -> Option<(Binding, Vec<Deprecated>)> {
+    if file.wan != wan || file.mac != mac_text(mac) {
+        return None;
+    }
+    let age_secs = now_unix.saturating_sub(file.obtained_unix);
+    let lease = |entry: &Dhcp6Binding| -> Option<Lease6> {
+        let net: Ipv6Net = entry.net.parse().ok()?;
+        (entry.valid_secs == u32::MAX || u64::from(entry.valid_secs) > age_secs).then_some(Lease6 {
+            net,
+            preferred: entry.preferred_secs,
+            valid: entry.valid_secs,
+        })
+    };
+    let prefixes: Vec<Lease6> = file.prefixes.iter().filter_map(lease).collect();
+    let addresses: Vec<Lease6> = file.addresses.iter().filter_map(lease).collect();
+    if prefixes.is_empty() && addresses.is_empty() {
+        return None;
+    }
+    let deprecated = file
+        .deprecated
+        .iter()
+        .filter(|gone| gone.until_unix > now_unix)
+        .filter_map(|gone| {
+            Some(Deprecated {
+                net: gone.net.parse().ok()?,
+                until_ms: now_ms.saturating_add((gone.until_unix - now_unix) * MS),
+            })
+        })
+        .collect();
+    Some((
+        Binding {
+            server: from_hex(&file.server_duid).unwrap_or_default(),
+            prefixes,
+            addresses,
+            t1: file.t1_secs,
+            t2: file.t2_secs,
+            dns: file
+                .dns
+                .iter()
+                .filter_map(|text| text.parse().ok())
+                .collect(),
+            search: file.search.clone(),
+            bound_at: now_ms.saturating_sub(age_secs * MS),
+        },
+        deprecated,
+    ))
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// The lease file's binding for this WAN and port, if any.
+fn read_binding(path: &Path, wan: &str, mac: [u8; 6]) -> Option<(Binding, Vec<Deprecated>)> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warn!("dhcp6 {wan} cannot read {}: {err}", path.display());
+            return None;
+        }
+    };
+    let file = match file::parse_dhcp6_lease(&text) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!("dhcp6 {wan} {}: {err}; ignoring it", path.display());
+            return None;
+        }
+    };
+    let restored = binding_from_file(&file, wan, mac, now_unix(), clock::uptime_ms());
+    if restored.is_none() {
+        info!(
+            "dhcp6 {wan} {}: lapsed or for another WAN or port; ignoring it",
+            path.display()
+        );
+    }
+    restored
+}
+
+async fn save_binding(
+    path: &Path,
+    wan: &str,
+    mac: [u8; 6],
+    binding: &Binding,
+    deprecated: &[Deprecated],
+) {
+    let file = binding_file(
+        wan,
+        mac,
+        binding,
+        deprecated,
+        now_unix(),
+        clock::uptime_ms(),
+    );
+    let result = match file::render_dhcp6_lease(&file) {
+        Ok(text) => state::write(path, text).await,
+        Err(err) => Err(io::Error::other(err.to_string())),
+    };
+    match result {
+        Ok(()) => debug!("dhcp6 {wan} binding saved {}", path.display()),
+        Err(err) => warn!(
+            "dhcp6 {wan} cannot save the binding to {}: {err}",
+            path.display()
+        ),
+    }
+}
+
+/// Everything the task keeps between inputs.
+struct Run<'a> {
+    task: &'a WanTask,
+    publisher: &'a Publisher,
+    socket: ClientSocket,
+    mac: [u8; 6],
+    path: PathBuf,
+    sends: Throttle,
+    binding: Option<Binding>,
+    deprecations: Deprecations,
+    /// A Solicit refused while the link-local address was tentative, to send again (#34).
+    pending: Option<(Vec<u8>, u8, Instant)>,
+    /// When carrier went, for the two-hour drop.
+    down_since: Option<Instant>,
+}
+
+/// The task: wait for the port, restore the binding from disk, run the client on the port's
+/// socket, publish what it binds, and keep the clocks.
+#[allow(clippy::too_many_lines)]
+async fn run(
+    task: &WanTask,
+    publisher: &Publisher,
+    mut world_rx: WorldRx,
+) -> Result<(), TaskError> {
+    let (ifindex, mac) = wait_for_link(&mut world_rx, &task.port).await?;
+    let lowest = lowest_port_mac(&world_rx.borrow()).unwrap_or(mac);
+    let duid = match load_or_create_duid(Path::new(DUID_PATH), lowest) {
+        Ok((duid, _)) => duid,
+        Err(err) => {
+            warn!(
+                "dhcp6 {}: cannot keep {DUID_PATH}: {err}; using an unsaved DUID",
+                task.wan
+            );
+            duid_ll(lowest)
+        }
+    };
+    let failed = |err: openfeo_net::dhcp4::DriverError| {
+        TaskError::from(format!("dhcp6 {}: {err}", task.wan))
+    };
+    let socket = ClientSocket::open(ifindex, &task.port).map_err(failed)?;
+    let path = lease_path(&task.wan);
+    let mut run = Run {
+        task,
+        publisher,
+        socket,
+        mac,
+        path,
+        sends: Throttle::new(NOISY_WINDOW),
+        binding: None,
+        deprecations: Deprecations::default(),
+        pending: None,
+        down_since: None,
+    };
+    let restored = read_binding(&run.path, &task.wan, mac);
+    if let Some((binding, deprecated)) = &restored {
+        info!("{}", restored_line(&task.wan, binding));
+        run.binding = Some(binding.clone());
+        run.deprecations.list.clone_from(deprecated);
+        run.publish();
+    }
+    let config = Config {
+        duid,
+        iaid_pd: iaid::iaid(iaid::PD, &task.wan),
+        iaid_na: iaid::iaid(iaid::NA, &task.wan),
+        pd_hint: task.pd_hint,
+    };
+    let mut client = Client::new(config.clone(), seed(SEED_SALT ^ u64::from(ifindex)));
+    let mut carrier = true;
+    let mut buf = vec![0u8; RECEIVE_BUFFER];
+    let mut outputs = client.handle(
+        Input::Start {
+            binding: restored.map(|(binding, _)| binding),
+        },
+        clock::uptime_ms(),
+    );
+    loop {
+        run.act(outputs).await;
+        let timer = client
+            .next_timeout()
+            .map(|at| Instant::from_std(clock::instant_at(at)));
+        let deprecation = run
+            .deprecations
+            .next_deadline()
+            .map(|at| Instant::from_std(clock::instant_at(at)));
+        let drop_at = run.down_since.map(|since| since + CARRIERLESS_DROP);
+        outputs = tokio::select! {
+            received = run.socket.recv(&mut buf) => {
+                let (_, len) = received.map_err(failed)?;
+                client.handle(Input::Packet(buf[..len].to_vec()), clock::uptime_ms())
+            }
+            () = wait_until(timer) => client.handle(Input::Timeout, clock::uptime_ms()),
+            () = wait_until(deprecation) => {
+                run.purge();
+                Vec::new()
+            }
+            () = wait_until(drop_at) => {
+                run.down_since = None;
+                run.drop_binding("no carrier for two hours");
+                client = Client::new(config.clone(), seed(SEED_SALT ^ u64::from(ifindex)));
+                Vec::new()
+            }
+            () = wait_until(run.pending.as_ref().map(|(_, _, at)| *at)) => {
+                run.resend();
+                Vec::new()
+            }
+            changed = world_rx.changed() => {
+                changed.map_err(|_| "world publisher gone")?;
+                let (up, index) = {
+                    let world = world_rx.borrow_and_update();
+                    let link = world.links.get(&task.port);
+                    (
+                        link.is_some_and(|link| link.up && link.carrier),
+                        link.map(|link| link.index),
+                    )
+                };
+                if let Some(index) = index
+                    && index != ifindex
+                {
+                    return Err(format!(
+                        "dhcp6 {}: {} changed index {ifindex} -> {index}; restarting",
+                        task.wan, task.port
+                    )
+                    .into());
+                }
+                if up == carrier {
+                    Vec::new()
+                } else {
+                    carrier = up;
+                    run.down_since = (!up).then(Instant::now);
+                    client.handle(if up { Input::LinkUp } else { Input::LinkDown }, clock::uptime_ms())
+                }
+            }
+        };
+    }
+}
+
+/// Sleep until `at`, or forever when there is no timer.
+async fn wait_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+impl Run<'_> {
+    /// Do what the core asked: send, bind, deprecate, tell the console.
+    async fn act(&mut self, outputs: Vec<Output>) {
+        for output in outputs {
+            match output {
+                Output::Send(bytes) => self.send(bytes),
+                Output::Bound { binding, renewed } => self.bound(binding, renewed).await,
+                Output::Gone(nets) => self.gone(&nets),
+                Output::Note(note) => {
+                    if let Some(line) = note_line(&self.task.wan, &note) {
+                        info!("{line}");
+                    } else {
+                        debug!("dhcp6 {}: {note:?}", self.task.wan);
+                    }
+                }
+            }
+        }
+    }
+
+    fn send(&mut self, bytes: Vec<u8>) {
+        if let Err(err) = self.socket.send(&bytes) {
+            if tentative_link_local(&err) {
+                debug!("dhcp6 {}: send: {err}; again in a second", self.task.wan);
+                self.pending = Some((bytes, RESEND_TRIES, Instant::now() + RESEND_AFTER));
+                return;
+            }
+            let line = format!("dhcp6 {}: send: {err}", self.task.wan);
+            if let Some(line) = self.sends.line(Instant::now(), &line) {
+                warn!("{line}");
+            } else {
+                debug!("{line}");
+            }
+        }
+    }
+
+    /// The Solicit refused a second ago, again (#34).
+    fn resend(&mut self) {
+        let Some((bytes, tries_left, _)) = self.pending.take() else {
+            return;
+        };
+        match self.socket.send(&bytes) {
+            Ok(()) => {}
+            Err(err) if tentative_link_local(&err) && tries_left > 1 => {
+                self.pending = Some((bytes, tries_left - 1, Instant::now() + RESEND_AFTER));
+            }
+            Err(err) => warn!("dhcp6 {}: send: {err}", self.task.wan),
+        }
+    }
+
+    async fn bound(&mut self, binding: Binding, renewed: bool) {
+        let nets: Vec<Ipv6Net> = binding.nets().collect();
+        self.deprecations.revive(&nets);
+        let same = self
+            .binding
+            .as_ref()
+            .is_some_and(|old| old.nets().collect::<Vec<_>>() == nets);
+        if renewed && same {
+            info!("dhcp6 {} renewed", self.task.wan);
+        } else {
+            info!("{}", bound_line(&self.task.wan, &binding));
+            info!("{}", resolvers_line(&self.task.wan, &binding));
+        }
+        save_binding(
+            &self.path,
+            &self.task.wan,
+            self.mac,
+            &binding,
+            &self.deprecations.list,
+        )
+        .await;
+        self.binding = Some(binding);
+        self.publish();
+    }
+
+    fn gone(&mut self, nets: &[Ipv6Net]) {
+        let now_ms = clock::uptime_ms();
+        for net in nets {
+            if net.prefix_len() == 128 {
+                info!("dhcp6 {} address {} gone", self.task.wan, net.addr());
+                continue;
+            }
+            let left = remaining_valid_ms(self.binding.as_ref(), *net, now_ms);
+            let until = deprecation_deadline(now_ms, left);
+            info!(
+                "{}",
+                gone_line(&self.task.wan, *net, until.saturating_sub(now_ms) / MS)
+            );
+            self.deprecations.add(*net, until);
+        }
+        if let Some(binding) = self.binding.as_mut() {
+            binding.prefixes.retain(|lease| !nets.contains(&lease.net));
+            binding.addresses.retain(|lease| !nets.contains(&lease.net));
+        }
+        self.publish();
+    }
+
+    /// Deprecations whose deadline passed are dropped.
+    fn purge(&mut self) {
+        for net in self.deprecations.purge(clock::uptime_ms()) {
+            info!("dhcp6 {} prefix {net} dropped", self.task.wan);
+        }
+        self.publish();
+    }
+
+    /// The binding is gone for `why`: everything it held goes through deprecation.
+    fn drop_binding(&mut self, why: &str) {
+        info!("dhcp6 {} binding dropped: {why}", self.task.wan);
+        if let Some(binding) = self.binding.take() {
+            let nets: Vec<Ipv6Net> = binding.nets().collect();
+            self.binding = Some(binding);
+            self.gone(&nets);
+            self.binding = None;
+        }
+        if let Err(err) = fs::remove_file(&self.path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            warn!(
+                "dhcp6 {} cannot remove {}: {err}",
+                self.task.wan,
+                self.path.display()
+            );
+        }
+        self.publish();
+    }
+
+    /// The World's view: the binding with the deprecations, or just the deprecations.
+    fn publish(&self) {
+        let fact = self.binding.as_ref().map_or_else(
+            || WanDhcp6Fact {
+                deprecated: self.deprecations.list.clone(),
+                ..WanDhcp6Fact::default()
+            },
+            |binding| fact_from(binding, &self.deprecations.list),
+        );
+        let wan = self.task.wan.clone();
+        self.publisher.update(|world| {
+            let facts = Arc::make_mut(&mut world.dhcp6);
+            if fact == WanDhcp6Fact::default() {
+                facts.remove(&wan);
+            } else {
+                facts.insert(wan.clone(), fact);
+            }
+        });
+    }
+}
+
+fn lease_text(lease: &Lease6) -> String {
+    format!(
+        "{} (preferred {} s, valid {} s)",
+        lease.net,
+        lifetime_text(lease.preferred),
+        lifetime_text(lease.valid)
+    )
+}
+
+fn lifetime_text(secs: u32) -> String {
+    if secs == u32::MAX {
+        "infinite".to_owned()
+    } else {
+        secs.to_string()
+    }
+}
+
+fn prefixes_text(binding: &Binding) -> String {
+    if binding.prefixes.is_empty() {
+        "prefix none".to_owned()
+    } else {
+        format!(
+            "prefix {}",
+            binding
+                .prefixes
+                .iter()
+                .map(lease_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn addresses_text(binding: &Binding) -> String {
+    if binding.addresses.is_empty() {
+        "address none".to_owned()
+    } else {
+        format!(
+            "address {}",
+            binding
+                .addresses
+                .iter()
+                .map(|lease| lease.net.addr().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// `dhcp6 wan0 bound prefix 2001:db8:100::/56 (preferred 40 s, valid 60 s) address
+/// 2001:db8:ffff::1a4 t1=10s t2=16s from 000300010...`.
+fn bound_line(wan: &str, binding: &Binding) -> String {
+    format!(
+        "dhcp6 {wan} bound {} {} t1={}s t2={}s from {}",
+        prefixes_text(binding),
+        addresses_text(binding),
+        lifetime_text(binding.t1),
+        lifetime_text(binding.t2),
+        hex(&binding.server)
+    )
+}
+
+/// `dhcp6 wan0 resolvers 2001:db8:ffff::1 search isp.example` (`none` for an empty list).
+fn resolvers_line(wan: &str, binding: &Binding) -> String {
+    let list = |items: Vec<String>| {
+        if items.is_empty() {
+            "none".to_owned()
+        } else {
+            items.join(",")
+        }
+    };
+    format!(
+        "dhcp6 {wan} resolvers {} search {}",
+        list(binding.dns.iter().map(ToString::to_string).collect()),
+        list(binding.search.clone())
+    )
+}
+
+/// `dhcp6 wan0 binding restored from disk: prefix … address …`.
+fn restored_line(wan: &str, binding: &Binding) -> String {
+    format!(
+        "dhcp6 {wan} binding restored from disk: {} {}",
+        prefixes_text(binding),
+        addresses_text(binding)
+    )
+}
+
+/// `dhcp6 wan0 prefix 2001:db8:100::/56 gone: deprecated for 55 s`.
+fn gone_line(wan: &str, net: Ipv6Net, secs: u64) -> String {
+    format!("dhcp6 {wan} prefix {net} gone: deprecated for {secs} s")
+}
+
+/// The console line for a note, when it deserves one.
+fn note_line(wan: &str, note: &Note) -> Option<String> {
+    Some(match note {
+        Note::Soliciting => format!("dhcp6 {wan} soliciting"),
+        Note::Requesting => format!("dhcp6 {wan} requesting"),
+        Note::Renewing | Note::Ignored(_) => return None,
+        Note::Rebinding => format!("dhcp6 {wan} rebinding"),
+        Note::NoPrefixAvailable => format!("dhcp6 {wan} no prefix available"),
+        Note::NoAddressAvailable => format!("dhcp6 {wan} no address available"),
+        Note::Restarting(why) => format!("dhcp6 {wan} restarting: {why}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAC: [u8; 6] = [0x52, 0x54, 0, 0xfe, 0, 0];
+    const SERVER: [u8; 10] = [0, 3, 0, 1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+
+    fn net(text: &str) -> Ipv6Net {
+        text.parse().unwrap()
+    }
+
+    fn binding(bound_at: u64) -> Binding {
+        Binding {
+            server: SERVER.to_vec(),
+            prefixes: vec![Lease6 {
+                net: net("2001:db8:100::/56"),
+                preferred: 40,
+                valid: 60,
+            }],
+            addresses: vec![Lease6 {
+                net: net("2001:db8:ffff::1a4/128"),
+                preferred: 40,
+                valid: 60,
+            }],
+            t1: 10,
+            t2: 16,
+            dns: vec!["2001:db8:ffff::1".parse().unwrap()],
+            search: vec!["isp.example".to_owned()],
+            bound_at,
+        }
+    }
+
+    fn deprecated(until_ms: u64) -> Deprecated {
+        Deprecated {
+            net: net("2001:db8:200::/56"),
+            until_ms,
+        }
+    }
+
+    #[test]
+    fn fact_from_carries_lifetimes_relative_to_obtained() {
+        let fact = fact_from(&binding(10_000), &[deprecated(70_000)]);
+        assert_eq!(
+            fact.prefixes,
+            vec![Lifetimed {
+                net: net("2001:db8:100::/56"),
+                obtained_ms: 10_000,
+                preferred_secs: 40,
+                valid_secs: 60,
+            }]
+        );
+        assert_eq!(fact.addresses[0].net, net("2001:db8:ffff::1a4/128"));
+        assert_eq!(fact.deprecated, vec![deprecated(70_000)]);
+        assert_eq!(
+            fact.dns,
+            vec!["2001:db8:ffff::1".parse::<std::net::Ipv6Addr>().unwrap()]
+        );
+        assert_eq!(fact.search, vec!["isp.example".to_owned()]);
+        assert_eq!(fact.server, SERVER.to_vec());
+    }
+
+    #[test]
+    fn binding_file_round_trips_with_its_deprecated_list() {
+        // Bound 5 s ago on the process clock, at wall-clock second 1_800_000_000.
+        let file = binding_file(
+            "wan0",
+            MAC,
+            &binding(10_000),
+            &[deprecated(70_000)],
+            1_800_000_000,
+            15_000,
+        );
+        assert_eq!(file.wan, "wan0");
+        assert_eq!(file.mac, "52:54:00:fe:00:00");
+        assert_eq!(file.server_duid, "00030001aabbccddeeff");
+        assert_eq!(file.obtained_unix, 1_799_999_995);
+        assert_eq!(file.prefixes[0].net, "2001:db8:100::/56");
+        assert_eq!(
+            (file.prefixes[0].preferred_secs, file.prefixes[0].valid_secs),
+            (40, 60)
+        );
+        assert_eq!(file.addresses[0].net, "2001:db8:ffff::1a4/128");
+        assert_eq!((file.t1_secs, file.t2_secs), (10, 16));
+        assert_eq!(file.deprecated[0].net, "2001:db8:200::/56");
+        assert_eq!(
+            file.deprecated[0].until_unix, 1_800_000_055,
+            "55 s ahead on both clocks"
+        );
+        let text = file::render_dhcp6_lease(&file).unwrap();
+        let parsed = file::parse_dhcp6_lease(&text).unwrap();
+        assert_eq!(parsed, file);
+        // Read back 20 s later: the leases keep their lifetimes, placed 25 s back on the new
+        // process clock, and the deprecation keeps its deadline.
+        let (restored, deprecated) =
+            binding_from_file(&parsed, "wan0", MAC, 1_800_000_020, 100_000).expect("restored");
+        assert_eq!(restored.prefixes, binding(0).prefixes);
+        assert_eq!(restored.addresses, binding(0).addresses);
+        assert_eq!(restored.bound_at, 75_000);
+        assert_eq!((restored.t1, restored.t2), (10, 16));
+        assert_eq!(restored.server, SERVER.to_vec());
+        assert_eq!(restored.dns, binding(0).dns);
+        assert_eq!(
+            deprecated,
+            vec![Deprecated {
+                net: net("2001:db8:200::/56"),
+                until_ms: 135_000
+            }]
+        );
+    }
+
+    #[test]
+    fn a_lapsed_or_foreign_binding_is_ignored() {
+        let file = binding_file("wan0", MAC, &binding(10_000), &[], 1_800_000_000, 15_000);
+        assert!(
+            binding_from_file(&file, "wan1", MAC, 1_800_000_001, 1).is_none(),
+            "another WAN"
+        );
+        assert!(
+            binding_from_file(&file, "wan0", [1; 6], 1_800_000_001, 1).is_none(),
+            "another port"
+        );
+        assert!(
+            binding_from_file(&file, "wan0", MAC, 1_800_000_100, 1).is_none(),
+            "valid 60 s, obtained 105 s ago: lapsed"
+        );
+        let (kept, deprecated) = binding_from_file(&file, "wan0", MAC, 1_800_000_050, 1).unwrap();
+        assert_eq!(kept.prefixes.len(), 1, "55 s old, 60 s valid: still there");
+        assert_eq!(deprecated, vec![]);
+        let mut old_deprecation = file.clone();
+        old_deprecation.deprecated.push(Dhcp6Deprecated {
+            net: "2001:db8:200::/56".to_owned(),
+            until_unix: 1_800_000_010,
+        });
+        let (_, deprecated) =
+            binding_from_file(&old_deprecation, "wan0", MAC, 1_800_000_020, 1).unwrap();
+        assert_eq!(
+            deprecated,
+            vec![],
+            "a deadline already passed is not restored"
+        );
+    }
+
+    #[test]
+    fn a_future_binding_is_counted_from_now() {
+        // Written at wall-clock 1_800_000_000; read on a board whose clock sits at its floor.
+        let file = binding_file("wan0", MAC, &binding(10_000), &[], 1_800_000_000, 10_000);
+        let (restored, _) =
+            binding_from_file(&file, "wan0", MAC, 1_700_000_000, 50_000).expect("restored");
+        assert_eq!(restored.bound_at, 50_000, "counted from now");
+        assert_eq!(restored.prefixes[0].valid, 60);
+    }
+
+    #[test]
+    fn a_gone_prefix_is_deprecated_for_the_lower_of_two_hours_and_its_remaining_valid_lifetime() {
+        let bound = binding(10_000);
+        // At 15 s, 55 s of the 60 s valid lifetime remain.
+        let left = remaining_valid_ms(Some(&bound), net("2001:db8:100::/56"), 15_000);
+        assert_eq!(left, Some(55_000));
+        assert_eq!(deprecation_deadline(15_000, left), 70_000);
+        assert_eq!(
+            deprecation_deadline(15_000, Some(10 * 3600 * MS)),
+            15_000 + DEPRECATION_SECS * MS,
+            "a long lease is capped at two hours"
+        );
+        assert_eq!(
+            deprecation_deadline(15_000, None),
+            15_000 + DEPRECATION_SECS * MS
+        );
+        assert_eq!(
+            remaining_valid_ms(Some(&bound), net("2001:db8:9::/56"), 15_000),
+            None,
+            "a prefix the binding never held"
+        );
+        assert_eq!(
+            remaining_valid_ms(Some(&bound), net("2001:db8:100::/56"), 90_000),
+            Some(0),
+            "already lapsed"
+        );
+    }
+
+    #[test]
+    fn carrier_loss_keeps_the_deprecated_list() {
+        let mut state = Deprecations::default();
+        state.add(net("2001:db8:200::/56"), 70_000);
+        state.add(net("2001:db8:300::/56"), 90_000);
+        state.add(net("2001:db8:200::/56"), 99_000);
+        assert_eq!(
+            state.list.len(),
+            2,
+            "a prefix is listed once, with its first deadline"
+        );
+        assert_eq!(state.next_deadline(), Some(70_000));
+        // Carrier comes and goes: nothing here reads the carrier, so the list stands.
+        assert_eq!(state.purge(69_999), vec![]);
+        assert_eq!(state.list.len(), 2);
+        assert_eq!(state.purge(70_000), vec![net("2001:db8:200::/56")]);
+        assert_eq!(state.next_deadline(), Some(90_000));
+        state.revive(&[net("2001:db8:300::/56")]);
+        assert_eq!(
+            state.list,
+            vec![],
+            "a prefix that came back is deprecated no more"
+        );
+        assert_eq!(state.next_deadline(), None);
+    }
+
+    #[test]
+    fn lines_follow_the_contract() {
+        let bound = binding(10_000);
+        assert_eq!(
+            bound_line("wan0", &bound),
+            "dhcp6 wan0 bound prefix 2001:db8:100::/56 (preferred 40 s, valid 60 s) address 2001:db8:ffff::1a4 t1=10s t2=16s from 00030001aabbccddeeff"
+        );
+        assert_eq!(
+            resolvers_line("wan0", &bound),
+            "dhcp6 wan0 resolvers 2001:db8:ffff::1 search isp.example"
+        );
+        assert_eq!(
+            restored_line("wan0", &bound),
+            "dhcp6 wan0 binding restored from disk: prefix 2001:db8:100::/56 (preferred 40 s, valid 60 s) address 2001:db8:ffff::1a4"
+        );
+        let mut bare = bound.clone();
+        bare.prefixes.clear();
+        bare.addresses.clear();
+        bare.dns.clear();
+        bare.search.clear();
+        assert_eq!(
+            bound_line("wan0", &bare),
+            "dhcp6 wan0 bound prefix none address none t1=10s t2=16s from 00030001aabbccddeeff"
+        );
+        assert_eq!(
+            resolvers_line("wan0", &bare),
+            "dhcp6 wan0 resolvers none search none"
+        );
+        assert_eq!(
+            gone_line("wan0", net("2001:db8:100::/56"), 55),
+            "dhcp6 wan0 prefix 2001:db8:100::/56 gone: deprecated for 55 s"
+        );
+        assert_eq!(
+            note_line("wan0", &Note::Soliciting),
+            Some("dhcp6 wan0 soliciting".to_owned())
+        );
+        assert_eq!(
+            note_line("wan0", &Note::Requesting),
+            Some("dhcp6 wan0 requesting".to_owned())
+        );
+        assert_eq!(
+            note_line("wan0", &Note::Rebinding),
+            Some("dhcp6 wan0 rebinding".to_owned())
+        );
+        assert_eq!(
+            note_line("wan0", &Note::NoPrefixAvailable),
+            Some("dhcp6 wan0 no prefix available".to_owned())
+        );
+        assert_eq!(
+            note_line("wan0", &Note::NoAddressAvailable),
+            Some("dhcp6 wan0 no address available".to_owned())
+        );
+        assert_eq!(
+            note_line("wan0", &Note::Restarting("the binding expired")),
+            Some("dhcp6 wan0 restarting: the binding expired".to_owned())
+        );
+        assert_eq!(note_line("wan0", &Note::Ignored("x")), None);
+        assert_eq!(note_line("wan0", &Note::Renewing), None);
+        assert_eq!(
+            lease_path("wan0").to_str(),
+            Some("/state/leases/dhcp6-wan0.toml")
+        );
+    }
+}

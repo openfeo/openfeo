@@ -10,6 +10,7 @@ mod chaos;
 mod cli;
 mod dhcp4;
 mod dhcp4_server;
+mod dhcp6;
 mod dns;
 mod heartbeat;
 mod identity;

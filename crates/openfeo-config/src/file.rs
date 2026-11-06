@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::ConfigError;
-use crate::{Config, Dhcp4Lease, PortMap};
+use crate::{Config, Dhcp4Lease, Dhcp6Lease, PortMap};
 
 /// Parse a `config.toml` text into a [`Config`]. Syntax, unknown keys and wrong types are
 /// errors; `config_version` and semantics are checked by `load`, not here.
@@ -66,6 +66,24 @@ pub fn parse_dhcp4_lease(text: &str) -> Result<Dhcp4Lease, ConfigError> {
 ///
 /// As [`render`].
 pub fn render_dhcp4_lease(lease: &Dhcp4Lease) -> Result<String, ConfigError> {
+    to_toml(lease)
+}
+
+/// Parse `/state/leases/dhcp6-<wan>.toml`.
+///
+/// # Errors
+///
+/// As [`parse`].
+pub fn parse_dhcp6_lease(text: &str) -> Result<Dhcp6Lease, ConfigError> {
+    from_table(table(text)?)
+}
+
+/// Render `/state/leases/dhcp6-<wan>.toml`.
+///
+/// # Errors
+///
+/// As [`render`].
+pub fn render_dhcp6_lease(lease: &Dhcp6Lease) -> Result<String, ConfigError> {
     to_toml(lease)
 }
 
