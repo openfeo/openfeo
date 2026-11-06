@@ -148,6 +148,19 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             None
         }
     };
+    // The ULA /48 (SPEC §5.2, §7.3): every LAN takes a /64 from it once a WAN carries IPv6.
+    let ula = match crate::identity::load_or_create_ula(std::path::Path::new(
+        crate::identity::ULA_PATH,
+    )) {
+        Ok((ula, created)) => {
+            info!("{}", crate::identity::ula_line(ula, created));
+            Some(ula)
+        }
+        Err(err) => {
+            warn!("identity: ula: {err}; no unique local addresses this boot");
+            None
+        }
+    };
 
     let (publisher, world_rx) = Publisher::new(World::new(config, portmap));
     let publisher = Arc::new(publisher);
@@ -155,6 +168,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         let cache = cache_rx.borrow();
         world.links = Arc::new(link_facts(&cache));
         world.routes = Arc::new(default_routes(&cache));
+        world.ula = ula;
     });
 
     {

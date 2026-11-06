@@ -12,6 +12,7 @@ mod dhcp4;
 mod dhcp4_server;
 mod dns;
 mod heartbeat;
+mod identity;
 mod ipv6;
 mod ra;
 mod router;
