@@ -455,14 +455,15 @@ fn ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_re
         config.wans[0].ipv6 = None;
         let ops = routing_pass(&mut rig, &config).await?;
         ensure!(
-            ops == 3,
-            "dropping [wans.ipv6] removed {ops} things, not three"
+            ops == 5,
+            "dropping [wans.ipv6] removed {ops} things, not five"
         );
         wait_until(&mut rig.rx, "no IPv6 of ours left", |c| {
             !c.routes
                 .iter()
                 .any(|r| r.v6 && r.protocol == RTPROT_OPENFEO)
                 && !c.addrs.iter().any(|a| a.net == lo6)
+                && !c.rules.iter().any(|r| r.protocol == RTPROT_OPENFEO)
         })
         .await?;
         anyhow::Ok(())

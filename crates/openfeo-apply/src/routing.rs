@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-//! The routing applier: addresses on managed interfaces and routes with `RTPROT_OPENFEO`. Adds
-//! what is missing; deletes IPv4 global-scope addresses on managed interfaces, IPv6 global-scope
-//! addresses on the interfaces whose IPv6 the router owns (`DesiredRouting::ipv6_owned`), and
-//! protocol-200 routes that are no longer desired; touches nothing else (IPv6 on any other
-//! interface, which stays the kernel's; link-local addresses; connected routes; anything on
-//! other interfaces; routes with other protocols). A pass is best-effort: a refused operation
-//! or a missing interface is reported at the end, after everything else was attempted.
+//! The routing applier: addresses on managed interfaces, routes and policy rules with
+//! `RTPROT_OPENFEO`. Adds what is missing; deletes IPv4 global-scope addresses on managed
+//! interfaces, IPv6 global-scope addresses on the interfaces whose IPv6 the router owns
+//! (`DesiredRouting::ipv6_owned`), and protocol-200 routes and rules that are no longer
+//! desired; touches nothing else (IPv6 on any other interface, which stays the kernel's;
+//! link-local addresses; connected routes; anything on other interfaces; routes and rules
+//! with other protocols). A pass is best-effort: a refused operation or a missing interface is
+//! reported at the end, after everything else was attempted.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use ipnet::IpNet;
 use openfeo_netlink::{
-    Cache, Error as NetlinkError, Netlink, RTPROT_OPENFEO, Route, RouteKind, SCOPE_UNIVERSE,
+    Cache, Error as NetlinkError, Netlink, RTPROT_OPENFEO, Route, RouteKind, Rule, RuleAction,
+    SCOPE_UNIVERSE, describe_rule,
 };
-use openfeo_reconcile::routing::{DesiredRoute, DesiredRouting, RouteKind as DesiredKind};
+use openfeo_reconcile::routing::{
+    DesiredRoute, DesiredRouting, DesiredRuleAction, RouteKind as DesiredKind,
+};
 
 use crate::{ApplyError, Pass, Report, is_managed, resolve};
 
@@ -121,6 +125,7 @@ impl RoutingApplier {
                 kind: match desired_route.kind {
                     DesiredKind::Unicast => RouteKind::Unicast,
                     DesiredKind::Blackhole => RouteKind::Blackhole,
+                    DesiredKind::Unreachable => RouteKind::Unreachable,
                 },
                 pref_src: desired_route.pref_src,
             };
@@ -143,7 +148,39 @@ impl RoutingApplier {
             pass.op(&op, nl.route_del(route).await, NetlinkError::is_absent);
         }
 
+        rules(&mut pass, desired, observed, nl).await;
         pass.finish()
+    }
+}
+
+/// Policy rules (SPEC §7.4): add the desired ones that are missing, delete the protocol-200
+/// ones that are not desired; the kernel's own rules are never touched.
+async fn rules(pass: &mut Pass, desired: &DesiredRouting, observed: &Cache, nl: &Netlink) {
+    let mut wanted: BTreeSet<Rule> = BTreeSet::new();
+    for desired_rule in &desired.rules {
+        let rule = Rule {
+            v6: desired_rule.v6,
+            priority: desired_rule.priority,
+            src: desired_rule.src,
+            action: match desired_rule.action {
+                DesiredRuleAction::ToTable(table) => RuleAction::ToTable(table),
+                DesiredRuleAction::Unreachable => RuleAction::Unreachable,
+            },
+            suppress_prefixlen: desired_rule.suppress_prefixlen,
+            protocol: RTPROT_OPENFEO,
+        };
+        wanted.insert(rule.clone());
+        if !observed.rules.contains(&rule) {
+            let op = format!("add {}", describe_rule(&rule));
+            pass.op(&op, nl.rule_add(&rule).await, NetlinkError::is_exist);
+        }
+    }
+    for rule in &observed.rules {
+        if rule.protocol != RTPROT_OPENFEO || wanted.contains(rule) {
+            continue;
+        }
+        let op = format!("del {}", describe_rule(rule));
+        pass.op(&op, nl.rule_del(rule).await, NetlinkError::is_absent);
     }
 }
 
@@ -153,6 +190,7 @@ fn describe(route: &Route, ifname: &str) -> String {
     let mut text = match route.kind {
         RouteKind::Unicast => String::new(),
         RouteKind::Blackhole => "blackhole ".to_owned(),
+        RouteKind::Unreachable => "unreachable ".to_owned(),
     };
     text.push_str(
         &route

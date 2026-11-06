@@ -1,6 +1,5 @@
 ---
 source: crates/openfeo-reconcile/src/routing.rs
-assertion_line: 357
 expression: desired
 ---
 addrs:
@@ -35,5 +34,6 @@ routes:
     priority: 10
     kind: Unicast
     pref_src: ~
+rules: []
 ipv6_owned:
   - lo
