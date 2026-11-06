@@ -155,6 +155,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
     crate::dns::spawn(&supervisor, &publisher, &world_rx);
     crate::ra::spawn(&supervisor, &publisher, &world_rx);
+    crate::dhcp6_server::spawn(&supervisor, &publisher, &world_rx);
     crate::time::spawn(&supervisor, &publisher, &world_rx);
     {
         let health = health.clone();
