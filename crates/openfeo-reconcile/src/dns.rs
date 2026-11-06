@@ -17,6 +17,7 @@ use openfeo_world::World;
 use serde::Serialize;
 
 use crate::bridge_name;
+use crate::lan6::{self, Lan6, State};
 
 /// One LAN the forwarder listens on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -24,8 +25,10 @@ pub struct DesiredListener {
     /// `br-<lan>`.
     pub ifname: String,
     pub address: Ipv4Addr,
-    /// The LAN's IPv6 address, when it has one: a second listener on the same bridge.
-    pub address6: Option<Ipv6Addr>,
+    /// The router's IPv6 addresses in the LAN, in `lan6`'s order (routed, delegated, ULA),
+    /// never a deprecated prefix's: when any, a second listener on the same bridge, and the
+    /// LAN's AAAA records.
+    pub address6: Vec<Ipv6Addr>,
 }
 
 /// A name the forwarder answers itself.
@@ -89,6 +92,7 @@ pub fn desired(world: &World) -> DesiredDns {
     let dns = world.config.dns.clone().unwrap_or_default();
 
     let blocks = crate::public::blocks(&world.config);
+    let lan6 = lan6::prefixes(world);
     let mut listeners = Vec::new();
     let mut lan_subnets = Vec::new();
     let mut guard_subnets = Vec::new();
@@ -100,7 +104,14 @@ pub fn desired(world: &World) -> DesiredDns {
         listeners.push(DesiredListener {
             ifname: bridge_name(&lan.name),
             address: net.addr(),
-            address6: lan.ipv6.parse::<Ipv6Net>().ok().map(|net| net.addr()),
+            address6: lan6
+                .prefixes
+                .iter()
+                .filter(|prefix| {
+                    prefix.lan == lan.name && !matches!(prefix.state, State::Deprecated { .. })
+                })
+                .map(|prefix| prefix.router)
+                .collect(),
         });
         let public = crate::public::lan_is_public(lan, &blocks);
         if !public || lan.dhcp.is_some() {
@@ -132,7 +143,7 @@ pub fn desired(world: &World) -> DesiredDns {
     }
     let mut learned_from = None;
     let mut wan_upstreams = Vec::new();
-    let router_addrs = router_addrs(&listeners, world);
+    let router_addrs = router_addrs(&listeners, world, &lan6);
     let mut wan_addrs: Vec<IpAddr> = Vec::new();
     if let Some(active) = active_wan(world) {
         if dns.use_wan_dns.unwrap_or(true) {
@@ -243,15 +254,29 @@ fn wan_dns(world: &World, wan: &Wan) -> Vec<IpAddr> {
             .filter_map(|text| text.parse().ok())
             .collect(),
     };
-    // A learned resolver joins once the kernel has the IPv6 default route (ADR-0019) and the
-    // router has a global source to ask from: the routed prefix's loopback address, or an
-    // address from a prefix the ISP advertised.
+    // A learned resolver (RDNSS, or the DHCPv6 binding's) joins once the kernel has the IPv6
+    // default route (ADR-0019) and the router has a global source to ask from: the routed
+    // prefix's loopback address, an address from a prefix the ISP advertised, or a delegation
+    // (its loopback address) or an address the ISP bound.
     if let Some(ipv6) = wan.ipv6.as_ref().filter(|ipv6| ipv6.mode != "disabled")
         && world.has_default(true, &ifname)
-        && let Some(fact) = world.ipv6.get(&wan.name)
-        && (!ipv6.prefix.is_empty() || !fact.addresses.is_empty())
     {
-        servers.extend(fact.dns.iter().copied().map(IpAddr::V6));
+        let fact = world.ipv6.get(&wan.name);
+        let fact6 = world.dhcp6.get(&wan.name);
+        let source = !ipv6.prefix.is_empty()
+            || fact.is_some_and(|fact| !fact.addresses.is_empty())
+            || fact6.is_some_and(|fact| !fact.prefixes.is_empty() || !fact.addresses.is_empty());
+        if source {
+            for fact_dns in fact
+                .map(|fact| &fact.dns)
+                .into_iter()
+                .chain(fact6.map(|fact| &fact.dns))
+            {
+                for server in fact_dns {
+                    push_unique(&mut servers, IpAddr::V6(*server));
+                }
+            }
+        }
     }
     servers
 }
@@ -277,6 +302,13 @@ fn wan_addresses(world: &World, wan: &Wan) -> Vec<IpAddr> {
     };
     if let Some(fact) = world.ipv6.get(&wan.name) {
         addrs.extend(fact.addresses.iter().map(|net| IpAddr::V6(net.addr())));
+    }
+    if let Some(fact) = world.dhcp6.get(&wan.name) {
+        addrs.extend(
+            fact.addresses
+                .iter()
+                .map(|lease| IpAddr::V6(lease.net.addr())),
+        );
     }
     addrs
 }
@@ -321,8 +353,9 @@ fn push_records(
     }
 }
 
-/// The router's own addresses: every LAN's, both families, and the IPv6 loopback address.
-fn router_addrs(listeners: &[DesiredListener], world: &World) -> Vec<IpAddr> {
+/// The router's own addresses: every LAN's, both families, and its loopback addresses (the
+/// routed prefix's, each delegation's, the ULA's).
+fn router_addrs(listeners: &[DesiredListener], world: &World, lan6: &Lan6) -> Vec<IpAddr> {
     let mut addrs: Vec<IpAddr> = listeners
         .iter()
         .map(|listener| IpAddr::V4(listener.address))
@@ -330,9 +363,12 @@ fn router_addrs(listeners: &[DesiredListener], world: &World) -> Vec<IpAddr> {
     addrs.extend(
         listeners
             .iter()
-            .filter_map(|listener| listener.address6.map(IpAddr::V6)),
+            .flat_map(|listener| listener.address6.iter().copied().map(IpAddr::V6)),
     );
     addrs.extend(loopback6(world).map(IpAddr::V6));
+    for addr in &lan6.loopback {
+        push_unique(&mut addrs, IpAddr::V6(*addr));
+    }
     addrs
 }
 
@@ -462,7 +498,10 @@ mod tests {
         assert!(d.router_addrs.contains(&ip("192.168.1.1")));
         assert_eq!(
             d.listeners[0].address6,
-            Some("2001:db8:1:222::1".parse().unwrap())
+            vec![
+                "2001:db8:1:222::1".parse::<Ipv6Addr>().unwrap(),
+                "fd12:3456:789a:1::1".parse().unwrap(),
+            ]
         );
         let config = forwarder_config(&d);
         assert_eq!(config.local.len(), 2);
@@ -475,6 +514,109 @@ mod tests {
     }
 
     #[test]
+    fn dhcp6_resolvers_join_behind_the_ipv6_route() {
+        let v6 = ip("2001:db8:ffff::1");
+        // Only the DHCPv6 binding names the resolver: the advertisements carry none.
+        let mut world = fixtures::pd_world();
+        let mut ra = fixtures::ipv6_fact();
+        ra.dns.clear();
+        world.ipv6 =
+            std::sync::Arc::new(std::collections::BTreeMap::from([("wan0".to_owned(), ra)]));
+        let d = desired(&world);
+        assert!(
+            d.wan_upstreams.contains(&v6) && d.upstreams.contains(&v6),
+            "the DHCPv6 resolver joins: {d:?}"
+        );
+        assert_eq!(d.learned_from.as_deref(), Some("wan0"));
+        world.routes = std::sync::Arc::new(std::collections::BTreeSet::new());
+        let d = desired(&world);
+        assert!(
+            !d.wan_upstreams.contains(&v6),
+            "no IPv6 default in the kernel yet: {d:?}"
+        );
+    }
+
+    #[test]
+    fn the_router_answers_aaaa_for_delegated_and_ula_addresses_and_not_deprecated_ones() {
+        let d = desired(&fixtures::pd_world());
+        for addr in [
+            "2001:db8:100:1::1",
+            "fd12:3456:789a:1::1",
+            "2001:db8:100:2::1",
+            "fd12:3456:789a:2::1",
+            "2001:db8:100::1",
+            "fd12:3456:789a::1",
+        ] {
+            assert!(
+                d.router_addrs.contains(&ip(addr)),
+                "{addr} in {:?}",
+                d.router_addrs
+            );
+        }
+        let v6: Vec<IpAddr> = d
+            .router_addrs
+            .iter()
+            .copied()
+            .filter(IpAddr::is_ipv6)
+            .collect();
+        assert_eq!(
+            v6[0],
+            ip("2001:db8:100:1::1"),
+            "a LAN's global address before its ULA one"
+        );
+        assert_eq!(v6[1], ip("fd12:3456:789a:1::1"));
+        let mut world = fixtures::pd_world();
+        let mut fact = fixtures::dhcp6_fact();
+        fact.deprecated.push(openfeo_world::Deprecated {
+            net: "2001:db8:200::/56".parse().unwrap(),
+            until_ms: 70_000,
+        });
+        world.dhcp6 = std::sync::Arc::new(std::collections::BTreeMap::from([(
+            "wan0".to_owned(),
+            fact,
+        )]));
+        let d = desired(&world);
+        assert!(
+            !d.router_addrs.contains(&ip("2001:db8:200:1::1")),
+            "a deprecated prefix's address is no answer: {:?}",
+            d.router_addrs
+        );
+        assert!(
+            d.wan_addrs.contains(&ip("2001:db8:ffff::1a4")),
+            "the IA_NA address is the WAN's: {:?}",
+            d.wan_addrs
+        );
+    }
+
+    #[test]
+    fn every_lan_address_is_a_listener() {
+        let d = desired(&fixtures::pd_world());
+        assert_eq!(
+            d.listeners[0].address6,
+            vec![
+                "2001:db8:100:1::1".parse::<Ipv6Addr>().unwrap(),
+                "fd12:3456:789a:1::1".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            d.listeners[1].address6,
+            vec![
+                "2001:db8:100:2::1".parse::<Ipv6Addr>().unwrap(),
+                "fd12:3456:789a:2::1".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            desired(&fixtures::static_world()).listeners[0].address6,
+            Vec::<Ipv6Addr>::new()
+        );
+    }
+
+    #[test]
+    fn pd_world_dns_snapshot() {
+        insta::assert_yaml_snapshot!(desired(&fixtures::pd_world()));
+    }
+
+    #[test]
     fn static_world_lists_the_lan_the_static_wan_dns_and_the_local_names() {
         let d = desired(&fixtures::static_world());
         insta::assert_yaml_snapshot!(d);
@@ -483,7 +625,7 @@ mod tests {
             vec![DesiredListener {
                 ifname: "br-lan0".into(),
                 address: Ipv4Addr::new(192, 168, 1, 1),
-                address6: None,
+                address6: vec![],
             }]
         );
         assert_eq!(

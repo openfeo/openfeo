@@ -64,7 +64,7 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
             ifname: listener.ifname.clone(),
             v6: false,
         });
-        if listener.address6.is_some() {
+        if !listener.address6.is_empty() {
             sockets.push(Listener {
                 ifname: listener.ifname.clone(),
                 v6: true,

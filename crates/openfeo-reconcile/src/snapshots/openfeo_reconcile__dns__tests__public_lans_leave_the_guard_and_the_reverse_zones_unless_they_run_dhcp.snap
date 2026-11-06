@@ -1,15 +1,14 @@
 ---
 source: crates/openfeo-reconcile/src/dns.rs
-assertion_line: 606
 expression: d
 ---
 listeners:
   - ifname: br-lan0
     address: 192.168.1.1
-    address6: ~
+    address6: []
   - ifname: br-dmz
     address: 192.0.2.233
-    address6: ~
+    address6: []
 upstreams:
   - 203.0.113.1
 learned_from: wan0
