@@ -129,4 +129,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "dhcp6_client"
+path = "fuzz_targets/dhcp6_client.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

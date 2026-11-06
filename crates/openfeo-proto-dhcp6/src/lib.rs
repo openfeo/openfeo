@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
+pub mod iaid;
 pub mod wire;
 
 /// Milliseconds on the driver's monotonic clock, as the other cores count time.
