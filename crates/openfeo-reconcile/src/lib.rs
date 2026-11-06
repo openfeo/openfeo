@@ -9,6 +9,7 @@
 
 pub mod dhcp;
 pub mod dns;
+pub mod lan6;
 pub mod links;
 pub mod nft;
 pub mod public;

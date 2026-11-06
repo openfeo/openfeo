@@ -1,0 +1,48 @@
+---
+source: crates/openfeo-reconcile/src/lan6.rs
+expression: "prefixes(&fixtures::pd_world())"
+---
+prefixes:
+  - lan: lan0
+    ifname: br-lan0
+    net: "2001:db8:100:1::/64"
+    router: "2001:db8:100:1::1"
+    source:
+      Delegated:
+        wan: wan0
+        parent: "2001:db8:100::/56"
+    state:
+      Live:
+        obtained_ms: 10000
+        preferred_secs: 40
+        valid_secs: 60
+  - lan: lan0
+    ifname: br-lan0
+    net: "fd12:3456:789a:1::/64"
+    router: "fd12:3456:789a:1::1"
+    source: Ula
+    state: Static
+  - lan: lan1
+    ifname: br-lan1
+    net: "2001:db8:100:2::/64"
+    router: "2001:db8:100:2::1"
+    source:
+      Delegated:
+        wan: wan0
+        parent: "2001:db8:100::/56"
+    state:
+      Live:
+        obtained_ms: 10000
+        preferred_secs: 40
+        valid_secs: 60
+  - lan: lan1
+    ifname: br-lan1
+    net: "fd12:3456:789a:2::/64"
+    router: "fd12:3456:789a:2::1"
+    source: Ula
+    state: Static
+loopback:
+  - "2001:db8:100::1"
+  - "fd12:3456:789a::1"
+pref_src: "2001:db8:100::1"
+left_out: []

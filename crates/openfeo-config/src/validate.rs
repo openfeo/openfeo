@@ -2895,6 +2895,7 @@ mod ipv6_tests {
     use crate::{PortMap, PortMapEntry};
 
     const VM_IPV6: &str = include_str!("../../../harness/fixtures/vm-ipv6.toml");
+    const VM_PD: &str = include_str!("../../../harness/fixtures/vm-pd.toml");
 
     fn live4() -> PortMap {
         PortMap {
@@ -2941,6 +2942,14 @@ mod ipv6_tests {
             .into_iter()
             .map(|v| (v.path, v.code))
             .collect()
+    }
+
+    #[test]
+    fn the_pd_fixture_validates() {
+        let cfg = crate::file::parse(VM_PD).expect("fixture parses");
+        assert_eq!(validate(&cfg, &live4()), vec![]);
+        assert_eq!(rules::pd_hint(cfg.wans[0].ipv6.as_ref().unwrap()), 56);
+        assert_eq!((cfg.lans[0].ipv6_index, cfg.lans[1].ipv6_index), (1, 2));
     }
 
     #[test]
