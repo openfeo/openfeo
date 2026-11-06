@@ -20,6 +20,7 @@ openfeo-proto-sntp = { path = "../crates/openfeo-proto-sntp" }
 # The oracle for the differential DNS target (ADR-0015); a fuzz dependency only, never shipped.
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 openfeo-proto-ndp = { path = "../crates/openfeo-proto-ndp" }
+openfeo-proto-dhcp6 = { path = "../crates/openfeo-proto-dhcp6" }
 # The oracle for the differential NDP target (ADR-0018); a fuzz dependency only, never shipped.
 smoltcp = { version = "0.14", default-features = false, features = ["proto-ipv6", "medium-ethernet", "socket-udp"] }
 
@@ -110,6 +111,20 @@ bench = false
 [[bin]]
 name = "ndp_server"
 path = "fuzz_targets/ndp_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dhcp6_message"
+path = "fuzz_targets/dhcp6_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dhcp6_differential"
+path = "fuzz_targets/dhcp6_differential.rs"
 test = false
 doc = false
 bench = false
