@@ -12,18 +12,25 @@ use std::net::Ipv6Addr;
 
 use libfuzzer_sys::fuzz_target;
 use openfeo_proto_ndp::server::{
-    Config, Input, MAX_RTR_ADV_INTERVAL, MIN_DELAY_BETWEEN_RAS, Output, Server,
+    Config, Input, Lifetime, MAX_RTR_ADV_INTERVAL, MIN_DELAY_BETWEEN_RAS, Output, PIO_PREFERRED,
+    PIO_VALID, Pio, Server,
 };
 
 fuzz_target!(|data: &[u8]| {
     let mut server = Server::new(
         Config {
-            prefix: "2001:db8:1:222::/64".parse().expect("a prefix"),
+            prefixes: vec![Pio {
+                prefix: "2001:db8:1:222::/64".parse().expect("a prefix"),
+                valid: Lifetime::Fixed(PIO_VALID),
+                preferred: Lifetime::Fixed(PIO_PREFERRED),
+            }],
             mac: [0x52, 0x54, 0, 0xfe, 0, 2],
-            router: "2001:db8:1:222::1".parse().expect("an address"),
+            rdnss: vec!["2001:db8:1:222::1".parse().expect("an address")],
             mtu: Some(1500),
             domain: "home.arpa".to_owned(),
             router_lifetime: 1800,
+            other: true,
+            routes: Vec::new(),
         },
         u64::from(data.first().copied().unwrap_or(1)),
     );
