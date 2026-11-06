@@ -401,7 +401,8 @@ fn decode_option(code: u16, body: &[u8], depth: u8) -> Result<Dhcp6Option, Error
         }
         OPT_STATUS_CODE if body.len() >= 2 => Dhcp6Option::StatusCode {
             code: StatusCode::from(u16::from_be_bytes([body[0], body[1]])),
-            message: String::from_utf8_lossy(&body[2..]).into_owned(),
+            // RFC 8415 §21.13: UTF-8 text; anything else is not a status option.
+            message: String::from_utf8(body[2..].to_vec()).map_err(|_| bad())?,
         },
         OPT_RAPID_COMMIT if body.is_empty() => Dhcp6Option::RapidCommit,
         OPT_DNS_SERVERS if body.len().is_multiple_of(16) => {
@@ -518,17 +519,24 @@ fn decode_names(mut bytes: &[u8]) -> Option<Vec<String>> {
             let label = bytes.get(..len)?;
             bytes = &bytes[len..];
             consumed += len;
-            if consumed > MAX_NAME {
+            if consumed > MAX_NAME || !label.iter().all(|byte| is_hostname_byte(*byte)) {
                 return None;
             }
             if !name.is_empty() {
                 name.push('.');
             }
-            name.push_str(&String::from_utf8_lossy(label));
+            name.push_str(str::from_utf8(label).ok()?);
         }
         names.push(name);
     }
     Some(names)
+}
+
+/// A byte a search-list label may carry: a letter, a digit, a hyphen or an underscore. Names
+/// on the wire are ASCII (an internationalised name travels as punycode), and a label holding a
+/// dot or a control character would not survive the trip through dotted text.
+fn is_hostname_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
 }
 
 fn encode_names(names: &[String], out: &mut Vec<u8>) {
@@ -883,6 +891,32 @@ mod tests {
         assert_eq!(
             Message::decode(&[7, 0, 0, 1, 0, 24, 0, 2, 5, b'a']),
             Err(Error::BadOption { code: 24 })
+        );
+    }
+
+    #[test]
+    fn a_status_message_must_be_utf8_and_a_label_must_be_hostname_bytes() {
+        // Status 0x3f01 with a message that is not UTF-8: what the differential fuzzer found
+        // dhcproto refusing while a lossy decode accepted it.
+        assert_eq!(
+            Message::decode(&[0, 0x26, 0, 0, 0, 13, 0, 4, 0x3f, 0x01, 0x87, 0x00]),
+            Err(Error::BadOption { code: 13 })
+        );
+        // A label with a dot inside would split differently on the way back.
+        assert_eq!(
+            Message::decode(&[7, 0, 0, 1, 0, 24, 0, 5, 3, b'a', b'.', b'b', 0]),
+            Err(Error::BadOption { code: 24 })
+        );
+        assert_eq!(
+            Message::decode(&[7, 0, 0, 1, 0, 24, 0, 5, 3, b'a', 0, b'b', 0]),
+            Err(Error::BadOption { code: 24 })
+        );
+        let message =
+            Message::decode(&[7, 0, 0, 1, 0, 24, 0, 7, 5, b'a', b'-', b'b', b'_', b'1', 0])
+                .unwrap();
+        assert_eq!(
+            message.options[0],
+            Dhcp6Option::DomainList(vec!["a-b_1".to_owned()])
         );
     }
 

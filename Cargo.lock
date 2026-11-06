@@ -1110,6 +1110,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfeo-proto-dhcp6"
+version = "0.1.0"
+dependencies = [
+ "dhcproto",
+ "ipnet",
+ "openfeo-proto-ndp",
+ "thiserror",
+]
+
+[[package]]
 name = "openfeo-proto-dns"
 version = "0.1.0"
 dependencies = [
