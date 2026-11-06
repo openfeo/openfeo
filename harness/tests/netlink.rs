@@ -1083,6 +1083,7 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
             reaches: Vec::new(),
             ipv6: String::new(),
             ra: None,
+            ipv6_index: 0,
         });
         let mut rig = Rig::connect().await?;
         let cache = rig.rx.borrow_and_update().clone();

@@ -73,6 +73,7 @@ impl Config {
                 reaches: Vec::new(),
                 ipv6: String::new(),
                 ra: None,
+                ipv6_index: 0,
             }],
             firewall: None,
             dns: None,

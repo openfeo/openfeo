@@ -101,15 +101,24 @@ pub enum Code {
     Ipv6WanTwice,
     /// A `[wans.ipv6] mode` other than `auto` or `disabled`.
     InvalidIpv6Mode,
-    /// `mode = "disabled"` beside a prefix or a LAN `ipv6`, which would then describe nothing.
+    /// `mode = "disabled"` beside a prefix, a gateway, a `pd_hint` or a LAN `ipv6`, which would
+    /// then describe nothing.
     Ipv6Disabled,
+    /// A `[wans.ipv6] pd_hint` outside 48 to 64.
+    InvalidPdHint,
+    /// A LAN `ipv6_index` above 65535.
+    InvalidIpv6Index,
+    /// Two LANs with the same `ipv6_index`.
+    Ipv6IndexTwice,
+    /// `ra` or `ipv6_index` beside `ipv6 = "none"`, which carries no IPv6 to advertise or number.
+    Ipv6None,
     /// A LAN `ipv6` outside the routed prefix.
     LanPrefixOutsideRouted,
     /// A LAN `ipv6` in the routed prefix's first /64, the router's own.
     LanPrefixReserved,
     /// A LAN `ipv6` with no routed prefix to lie in.
     LanPrefixWithoutRouted,
-    /// `ra` on a LAN without `ipv6`.
+    /// `ra` on a LAN that carries no IPv6: no routed /64 and no WAN with `[wans.ipv6]`.
     RaWithoutIpv6,
     /// Two `[[dns.records]]` with the same name and address family.
     DuplicateRecord,
@@ -222,6 +231,10 @@ impl Code {
             Code::Ipv6WanTwice => "ipv6_wan_twice",
             Code::InvalidIpv6Mode => "invalid_ipv6_mode",
             Code::Ipv6Disabled => "ipv6_disabled",
+            Code::InvalidPdHint => "invalid_pd_hint",
+            Code::InvalidIpv6Index => "invalid_ipv6_index",
+            Code::Ipv6IndexTwice => "ipv6_index_twice",
+            Code::Ipv6None => "ipv6_none",
             Code::LanPrefixOutsideRouted => "lan_prefix_outside_routed",
             Code::LanPrefixReserved => "lan_prefix_reserved",
             Code::LanPrefixWithoutRouted => "lan_prefix_without_routed",
@@ -268,7 +281,17 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
     let mut owners = PortOwners::default();
     let mut pools = Pools::default();
     let mut ipv6_wans = false;
-    let lans_have_ipv6 = config.lans.iter().any(|lan| !lan.ipv6.is_empty());
+    let lans_have_ipv6 = config
+        .lans
+        .iter()
+        .any(|lan| !lan.ipv6.is_empty() && !rules::lan_is_ipv4_only(lan));
+    // Once a WAN carries `[wans.ipv6]` every LAN takes a ULA /64 (SPEC §7.3), so `ra` means
+    // something on any LAN that is not IPv4-only.
+    pools.router_has_ipv6 = config.wans.iter().any(|wan| {
+        wan.ipv6
+            .as_ref()
+            .is_some_and(|ipv6| ipv6.mode != "disabled")
+    });
 
     if let Some(system_config) = &config.system {
         system(&mut report, system_config);
@@ -365,6 +388,12 @@ struct Pools<'c> {
     lan_prefixes6: Vec<(String, Ipv6Net)>,
     /// Every LAN's IPv6 router address, for the upstream check.
     lan_addrs6: Vec<Ipv6Addr>,
+    /// Every effective `ipv6_index` (typed, or the LAN's position) with its path and whether it
+    /// was typed, for the uniqueness check.
+    indexes6: Vec<(String, u32, bool)>,
+    /// Whether a WAN carries `[wans.ipv6]` in mode auto: then every LAN that is not IPv4-only
+    /// carries at least the ULA /64 (SPEC §7.3).
+    router_has_ipv6: bool,
     /// Every reservation hostname, lowercase, for the record check.
     hostnames: BTreeSet<String>,
 }
@@ -467,12 +496,32 @@ fn lans<'c>(
         }
         reaches(report, &path, lan, &lan_names);
         let net6 = lan_ipv6(report, &path, lan, pools);
-        if lan.ra.is_some() && lan.ipv6.is_empty() {
-            report.push(
-                format!("{path}.ra"),
-                Code::RaWithoutIpv6,
-                "ra applies to a LAN with ipv6; set the LAN's /64 or drop ra".to_owned(),
-            );
+        if rules::lan_is_ipv4_only(lan) {
+            if lan.ra.is_some() {
+                report.push(
+                    format!("{path}.ra"),
+                    Code::Ipv6None,
+                    "ipv6 = \"none\" leaves nothing to advertise; drop ra".to_owned(),
+                );
+            }
+            if lan.ipv6_index != 0 {
+                report.push(
+                    format!("{path}.ipv6_index"),
+                    Code::Ipv6None,
+                    "ipv6 = \"none\" takes no /64 from any prefix; drop ipv6_index".to_owned(),
+                );
+            }
+        } else {
+            if lan.ra.is_some() && lan.ipv6.is_empty() && !pools.router_has_ipv6 {
+                report.push(
+                    format!("{path}.ra"),
+                    Code::RaWithoutIpv6,
+                    "ra applies to a LAN that carries IPv6; set the LAN's /64, give a WAN \
+                     [wans.ipv6], or drop ra"
+                        .to_owned(),
+                );
+            }
+            lan_ipv6_index(report, &path, lan, pools, i + 1);
         }
         for reservation in lan.dhcp.iter().flat_map(|dhcp| &dhcp.r#static) {
             if !reservation.hostname.is_empty() {
@@ -680,6 +729,12 @@ fn rule_target(report: &mut Report, path: &str, from: &str, to: &str, lans: &[La
         lans.iter()
             .find(|lan| lan.net.is_some_and(|net| target.within(net.trunc())))
     } else if let Some(target) = rules::parse_target6(to) {
+        // A ULA target is placed on its LAN at run time, by the LAN's ULA /64 (SPEC §7.5):
+        // the ULA is generated on the box, so validation cannot know which LAN that is.
+        let (first, last) = target.bounds();
+        if rules::is_ula(Ipv6Net::from(first)) && rules::is_ula(Ipv6Net::from(last)) {
+            return;
+        }
         lans.iter()
             .find(|lan| lan.net6.is_some_and(|net| target.within(net.trunc())))
     } else {
@@ -804,18 +859,104 @@ fn ipv6_wan(
     }
     if !ipv6.gateway.is_empty() {
         report.addr6(&format!("{path}.gateway"), &ipv6.gateway);
+        if ipv6.mode == "disabled" {
+            report.push(
+                format!("{path}.gateway"),
+                Code::Ipv6Disabled,
+                "\"disabled\" installs no IPv6 default, so a gateway would describe nothing; set \
+                 mode = \"auto\" or drop it"
+                    .to_owned(),
+            );
+        }
+    }
+    if ipv6.pd_hint != 0 {
+        if !(48..=64).contains(&ipv6.pd_hint) {
+            report.push(
+                format!("{path}.pd_hint"),
+                Code::InvalidPdHint,
+                format!(
+                    "{} is not a delegation length an ISP hands out; use 48 to 64 (56 when absent)",
+                    ipv6.pd_hint
+                ),
+            );
+        }
+        if ipv6.mode == "disabled" {
+            report.push(
+                format!("{path}.pd_hint"),
+                Code::Ipv6Disabled,
+                "\"disabled\" runs no DHCPv6 client, so a pd_hint would describe nothing; set \
+                 mode = \"auto\" or drop it"
+                    .to_owned(),
+            );
+        }
     }
 }
 
+/// A LAN's `ipv6_index` (SPEC §7.3): typed 1 to 65535 (0 is absent), or the LAN's 1-based
+/// `position` counting every LAN; the effective index is no other LAN's, a clash being flagged
+/// on the later LAN in configuration order.
+fn lan_ipv6_index(
+    report: &mut Report,
+    path: &str,
+    lan: &crate::Lan,
+    pools: &mut Pools<'_>,
+    position: usize,
+) {
+    let path = format!("{path}.ipv6_index");
+    let typed = lan.ipv6_index != 0;
+    if lan.ipv6_index > 0xffff {
+        report.push(
+            path,
+            Code::InvalidIpv6Index,
+            format!(
+                "{} is above 65535, the most a ULA /48 can number; use 1 to 65535",
+                lan.ipv6_index
+            ),
+        );
+        return;
+    }
+    let index = if typed {
+        lan.ipv6_index
+    } else {
+        u32::try_from(position).unwrap_or(u32::MAX)
+    };
+    if let Some((other_path, _, other_typed)) =
+        pools.indexes6.iter().find(|(_, other, _)| *other == index)
+    {
+        let other = if *other_typed {
+            format!("{other_path}'s")
+        } else {
+            format!(
+                "{}'s by position; pin that LAN's ipv6_index or choose another",
+                other_path.trim_end_matches(".ipv6_index")
+            )
+        };
+        report.push(
+            path,
+            Code::Ipv6IndexTwice,
+            if typed {
+                format!("index {index} is already {other}")
+            } else {
+                format!(
+                    "this LAN's index by position, {index}, is already {other}; pin its \
+                     ipv6_index"
+                )
+            },
+        );
+        return;
+    }
+    pools.indexes6.push((path, index, typed));
+}
+
 /// A LAN's `ipv6` (SPEC §7.3): a host address with a /64 prefix, inside the routed prefix, not
-/// its first /64, and no other LAN's. Returns the /64 that passed.
+/// its first /64, and no other LAN's; or empty; or the word `none`. Returns the /64 that passed.
 fn lan_ipv6(
     report: &mut Report,
     path: &str,
     lan: &crate::Lan,
     pools: &mut Pools<'_>,
 ) -> Option<Ipv6Net> {
-    if lan.ipv6.is_empty() {
+    if lan.ipv6.is_empty() || rules::lan_is_ipv4_only(lan) {
         return None;
     }
     let path = format!("{path}.ipv6");
@@ -1739,6 +1880,7 @@ mod tests {
             reaches: Vec::new(),
             ipv6: String::new(),
             ra: None,
+            ipv6_index: 0,
         }
     }
 
@@ -2775,7 +2917,12 @@ mod ipv6_tests {
     /// A static IPv4 WAN with `[wans.ipv6]` holding `wan_ipv6`, lan0 on p2 with the `lan0`
     /// lines (its `ipv6` among them) and a `nas` reservation, then `tail`.
     fn config(wan_ipv6: &str, lan0: &str, tail: &str) -> Config {
-        crate::file::parse(&format!(
+        crate::file::parse(&config_text(wan_ipv6, lan0, tail)).expect("test config parses")
+    }
+
+    /// The TOML behind [`config`], for a test that expects the parser itself to refuse it.
+    fn config_text(wan_ipv6: &str, lan0: &str, tail: &str) -> String {
+        format!(
             "config_version = 1\n[system]\nhostname = \"openfeo\"\ndomain = \"home.arpa\"\n\
              [[wans]]\nname = \"wan0\"\nport = \"p0\"\n[wans.static]\naddress = \"203.0.113.10/24\"\n\
              gateway = \"203.0.113.1\"\n{wan_ipv6}\n\
@@ -2783,8 +2930,7 @@ mod ipv6_tests {
              [lans.dhcp]\nrange = [\"192.168.1.100\", \"192.168.1.200\"]\n\
              [[lans.dhcp.static]]\nmac = \"52:54:00:fe:10:10\"\nip = \"192.168.1.10\"\nhostname = \"nas\"\n\
              {tail}\n"
-        ))
-        .expect("test config parses")
+        )
     }
 
     const ROUTED: &str = "[wans.ipv6]\nprefix = \"2001:db8:1::/48\"\n";
@@ -2934,12 +3080,23 @@ mod ipv6_tests {
     }
 
     #[test]
-    fn ra_without_ipv6_is_refused() {
-        let cfg = config(ROUTED, "ra = false\n", "");
+    fn ra_without_any_ipv6_is_refused_and_allowed_once_a_wan_has_ipv6() {
+        // No WAN carries IPv6: nothing to advertise, so `ra` describes nothing.
+        let cfg = config("", "ra = false\n", "");
         assert_eq!(
             found(&cfg),
             vec![("lans[0].ra".to_owned(), Code::RaWithoutIpv6)]
         );
+        // A disabled WAN is no WAN with IPv6 either.
+        let cfg = config("[wans.ipv6]\nmode = \"disabled\"\n", "ra = false\n", "");
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[0].ra".to_owned(), Code::RaWithoutIpv6)]
+        );
+        // Once a WAN has IPv6 every LAN carries at least the ULA /64 (SPEC §7.3), so `ra`
+        // applies with or without a routed /64.
+        assert_eq!(found(&config(ROUTED, "ra = false\n", "")), vec![]);
+        assert_eq!(found(&config("[wans.ipv6]\n", "ra = false\n", "")), vec![]);
         assert_eq!(
             found(&config(
                 ROUTED,
@@ -2947,6 +3104,144 @@ mod ipv6_tests {
                 ""
             )),
             vec![]
+        );
+    }
+
+    #[test]
+    fn pd_hint_outside_48_to_64_is_refused() {
+        for bad in ["47", "65", "0x1"] {
+            let Ok(cfg) = crate::file::parse(&config_text(
+                &format!("[wans.ipv6]\npd_hint = {bad}\n"),
+                "",
+                "",
+            )) else {
+                continue; // `0x1` is not TOML's integer; the parser refuses it first
+            };
+            assert_eq!(
+                found(&cfg),
+                vec![("wans[0].ipv6.pd_hint".to_owned(), Code::InvalidPdHint)],
+                "pd_hint = {bad}"
+            );
+        }
+        for good in ["48", "56", "64"] {
+            let cfg = config(&format!("[wans.ipv6]\npd_hint = {good}\n"), "", "");
+            assert_eq!(found(&cfg), vec![], "pd_hint = {good}");
+        }
+    }
+
+    #[test]
+    fn ipv6_index_above_65535_is_refused_and_zero_is_absent() {
+        let cfg = config("[wans.ipv6]\n", "ipv6_index = 65536\n", "");
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[0].ipv6_index".to_owned(), Code::InvalidIpv6Index)]
+        );
+        assert_eq!(
+            found(&config("[wans.ipv6]\n", "ipv6_index = 0\n", "")),
+            vec![]
+        );
+        assert_eq!(
+            found(&config("[wans.ipv6]\n", "ipv6_index = 65535\n", "")),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn two_lans_with_one_ipv6_index_are_refused() {
+        let cfg = config(
+            "[wans.ipv6]\n",
+            "ipv6_index = 3\n",
+            "[[lans]]\nname = \"lan1\"\nports = [\"p3\"]\nipv4 = \"192.168.2.1/24\"\nipv6_index = 3\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[1].ipv6_index".to_owned(), Code::Ipv6IndexTwice)]
+        );
+        // An unpinned LAN's index is its position (lan0 is 1): a later LAN pinned to it clashes,
+        // and so does a later unpinned LAN whose position an earlier pin took.
+        let cfg = config(
+            "[wans.ipv6]\n",
+            "",
+            "[[lans]]\nname = \"lan1\"\nports = [\"p3\"]\nipv4 = \"192.168.2.1/24\"\nipv6_index = 1\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[1].ipv6_index".to_owned(), Code::Ipv6IndexTwice)]
+        );
+        let cfg = config(
+            "[wans.ipv6]\n",
+            "ipv6_index = 2\n",
+            "[[lans]]\nname = \"lan1\"\nports = [\"p3\"]\nipv4 = \"192.168.2.1/24\"\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("lans[1].ipv6_index".to_owned(), Code::Ipv6IndexTwice)]
+        );
+        // An IPv4-only LAN takes no index, so it clashes with nobody.
+        let cfg = config(
+            "[wans.ipv6]\n",
+            "ipv6_index = 3\n",
+            "[[lans]]\nname = \"lan1\"\nports = [\"p3\"]\nipv4 = \"192.168.2.1/24\"\nipv6 = \"none\"\n",
+        );
+        assert_eq!(found(&cfg), vec![]);
+    }
+
+    #[test]
+    fn ipv6_none_refuses_ra_and_an_index() {
+        let cfg = config(
+            "[wans.ipv6]\n",
+            "ipv6 = \"none\"\nra = true\nipv6_index = 2\n",
+            "",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![
+                ("lans[0].ra".to_owned(), Code::Ipv6None),
+                ("lans[0].ipv6_index".to_owned(), Code::Ipv6None),
+            ]
+        );
+        assert_eq!(
+            found(&config("[wans.ipv6]\n", "ipv6 = \"none\"\n", "")),
+            vec![]
+        );
+        // `none` is fine without any IPv6 WAN too: it says the same thing the absence says.
+        assert_eq!(found(&config("", "ipv6 = \"none\"\n", "")), vec![]);
+    }
+
+    #[test]
+    fn disabled_mode_refuses_a_gateway_and_a_pd_hint() {
+        let cfg = config(
+            "[wans.ipv6]\nmode = \"disabled\"\ngateway = \"fe80::1\"\npd_hint = 56\n",
+            "",
+            "",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![
+                ("wans[0].ipv6.gateway".to_owned(), Code::Ipv6Disabled),
+                ("wans[0].ipv6.pd_hint".to_owned(), Code::Ipv6Disabled),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rule_may_target_a_ula_address() {
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[firewall.rules]]\nname = \"ula\"\nfrom = \"wan\"\nto = \"fd12:3456:789a:1::10\"\n\
+             proto = \"tcp\"\nports = [\"80\"]\n",
+        );
+        assert_eq!(found(&cfg), vec![]);
+        let cfg = config(
+            ROUTED,
+            LAN0_V6,
+            "[[firewall.rules]]\nname = \"far\"\nfrom = \"wan\"\nto = \"2001:db8:9::10\"\n\
+             proto = \"tcp\"\nports = [\"80\"]\n",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("firewall.rules[0].to".to_owned(), Code::InvalidRuleTarget)]
         );
     }
 

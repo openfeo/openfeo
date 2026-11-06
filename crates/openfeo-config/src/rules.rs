@@ -93,6 +93,34 @@ pub fn is_global_unicast_v6(net: Ipv6Net) -> bool {
     global.contains(&net.network()) && global.contains(&net.broadcast())
 }
 
+/// Whether `net` lies entirely in unique local address space, `fc00::/7` (RFC 4193).
+#[must_use]
+pub fn is_ula(net: Ipv6Net) -> bool {
+    let ula = Ipv6Net::new_assert(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7);
+    ula.contains(&net.network()) && ula.contains(&net.broadcast())
+}
+
+/// The word under a LAN's `ipv6` that keeps it IPv4-only (SPEC §7.3).
+pub const IPV6_NONE: &str = "none";
+
+/// Whether the LAN carries no IPv6 at all: `ipv6 = "none"`.
+#[must_use]
+pub fn lan_is_ipv4_only(lan: &crate::Lan) -> bool {
+    lan.ipv6 == IPV6_NONE
+}
+
+/// The delegation length asked for: 48 to 64, or 56 when absent (SPEC §7.3).
+pub const PD_HINT_DEFAULT: u8 = 56;
+
+/// `[wans.ipv6].pd_hint` with its default; validation keeps it in 48..=64.
+#[must_use]
+pub fn pd_hint(ipv6: &crate::Ipv6Wan) -> u8 {
+    u8::try_from(ipv6.pd_hint)
+        .ok()
+        .filter(|hint| (48..=64).contains(hint))
+        .unwrap_or(PD_HINT_DEFAULT)
+}
+
 /// `a`, `a-b` (with `a <= b`) or `a/n`; `None` for anything else.
 #[must_use]
 pub fn parse_target(text: &str) -> Option<Target> {
