@@ -64,14 +64,29 @@ impl LinksApplier {
     }
 }
 
-/// `addr_gen_mode = 2` (stable-privacy) and the secret, as the kernel wants it, on one port.
-/// The kernel generates the link-local address when the port comes up, in the mode set then.
+/// The knobs an IPv6 WAN port gets before it comes up (SPEC §7.3): the kernel's own
+/// autoconfiguration off, so no advertisement in the window before the sysctl pass can give the
+/// port an address or a route behind the client's back (#31), and stable-privacy addressing,
+/// since the kernel generates the link-local address when the port comes up, in the mode set
+/// then. The secret itself is written beside these.
+fn pre_up_writes(port: &str) -> Vec<(String, &'static str)> {
+    vec![
+        (format!("net/ipv6/conf/{port}/accept_ra"), "0"),
+        (format!("net/ipv6/conf/{port}/autoconf"), "0"),
+        (format!("net/ipv6/conf/{port}/addr_gen_mode"), "2"),
+    ]
+}
+
+/// The secret, then every write of [`pre_up_writes`], on one port.
 fn stable_privacy(port: &str, secret: [u8; 16]) -> std::io::Result<()> {
     sysctl::write(
         &format!("net/ipv6/conf/{port}/stable_secret"),
         &Ipv6Addr::from(secret).to_string(),
     )?;
-    sysctl::write(&format!("net/ipv6/conf/{port}/addr_gen_mode"), "2")
+    for (path, value) in pre_up_writes(port) {
+        sysctl::write(&path, value)?;
+    }
+    Ok(())
 }
 
 /// Whether the port already generates stable-privacy addresses.
@@ -284,5 +299,24 @@ async fn up_down(
                 |_| false,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wan_with_ipv6_gets_accept_ra_and_autoconf_off_before_up() {
+        let writes = pre_up_writes("p0");
+        assert_eq!(
+            writes,
+            vec![
+                ("net/ipv6/conf/p0/accept_ra".to_owned(), "0"),
+                ("net/ipv6/conf/p0/autoconf".to_owned(), "0"),
+                ("net/ipv6/conf/p0/addr_gen_mode".to_owned(), "2"),
+            ],
+            "the kernel's own autoconfiguration is off before the port can see an advertisement (#31)"
+        );
     }
 }
