@@ -24,6 +24,7 @@ use crate::qemu::VERBOSE_ENV;
 /// 203.0.113.1) because Kea 2.4.1 (Ubuntu 24.04, CI) has no definition for
 /// `classless-static-route` and Kea 3.x refuses a user definition of it; the bytes work on both.
 const KEA_DHCP4_TEMPLATE: &str = include_str!("../fixtures/kea-dhcp4.json.tmpl");
+const KEA_DHCP6_TEMPLATE: &str = include_str!("../fixtures/kea-dhcp6.json.tmpl");
 /// Time a daemon gets to leave after SIGTERM before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
@@ -104,6 +105,73 @@ pub fn kea_dhcp4(ns: &NetNs, iface: &str, run_dir: &Path) -> Result<Daemon> {
         .env("KEA_LOCKFILE_DIR", run_dir)
         .env("KEA_PIDFILE_DIR", run_dir);
     Daemon::spawn("kea-dhcp4", cmd)
+}
+
+/// What the lab's Kea DHCPv6 server hands out on one ISP interface (SPEC §11): an address from
+/// the link's pool, and a /56 from `pd_pool` when there is one, with the lifetimes a scenario
+/// can watch (T1 10 s, T2 16 s, preferred 40 s, valid 60 s), or ten times longer except T1 and
+/// T2 when `long_lived`, for a scenario that reboots the router inside a binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kea6Config {
+    /// The interface in the ISP namespace.
+    pub iface: String,
+    /// The delegation pool, cut into /56s; `None` serves addresses only.
+    pub pd_pool: Option<ipnet::Ipv6Net>,
+    pub long_lived: bool,
+}
+
+impl Kea6Config {
+    /// The usual server on ISP A's `wan0`, delegating from `pool` when given.
+    #[must_use]
+    pub fn isp(pool: Option<ipnet::Ipv6Net>) -> Self {
+        Kea6Config {
+            iface: "wan0".to_owned(),
+            pd_pool: pool,
+            long_lived: false,
+        }
+    }
+}
+
+/// The Kea DHCPv6 config for `config`.
+#[must_use]
+pub fn render_kea_dhcp6(config: &Kea6Config) -> String {
+    let pd_pools = config.pd_pool.map_or_else(String::new, |pool| {
+        format!(
+            "{{ \"prefix\": \"{}\", \"prefix-len\": {}, \"delegated-len\": 56 }}",
+            pool.network(),
+            pool.prefix_len()
+        )
+    });
+    let (preferred, valid) = if config.long_lived {
+        ("400", "600")
+    } else {
+        ("40", "60")
+    };
+    KEA_DHCP6_TEMPLATE
+        .replace("{{IFACE}}", &config.iface)
+        .replace("{{PD_POOLS}}", &pd_pools)
+        .replace("{{RENEW}}", "10")
+        .replace("{{REBIND}}", "16")
+        .replace("{{PREFERRED}}", preferred)
+        .replace("{{VALID}}", valid)
+}
+
+/// Kea DHCPv6 serving `config` inside `ns`; config, lock and pid files go under `run_dir`.
+/// Ready when it logs `DHCP6_STARTED`.
+///
+/// # Errors
+///
+/// When the config cannot be written or `kea-dhcp6` cannot be spawned.
+pub fn kea_dhcp6(ns: &NetNs, config: &Kea6Config, run_dir: &Path) -> Result<Daemon> {
+    let path = run_dir.join("kea-dhcp6.json");
+    std::fs::write(&path, render_kea_dhcp6(config))
+        .with_context(|| format!("write {}", path.display()))?;
+    let mut cmd = ns.command("kea-dhcp6")?;
+    cmd.arg("-c")
+        .arg(&path)
+        .env("KEA_LOCKFILE_DIR", run_dir)
+        .env("KEA_PIDFILE_DIR", run_dir);
+    Daemon::spawn("kea-dhcp6", cmd)
 }
 
 /// An HTTP target in `ns` serving `body` as `index.html` from `dir` on `bind:port`, either
@@ -313,6 +381,47 @@ pub fn sntp_server(ns: &NetNs, bind: &str, offset_secs: i64, stratum: u8) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kea6_template_renders_the_pool_and_omits_it_when_none() {
+        let config = Kea6Config::isp(Some("2001:db8:100::/48".parse().unwrap()));
+        let text = render_kea_dhcp6(&config);
+        assert!(text.contains("\"interfaces\": [ \"wan0\" ]"), "{text}");
+        assert!(
+            text.contains(
+                "{ \"prefix\": \"2001:db8:100::\", \"prefix-len\": 48, \"delegated-len\": 56 }"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"renew-timer\": 10,") && text.contains("\"valid-lifetime\": 60,"),
+            "{text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            json["Dhcp6"]["subnet6"][0]["pd-pools"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let none = render_kea_dhcp6(&Kea6Config::isp(None));
+        let json: serde_json::Value = serde_json::from_str(&none).expect("valid JSON");
+        assert_eq!(
+            json["Dhcp6"]["subnet6"][0]["pd-pools"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+        let long = render_kea_dhcp6(&Kea6Config {
+            long_lived: true,
+            ..Kea6Config::isp(Some("2001:db8:100::/48".parse().unwrap()))
+        });
+        assert!(
+            long.contains("\"valid-lifetime\": 600,")
+                && long.contains("\"preferred-lifetime\": 400,"),
+            "{long}"
+        );
+    }
 
     #[test]
     fn template_renders_iface() {

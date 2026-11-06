@@ -604,6 +604,70 @@ pub fn parse_udhcpc_output(stdout: &str) -> Vec<UdhcpcEvent> {
     events
 }
 
+/// What busybox `udhcpc6 -l` (an Information-Request, the stateless reference client) was told:
+/// the resolvers (option 23) and the search list (option 24).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Udhcpc6Info {
+    pub dns: Vec<String>,
+    pub search: Vec<String>,
+}
+
+const UDHCPC6_SCRIPT: &str = "#!/bin/sh\n\
+# SPDX-License-Identifier: GPL-2.0-or-later\n\
+# Copyright (C) 2026 Andrew Newton\n\
+# The lab's udhcpc6 script: report every event and the environment udhcpc6 set for it.\n\
+echo \"udhcpc-event $1\"\n\
+env | sed 's/^/udhcpc-env /'\n";
+
+/// busybox `udhcpc6 -l -i <iface> -f -n -q -O dns -O search -s <script>` inside `ns`: one
+/// Information-Request to the routers on the link, answered by the stateless responder, read
+/// through the script's report of udhcpc6's environment (`dns` and `search`, space-separated).
+///
+/// # Errors
+///
+/// When the script cannot be written, busybox cannot be run, the run times out, or no answer
+/// arrived within udhcpc6's own tries (the events seen are in the error text).
+pub fn udhcpc6_info(
+    ns: &NetNs,
+    iface: &str,
+    run_dir: &Path,
+    timeout: Duration,
+) -> Result<Udhcpc6Info> {
+    let script = run_dir.join("udhcpc6.sh");
+    std::fs::write(&script, UDHCPC6_SCRIPT)
+        .with_context(|| format!("write {}", script.display()))?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    let mut cmd = ns.command("busybox")?;
+    cmd.args([
+        "udhcpc6", "-v", "-l", "-i", iface, "-f", "-n", "-q", "-t", "4", "-T", "2", "-O", "dns",
+        "-O", "search", "-s",
+    ])
+    .arg(&script);
+    let output = run_with_timeout(&mut cmd, timeout)?;
+    trace_udhcpc(output.status, &output.stderr);
+    let events = parse_udhcpc_output(&String::from_utf8_lossy(&output.stdout));
+    let answered = events
+        .iter()
+        .find(|event| event.kind == "bound" || event.kind == "renew")
+        .with_context(|| {
+            format!(
+                "udhcpc6 got no answer: events {events:?}, stderr {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        })?;
+    let list = |key: &str| -> Vec<String> {
+        answered
+            .env
+            .get(key)
+            .map(|value| value.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default()
+    };
+    Ok(Udhcpc6Info {
+        dns: list("dns"),
+        search: list("search"),
+    })
+}
+
 /// Run `cmd` with captured output, killing it after `timeout`.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<std::process::Output> {
     cmd.stdin(Stdio::null())

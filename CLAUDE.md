@@ -47,8 +47,8 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 ## Harness
 Rootless: user + mount + net namespaces, no sudo. Needs `/dev/kvm` (falls back to TCG) and `/dev/net/tun`
 readable, and unprivileged user namespaces enabled. Host-side `pppd` (M3) additionally needs `/dev/ppp`
-group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4`, `busybox` (`udhcpc`, the reference
-DHCP client), `dnsmasq` (the upstream resolver), `dig` (the DNS client), `ntpdate` (the reference time client), `mkfs.ext4`,
+group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4` and `kea-dhcp6` (the ISP's servers),
+`busybox` (`udhcpc`, the reference DHCP client; `udhcpc6`, the stateless DHCPv6 one), `dnsmasq` (the upstream resolver), `dig` (the DNS client), `ntpdate` (the reference time client), `mkfs.ext4`,
 `ping`, `python3` (HTTP targets and the lab's SNTP server);
 building needs `musl-gcc`, `pkg-config`, `bison`, `flex` and `rsync` (the kernel's `headers_install`). The sandboxed nft scenarios need the
 kernel to load the `ct`/`fib`/`nat`/`limit` nft modules, and every VLAN scenario (sandbox and QEMU alike: the
@@ -60,7 +60,8 @@ namespace on the router's `p3`; a VLAN client is a sub-interface of a LAN tap mo
 suite runs the DHCPv4 client against Kea over a veth pair, no QEMU, and the `dhcp4_server` suite runs the
 DHCPv4 server driver against the LAN-side clients (our own as the hidden `openfeo-harness dhcp-client`
 subcommand, busybox `udhcpc` as the reference; `OPENFEO_TRACE=1` shows their and the driver's account of a
-run); the `dns` suite runs the forwarder driver between a LAN host running `dig` and dnsmasq in
+run); the `dhcp6` suite runs the DHCPv6 client core against Kea's DHCPv6 server over a veth pair (a second
+pool stands in for the ISP changing the prefix) and the stateless responder against busybox `udhcpc6`; the `dns` suite runs the forwarder driver between a LAN host running `dig` and dnsmasq in
 authoritative mode for `isp.example` (the same dnsmasq serves as the upstream on isp0 in the QEMU
 scenarios); the `sntp` suite runs the time driver on a recording clock between a LAN host (`ntpdate -q`
 and raw queries) and the lab's Python SNTP server (`harness/fixtures/sntp-server.py`), whose
