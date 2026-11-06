@@ -13,10 +13,11 @@ use ipnet::IpNet;
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::route::{RouteMessage, RouteProtocol, RouteScope, RouteType};
+use netlink_packet_route::rule::{RuleAction as NlRuleAction, RuleAttribute, RuleMessage};
 use rtnetlink::{LinkBridge, LinkUnspec, LinkVlan, RouteMessageBuilder};
 
 use crate::monitor::{Error, Netlink, request_error};
-use crate::types::{Route, RouteKind};
+use crate::types::{Route, RouteKind, Rule, RuleAction, TABLE_MAIN};
 
 /// Linux errno values the appliers reason about.
 pub mod errno {
@@ -271,15 +272,110 @@ impl Netlink {
             .await
             .map_err(|e| request_error(format!("del route {}", describe(route)), e))
     }
+
+    /// `ip rule add`, with the rule's priority, source, action, suppression and protocol.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses (`EEXIST` for a duplicate).
+    pub async fn rule_add(&self, rule: &Rule) -> Result<(), Error> {
+        let mut request = self.handle.rule().add();
+        *request.message_mut() = rule_message(rule);
+        request
+            .execute()
+            .await
+            .map_err(|e| request_error(format!("add {}", describe_rule(rule)), e))
+    }
+
+    /// `ip rule del` of exactly this rule.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses (`ENOENT` when it is not there).
+    pub async fn rule_del(&self, rule: &Rule) -> Result<(), Error> {
+        self.handle
+            .rule()
+            .del(rule_message(rule))
+            .execute()
+            .await
+            .map_err(|e| request_error(format!("del {}", describe_rule(rule)), e))
+    }
 }
 
-/// `default via 10.0.0.1 dev 3 proto 200 metric 10`, or `blackhole 192.0.2.248/29 proto 200
-/// metric 1000`, for errors and logs.
+/// `rule 2000 from 2001:db8:100::/56 lookup 100 proto 200`, `rule 1500 from all lookup main
+/// suppress_prefixlength 0 proto 200` or `rule 2000 from 2001:db8:200::/56 unreachable proto
+/// 200`, for errors and logs.
+#[must_use]
+pub fn describe_rule(rule: &Rule) -> String {
+    let mut text = format!("rule {} from ", rule.priority);
+    match rule.src {
+        Some(src) => {
+            let _ = write!(text, "{src}");
+        }
+        None => text.push_str("all"),
+    }
+    match rule.action {
+        RuleAction::ToTable(TABLE_MAIN) => text.push_str(" lookup main"),
+        RuleAction::ToTable(table) => {
+            let _ = write!(text, " lookup {table}");
+        }
+        RuleAction::Unreachable => text.push_str(" unreachable"),
+    }
+    if let Some(len) = rule.suppress_prefixlen {
+        let _ = write!(text, " suppress_prefixlength {len}");
+    }
+    let _ = write!(text, " proto {}", rule.protocol);
+    text
+}
+
+/// The message for `rule`: the family and action in the header, the table in the header when
+/// it fits a byte and always as an attribute, the source with its length, the priority, the
+/// suppression and the protocol.
+fn rule_message(rule: &Rule) -> RuleMessage {
+    let mut message = RuleMessage::default();
+    message.header.family = if rule.v6 {
+        AddressFamily::Inet6
+    } else {
+        AddressFamily::Inet
+    };
+    match rule.action {
+        RuleAction::ToTable(table) => {
+            message.header.action = NlRuleAction::ToTable;
+            message.header.table = u8::try_from(table).unwrap_or(RT_TABLE_COMPAT);
+            message.attributes.push(RuleAttribute::Table(table));
+        }
+        RuleAction::Unreachable => message.header.action = NlRuleAction::Unreachable,
+    }
+    if let Some(src) = rule.src {
+        message.header.src_len = src.prefix_len();
+        message.attributes.push(RuleAttribute::Source(src.addr()));
+    }
+    message
+        .attributes
+        .push(RuleAttribute::Priority(rule.priority));
+    if let Some(len) = rule.suppress_prefixlen {
+        message
+            .attributes
+            .push(RuleAttribute::SuppressPrefixLen(u32::from(len)));
+    }
+    message
+        .attributes
+        .push(RuleAttribute::Protocol(RouteProtocol::from(rule.protocol)));
+    message
+}
+
+/// `RT_TABLE_COMPAT`: the header's table byte for a table id above 255, which the attribute
+/// then carries in full.
+const RT_TABLE_COMPAT: u8 = 252;
+
+/// `default via 10.0.0.1 dev 3 proto 200 metric 10`, `blackhole 192.0.2.248/29 proto 200
+/// metric 1000` or `unreachable default proto 200 metric 1000 table 100`, for errors and logs.
 #[must_use]
 pub fn describe(route: &Route) -> String {
     let mut text = match route.kind {
         RouteKind::Unicast => String::new(),
         RouteKind::Blackhole => "blackhole ".to_owned(),
+        RouteKind::Unreachable => "unreachable ".to_owned(),
     };
     text.push_str(
         &route
@@ -320,6 +416,7 @@ fn route_message_builder(route: &Route) -> RouteMessage {
     let kind = match route.kind {
         RouteKind::Unicast => RouteType::Unicast,
         RouteKind::Blackhole => RouteType::BlackHole,
+        RouteKind::Unreachable => RouteType::Unreachable,
     };
     if route.v6 {
         let mut builder = RouteMessageBuilder::<Ipv6Addr>::new()
