@@ -19,10 +19,17 @@ pub const FAILURE_CODE: u8 = 4;
 /// A CHAP packet's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    Challenge { value: Vec<u8>, name: Vec<u8> },
-    Response { value: Vec<u8>, name: Vec<u8> },
-    Success(String),
-    Failure(String),
+    Challenge {
+        value: Vec<u8>,
+        name: Vec<u8>,
+    },
+    Response {
+        value: Vec<u8>,
+        name: Vec<u8>,
+    },
+    /// The server's message, bytes as sent (shown lossily, never round-tripped as text).
+    Success(Vec<u8>),
+    Failure(Vec<u8>),
 }
 
 impl Message {
@@ -40,7 +47,6 @@ impl Message {
                 .ok_or(Error::Truncated)?;
             Ok((value.to_vec(), name.to_vec()))
         };
-        let text = |data: &[u8]| String::from_utf8_lossy(data).into_owned();
         match packet.code {
             CHALLENGE_CODE => {
                 let (value, name) = valued(&packet.data)?;
@@ -50,8 +56,8 @@ impl Message {
                 let (value, name) = valued(&packet.data)?;
                 Ok(Message::Response { value, name })
             }
-            SUCCESS_CODE => Ok(Message::Success(text(&packet.data))),
-            FAILURE_CODE => Ok(Message::Failure(text(&packet.data))),
+            SUCCESS_CODE => Ok(Message::Success(packet.data.clone())),
+            FAILURE_CODE => Ok(Message::Failure(packet.data.clone())),
             code => Err(Error::Length {
                 declared: u16::from(code),
                 actual: 0,
@@ -72,8 +78,8 @@ impl Message {
         let (code, data) = match self {
             Message::Challenge { value, name } => (CHALLENGE_CODE, valued(value, name)),
             Message::Response { value, name } => (RESPONSE_CODE, valued(value, name)),
-            Message::Success(text) => (SUCCESS_CODE, text.as_bytes().to_vec()),
-            Message::Failure(text) => (FAILURE_CODE, text.as_bytes().to_vec()),
+            Message::Success(text) => (SUCCESS_CODE, text.clone()),
+            Message::Failure(text) => (FAILURE_CODE, text.clone()),
         };
         Packet { code, id, data }
     }
@@ -144,7 +150,7 @@ impl Client {
             }
             Ok(Message::Failure(text)) => {
                 self.authenticated = false;
-                vec![Output::Failed(text)]
+                vec![Output::Failed(String::from_utf8_lossy(&text).into_owned())]
             }
             _ => Vec::new(),
         }
@@ -201,17 +207,14 @@ mod tests {
         assert_eq!(packet.data[0], 16);
         assert_eq!(&packet.data[17..], b"isp");
         assert_eq!(Message::decode(&packet), Ok(challenge));
-        let success = Message::Success("Welcome".to_owned()).encode(1);
+        let success = Message::Success(b"Welcome".to_vec()).encode(1);
         assert_eq!(success.data, b"Welcome".to_vec());
         assert_eq!(
             Message::decode(&success),
-            Ok(Message::Success("Welcome".to_owned()))
+            Ok(Message::Success(b"Welcome".to_vec()))
         );
-        let failure = Message::Failure(String::new()).encode(1);
-        assert_eq!(
-            Message::decode(&failure),
-            Ok(Message::Failure(String::new()))
-        );
+        let failure = Message::Failure(Vec::new()).encode(1);
+        assert_eq!(Message::decode(&failure), Ok(Message::Failure(Vec::new())));
         let short = Packet {
             code: CHALLENGE_CODE,
             id: 1,
@@ -224,6 +227,22 @@ mod tests {
             data: vec![],
         };
         assert!(Message::decode(&odd).is_err());
+    }
+
+    #[test]
+    fn a_failure_with_bytes_that_are_not_utf8_round_trips() {
+        let data = vec![0xff, 0xfe, b'n', 0x80];
+        let packet = Packet {
+            code: FAILURE_CODE,
+            id: 2,
+            data: data.clone(),
+        };
+        let message = Message::decode(&packet).unwrap();
+        assert_eq!(message, Message::Failure(data.clone()));
+        assert_eq!(
+            Message::decode(&message.encode(2)),
+            Ok(Message::Failure(data))
+        );
     }
 
     #[test]
@@ -247,7 +266,7 @@ mod tests {
         assert_eq!(hex(&value), RESPONSE);
         assert_eq!(name, b"openfeo@isp.example".to_vec());
         assert!(!client.authenticated());
-        let out = client.handle(&Message::Success("Welcome".to_owned()).encode(1));
+        let out = client.handle(&Message::Success(b"Welcome".to_vec()).encode(1));
         assert_eq!(out, vec![Output::Ok]);
         assert!(client.authenticated());
     }
@@ -255,7 +274,7 @@ mod tests {
     #[test]
     fn chap_failure_fails_and_a_rechallenge_after_success_is_answered() {
         let mut client = new_client();
-        let out = client.handle(&Message::Failure("Access denied".to_owned()).encode(3));
+        let out = client.handle(&Message::Failure(b"Access denied".to_vec()).encode(3));
         assert_eq!(out, vec![Output::Failed("Access denied".to_owned())]);
         let mut client = new_client();
         client.handle(
@@ -265,7 +284,7 @@ mod tests {
             }
             .encode(1),
         );
-        client.handle(&Message::Success(String::new()).encode(1));
+        client.handle(&Message::Success(Vec::new()).encode(1));
         let out = client.handle(
             &Message::Challenge {
                 value: vec![9; 16],

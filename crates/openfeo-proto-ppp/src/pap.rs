@@ -24,9 +24,13 @@ pub const MAX_TRIES: u32 = 10;
 /// A PAP packet's content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    Request { peer_id: Vec<u8>, password: Vec<u8> },
-    Ack(String),
-    Nak(String),
+    Request {
+        peer_id: Vec<u8>,
+        password: Vec<u8>,
+    },
+    /// The server's message, bytes as sent (shown lossily, never round-tripped as text).
+    Ack(Vec<u8>),
+    Nak(Vec<u8>),
 }
 
 /// A length-prefixed field and what follows it.
@@ -44,12 +48,12 @@ fn put_counted(out: &mut Vec<u8>, data: &[u8]) {
 }
 
 /// An Ack's or Nak's message: a counted field, or nothing at all (pppd sends none).
-fn message_of(data: &[u8]) -> Result<String, Error> {
+fn message_of(data: &[u8]) -> Result<Vec<u8>, Error> {
     if data.is_empty() {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
     let (text, _) = counted(data)?;
-    Ok(String::from_utf8_lossy(text).into_owned())
+    Ok(text.to_vec())
 }
 
 impl Message {
@@ -89,11 +93,11 @@ impl Message {
                 REQUEST
             }
             Message::Ack(text) => {
-                put_counted(&mut data, text.as_bytes());
+                put_counted(&mut data, text);
                 ACK
             }
             Message::Nak(text) => {
-                put_counted(&mut data, text.as_bytes());
+                put_counted(&mut data, text);
                 NAK
             }
         };
@@ -178,7 +182,7 @@ impl Client {
                     }
                     Ok(Message::Nak(text)) => {
                         self.finish();
-                        vec![Output::Failed(text)]
+                        vec![Output::Failed(String::from_utf8_lossy(&text).into_owned())]
                     }
                     _ => Vec::new(),
                 }
@@ -254,15 +258,12 @@ mod tests {
         assert_eq!(packet.id, 7);
         assert_eq!(packet.data, b"\x04user\x02pw".to_vec());
         assert_eq!(Message::decode(&packet), Ok(request));
-        let ack = Message::Ack("welcome".to_owned()).encode(7);
+        let ack = Message::Ack(b"welcome".to_vec()).encode(7);
         assert_eq!(ack.data, b"\x07welcome".to_vec());
-        assert_eq!(
-            Message::decode(&ack),
-            Ok(Message::Ack("welcome".to_owned()))
-        );
-        let nak = Message::Nak(String::new()).encode(7);
+        assert_eq!(Message::decode(&ack), Ok(Message::Ack(b"welcome".to_vec())));
+        let nak = Message::Nak(Vec::new()).encode(7);
         assert_eq!(nak.data, vec![0]);
-        assert_eq!(Message::decode(&nak), Ok(Message::Nak(String::new())));
+        assert_eq!(Message::decode(&nak), Ok(Message::Nak(Vec::new())));
         let short = Packet {
             code: 1,
             id: 1,
@@ -276,7 +277,7 @@ mod tests {
         };
         assert_eq!(
             Message::decode(&bare_ack),
-            Ok(Message::Ack(String::new())),
+            Ok(Message::Ack(Vec::new())),
             "pppd sends none"
         );
         let odd = Packet {
@@ -285,6 +286,25 @@ mod tests {
             data: vec![],
         };
         assert!(Message::decode(&odd).is_err());
+    }
+
+    #[test]
+    fn a_nak_with_bytes_that_are_not_utf8_round_trips() {
+        // Found by the ppp_auth fuzz target: a lossy text would grow past 255 bytes on the way
+        // back and lose its tail; the wire carries bytes, so the message is bytes.
+        let mut data = vec![0u8, 0xff];
+        data.extend(std::iter::repeat_n(0x6e, 40));
+        data.extend(std::iter::repeat_n(0xff, 200));
+        let mut packet_data = vec![u8::try_from(data.len()).unwrap()];
+        packet_data.extend_from_slice(&data);
+        let packet = Packet {
+            code: NAK,
+            id: 3,
+            data: packet_data,
+        };
+        let message = Message::decode(&packet).unwrap();
+        assert_eq!(message, Message::Nak(data.clone()));
+        assert_eq!(Message::decode(&message.encode(3)), Ok(Message::Nak(data)));
     }
 
     #[test]
@@ -301,11 +321,11 @@ mod tests {
             })
         );
         assert_eq!(client.next_timeout(), Some(1_000 + RETRY));
-        let ack = Message::Ack("ok".to_owned()).encode(sends[0].id);
+        let ack = Message::Ack(b"ok".to_vec()).encode(sends[0].id);
         let out = client.handle(Input::Packet(ack), 1_200);
         assert_eq!(out, vec![Output::Ok]);
         assert_eq!(client.next_timeout(), None);
-        let late = Message::Nak("no".to_owned()).encode(sends[0].id);
+        let late = Message::Nak(b"no".to_vec()).encode(sends[0].id);
         assert!(
             client.handle(Input::Packet(late), 1_300).is_empty(),
             "done is done"
@@ -317,9 +337,12 @@ mod tests {
         let mut client = new_client();
         let out = client.start(0);
         let id = sent(&out)[0].id;
-        let wrong_id = Message::Nak("Login incorrect".to_owned()).encode(id.wrapping_add(1));
-        assert!(client.handle(Input::Packet(wrong_id), 100).is_empty());
-        let nak = Message::Nak("Login incorrect".to_owned()).encode(id);
+        let wrong_id = Message::Nak(b"Login incorrect".to_vec()).encode(id.wrapping_add(1));
+        assert!(
+            client.handle(Input::Packet(wrong_id), 100).is_empty(),
+            "another identifier is not ours"
+        );
+        let nak = Message::Nak(b"Login incorrect".to_vec()).encode(id);
         let out = client.handle(Input::Packet(nak), 200);
         assert_eq!(out, vec![Output::Failed("Login incorrect".to_owned())]);
         assert_eq!(client.next_timeout(), None);
