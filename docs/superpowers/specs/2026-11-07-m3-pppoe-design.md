@@ -463,8 +463,10 @@ what every PPPoE client does and what the AC expects).
 
 This host cannot load a PPP module until it is rebooted (the running kernel's modules are
 gone from disk) and `/dev/ppp` is root-only; the cloud sandbox has no PPP modules; CI's runner
-kernel is believed to carry them but has not been asked. So the milestone is cut in two, each
-with its own branch, plan and PR, as M2 was:
+kernel (`7.0.0-1017-azure`, asked by a throwaway probe branch on 2026-11-07) loads
+`ppp_generic`, `pppoe`, `pppox` and `ppp_async`, lets `sudo chmod 666 /dev/ppp` through, and
+installs `ppp` and `pppoe`. So the milestone is cut in two, each with its own branch, plan and
+PR, as M2 was, and part 2 is proven on CI (and on this host once rebooted):
 
 - **Part 1 (this run)**: everything provable without PPP in the kernel: `openfeo-proto-ppp`
   entire with its fuzz targets, the config and validation, the fact, `wan_netdev` and every
@@ -477,10 +479,8 @@ with its own branch, plan and PR, as M2 was:
 - **Part 2**: the kernel plumbing proven live (`sys.rs`'s calls against `/dev/ppp` and
   `AF_PPPOX`), the `pppoe` sandbox suite, the `m3` QEMU suite, `pppoe-server` in the lab,
   check-env, CI and the cloud setup. It starts when a kernel with the PPP modules is at hand:
-  CI's, once a probe (a one-job workflow on a throwaway branch) shows `modprobe ppp_generic
-  pppoe ppp_async` and a writable `/dev/ppp` there, or this host after its reboot and the udev
-  rule. If CI's kernel lacks the modules, part 2 runs only on a rebooted development host and
-  CI skips the PPP scenarios with `OPENFEO_NO_SKIP` relaxed for them: a maintainer decision.
+  CI's (the probe answered yes: the workflow adds `sudo modprobe ppp_generic pppoe ppp_async`
+  and the `chmod`), or this host after its reboot and the udev rule.
 
 ## SPEC amendments (the plan's first task)
 
