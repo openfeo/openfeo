@@ -13,8 +13,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
-use openfeo_harness::daemons::{self, Auth, Daemon, PppoeServerConfig};
-use openfeo_harness::lab::{BOOT_TIMEOUT, Lab};
+use openfeo_harness::daemons::{self, Auth, Daemon, PppoeServerConfig, RadvdConfig};
+use openfeo_harness::lab::{BOOT_TIMEOUT, Lab, ROUTED_PREFIX6};
 use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Match, Regex};
 use openfeo_harness::netns::NetNs;
@@ -54,6 +54,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "the_tagged_wan_runs_pppoe_over_a_vlan",
         run: the_tagged_wan_runs_pppoe_over_a_vlan,
+    },
+    Scenario {
+        name: "ipv6_over_ppp_gives_the_lan_a_gua_and_reaches_the_isp",
+        run: ipv6_over_ppp_gives_the_lan_a_gua_and_reaches_the_isp,
     },
 ];
 
@@ -131,7 +135,6 @@ fn fetch(ns: &NetNs, addr: &str) -> anyhow::Result<String> {
 }
 
 /// What a PPPoE boot established.
-#[allow(dead_code)] // the identifier is read by the IPv6 scenarios
 struct Booted {
     /// The console after the last PPP line waited for.
     cur: Cursor,
@@ -141,7 +144,6 @@ struct Booted {
     local_iid: u64,
 }
 
-#[allow(dead_code)]
 impl Booted {
     /// The router's link-local on `ppp-wan0`: `fe80::<identifier>`.
     fn link_local(&self) -> String {
@@ -407,4 +409,59 @@ fn the_tagged_wan_runs_pppoe_over_a_vlan(lab: &mut Lab) -> anyhow::Result<()> {
     let _server = http_target(lab, &lab.isp0, "203.0.113.1", 8080, body)?;
     ensure!(fetch(&lab.lan0, ISP_HTTP)? == body);
     no_password_on_the_console(lab, &tagged)
+}
+
+const ROUTER_LEARNED: &str = r"openfeo: wan wan0 ipv6 router fe80::1 \(learned\)";
+/// The routing applier's IPv6 default through the PPP netdev, in the main table.
+const DEFAULT6_OVER_PPP: &str =
+    r"openfeo: add route default via fe80::1 dev ppp-wan0( src [0-9a-f:]+)? proto 200 metric 10$";
+/// The LAN host's own address in lan0's /64 of the routed /48.
+const LAN0_NET6: &str = "2001:db8:1:222:";
+
+/// Poll `done` every 200 ms until it says so, or `what` has not happened within `timeout`.
+fn wait_until(
+    timeout: Duration,
+    what: &str,
+    mut done: impl FnMut() -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if done()? {
+            return Ok(());
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "{what} did not happen within {timeout:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The routed /48 over PPP (SPEC §7.3 part 2's shape, `vm-pppoe.toml`): radvd on the ISP's
+/// `ppp<N>` gives the router its IPv6 default through `ppp-wan0`; the ISP routes the /48 to the
+/// router's IPV6CP link-local; the LAN host configures itself from lan0's /64 and fetches the
+/// ISP's target over IPv6.
+fn ipv6_over_ppp_gives_the_lan_a_gua_and_reaches_the_isp(lab: &mut Lab) -> anyhow::Result<()> {
+    let booted = boot_pppoe(lab, &PppoeServerConfig::isp("wan0", Auth::Chap), VM_PPPOE)?;
+    let ppp = lab.isp_ppp_ifname("wan0", SOON)?;
+    lab.start_radvd_on(&RadvdConfig::isp(&ppp))?;
+    lab.isp_route_block6_on(ROUTED_PREFIX6, &booted.link_local(), &ppp)?;
+    let c = lab.console()?;
+    c.wait_for(&mut Cursor::default(), &re(ROUTER_LEARNED), SOON)?;
+    c.wait_for(&mut Cursor::default(), &re(DEFAULT6_OVER_PPP), SOON)?;
+    // A link that comes up now solicits and the router answers at once.
+    lab.lan0.ip(&["link", "set", "lan0", "down"])?;
+    Lab::host(&lab.lan0, "lan0", "192.168.1.2/24", "192.168.1.1")?;
+    wait_until(SOON, "the LAN host's address in lan0's /64", || {
+        Ok(lab
+            .lan0
+            .ip(&["-6", "addr", "show", "dev", "lan0", "scope", "global"])?
+            .lines()
+            .any(|line| line.contains(LAN0_NET6) && !line.contains("tentative")))
+    })?;
+    let body = "openfeo isp target over ipv6 over ppp";
+    let _server = http_target(lab, &lab.isp0, "2001:db8:ffff::1", 8080, body)?;
+    let got = fetch(&lab.lan0, "[2001:db8:ffff::1]:8080")?;
+    ensure!(got == body, "unexpected body {got:?}");
+    no_password_on_the_console(lab, "wan0")
 }

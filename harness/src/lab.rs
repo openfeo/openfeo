@@ -221,6 +221,17 @@ impl Lab {
         Ok(())
     }
 
+    /// As [`Lab::isp_route_block6`], through `dev` (an ISP PPP interface) instead of `wan0`.
+    ///
+    /// # Errors
+    ///
+    /// When `ip` fails.
+    pub fn isp_route_block6_on(&self, block: &str, via: &str, dev: &str) -> Result<()> {
+        self.isp0
+            .ip(&["-6", "route", "replace", block, "via", via, "dev", dev])?;
+        Ok(())
+    }
+
     /// Give ISP A its IPv6 on `wan0` ([`ISP0_ADDR6`] and [`ISP0_LINK_LOCAL6`] as its only
     /// link-local, without DAD so they are usable at once) and IPv6 forwarding, then start radvd
     /// there with `config` (`daemons::radvd`); returns once it announces itself. The daemon joins
@@ -257,6 +268,51 @@ impl Lab {
         let mut forwarding = self.isp0.command("sh")?;
         forwarding.args(["-c", "echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"]);
         let _ = netns::run(&mut forwarding);
+        let radvd = daemons::radvd(&self.isp0, config, &self.run_dir)?;
+        radvd.log.wait_for(
+            &mut Cursor::default(),
+            &Regex::new("version .* started").context("regex")?,
+            Duration::from_secs(10),
+        )?;
+        self.daemons.push(radvd);
+        Ok(())
+    }
+
+    /// Start radvd on one of ISP A's PPP interfaces (`config.iface`, a session's `ppp<N>`):
+    /// [`ISP0_ADDR6`] on `wan0` for the ISP's targets, IPv6 forwarding, and once `pppd` has put
+    /// the ISP's IPV6CP link-local (`fe80::1`) on the interface, radvd. The daemon joins
+    /// [`Lab::daemons`], named `radvd-<iface>`.
+    ///
+    /// # Errors
+    ///
+    /// When the link-local does not appear within 10 s, or radvd cannot be started or does not
+    /// come up within 10 s.
+    pub fn start_radvd_on(&mut self, config: &daemons::RadvdConfig) -> Result<()> {
+        self.isp0
+            .ip(&["-6", "addr", "replace", ISP0_ADDR6, "dev", "wan0", "nodad"])?;
+        let mut forwarding = self.isp0.command("sh")?;
+        forwarding.args(["-c", "echo 1 > /proc/sys/net/ipv6/conf/all/forwarding"]);
+        let _ = netns::run(&mut forwarding);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !self
+            .isp0
+            .ip(&["-6", "addr", "show", "dev", &config.iface, "scope", "link"])?
+            .lines()
+            .any(|line| {
+                let line = line.trim();
+                line.starts_with("inet6 fe80::1/") || line.starts_with("inet6 fe80::1 ")
+            })
+        {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "no fe80::1 on {} within 10 s: {}",
+                config.iface,
+                self.isp0
+                    .ip(&["-6", "addr", "show", "dev", &config.iface])
+                    .unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let radvd = daemons::radvd(&self.isp0, config, &self.run_dir)?;
         radvd.log.wait_for(
             &mut Cursor::default(),
