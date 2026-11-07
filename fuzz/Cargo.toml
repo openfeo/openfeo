@@ -179,4 +179,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ppp_session"
+path = "fuzz_targets/ppp_session.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

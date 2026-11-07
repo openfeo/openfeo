@@ -164,6 +164,11 @@ impl<O: Options> Fsm<O> {
         &self.options
     }
 
+    /// The protocol's options, to act on what the automaton left to the protocol.
+    pub fn options_mut(&mut self) -> &mut O {
+        &mut self.options
+    }
+
     // --- administrative events ----------------------------------------------------------------
 
     fn up(&mut self, now: Timestamp, out: &mut Vec<Action>) {

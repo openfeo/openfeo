@@ -19,6 +19,7 @@ pub mod lcp;
 mod md5;
 pub mod pap;
 pub mod pppoe;
+pub mod session;
 
 /// Milliseconds on the driver's monotonic clock, as the other cores count time.
 pub type Timestamp = u64;
