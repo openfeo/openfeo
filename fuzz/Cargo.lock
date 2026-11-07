@@ -669,6 +669,7 @@ dependencies = [
  "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
+ "openfeo-proto-ppp",
  "openfeo-proto-sntp",
  "smoltcp",
 ]
@@ -710,6 +711,15 @@ name = "openfeo-proto-ndp"
 version = "0.1.0"
 dependencies = [
  "ipnet",
+ "thiserror",
+]
+
+[[package]]
+name = "openfeo-proto-ppp"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "openfeo-proto-ndp",
  "thiserror",
 ]
 

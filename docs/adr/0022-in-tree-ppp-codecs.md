@@ -19,10 +19,11 @@ harness's captures from `pppoe-server` and `pppd`.
 
 `openfeo-proto-ppp` holds the codecs, pure and bounded (at most 32 discovery tags of at most
 1480 bytes, option lists checked against their packet length, two-byte protocol fields only).
-Each parser has a fuzz target in the PR that adds it. `ppproperly` is used as a differential
-oracle in a dev-dependency only if `cargo deny check` accepts it and it decodes the lab's
-packets; otherwise the tests pin the RFCs' examples and the harness's captures, and this ADR
-is amended with the outcome.
+Each parser has a fuzz target in the PR that adds it. No differential oracle: `ppproperly` is
+not published on crates.io (checked 7 November 2026) and no other maintained Rust PPP codec
+was found, so the tests pin the RFCs' own layouts byte for byte (RFC 2516 §5, RFC 1661 §5,
+RFC 1994 §4, RFC 1332 §3, RFC 5072 §4) and the harness's captures from `pppoe-server` and
+`pppd` once part 2 has them.
 
 ## Consequences
 

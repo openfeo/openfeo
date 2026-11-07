@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-proto-ppp"
+description = "OpenFeO PPPoE and PPP without sockets or clocks: discovery, the frame, LCP, PAP, CHAP, IPCP, IPV6CP and a session core (SPEC §7.2, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ipnet.workspace = true
+thiserror.workspace = true
+# The RFC 7217 identifier and the in-tree SHA-256 behind the IPV6CP interface identifier; a
+# pure crate like this one.
+openfeo-proto-ndp = { path = "../openfeo-proto-ndp" }
+
+[lints]
+workspace = true

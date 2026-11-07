@@ -1141,6 +1141,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openfeo-proto-ppp"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "openfeo-proto-ndp",
+ "thiserror",
+]
+
+[[package]]
 name = "openfeo-proto-sntp"
 version = "0.1.0"
 dependencies = [
