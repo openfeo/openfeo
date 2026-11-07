@@ -303,6 +303,86 @@ impl Lab {
         self.start_kea6(config)
     }
 
+    /// Start the lab's access concentrator on `config.iface` in isp0 (`daemons::pppoe_server`):
+    /// the lab's account in the sandbox's `/etc/ppp`, `pppd` logging to [`Lab::pppd_log`]. The
+    /// daemon joins [`Lab::daemons`], named `pppoe-server-<iface>`.
+    ///
+    /// # Errors
+    ///
+    /// When the server cannot be set up or exits at once.
+    pub fn start_pppoe_server(&mut self, config: &daemons::PppoeServerConfig) -> Result<()> {
+        let server = daemons::pppoe_server(&self.isp0, config, &self.run_dir)?;
+        self.daemons.push(server);
+        Ok(())
+    }
+
+    /// Stop the access concentrator with SIGTERM to it and every `pppd` it spawned: each session
+    /// gets a Terminate-Request and a PADT. `true` when one was running.
+    pub fn stop_pppoe_server(&mut self) -> bool {
+        self.end_pppoe_server(nix::sys::signal::Signal::SIGTERM)
+    }
+
+    /// Kill the access concentrator and its `pppd`s with SIGKILL: nothing goes out, the router
+    /// learns from its unanswered echoes. `true` when one was running.
+    pub fn kill_pppoe_server(&mut self) -> bool {
+        self.end_pppoe_server(nix::sys::signal::Signal::SIGKILL)
+    }
+
+    fn end_pppoe_server(&mut self, signal: nix::sys::signal::Signal) -> bool {
+        let before = self.daemons.len();
+        for daemon in &mut self.daemons {
+            if daemon.name.starts_with("pppoe-server-") {
+                daemon.signal(signal);
+            }
+        }
+        self.daemons
+            .retain(|daemon| !daemon.name.starts_with("pppoe-server-"));
+        self.daemons.len() != before
+    }
+
+    /// Stop the access concentrator and start it again with `config`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lab::start_pppoe_server`].
+    pub fn restart_pppoe_server(&mut self, config: &daemons::PppoeServerConfig) -> Result<()> {
+        self.stop_pppoe_server();
+        self.start_pppoe_server(config)
+    }
+
+    /// Where the sessions' `pppd` on `iface` log.
+    #[must_use]
+    pub fn pppd_log(&self, iface: &str) -> PathBuf {
+        daemons::pppd_log_path(&self.run_dir, iface)
+    }
+
+    /// The ISP's PPP interface of the current session on `iface` (`ppp<N>`, from `pppd`'s
+    /// `Using interface` line), once one exists: where radvd and Kea's DHCPv6 server run for the
+    /// IPv6-over-PPP scenarios.
+    ///
+    /// # Errors
+    ///
+    /// When no session has named its interface within `timeout`.
+    pub fn isp_ppp_ifname(&self, iface: &str, timeout: Duration) -> Result<String> {
+        let log = self.pppd_log(iface);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(name) = std::fs::read_to_string(&log)
+                .ok()
+                .and_then(|text| daemons::last_ppp_ifname(&text))
+            {
+                return Ok(name);
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "no `Using interface` in {} within {timeout:?}",
+                    log.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Stop the lab's radvd (its final advertisements carry lifetime 0, as a router going away
     /// sends them); `true` when one was running.
     pub fn stop_radvd(&mut self) -> bool {

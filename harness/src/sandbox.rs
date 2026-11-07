@@ -5,6 +5,7 @@
 //! namespaces and daemons without sudo (ADR-0006).
 
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use nix::mount::{MsFlags, mount};
@@ -53,6 +54,18 @@ pub fn enter() -> Result<()> {
         Some("mode=0755"),
     )
     .context("mount tmpfs on /run")?;
+    // pppd reads its secrets from the fixed path /etc/ppp: the lab's account goes on a tmpfs of
+    // the sandbox's own, never into (or out of) the host's directory (M3).
+    if Path::new("/etc/ppp").is_dir() {
+        mount(
+            Some("tmpfs"),
+            "/etc/ppp",
+            Some("tmpfs"),
+            MsFlags::empty(),
+            Some("mode=0755"),
+        )
+        .context("mount tmpfs on /etc/ppp")?;
+    }
     for dir in RUN_DIRS {
         fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
     }

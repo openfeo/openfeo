@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, ensure};
+use openfeo_harness::daemons::{self, Auth, PppoeServerConfig};
 use openfeo_harness::lab::Lab;
 use openfeo_harness::lanclient::link_info;
 use openfeo_harness::netns;
@@ -38,6 +39,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "session_attach_makes_a_unit_netdev",
         run: session_attach_makes_a_unit_netdev,
+    },
+    Scenario {
+        name: "pppoe_server_answers_discovery_in_the_sandbox",
+        run: pppoe_server_answers_discovery_in_the_sandbox,
     },
 ];
 
@@ -177,7 +182,8 @@ fn ac_answer(log: &mut AcLog, packet: &pppoe::Discovery) -> Option<Vec<u8>> {
 /// seen, in order.
 struct Bench {
     near: Discovery,
-    far: Discovery,
+    /// The scripted access concentrator's socket; `None` when a real one answers.
+    far: Option<Discovery>,
     client: Client,
     start: Instant,
     pending: Vec<Output>,
@@ -189,8 +195,21 @@ struct Bench {
 impl Bench {
     /// Both sockets open and the client started (a PADI pending). Call inside the runtime.
     fn start(rig: &Rig, max_payload: Option<u16>) -> anyhow::Result<Self> {
-        let near = Discovery::open(rig.client.0, CLIENT_IF)?;
         let far = Discovery::open(rig.ac.0, AC_IF)?;
+        Self::with_far(rig, max_payload, Some(far))
+    }
+
+    /// The client alone: a real access concentrator answers on the far end.
+    fn start_client_only(rig: &Rig, max_payload: Option<u16>) -> anyhow::Result<Self> {
+        Self::with_far(rig, max_payload, None)
+    }
+
+    fn with_far(
+        rig: &Rig,
+        max_payload: Option<u16>,
+        far: Option<Discovery>,
+    ) -> anyhow::Result<Self> {
+        let near = Discovery::open(rig.client.0, CLIENT_IF)?;
         let mut client = Client::new(
             Config {
                 service: None,
@@ -253,12 +272,12 @@ impl Bench {
                     let bytes = self.near_buf[..len].to_vec();
                     self.feed(Input::Packet { from, bytes });
                 }
-                received = self.far.recv(&mut self.far_buf) => {
+                received = recv_far(self.far.as_ref(), &mut self.far_buf) => {
                     let (from, len) = received?;
                     let packet = pppoe::Discovery::decode(&self.far_buf[..len])
                         .context("the ac decodes the client's frame")?;
                     if let Some(reply) = ac_answer(&mut self.log, &packet) {
-                        self.far.send(from, &reply)?;
+                        self.far.as_ref().context("a scripted ac")?.send(from, &reply)?;
                     }
                 }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(timer)) => {
@@ -276,7 +295,38 @@ impl Bench {
             tags: vec![],
         }
         .encode();
-        Ok(self.far.send(to, &padt)?)
+        Ok(self
+            .far
+            .as_ref()
+            .context("a scripted ac")?
+            .send(to, &padt)?)
+    }
+}
+
+/// The far socket's next frame, or never when there is no far socket.
+async fn recv_far(
+    far: Option<&Discovery>,
+    buf: &mut [u8],
+) -> Result<([u8; 6], usize), openfeo_net::dhcp4::DriverError> {
+    match far {
+        Some(far) => far.recv(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// `/dev/ppp` opens read-write, or the scenario skips with the udev rule to add.
+fn require_dev_ppp() -> anyhow::Result<()> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/ppp")
+    {
+        Ok(_) => Ok(()),
+        Err(err) => Err(Skip(format!(
+            "/dev/ppp: {err}: load ppp_generic and make it group-accessible \
+             (udev: KERNEL==\"ppp\", GROUP=\"<your group>\", MODE=\"0660\")"
+        ))
+        .into()),
     }
 }
 
@@ -391,6 +441,39 @@ fn session_attach_makes_a_unit_netdev(_lab: &mut Lab) -> anyhow::Result<()> {
             );
             thread::sleep(Duration::from_millis(50));
         }
+        anyhow::Ok(())
+    })
+}
+
+/// rp-pppoe's server, as the sandbox's mapped root on the far veth end, answers our discovery
+/// with a session: the lab's access concentrator exists and part 2 can rest on it.
+fn pppoe_server_answers_discovery_in_the_sandbox(lab: &mut Lab) -> anyhow::Result<()> {
+    require_dev_ppp()?;
+    let rig = Rig::create()?;
+    let config = PppoeServerConfig::isp(AC_IF, Auth::None);
+    let _server = daemons::pppoe_server_in_sandbox(&config, &lab.run_dir)?;
+    runtime()?.block_on(async {
+        let mut bench = Bench::start_client_only(&rig, None)?;
+        let outputs = bench.run_until(SOON, is_session).await?;
+        let Some(Output::Session {
+            id,
+            ac_mac,
+            ac_name,
+            max_payload,
+        }) = outputs.last()
+        else {
+            anyhow::bail!("no session: {outputs:?}");
+        };
+        ensure!(
+            *ac_mac == rig.ac.1,
+            "the session is with the far end: {outputs:?}"
+        );
+        ensure!(ac_name == "isp", "the server's name: {ac_name}");
+        ensure!(*id != 0, "a session id");
+        ensure!(
+            max_payload.is_none(),
+            "rp-pppoe offers no RFC 4638 payload: {max_payload:?}"
+        );
         anyhow::Ok(())
     })
 }

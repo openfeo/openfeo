@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,9 @@ pub struct Daemon {
     child: Child,
     /// stdout and stderr, merged.
     pub log: Lines,
+    /// Whether the daemon leads a process group of its own (spawned with
+    /// [`Daemon::spawn_group`]): it is then stopped with the processes it forked.
+    group: bool,
 }
 
 impl Daemon {
@@ -57,7 +60,45 @@ impl Daemon {
             name: name.to_owned(),
             child,
             log,
+            group: false,
         })
+    }
+
+    /// As [`Daemon::spawn`], with the daemon leading a process group of its own, so the
+    /// processes it forks (`pppoe-server`'s `pppd` per session) are signalled and stopped with it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Daemon::spawn`].
+    pub fn spawn_group(name: &str, mut cmd: Command) -> Result<Self> {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+        let mut daemon = Self::spawn(name, cmd)?;
+        daemon.group = true;
+        Ok(daemon)
+    }
+
+    /// The daemon's process id (its group's id too, for one made by [`Daemon::spawn_group`]).
+    #[must_use]
+    pub fn pid(&self) -> i32 {
+        i32::try_from(self.child.id()).unwrap_or(i32::MAX)
+    }
+
+    /// Send `signal` to the daemon, and to everything it forked when it leads a group; after a
+    /// signal that ends processes, wait up to five seconds for them to be gone.
+    pub fn signal(&mut self, signal: Signal) {
+        let target = if self.group { -self.pid() } else { self.pid() };
+        let _ = kill(Pid::from_raw(target), signal);
+        if matches!(signal, Signal::SIGTERM | Signal::SIGKILL) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let _ = self.child.try_wait();
+                if kill(Pid::from_raw(target), None).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     /// Still alive?
@@ -68,6 +109,12 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        if self.group {
+            self.signal(Signal::SIGTERM);
+            self.signal(Signal::SIGKILL);
+            let _ = self.child.wait();
+            return;
+        }
         if let Ok(pid) = i32::try_from(self.child.id()) {
             let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
         }
@@ -366,6 +413,242 @@ pub fn radvd(ns: &NetNs, config: &RadvdConfig, run_dir: &Path) -> Result<Daemon>
     Daemon::spawn(&format!("radvd-{}", config.iface), cmd)
 }
 
+/// How the lab's access concentrator wants the router authenticated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Auth {
+    None,
+    Pap,
+    Chap,
+}
+
+/// The lab's access concentrator (M3): rp-pppoe's `pppoe-server` spawning `pppd` per session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PppoeServerConfig {
+    /// The interface it listens on: isp0's `wan0`, or the sandbox suite's far veth end.
+    pub iface: String,
+    /// The access concentrator's name in its PADO.
+    pub ac_name: String,
+    /// The service name it advertises; empty for any.
+    pub service: String,
+    pub auth: Auth,
+    /// `pppd`'s MTU and MRU: 1492, or 1500 to see the router's RFC 4638 fallback.
+    pub mtu: u16,
+    /// IPV6CP with the identifiers `::1` (the ISP) and `::2` (suggested to the router).
+    pub ipv6: bool,
+    /// `pppd`'s LCP echo interval; three missed echoes end its side of the session.
+    pub echo_interval_secs: u8,
+}
+
+/// The ISP's address on the PPP link: the IPCP peer the router sees.
+pub const PPP_ISP_ADDR: &str = "203.0.113.1";
+/// The first address of the pool the ISP hands out.
+pub const PPP_POOL_START: &str = "203.0.113.100";
+/// The lab's PPP account: documentation credentials, nothing real.
+pub const PPP_USERNAME: &str = "openfeo@isp.example";
+/// The lab account's password.
+pub const PPP_PASSWORD: &str = "example-secret";
+
+impl PppoeServerConfig {
+    /// The ISP as the lab runs it: access concentrator `isp`, any service, MTU 1492, IPV6CP on,
+    /// echoes every 5 s.
+    #[must_use]
+    pub fn isp(iface: &str, auth: Auth) -> Self {
+        Self {
+            iface: iface.to_owned(),
+            ac_name: "isp".to_owned(),
+            service: String::new(),
+            auth,
+            mtu: 1492,
+            ipv6: true,
+            echo_interval_secs: 5,
+        }
+    }
+}
+
+/// The `pppd` options file the server passes to each session's `pppd` (`-O`).
+#[must_use]
+pub fn render_pppd_options(config: &PppoeServerConfig, log: &Path) -> String {
+    let auth = match config.auth {
+        Auth::None => "noauth",
+        Auth::Pap => "require-pap",
+        Auth::Chap => "require-chap",
+    };
+    let mut out = format!(
+        "debug\nlogfile {}\n{auth}\nms-dns {PPP_ISP_ADDR}\nlcp-echo-interval {}\nlcp-echo-failure 3\nmtu {}\nmru {}\n",
+        log.display(),
+        config.echo_interval_secs,
+        config.mtu,
+        config.mtu
+    );
+    out.push_str(if config.ipv6 {
+        "+ipv6\nipv6 ::1,::2\n"
+    } else {
+        "noipv6\n"
+    });
+    out
+}
+
+/// `pap-secrets` and `chap-secrets` under `/etc/ppp` (the sandbox's own tmpfs, never the host's),
+/// mode 0600, and an empty `options`, so `pppd` reads the lab's account and nothing else.
+///
+/// # Errors
+///
+/// When `/etc/ppp` cannot be written (no tmpfs over it: the sandbox was not entered).
+pub fn write_ppp_secrets(username: &str, password: &str) -> Result<()> {
+    let line = secrets_line(username, password);
+    for name in ["pap-secrets", "chap-secrets"] {
+        let path = Path::new("/etc/ppp").join(name);
+        std::fs::write(&path, &line).with_context(|| format!("write {}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
+    std::fs::write("/etc/ppp/options", "").context("write /etc/ppp/options")?;
+    Ok(())
+}
+
+/// One secrets line: the client, any server, the quoted secret, any address.
+fn secrets_line(username: &str, password: &str) -> String {
+    format!("\"{username}\" * \"{password}\" *\n")
+}
+
+/// `pppd`'s version from what `pppd --version` prints (`pppd version 2.5.4`).
+#[must_use]
+pub fn parse_pppd_version(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .skip_while(|word| *word != "version")
+        .nth(1)
+        .map(str::to_owned)
+}
+
+/// The PPPoE plugin of the installed `pppd`, for the server's kernel mode (`-g`): pppd's own,
+/// since a plugin built for another pppd release is refused (rp-pppoe's on Arch is built for
+/// 2.5.3). pppd 2.5 names it `pppoe.so`, Debian's and Ubuntu's 2.4 `rp-pppoe.so`.
+///
+/// # Errors
+///
+/// When `pppd` cannot be run or no plugin is found where distributions put them.
+pub fn pppd_plugin() -> Result<PathBuf> {
+    let output = Command::new("pppd")
+        .arg("--version")
+        .output()
+        .context("run pppd --version")?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let version = parse_pppd_version(&text)
+        .with_context(|| format!("no version in `pppd --version`: {text:?}"))?;
+    let mut tried = Vec::new();
+    for root in [
+        "/usr/lib/pppd",
+        "/usr/lib/x86_64-linux-gnu/pppd",
+        "/usr/lib64/pppd",
+    ] {
+        for name in ["pppoe.so", "rp-pppoe.so"] {
+            let path = Path::new(root).join(&version).join(name);
+            if path.exists() {
+                return Ok(path);
+            }
+            tried.push(path.display().to_string());
+        }
+    }
+    anyhow::bail!(
+        "no PPPoE plugin for pppd {version}; tried {}",
+        tried.join(", ")
+    )
+}
+
+/// Where each session's `pppd` logs (`logfile`): its `Using interface pppN` and `local IP
+/// address` lines are what scenarios read.
+#[must_use]
+pub fn pppd_log_path(run_dir: &Path, iface: &str) -> PathBuf {
+    run_dir.join(format!("pppd-{iface}.log"))
+}
+
+/// The last `Using interface pppN` of a `pppd` log: the ISP's side of the current session.
+#[must_use]
+pub fn last_ppp_ifname(log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("Using interface "))
+        .map(|name| name.trim().to_owned())
+}
+
+/// The server's command line, shared by the namespace and sandbox variants.
+fn pppoe_server_command(
+    mut cmd: Command,
+    config: &PppoeServerConfig,
+    run_dir: &Path,
+) -> Result<Command> {
+    std::fs::create_dir_all(run_dir).with_context(|| format!("mkdir {}", run_dir.display()))?;
+    write_ppp_secrets(PPP_USERNAME, PPP_PASSWORD)?;
+    let log = pppd_log_path(run_dir, &config.iface);
+    let _ = std::fs::remove_file(&log);
+    let options = run_dir.join(format!("pppd-{}.options", config.iface));
+    std::fs::write(&options, render_pppd_options(config, &log))
+        .with_context(|| format!("write {}", options.display()))?;
+    let pid = run_dir.join(format!("pppoe-server-{}.pid", config.iface));
+    let _ = std::fs::remove_file(&pid);
+    // Kernel mode (`-k`): the user-mode `pppoe` helper cannot drop privileges in a user
+    // namespace with one uid mapped, and kernel PPPoE is what the router speaks anyway.
+    cmd.env("HOME", run_dir)
+        .arg("-k")
+        .arg("-g")
+        .arg(pppd_plugin()?)
+        .args(["-F", "-I", &config.iface, "-C", &config.ac_name]);
+    if !config.service.is_empty() {
+        cmd.args(["-S", &config.service]);
+    }
+    cmd.args(["-L", PPP_ISP_ADDR, "-R", PPP_POOL_START, "-N", "4", "-O"])
+        .arg(&options)
+        .arg("-X")
+        .arg(&pid);
+    Ok(cmd)
+}
+
+/// The access concentrator inside `ns` (isp0's `wan0` for the QEMU suites).
+///
+/// # Errors
+///
+/// When the secrets or options cannot be written, no plugin is found, or the server cannot be
+/// spawned or exits at once.
+pub fn pppoe_server(ns: &NetNs, config: &PppoeServerConfig, run_dir: &Path) -> Result<Daemon> {
+    let cmd = pppoe_server_command(ns.command("pppoe-server")?, config, run_dir)?;
+    started(Daemon::spawn_group(
+        &format!("pppoe-server-{}", config.iface),
+        cmd,
+    )?)
+}
+
+/// The access concentrator in the current namespace (the sandbox suite's far veth end).
+///
+/// # Errors
+///
+/// As [`pppoe_server`].
+pub fn pppoe_server_in_sandbox(config: &PppoeServerConfig, run_dir: &Path) -> Result<Daemon> {
+    let cmd = pppoe_server_command(Command::new("pppoe-server"), config, run_dir)?;
+    started(Daemon::spawn_group(
+        &format!("pppoe-server-{}", config.iface),
+        cmd,
+    )?)
+}
+
+/// `pppoe-server -F` prints nothing when it starts listening: a server still running after a
+/// moment is up; one that exited at once says why on its output.
+fn started(mut daemon: Daemon) -> Result<Daemon> {
+    std::thread::sleep(Duration::from_millis(300));
+    if daemon.is_running() {
+        return Ok(daemon);
+    }
+    anyhow::bail!(
+        "{} exited at once: {}",
+        daemon.name,
+        daemon.log.tail(20).join(" | ")
+    )
+}
+
 /// The lab's SNTP server (`harness/fixtures/sntp-server.py`) on `bind:123` inside `ns`: every
 /// mode 3 request is answered with mode 4, stratum `stratum`, reference id `LOCL` and this
 /// host's clock shifted by `offset_secs`; each request is logged as `query from <addr>:<port>`;
@@ -392,6 +675,51 @@ pub fn sntp_server(ns: &NetNs, bind: &str, offset_secs: i64, stratum: u8) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pppd_options_render_in_a_fixed_order() {
+        let config = PppoeServerConfig {
+            mtu: 1500,
+            ..PppoeServerConfig::isp("wan0", Auth::Chap)
+        };
+        assert_eq!(
+            render_pppd_options(&config, Path::new("/run/x/pppd-wan0.log")),
+            "debug\nlogfile /run/x/pppd-wan0.log\nrequire-chap\nms-dns 203.0.113.1\nlcp-echo-interval 5\nlcp-echo-failure 3\nmtu 1500\nmru 1500\n+ipv6\nipv6 ::1,::2\n"
+        );
+        let plain = PppoeServerConfig {
+            ipv6: false,
+            ..PppoeServerConfig::isp("e1", Auth::None)
+        };
+        assert!(render_pppd_options(&plain, Path::new("l")).ends_with("noauth\nms-dns 203.0.113.1\nlcp-echo-interval 5\nlcp-echo-failure 3\nmtu 1492\nmru 1492\nnoipv6\n"));
+    }
+
+    #[test]
+    fn secrets_quote_the_password() {
+        assert_eq!(
+            secrets_line("openfeo@isp.example", "example-secret"),
+            "\"openfeo@isp.example\" * \"example-secret\" *\n"
+        );
+    }
+
+    #[test]
+    fn the_pppd_version_comes_from_its_banner() {
+        assert_eq!(
+            parse_pppd_version("pppd version 2.5.4\n").as_deref(),
+            Some("2.5.4")
+        );
+        assert_eq!(
+            parse_pppd_version("pppd version 2.4.9"),
+            Some("2.4.9".to_owned())
+        );
+        assert_eq!(parse_pppd_version("nothing"), None);
+    }
+
+    #[test]
+    fn the_ppp_interface_comes_from_the_last_using_interface_line() {
+        let log = "using channel 1\nUsing interface ppp0\nConnect: ppp0 <--> e1\nConnection terminated.\nusing channel 2\nUsing interface ppp3\n";
+        assert_eq!(last_ppp_ifname(log).as_deref(), Some("ppp3"));
+        assert_eq!(last_ppp_ifname("Connect: nothing"), None);
+    }
+
     use super::*;
 
     #[test]
