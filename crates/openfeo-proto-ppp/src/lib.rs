@@ -13,6 +13,8 @@ pub mod chap;
 pub mod discovery;
 pub mod frame;
 pub mod fsm;
+pub mod ipcp;
+pub mod ipv6cp;
 pub mod lcp;
 mod md5;
 pub mod pap;

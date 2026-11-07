@@ -165,4 +165,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ppp_ipcp"
+path = "fuzz_targets/ppp_ipcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ppp_ipv6cp"
+path = "fuzz_targets/ppp_ipv6cp.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
