@@ -361,13 +361,18 @@ fn addr_from(msg: &AddressMessage) -> Option<Addr> {
             _ => {}
         }
     }
-    // On point-to-point IPv4 links IFA_ADDRESS is the peer; IFA_LOCAL is always ours.
+    // On point-to-point links IFA_ADDRESS is the peer; IFA_LOCAL is always ours.
     let ip = local.or(address)?;
+    let peer = match (local, address) {
+        (Some(local), Some(address)) if address != local => Some(address),
+        _ => None,
+    };
     let net = IpNet::new(ip, msg.header.prefix_len).ok()?;
     Some(Addr {
         ifindex: msg.header.index,
         net,
         scope: u8::from(msg.header.scope),
+        peer,
     })
 }
 

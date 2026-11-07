@@ -129,10 +129,22 @@ impl Pass {
 }
 
 /// The interfaces OpenFeO manages, by name: its bridges, its physical ports and their VLAN
-/// sub-interfaces `pN.V` (SPEC §7.1, ADR-0017).
+/// sub-interfaces `pN.V` (SPEC §7.1, ADR-0017), and the PPP netdevs `ppp-<wan>` its links
+/// applier renamed from the kernel's `ppp<N>` (ADR-0023): no other name of that shape exists
+/// on the appliance.
 #[must_use]
 pub fn is_managed(ifname: &str) -> bool {
-    ifname.starts_with("br-") || is_vlan_port_name(ifname) || is_port_name(ifname)
+    ifname.starts_with("br-")
+        || is_vlan_port_name(ifname)
+        || is_port_name(ifname)
+        || is_ppp_name(ifname)
+}
+
+/// `ppp-<wan>`: a PPPoE WAN's netdev after the rename.
+fn is_ppp_name(ifname: &str) -> bool {
+    ifname
+        .strip_prefix("ppp-")
+        .is_some_and(|rest| !rest.is_empty())
 }
 
 /// `p<digits>`.
@@ -168,7 +180,19 @@ mod tests {
         for name in ["br-lan0", "p0", "p12"] {
             assert!(is_managed(name), "{name}");
         }
-        for name in ["lo", "eth0", "p", "px", "p1a", "veth0", "ppp-wan0"] {
+        for name in ["lo", "eth0", "p", "px", "p1a", "veth0"] {
+            assert!(!is_managed(name), "{name}");
+        }
+    }
+
+    /// The kernel's `ppp<N>` is a unit the applier has not renamed yet, or someone else's;
+    /// `ppp-<wan>` only ever comes from the rename (ADR-0023).
+    #[test]
+    fn managed_interfaces_include_renamed_ppp_netdevs() {
+        for name in ["ppp-wan0", "ppp-wan1"] {
+            assert!(is_managed(name), "{name}");
+        }
+        for name in ["ppp0", "ppp7", "ppp-", "ppp", "pppoe-wan0"] {
             assert!(!is_managed(name), "{name}");
         }
     }

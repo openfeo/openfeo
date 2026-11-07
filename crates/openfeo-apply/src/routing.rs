@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-//! The routing applier: addresses on managed interfaces, routes and policy rules with
-//! `RTPROT_OPENFEO`. Adds what is missing; deletes IPv4 global-scope addresses on managed
-//! interfaces, IPv6 global-scope addresses on the interfaces whose IPv6 the router owns
+//! The routing applier: addresses on managed interfaces (point-to-point ones with their peer),
+//! routes and policy rules with `RTPROT_OPENFEO`. Adds what is missing; deletes IPv4
+//! global-scope addresses on managed interfaces, IPv6 global-scope addresses on the interfaces whose IPv6 the router owns
 //! (`DesiredRouting::ipv6_owned`), and protocol-200 routes and rules that are no longer
 //! desired; touches nothing else (IPv6 on any other interface, which stays the kernel's;
 //! link-local addresses; connected routes; anything on other interfaces; routes and rules
@@ -12,6 +12,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 use ipnet::IpNet;
 use openfeo_netlink::{
@@ -50,50 +51,7 @@ impl RoutingApplier {
     ) -> Result<Report, ApplyError> {
         let mut pass = Pass::default();
 
-        let mut wanted_addrs: BTreeSet<(u32, IpNet)> = BTreeSet::new();
-        for addr in &desired.addrs {
-            let index = match resolve(observed, nl, &addr.ifname).await {
-                Ok(index) => index,
-                Err(err) => {
-                    pass.fail(err);
-                    continue;
-                }
-            };
-            wanted_addrs.insert((index, addr.net));
-            let present = observed
-                .addrs
-                .iter()
-                .any(|a| a.ifindex == index && a.net == addr.net);
-            if !present {
-                let op = format!("add addr {} dev {}", addr.net, addr.ifname);
-                pass.op(
-                    &op,
-                    nl.addr_add(index, addr.net).await,
-                    NetlinkError::is_exist,
-                );
-            }
-        }
-        for addr in &observed.addrs {
-            let Some(link) = observed.links.get(&addr.ifindex) else {
-                continue;
-            };
-            let ours = match addr.net {
-                IpNet::V4(_) => is_managed(&link.name),
-                IpNet::V6(_) => desired.ipv6_owned.contains(&link.name),
-            };
-            if !ours
-                || addr.scope != SCOPE_UNIVERSE
-                || wanted_addrs.contains(&(addr.ifindex, addr.net))
-            {
-                continue;
-            }
-            let op = format!("del addr {} dev {}", addr.net, link.name);
-            pass.op(
-                &op,
-                nl.addr_del(addr.ifindex, addr.net).await,
-                NetlinkError::is_absent,
-            );
-        }
+        addresses(&mut pass, desired, observed, nl).await;
 
         let mut wanted_routes: BTreeSet<Route> = BTreeSet::new();
         // Routes without a gateway (hosts on the port) first: a route through such a host is
@@ -150,6 +108,70 @@ impl RoutingApplier {
 
         rules(&mut pass, desired, observed, nl).await;
         pass.finish()
+    }
+}
+
+/// Addresses: add the desired ones that are missing, delete the global-scope ones on managed
+/// interfaces (IPv4) and on interfaces whose IPv6 the router owns that are not desired. An
+/// address is its interface, its prefix and, on a point-to-point link, its peer: a new session's
+/// address with a new peer is a new address, and the old one goes.
+async fn addresses(pass: &mut Pass, desired: &DesiredRouting, observed: &Cache, nl: &Netlink) {
+    let mut wanted: BTreeSet<(u32, IpNet, Option<IpAddr>)> = BTreeSet::new();
+    for addr in &desired.addrs {
+        let index = match resolve(observed, nl, &addr.ifname).await {
+            Ok(index) => index,
+            Err(err) => {
+                pass.fail(err);
+                continue;
+            }
+        };
+        wanted.insert((index, addr.net, addr.peer));
+        let present = observed
+            .addrs
+            .iter()
+            .any(|a| a.ifindex == index && a.net == addr.net && a.peer == addr.peer);
+        if present {
+            continue;
+        }
+        let (op, result) = if let Some(peer) = addr.peer {
+            (
+                format!("add addr {} peer {peer} dev {}", addr.net, addr.ifname),
+                nl.addr_add_peer(index, addr.net, peer).await,
+            )
+        } else {
+            (
+                format!("add addr {} dev {}", addr.net, addr.ifname),
+                nl.addr_add(index, addr.net).await,
+            )
+        };
+        pass.op(&op, result, NetlinkError::is_exist);
+    }
+    for addr in &observed.addrs {
+        let Some(link) = observed.links.get(&addr.ifindex) else {
+            continue;
+        };
+        let ours = match addr.net {
+            IpNet::V4(_) => is_managed(&link.name),
+            IpNet::V6(_) => desired.ipv6_owned.contains(&link.name),
+        };
+        if !ours
+            || addr.scope != SCOPE_UNIVERSE
+            || wanted.contains(&(addr.ifindex, addr.net, addr.peer))
+        {
+            continue;
+        }
+        let (op, result) = if let Some(peer) = addr.peer {
+            (
+                format!("del addr {} peer {peer} dev {}", addr.net, link.name),
+                nl.addr_del_peer(addr.ifindex, addr.net, peer).await,
+            )
+        } else {
+            (
+                format!("del addr {} dev {}", addr.net, link.name),
+                nl.addr_del(addr.ifindex, addr.net).await,
+            )
+        };
+        pass.op(&op, result, NetlinkError::is_absent);
     }
 }
 

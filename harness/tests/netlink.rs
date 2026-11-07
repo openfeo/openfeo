@@ -7,9 +7,9 @@
 //! scenario uses interface names of its own and deletes them on the way out, because the sandbox's
 //! network namespace outlives the scenarios.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +32,9 @@ use openfeo_netlink::{
 };
 use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
+use openfeo_reconcile::links::{DesiredLinks, DesiredPort, DesiredPpp, PPPOE_PORT_MTU, PortKind};
 use openfeo_reconcile::nft::nft;
+use openfeo_reconcile::routing::{DesiredAddr, DesiredRouting};
 use openfeo_reconcile::sysctl::DesiredSysctl;
 use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, TimeFact, WanIpv6Fact, World};
 use tokio::sync::watch;
@@ -145,6 +147,18 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "routing_applier_owns_block_blackholes",
         run: routing_applier_owns_block_blackholes,
+    },
+    Scenario {
+        name: "a_point_to_point_address_is_added_with_its_peer_and_removed",
+        run: a_point_to_point_address_is_added_with_its_peer_and_removed,
+    },
+    Scenario {
+        name: "the_links_applier_renames_and_sizes_a_unit_netdev",
+        run: the_links_applier_renames_and_sizes_a_unit_netdev,
+    },
+    Scenario {
+        name: "a_refused_port_mtu_is_tolerated",
+        run: a_refused_port_mtu_is_tolerated,
     },
 ];
 
@@ -1659,4 +1673,203 @@ fn a_rule_added_behind_the_monitors_back_is_cached(_lab: &mut Lab) -> anyhow::Re
         .await?;
         anyhow::Ok(())
     })?
+}
+
+/// A PPP netdev's address is point-to-point: ours as `IFA_LOCAL`, the peer as `IFA_ADDRESS`.
+/// The primitive adds and removes one, the cache shows it under our address with the peer, and
+/// the routing applier adds it from a `DesiredAddr` with a peer on a managed `ppp-*` link and
+/// removes it when the desire goes. (A veth stands in for the PPP unit: the sandbox has no
+/// `/dev/ppp`, and the kernel treats a point-to-point address the same on any link.)
+fn a_point_to_point_address_is_added_with_its_peer_and_removed(
+    _lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "ppp-wan9"]);
+    netns::ip(&[
+        "link",
+        "add",
+        "ppp-wan9",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        "ppp-wan9p",
+    ])?;
+    netns::ip(&["link", "set", "ppp-wan9", "up"])?;
+    let result = block_on(async {
+        let mut rig = Rig::connect().await?;
+        let index = rig
+            .rx
+            .borrow()
+            .link_by_name("ppp-wan9")
+            .context("ppp-wan9")?
+            .index;
+        let net: IpNet = "203.0.113.100/32".parse()?;
+        let peer: IpAddr = "203.0.113.1".parse()?;
+        rig.nl.addr_add_peer(index, net, peer).await?;
+        wait_until(
+            &mut rig.rx,
+            "the point-to-point address in the cache",
+            |c| {
+                c.addrs
+                    .iter()
+                    .any(|a| a.ifindex == index && a.net == net && a.peer == Some(peer))
+            },
+        )
+        .await?;
+        let shown = netns::ip(&["-4", "addr", "show", "ppp-wan9"])?;
+        ensure!(
+            shown.contains("203.0.113.100 peer 203.0.113.1/32"),
+            "ip shows {shown}"
+        );
+        rig.nl.addr_del_peer(index, net, peer).await?;
+        wait_until(&mut rig.rx, "the address gone", |c| {
+            !c.addrs.iter().any(|a| a.ifindex == index && a.net == net)
+        })
+        .await?;
+        // Through the applier: desired with the peer, then desired without it.
+        let desired = DesiredRouting {
+            addrs: BTreeSet::from([DesiredAddr {
+                ifname: "ppp-wan9".to_owned(),
+                net,
+                peer: Some(peer),
+            }]),
+            ..DesiredRouting::default()
+        };
+        let cache = rig.rx.borrow_and_update().clone();
+        let report = rig.routing.apply(&desired, &cache, &rig.nl).await?;
+        ensure!(report.ops == 1, "one add, got {}", report.ops);
+        wait_until(&mut rig.rx, "the applier's address", |c| {
+            c.addrs
+                .iter()
+                .any(|a| a.ifindex == index && a.net == net && a.peer == Some(peer))
+        })
+        .await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let report = rig.routing.apply(&desired, &cache, &rig.nl).await?;
+        ensure!(
+            report.ops == 0,
+            "a second pass changed {} things",
+            report.ops
+        );
+        let cache = rig.rx.borrow_and_update().clone();
+        let report = rig
+            .routing
+            .apply(&DesiredRouting::default(), &cache, &rig.nl)
+            .await?;
+        ensure!(report.ops == 1, "one removal, got {}", report.ops);
+        wait_until(&mut rig.rx, "the applier's address gone", |c| {
+            !c.addrs.iter().any(|a| a.ifindex == index && a.net == net)
+        })
+        .await?;
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "ppp-wan9"]);
+    result?
+}
+
+/// The kernel names a PPP unit `ppp<N>`; the links applier renames it to the WAN's `ppp-<wan>`,
+/// sets the negotiated MTU and brings it up, once, and leaves it alone afterwards (ADR-0023).
+/// A veth created under the kernel's unit name stands in for the unit.
+fn the_links_applier_renames_and_sizes_a_unit_netdev(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "ppp7"]);
+    let _ = netns::ip(&["link", "del", "ppp-wan0"]);
+    netns::ip(&[
+        "link", "add", "ppp7", "type", "veth", "peer", "name", "ppp7p",
+    ])?;
+    let result = block_on(async {
+        let mut rig = Rig::connect().await?;
+        wait_until(&mut rig.rx, "ppp7 in the cache", |c| {
+            c.link_by_name("ppp7").is_some()
+        })
+        .await?;
+        let desired = DesiredLinks {
+            ppp: BTreeMap::from([("ppp-wan0".to_owned(), DesiredPpp { unit: 7, mtu: 1492 })]),
+            ..DesiredLinks::default()
+        };
+        let cache = rig.rx.borrow_and_update().clone();
+        let report = rig.links.apply(&desired, &cache, &rig.nl).await?;
+        ensure!(report.ops >= 2, "rename, MTU and up: got {}", report.ops);
+        wait_until(&mut rig.rx, "ppp-wan0 up at 1492", |c| {
+            c.link_by_name("ppp7").is_none()
+                && c.link_by_name("ppp-wan0")
+                    .is_some_and(|l| l.mtu == 1492 && l.up)
+        })
+        .await?;
+        let cache = rig.rx.borrow_and_update().clone();
+        let report = rig.links.apply(&desired, &cache, &rig.nl).await?;
+        ensure!(
+            report.ops == 0,
+            "a second pass changed {} things",
+            report.ops
+        );
+        // A unit the World no longer desires is left alone: the task's drop removes it.
+        let cache = rig.rx.borrow_and_update().clone();
+        let report = rig
+            .links
+            .apply(&DesiredLinks::default(), &cache, &rig.nl)
+            .await?;
+        ensure!(
+            report.ops == 0,
+            "an undesired ppp-* is not touched: {}",
+            report.ops
+        );
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "ppp-wan0"]);
+    let _ = netns::ip(&["link", "del", "ppp7"]);
+    result?
+}
+
+/// A port that cannot carry 1508-byte frames (here a VLAN sub-interface whose parent stays at
+/// 1500) keeps its MTU and the pass goes on without failing: the offer of a 1500-byte payload
+/// is simply withheld (SPEC §7.2).
+fn a_refused_port_mtu_is_tolerated(_lab: &mut Lab) -> anyhow::Result<()> {
+    vlanprobe::require_vlan_links()?;
+    let _ = netns::ip(&["link", "del", "mv0"]);
+    netns::ip(&["link", "add", "mv0", "type", "veth", "peer", "name", "mv1"])?;
+    netns::ip(&[
+        "link", "add", "link", "mv0", "name", "mv0.7", "type", "vlan", "id", "7",
+    ])?;
+    netns::ip(&["link", "set", "mv0", "up"])?;
+    let result = block_on(async {
+        let mut rig = Rig::connect().await?;
+        wait_until(&mut rig.rx, "mv0.7 in the cache", |c| {
+            c.link_by_name("mv0.7").is_some()
+        })
+        .await?;
+        let desired = DesiredLinks {
+            ports: BTreeMap::from([(
+                "mv0.7".to_owned(),
+                DesiredPort {
+                    name: "mv0.7".to_owned(),
+                    kind: PortKind::Vlan {
+                        parent: "mv0".to_owned(),
+                        id: 7,
+                    },
+                    up: true,
+                    master: None,
+                    mtu: Some(PPPOE_PORT_MTU),
+                    ipv6_stable_privacy: false,
+                },
+            )]),
+            ..DesiredLinks::default()
+        };
+        let cache = rig.rx.borrow_and_update().clone();
+        let report = rig.links.apply(&desired, &cache, &rig.nl).await;
+        let report = report.context("the pass must not fail on the refused MTU")?;
+        ensure!(report.ops >= 1, "the MTU was attempted: {}", report.ops);
+        let mtu = rig
+            .rx
+            .borrow()
+            .link_by_name("mv0.7")
+            .map(|l| l.mtu)
+            .context("mv0.7")?;
+        ensure!(
+            mtu == 1500,
+            "the sub-interface stays at its parent's MTU, not {mtu}"
+        );
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "mv0"]);
+    result?
 }

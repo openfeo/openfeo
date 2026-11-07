@@ -70,6 +70,9 @@ pub struct Addr {
     pub net: IpNet,
     /// `RT_SCOPE_*` ([`SCOPE_UNIVERSE`] is global).
     pub scope: u8,
+    /// The far end of a point-to-point address (`IFA_ADDRESS` when it differs from
+    /// `IFA_LOCAL`): a PPP netdev's peer. `None` for an ordinary address.
+    pub peer: Option<IpAddr>,
 }
 
 /// A route's type (`RTN_*`): everything OpenFeO adds is unicast except the blackholes for

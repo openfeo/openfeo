@@ -3,16 +3,17 @@
 
 //! The links applier: create the LAN bridges (VLAN filtering on), delete stray `br-*` bridges,
 //! create the VLAN sub-interfaces `pN.V` and delete stray ones (ADR-0017), set bridge MACs,
-//! enslave and release ports, bring ports and bridges up or down. Order inside a pass: bridges,
-//! VLANs, MACs, membership, ports up/down, bridges up, so a bridge never comes up with a random
-//! MAC. A pass is best-effort: a bridge the kernel refuses (or cannot be found) is reported at
-//! the end, after every other LAN was dealt with.
+//! enslave and release ports, bring ports and bridges up or down, set port MTUs, and rename,
+//! size and raise the PPP netdevs (ADR-0023). Order inside a pass: bridges, VLANs, MACs,
+//! membership, ports up/down, bridges up, so a bridge never comes up with a random MAC; MTUs;
+//! PPP netdevs last. A pass is best-effort: a bridge the kernel refuses (or cannot be found) is
+//! reported at the end, after every other LAN was dealt with.
 
 use std::net::Ipv6Addr;
 
 use openfeo_netlink::{Cache, Error as NetlinkError, Link, LinkKind, Netlink};
 use openfeo_platform::sysctl;
-use openfeo_reconcile::links::{DesiredLinks, PortKind};
+use openfeo_reconcile::links::{DesiredLinks, PPPOE_PORT_MTU, PortKind};
 
 use crate::{ApplyError, Pass, Report, is_vlan_port_name, resolve};
 
@@ -60,6 +61,7 @@ impl LinksApplier {
         membership(&mut pass, desired, observed, nl).await;
         up_down(&mut pass, desired, observed, nl, self.ipv6_secret).await;
         mtus(&mut pass, desired, observed, nl).await;
+        ppp(&mut pass, desired, observed, nl).await;
         pass.finish()
     }
 }
@@ -95,16 +97,56 @@ fn has_stable_privacy(port: &str) -> bool {
         .is_ok_and(|mode| mode.trim() == "2")
 }
 
-/// Ports with a desired MTU (a DHCP WAN's lease) that the kernel does not have yet.
+/// Ports with a desired MTU (a DHCP WAN's lease, a PPPoE WAN's 1508) that the kernel does not
+/// have yet. A port that cannot carry 1508-byte frames keeps its MTU and the pass goes on:
+/// nothing above 1492 is offered over it (SPEC §7.2).
 async fn mtus(pass: &mut Pass, desired: &DesiredLinks, observed: &Cache, nl: &Netlink) {
     for (port_name, port) in &desired.ports {
         let (Some(mtu), Some(link)) = (port.mtu, observed.link_by_name(port_name)) else {
             continue;
         };
-        if link.mtu != mtu {
+        if link.mtu == mtu {
+            continue;
+        }
+        match nl.link_set_mtu(link.index, mtu).await {
+            Err(err) if mtu == PPPOE_PORT_MTU && err.is_invalid() => {
+                tracing::debug!("{port_name} cannot take mtu {mtu}; keeping {}", link.mtu);
+            }
+            result => pass.op(&format!("set {port_name} mtu {mtu}"), result, |_| false),
+        }
+    }
+}
+
+/// The PPP netdevs (ADR-0023): the kernel's `ppp<unit>` is renamed to the WAN's `ppp-<wan>`,
+/// given the negotiated MTU and brought up; one already under its name only gets what it
+/// lacks. A `ppp-*` link nothing desires is a task between sessions and is left alone.
+async fn ppp(pass: &mut Pass, desired: &DesiredLinks, observed: &Cache, nl: &Netlink) {
+    for (name, netdev) in &desired.ppp {
+        let unit_name = format!("ppp{}", netdev.unit);
+        let link = if let Some(link) = observed.link_by_name(name) {
+            link
+        } else {
+            let Some(link) = observed.link_by_name(&unit_name) else {
+                continue;
+            };
             pass.op(
-                &format!("set {port_name} mtu {mtu}"),
-                nl.link_set_mtu(link.index, mtu).await,
+                &format!("rename {unit_name} to {name}"),
+                nl.link_set_name(link.index, name).await,
+                |_| false,
+            );
+            link
+        };
+        if link.mtu != netdev.mtu {
+            pass.op(
+                &format!("set {name} mtu {}", netdev.mtu),
+                nl.link_set_mtu(link.index, netdev.mtu).await,
+                |_| false,
+            );
+        }
+        if !link.up {
+            pass.op(
+                &format!("set {name} up"),
+                nl.link_set_up(link.index, true).await,
                 |_| false,
             );
         }
