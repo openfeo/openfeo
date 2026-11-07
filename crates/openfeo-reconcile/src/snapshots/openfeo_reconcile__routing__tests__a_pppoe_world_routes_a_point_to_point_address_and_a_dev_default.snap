@@ -1,0 +1,78 @@
+---
+source: crates/openfeo-reconcile/src/routing.rs
+expression: desired
+---
+addrs:
+  - ifname: br-lan0
+    net: 192.168.1.1/24
+    peer: ~
+  - ifname: br-lan0
+    net: "2001:db8:1:222::1/64"
+    peer: ~
+  - ifname: br-lan0
+    net: "fd12:3456:789a:1::1/64"
+    peer: ~
+  - ifname: lo
+    net: "2001:db8:1::1/128"
+    peer: ~
+  - ifname: lo
+    net: "fd12:3456:789a::1/128"
+    peer: ~
+  - ifname: ppp-wan0
+    net: 203.0.113.100/32
+    peer: 203.0.113.1
+  - ifname: ppp-wan0
+    net: "fe80::1234:5678:9abc:def0/64"
+    peer: ~
+routes:
+  - ifname: ~
+    dst: "2001:db8:1::/48"
+    gateway: ~
+    table: 254
+    protocol: 200
+    priority: 1000
+    kind: Blackhole
+    pref_src: ~
+  - ifname: ppp-wan0
+    dst: ~
+    gateway: 203.0.113.1
+    table: 254
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: ~
+  - ifname: ppp-wan0
+    dst: ~
+    gateway: "fe80::1"
+    table: 100
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: "2001:db8:1::1"
+  - ifname: ppp-wan0
+    dst: ~
+    gateway: "fe80::1"
+    table: 254
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: "2001:db8:1::1"
+  - ifname: ppp-wan0
+    dst: "fe80::2/128"
+    gateway: ~
+    table: 254
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: ~
+rules:
+  - v6: true
+    priority: 1500
+    src: ~
+    action:
+      ToTable: 254
+    suppress_prefixlen: 0
+ipv6_owned:
+  - br-lan0
+  - lo
+  - ppp-wan0

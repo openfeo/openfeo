@@ -11,7 +11,9 @@ use openfeo_config::{Config, PortMap};
 
 use ipnet::Ipv6Net;
 
-use crate::{DefaultRoute, Dhcp4Fact, LeaseFact, MacAddr, TimeFact, WanDhcp6Fact, WanIpv6Fact};
+use crate::{
+    DefaultRoute, Dhcp4Fact, LeaseFact, MacAddr, PppoeFact, TimeFact, WanDhcp6Fact, WanIpv6Fact,
+};
 
 /// What the netlink monitor knows about one interface (SPEC §7.1: link state is a fact).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +58,8 @@ pub struct World {
     pub routes: Arc<BTreeSet<DefaultRoute>>,
     /// What each WAN's DHCPv6 client holds, keyed by WAN name (SPEC §7.3).
     pub dhcp6: Arc<BTreeMap<String, WanDhcp6Fact>>,
+    /// Every PPPoE WAN's session, by WAN name, while it exists (SPEC §7.2).
+    pub pppoe: Arc<BTreeMap<String, PppoeFact>>,
     /// The router's ULA /48 (`identity/ula`), once loaded; `None` when it could not be kept.
     pub ula: Option<Ipv6Net>,
 }
@@ -75,6 +79,7 @@ impl World {
             ipv6: Arc::new(BTreeMap::new()),
             routes: Arc::new(BTreeSet::new()),
             dhcp6: Arc::new(BTreeMap::new()),
+            pppoe: Arc::new(BTreeMap::new()),
             ula: None,
         }
     }

@@ -240,14 +240,20 @@ pub(crate) fn active_wan(world: &World) -> Option<&Wan> {
 /// lease over IPv4, the advertisements' RDNSS over IPv6), each learned family only while the
 /// kernel has a default route of that family through the WAN (ADR-0019).
 fn wan_dns(world: &World, wan: &Wan) -> Vec<IpAddr> {
-    let ifname = crate::wan_ifname(wan);
+    let ifname = crate::wan_netdev(wan);
     let mut servers: Vec<IpAddr> = match &wan.kind {
         Some(wan::Kind::Dhcp(_)) if world.has_default(false, &ifname) => world
             .dhcp4
             .get(&wan.name)
             .map(|lease| lease.dns.iter().copied().map(IpAddr::V4).collect())
             .unwrap_or_default(),
-        // A PPPoE WAN's resolvers come from IPCP (M3 part 1, the fact and reconciler task).
+        // IPCP's resolvers, behind the IPv4 route like a lease's (ADR-0019).
+        Some(wan::Kind::Pppoe(_)) if world.has_default(false, &ifname) => world
+            .pppoe
+            .get(&wan.name)
+            .and_then(|fact| fact.ipv4.as_ref())
+            .map(|ipv4| ipv4.dns.iter().copied().map(IpAddr::V4).collect())
+            .unwrap_or_default(),
         Some(wan::Kind::Dhcp(_) | wan::Kind::Pppoe(_)) | None => Vec::new(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .dns
@@ -292,8 +298,13 @@ fn wan_addresses(world: &World, wan: &Wan) -> Vec<IpAddr> {
             .map(|lease| IpAddr::V4(lease.address.addr()))
             .into_iter()
             .collect(),
-        // A PPPoE WAN's address comes from IPCP (M3 part 1, the fact and reconciler task).
-        Some(wan::Kind::Pppoe(_)) => Vec::new(),
+        Some(wan::Kind::Pppoe(_)) => world
+            .pppoe
+            .get(&wan.name)
+            .and_then(|fact| fact.ipv4.as_ref())
+            .map(|ipv4| IpAddr::V4(ipv4.local))
+            .into_iter()
+            .collect(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .address
             .parse::<Ipv4Net>()
@@ -391,6 +402,27 @@ fn push_unique<T: PartialEq>(upstreams: &mut Vec<T>, upstream: T) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipcp_resolvers_join_behind_the_ipv4_route() {
+        let with_route = desired(&fixtures::pppoe_world());
+        assert!(
+            with_route
+                .upstreams
+                .contains(&"203.0.113.1".parse().unwrap()),
+            "{:?}",
+            with_route.upstreams
+        );
+        let mut world = fixtures::pppoe_world();
+        world.routes = std::sync::Arc::new(std::collections::BTreeSet::new());
+        let without = desired(&world);
+        assert!(
+            !without.upstreams.contains(&"203.0.113.1".parse().unwrap()),
+            "not before the route: {:?}",
+            without.upstreams
+        );
+        insta::assert_yaml_snapshot!(with_route);
+    }
+
     use super::*;
     use crate::fixtures;
     use openfeo_config::Dns;

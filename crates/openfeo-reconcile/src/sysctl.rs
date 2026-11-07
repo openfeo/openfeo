@@ -37,7 +37,11 @@ pub fn sysctl(world: &World, forwarding: bool) -> DesiredSysctl {
         if world.ports.id_of(&wan.port).is_none() {
             continue;
         }
-        let ifname = crate::wan_ifname(wan);
+        let ifname = crate::wan_netdev(wan);
+        // A PPP netdev's knobs exist only while the kernel shows it (ADR-0023).
+        if openfeo_config::rules::is_pppoe(wan) && !world.links.contains_key(&ifname) {
+            continue;
+        }
         entries.insert(send_redirects(&ifname), "0".to_owned());
         if let Some(ipv6) = &wan.ipv6
             && ipv6.mode != "disabled"
@@ -86,6 +90,29 @@ pub fn send_redirects(ifname: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pppoe_wan_sets_its_ipv6_knobs_on_the_netdev_once_it_exists() {
+        let on = sysctl(&crate::fixtures::pppoe_world(), true).entries;
+        assert_eq!(
+            on.get("net/ipv6/conf/ppp-wan0/accept_ra")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            on.get("net/ipv6/conf/ppp-wan0/mtu").map(String::as_str),
+            Some("1492")
+        );
+        assert!(
+            on.keys().all(|key| !key.contains("/p0/")),
+            "nothing on the port: {on:?}"
+        );
+        let before = sysctl(&crate::fixtures::pppoe_world_without_link(), true).entries;
+        assert!(
+            before.keys().all(|key| !key.contains("ppp-wan0")),
+            "{before:?}"
+        );
+    }
+
     use super::*;
 
     #[test]

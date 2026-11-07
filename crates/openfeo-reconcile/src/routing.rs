@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use openfeo_config::rules::is_global_unicast_v6;
+use openfeo_config::rules::{self, is_global_unicast_v6};
 use openfeo_config::{Ipv6Wan, Wan, wan};
 use openfeo_world::World;
 use serde::Serialize;
@@ -42,6 +42,8 @@ pub struct DesiredAddr {
     pub ifname: String,
     /// Address and prefix.
     pub net: IpNet,
+    /// The far end of a point-to-point link (a PPP netdev's peer), `IFA_ADDRESS` to the kernel.
+    pub peer: Option<IpAddr>,
 }
 
 /// A route's type: unicast, or a blackhole for a declared public block (SPEC §7.4). Mirrors
@@ -151,7 +153,7 @@ pub fn routing(world: &World) -> DesiredRouting {
         if world.ports.id_of(&wan_config.port).is_none() {
             continue;
         }
-        let ifname = crate::wan_ifname(wan_config);
+        let ifname = crate::wan_netdev(wan_config);
         let route = |dst: Option<IpNet>, gateway: IpAddr| DesiredRoute {
             ifname: Some(ifname.clone()),
             dst,
@@ -162,20 +164,27 @@ pub fn routing(world: &World) -> DesiredRouting {
             kind: RouteKind::Unicast,
             pref_src: None,
         };
+        // A PPP netdev exists only while its session does: until the kernel shows it, nothing
+        // is desired for it (ADR-0023), or every pass would wait on a missing interface.
+        let netdev_present = !rules::is_pppoe(wan_config) || world.links.contains_key(&ifname);
         if let Some(ipv6) = &wan_config.ipv6
             && ipv6.mode != "disabled"
+            && netdev_present
         {
             ipv6_routing(world, wan_config, ipv6, &ifname, index, &lan6, &mut desired);
         }
         match &wan_config.kind {
-            // A PPPoE WAN's addresses and routes come from its session fact (M3 part 1, the
-            // fact and reconciler task).
-            Some(wan::Kind::Pppoe(_)) => {}
+            Some(wan::Kind::Pppoe(_)) => {
+                if netdev_present {
+                    pppoe_routing(world, wan_config, &ifname, &mut desired);
+                }
+            }
             Some(wan::Kind::Static(static_wan)) => {
                 if let Ok(net) = static_wan.address.parse::<IpNet>() {
                     desired.addrs.insert(DesiredAddr {
                         ifname: ifname.clone(),
                         net,
+                        peer: None,
                     });
                 }
                 if let Ok(gateway) = static_wan.gateway.parse::<IpAddr>() {
@@ -189,6 +198,7 @@ pub fn routing(world: &World) -> DesiredRouting {
                 desired.addrs.insert(DesiredAddr {
                     ifname: ifname.clone(),
                     net: IpNet::V4(lease.address),
+                    peer: None,
                 });
                 // RFC 3442: classless routes replace the router option, and `0.0.0.0/0` among
                 // them is the default route. A gateway outside the leased subnet (a /32 lease,
@@ -252,6 +262,7 @@ fn lan_addresses(world: &World, lan6: &Lan6, desired: &mut DesiredRouting) {
             desired.addrs.insert(DesiredAddr {
                 ifname: bridge_name(&lan.name),
                 net,
+                peer: None,
             });
         }
     }
@@ -259,6 +270,7 @@ fn lan_addresses(world: &World, lan6: &Lan6, desired: &mut DesiredRouting) {
         desired.addrs.insert(DesiredAddr {
             ifname: prefix.ifname.clone(),
             net: IpNet::V6(Ipv6Net::new_assert(prefix.router, 64)),
+            peer: None,
         });
     }
     let ipv6_wan = world.config.wans.iter().any(|wan| {
@@ -284,6 +296,47 @@ fn lan_addresses(world: &World, lan6: &Lan6, desired: &mut DesiredRouting) {
 /// the WAN's own table holding the default, or `unreachable default` while there is none; the
 /// 1500 suppress-main rule; a source rule per delegated prefix into the WAN's table and an
 /// `unreachable` rule per deprecated prefix.
+/// A PPPoE WAN's session on its netdev (ADR-0023): the IPCP address as a point-to-point
+/// address with the peer, the default through the netdev (via the peer when it is numbered),
+/// and the IPV6CP identifiers as our link-local address and the peer's on-link /128.
+fn pppoe_routing(world: &World, wan_config: &Wan, ifname: &str, desired: &mut DesiredRouting) {
+    let Some(fact) = world.pppoe.get(&wan_config.name) else {
+        return;
+    };
+    let route = |dst: Option<IpNet>, gateway: Option<IpAddr>| DesiredRoute {
+        ifname: Some(ifname.to_owned()),
+        dst,
+        gateway,
+        table: TABLE_MAIN,
+        protocol: RTPROT_OPENFEO,
+        priority: wan_config.priority,
+        kind: RouteKind::Unicast,
+        pref_src: None,
+    };
+    if let Some(ipv4) = &fact.ipv4 {
+        desired.addrs.insert(DesiredAddr {
+            ifname: ifname.to_owned(),
+            net: IpNet::V4(Ipv4Net::from(ipv4.local)),
+            peer: ipv4.peer.map(IpAddr::V4),
+        });
+        desired
+            .routes
+            .insert(route(None, ipv4.peer.map(IpAddr::V4)));
+    }
+    if let Some(ipv6) = &fact.ipv6 {
+        let link_local = |iid: u64| Ipv6Addr::from((0xfe80u128 << 112) | u128::from(iid));
+        desired.addrs.insert(DesiredAddr {
+            ifname: ifname.to_owned(),
+            net: IpNet::V6(Ipv6Net::new_assert(link_local(ipv6.local_iid), 64)),
+            peer: None,
+        });
+        desired.routes.insert(route(
+            Some(IpNet::V6(Ipv6Net::from(link_local(ipv6.peer_iid)))),
+            None,
+        ));
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn ipv6_routing(
     world: &World,
@@ -337,6 +390,7 @@ fn ipv6_routing(
             desired.addrs.insert(DesiredAddr {
                 ifname: ifname.to_owned(),
                 net: IpNet::V6(*addr),
+                peer: None,
             });
         }
         for on_link in fact.on_link.iter().filter(|net| usable(net)) {
@@ -351,6 +405,7 @@ fn ipv6_routing(
             desired.addrs.insert(DesiredAddr {
                 ifname: ifname.to_owned(),
                 net: IpNet::V6(addr.net),
+                peer: None,
             });
         }
         for delegated in fact6.prefixes.iter().chain_deprecated(fact6) {
@@ -395,6 +450,7 @@ fn ipv6_routing(
         desired.addrs.insert(DesiredAddr {
             ifname: "lo".to_owned(),
             net: IpNet::V6(Ipv6Net::new_assert(router_address(prefix), 128)),
+            peer: None,
         });
         desired.routes.insert(blackhole(prefix));
     }
@@ -402,6 +458,7 @@ fn ipv6_routing(
         desired.addrs.insert(DesiredAddr {
             ifname: "lo".to_owned(),
             net: IpNet::V6(Ipv6Net::new_assert(*addr, 128)),
+            peer: None,
         });
     }
     desired.rules.insert(DesiredRule {
@@ -450,6 +507,81 @@ impl<'a, I: Iterator<Item = &'a openfeo_world::Lifetimed> + 'a> ChainDeprecated<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pppoe_world_routes_a_point_to_point_address_and_a_dev_default() {
+        let desired = routing(&fixtures::pppoe_world());
+        assert!(
+            desired.addrs.contains(&DesiredAddr {
+                ifname: "ppp-wan0".to_owned(),
+                net: "203.0.113.100/32".parse().unwrap(),
+                peer: Some("203.0.113.1".parse().unwrap()),
+            }),
+            "{:?}",
+            desired.addrs
+        );
+        let default = desired
+            .routes
+            .iter()
+            .find(|route| {
+                route.dst.is_none()
+                    && route.ifname.as_deref() == Some("ppp-wan0")
+                    && route.table == TABLE_MAIN
+                    && !route.gateway.is_some_and(|g| g.is_ipv6())
+            })
+            .expect("an IPv4 default through the netdev");
+        assert_eq!(default.gateway, Some("203.0.113.1".parse().unwrap()));
+        assert_eq!(default.priority, 10);
+        assert!(
+            desired.addrs.iter().all(|addr| addr.ifname != "p0"),
+            "nothing on the port: {:?}",
+            desired.addrs
+        );
+        insta::assert_yaml_snapshot!(desired);
+    }
+
+    #[test]
+    fn the_ipv6cp_identifiers_give_the_link_local_and_the_peer_route() {
+        let desired = routing(&fixtures::pppoe_world());
+        assert!(
+            desired.addrs.contains(&DesiredAddr {
+                ifname: "ppp-wan0".to_owned(),
+                net: "fe80::1234:5678:9abc:def0/64".parse().unwrap(),
+                peer: None,
+            }),
+            "{:?}",
+            desired.addrs
+        );
+        assert!(
+            desired
+                .routes
+                .iter()
+                .any(|route| route.ifname.as_deref() == Some("ppp-wan0")
+                    && route.dst == Some("fe80::2/128".parse().unwrap())
+                    && route.gateway.is_none()),
+            "the peer's link-local is on the link: {:?}",
+            desired.routes
+        );
+    }
+
+    #[test]
+    fn a_pppoe_wan_desires_nothing_for_its_netdev_until_the_link_exists() {
+        let desired = routing(&fixtures::pppoe_world_without_link());
+        assert!(
+            desired.addrs.iter().all(|addr| addr.ifname != "ppp-wan0"),
+            "{:?}",
+            desired.addrs
+        );
+        assert!(
+            desired
+                .routes
+                .iter()
+                .all(|route| route.ifname.as_deref() != Some("ppp-wan0")),
+            "{:?}",
+            desired.routes
+        );
+        assert!(!desired.ipv6_owned.contains("ppp-wan0"));
+    }
+
     use super::*;
     use crate::fixtures;
     use std::collections::BTreeMap;

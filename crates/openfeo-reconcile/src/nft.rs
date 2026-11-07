@@ -30,7 +30,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::lan6;
-use crate::{TABLE, bridge_name, public, wan_ifname};
+use crate::{TABLE, bridge_name, public, wan_netdev};
 
 /// The table's family: one ruleset for IPv4 and IPv6 (SPEC §9).
 pub const FAMILY: &str = "inet";
@@ -168,7 +168,7 @@ pub fn nft(world: &World) -> DesiredNft {
     ];
     ruleset.extend(rpfilter_chain());
     ruleset.extend(input_chain(wan_ping));
-    ruleset.extend(forward_chain());
+    ruleset.extend(forward_chain(&mss_clamped(world)));
     ruleset.extend(dstnat_chain());
     ruleset.extend(srcnat_chain());
 
@@ -190,7 +190,7 @@ fn zones(world: &World) -> Zones {
             .wans
             .iter()
             .filter(|wan| world.ports.id_of(&wan.port).is_some())
-            .map(wan_ifname)
+            .map(wan_netdev)
             .collect(),
         ..Zones::default()
     };
@@ -796,7 +796,42 @@ fn service_rule(set: &str, family: Option<Value>, protocol: &str, ports: Value) 
 /// Forwarded traffic: default drop. Translated flows from a WAN, and from a LAN only along an
 /// allowed pair; the rules; LAN→WAN for the LANs that reach it; the allowed LAN pairs (every LAN
 /// with itself, plus its `reaches`).
-fn forward_chain() -> Vec<Value> {
+/// The WAN netdevs the kernel shows with an MTU below 1500: TCP's MSS is clamped to the route
+/// MTU on their SYNs both ways (SPEC §7.2), so a PPPoE line (or a lease that lowered the MTU)
+/// is not a LAN full of stalled connections.
+fn mss_clamped(world: &World) -> Vec<String> {
+    world
+        .config
+        .wans
+        .iter()
+        .filter(|wan| world.ports.id_of(&wan.port).is_some())
+        .map(wan_netdev)
+        .filter(|netdev| world.links.get(netdev).is_some_and(|link| link.mtu < 1500))
+        .collect()
+}
+
+/// `tcp flags syn tcp option maxseg size set rt mtu`.
+fn mss_clamp_rules(netdevs: &[String]) -> Vec<Value> {
+    let clamp = || json!({"mangle": {"key": {"tcp option": {"name": "maxseg", "field": "size"}}, "value": {"rt": {"key": "mtu"}}}});
+    let syn = || is_in(payload("tcp", "flags"), json!("syn"));
+    netdevs
+        .iter()
+        .flat_map(|netdev| {
+            [
+                rule(
+                    "forward",
+                    vec![eq(meta("oifname"), json!(netdev)), syn(), clamp()],
+                ),
+                rule(
+                    "forward",
+                    vec![eq(meta("iifname"), json!(netdev)), syn(), clamp()],
+                ),
+            ]
+        })
+        .collect()
+}
+
+fn forward_chain(mss_clamped: &[String]) -> Vec<Value> {
     let mut rules = vec![
         chain("forward", "filter", "forward", 0, "drop"),
         rule(
@@ -804,6 +839,9 @@ fn forward_chain() -> Vec<Value> {
             vec![ct_state(json!(["established", "related"])), accept()],
         ),
         rule("forward", vec![ct_state(json!("invalid")), drop()]),
+    ];
+    rules.extend(mss_clamp_rules(mss_clamped));
+    rules.extend([
         // ULA never crosses a WAN (RFC 4193 §4.3; SPEC §7.5): a host that picked a unique local
         // source for a global destination is told at once, so it falls back, and nothing
         // unique local arrives from a WAN.
@@ -824,7 +862,7 @@ fn forward_chain() -> Vec<Value> {
             "forward",
             vec![ct_status_dnat(), iif_oif_pair_in("lan_pairs"), accept()],
         ),
-    ];
+    ]);
     rules.extend(rules_set_rules());
     rules.extend([
         rule(
@@ -917,6 +955,43 @@ fn srcnat_chain() -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sub_1500_wan_gets_the_mss_clamp_both_ways() {
+        let desired = nft(&crate::fixtures::pppoe_world());
+        let clamps: Vec<&Value> = rules_of(&desired.ruleset, "forward")
+            .into_iter()
+            .filter(|rule| rule.to_string().contains("\"mangle\""))
+            .collect();
+        assert_eq!(clamps.len(), 2, "{clamps:?}");
+        let text = clamps
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("\"oifname\"") && text.contains("\"iifname\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("ppp-wan0") && text.contains("maxseg") && text.contains("\"rt\""),
+            "{text}"
+        );
+        assert!(text.contains("\"syn\""), "SYN only: {text}");
+        let plain = nft(&crate::fixtures::static_world());
+        assert!(
+            rules_of(&plain.ruleset, "forward")
+                .iter()
+                .all(|rule| !rule.to_string().contains("\"mangle\"")),
+            "a 1500 WAN needs no clamp"
+        );
+        let set = desired
+            .ruleset
+            .iter()
+            .find(|v| v.pointer("/add/set/name").and_then(Value::as_str) == Some("wan_if"))
+            .expect("the wan_if set");
+        assert_eq!(set.pointer("/add/set/elem"), Some(&json!(["ppp-wan0"])));
+    }
+
     use super::*;
     use crate::fixtures;
 

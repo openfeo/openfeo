@@ -5,6 +5,7 @@ expression: desired
 addrs:
   - ifname: br-lan0
     net: 192.168.1.1/24
+    peer: ~
 routes: []
 rules: []
 ipv6_owned:

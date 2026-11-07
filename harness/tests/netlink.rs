@@ -881,6 +881,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         ipv6: Arc::new(BTreeMap::new()),
         routes: Arc::new(std::collections::BTreeSet::new()),
         dhcp6: Arc::new(BTreeMap::new()),
+        pppoe: Arc::new(BTreeMap::new()),
         ula: None,
     }
 }

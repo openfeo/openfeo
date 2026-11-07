@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_world::{
-    DefaultRoute, Dhcp4Fact, LeaseFact, Lifetimed, LinkFact, MacAddr, TimeFact, WanDhcp6Fact,
-    WanIpv6Fact, World,
+    DefaultRoute, Dhcp4Fact, LeaseFact, Lifetimed, LinkFact, MacAddr, PppIpv4, PppIpv6, PppoeFact,
+    TimeFact, WanDhcp6Fact, WanIpv6Fact, World,
 };
 
 pub const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
@@ -20,6 +20,7 @@ pub const VM_VLANS: &str = include_str!("../../../harness/fixtures/vm-vlans.toml
 pub const VM_PUBLIC: &str = include_str!("../../../harness/fixtures/vm-public.toml");
 pub const VM_IPV6: &str = include_str!("../../../harness/fixtures/vm-ipv6.toml");
 pub const VM_PD: &str = include_str!("../../../harness/fixtures/vm-pd.toml");
+pub const VM_PPPOE: &str = include_str!("../../../harness/fixtures/vm-pppoe.toml");
 
 pub fn portmap() -> PortMap {
     PortMap {
@@ -67,6 +68,7 @@ fn world(config: Config) -> World {
         ipv6: Arc::new(BTreeMap::new()),
         routes: Arc::new(std::collections::BTreeSet::new()),
         dhcp6: Arc::new(BTreeMap::new()),
+        pppoe: Arc::new(BTreeMap::new()),
         ula: None,
     }
 }
@@ -317,5 +319,75 @@ pub fn pd_world() -> World {
             ifname: "p0".to_owned(),
         },
     ]));
+    world
+}
+
+/// The session the lab's access concentrator grants (`vm-pppoe.toml`): IPCP numbered us from
+/// the ISP's pool with the ISP as peer and resolver, IPV6CP settled both identifiers.
+pub fn pppoe_fact() -> PppoeFact {
+    PppoeFact {
+        session_id: 1,
+        ac_mac: [0x52, 0x54, 0x00, 0xfe, 0x00, 0x01],
+        ac_name: "isp".to_owned(),
+        unit: 0,
+        mtu: 1492,
+        ipv4: Some(PppIpv4 {
+            local: "203.0.113.100".parse().expect("an address"),
+            peer: Some("203.0.113.1".parse().expect("an address")),
+            dns: vec!["203.0.113.1".parse().expect("an address")],
+        }),
+        ipv6: Some(PppIpv6 {
+            local_iid: 0x1234_5678_9abc_def0,
+            peer_iid: 2,
+        }),
+        up_since_ms: 5_000,
+    }
+}
+
+/// `vm-pppoe.toml` with the session up and the kernel showing `ppp-wan0`: p0 up with carrier,
+/// the unit's netdev at index 9 with the negotiated MTU and the IPV6CP link-local, the router
+/// learned over the link, both defaults through the netdev, the ULA loaded.
+pub fn pppoe_world() -> World {
+    let mut world = pppoe_world_without_link();
+    let mut links = (*world.links).clone();
+    links.insert(
+        "ppp-wan0".to_owned(),
+        LinkFact {
+            index: 9,
+            name: "ppp-wan0".to_owned(),
+            up: true,
+            carrier: true,
+            mac: None,
+            mtu: 1492,
+            link_local6: Some("fe80::1234:5678:9abc:def0".parse().expect("an address")),
+        },
+    );
+    world.links = Arc::new(links);
+    world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), ipv6_fact())]));
+    world.routes = Arc::new(std::collections::BTreeSet::from([
+        DefaultRoute {
+            v6: false,
+            ifname: "ppp-wan0".to_owned(),
+        },
+        DefaultRoute {
+            v6: true,
+            ifname: "ppp-wan0".to_owned(),
+        },
+    ]));
+    world
+}
+
+/// `vm-pppoe.toml` with the session fact published but the kernel not yet showing the unit's
+/// netdev: nothing may be desired for `ppp-wan0`.
+pub fn pppoe_world_without_link() -> World {
+    let mut world = world(openfeo_config::file::parse(VM_PPPOE).expect("fixture parses"));
+    let mut links = link_facts();
+    if let Some(p0) = links.get_mut("p0") {
+        p0.up = true;
+        p0.carrier = true;
+    }
+    world.links = Arc::new(links);
+    world.pppoe = Arc::new(BTreeMap::from([("wan0".to_owned(), pppoe_fact())]));
+    world.ula = Some(ULA.parse().expect("a prefix"));
     world
 }
