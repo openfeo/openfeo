@@ -9,10 +9,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod chap;
 pub mod discovery;
 pub mod frame;
 pub mod fsm;
 pub mod lcp;
+mod md5;
+pub mod pap;
 pub mod pppoe;
 
 /// Milliseconds on the driver's monotonic clock, as the other cores count time.
