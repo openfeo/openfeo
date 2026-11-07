@@ -10,6 +10,8 @@
 #![forbid(unsafe_code)]
 
 pub mod discovery;
+pub mod frame;
+pub mod fsm;
 pub mod pppoe;
 
 /// Milliseconds on the driver's monotonic clock, as the other cores count time.
