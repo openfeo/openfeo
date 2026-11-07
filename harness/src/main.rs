@@ -61,6 +61,11 @@ enum Cmd {
     /// cannot load `8021q`, 1 on any other error.
     #[command(hide = true)]
     ProbeVlan,
+    /// Internal: inside the sandbox, exit 0 if `/dev/ppp` opens (`ppp_generic` wants
+    /// `CAP_NET_ADMIN` in the opener's user namespace, so the probe must run where the
+    /// scenarios do), 3 if it does not.
+    #[command(hide = true)]
+    ProbePpp,
     /// Internal: our DHCPv4 client on an interface of the current namespace, one JSON event per
     /// line; the LAN side of the DHCPv4 server scenarios.
     #[command(hide = true)]
@@ -100,6 +105,7 @@ fn main() -> ExitCode {
         Cmd::CheckSandbox => sandbox::enter().map(|()| ExitCode::SUCCESS),
         Cmd::ProbeNft => probe_nft(),
         Cmd::ProbeVlan => probe_vlan(),
+        Cmd::ProbePpp => probe_ppp(),
         Cmd::DhcpClient {
             iface,
             request,
@@ -185,6 +191,7 @@ fn check() -> Result<ExitCode> {
         .open("/dev/net/tun")
         .is_ok();
     report("/dev/net/tun", tun, "");
+    report_ppp()?;
     for bin in [
         "qemu-system-x86_64",
         "ip",
@@ -196,6 +203,8 @@ fn check() -> Result<ExitCode> {
         "ntpdate",
         "radvd",
         "rdisc6",
+        "pppd",
+        "pppoe-server",
         "mkfs.ext4",
         "ping",
         "python3",
@@ -364,6 +373,36 @@ fn nft_expressions_work() -> Result<Result<(), String>> {
 
 fn vlan_links_work() -> Result<Result<(), String>> {
     probe_in_child("probe-vlan")
+}
+
+/// `/dev/ppp` and the PPPoE plugin, reported but not fatal: the PPPoE scenarios (M3) skip without
+/// them, as the VLAN ones do without 8021q.
+fn report_ppp() -> Result<()> {
+    // Opened from the sandbox: ppp_generic wants CAP_NET_ADMIN in the opener's user namespace.
+    match probe_in_child("probe-ppp")? {
+        Ok(()) => println!("{:<30} ok", "/dev/ppp"),
+        Err(detail) => println!(
+            "{:<30} no ({detail}; the PPPoE scenarios skip: load ppp_generic and add udev: KERNEL==\"ppp\", GROUP=\"<your group>\", MODE=\"0660\")",
+            "/dev/ppp"
+        ),
+    }
+    match daemons::pppd_plugin() {
+        Ok(path) => println!("{:<30} ok ({})", "pppd PPPoE plugin", path.display()),
+        Err(err) => println!("{:<30} no ({err:#})", "pppd PPPoE plugin"),
+    }
+    Ok(())
+}
+
+fn probe_ppp() -> Result<ExitCode> {
+    sandbox::enter()?;
+    probe_exit(
+        File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/ppp")
+            .map(drop)
+            .map_err(|err| scenario::Skip(format!("/dev/ppp: {err}")).into()),
+    )
 }
 
 /// Re-run ourselves with a hidden probe subcommand (the sandbox is entered in a child, see

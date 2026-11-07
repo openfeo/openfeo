@@ -57,7 +57,7 @@ $SUDO apt-get update -qq
 $SUDO apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl git xz-utils kmod procps rsync \
   musl-tools pkg-config bison flex bc libelf-dev libssl-dev ccache zstd cpio e2fsprogs \
-  qemu-system-x86 kea-dhcp4-server kea-dhcp6-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate radvd ndisc6 \
+  qemu-system-x86 kea-dhcp4-server kea-dhcp6-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate radvd ndisc6 ppp pppoe \
   iproute2 iputils-ping python3
 
 log "Rust toolchain (rust-toolchain.toml: stable, musl target, clippy, rustfmt)"
@@ -113,9 +113,13 @@ $SUDO sysctl -q -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
 $SUDO apparmor_parser -R /etc/apparmor.d/usr.sbin.kea-dhcp4 2>/dev/null || true
 $SUDO apparmor_parser -R /etc/apparmor.d/usr.sbin.kea-dhcp6 2>/dev/null || true
 # Autoload from a user namespace is not guaranteed; load what the sandboxed scenarios use.
-for m in nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q; do
+for m in nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q ppp_generic pppox pppoe ppp_async; do
   $SUDO modprobe "$m" 2>/dev/null || true
 done
+# The PPPoE scenarios (M3) open /dev/ppp as the harness user; a sandbox has no udev rule to wait for.
+if [ -e /dev/ppp ]; then
+  $SUDO chmod 0666 /dev/ppp 2>/dev/null || true
+fi
 if [ -e /dev/kvm ]; then
   $SUDO chmod 0666 /dev/kvm 2>/dev/null || true
 fi
@@ -155,7 +159,7 @@ log 'sandbox facts (make check-env in the session says more)'
 echo "kernel: $(uname -r); cpus: $(nproc); user: $(id -un) ($(id -u))"
 virt=$(grep -c -E 'vmx|svm' /proc/cpuinfo 2>/dev/null || true)
 echo "cpus reporting vmx/svm: ${virt:-0}"
-for dev in /dev/kvm /dev/net/tun; do
+for dev in /dev/kvm /dev/net/tun /dev/ppp; do
   if [ -e "$dev" ]; then echo "$dev: $(stat -c '%A %U:%G' "$dev")"; else echo "$dev: absent"; fi
 done
 if unshare -Urn true 2>/dev/null; then echo "unprivileged user+net namespaces: ok"; else echo "unprivileged user+net namespaces: REFUSED"; fi

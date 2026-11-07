@@ -75,7 +75,14 @@ IPv6 QEMU scenarios, where `Lab::isp_route_block6` routes `2001:db8:1::/48` to t
 floor; Kea's one template serves 60-second leases
 renewing at 20 s to every lab run, so a renewal is observable within a scenario. CI runs Ubuntu 24.04's Kea
 2.4.1, so the template uses only what that version accepts (option 121 is given by code as RFC 3442 bytes);
-`make check-env` tests the template against the installed Kea and prints Kea's own error when it refuses.
+`make check-env` tests the template against the installed Kea and prints Kea's own error when it refuses. The ISP's PPP side (M3)
+is rp-pppoe's `pppoe-server` in kernel mode (`-k`, since its user-mode helper cannot drop privileges with one uid
+mapped) pointed at pppd's own PPPoE plugin (`-g`; `daemons::pppd_plugin` finds it), spawning `pppd` per session with
+the lab's account on a tmpfs the sandbox mounts over `/etc/ppp`; `pppd` calls `setsid()`, so the daemon handle stops a
+server by its descendants in `/proc`, not its process group. The `pppoe` sandbox suite runs the session core against
+it over a veth pair (the server's end in a namespace of its own); the `m3` QEMU suite boots `vm-pppoe*.toml` against
+it on isp0, with radvd and Kea's DHCPv6 server on the session's `ppp<N>` (`Lab::start_radvd_on`; Kea needs a plain
+`fe80::1/64` there, not pppd's point-to-point one). `make check-env` reports `/dev/ppp` and the plugin.
 
 ## Cloud sandbox
 `scripts/cloud-setup.sh` is the setup script for an ephemeral Ubuntu 24.04 sandbox (a Claude Code on the web
