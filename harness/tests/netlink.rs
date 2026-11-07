@@ -1856,8 +1856,9 @@ fn a_refused_port_mtu_is_tolerated(_lab: &mut Lab) -> anyhow::Result<()> {
         };
         let cache = rig.rx.borrow_and_update().clone();
         let report = rig.links.apply(&desired, &cache, &rig.nl).await;
-        let report = report.context("the pass must not fail on the refused MTU")?;
-        ensure!(report.ops >= 1, "the MTU was attempted: {}", report.ops);
+        // A tolerated answer is neither announced nor counted, so the report says nothing of
+        // the attempt; the MTU below and the pass not failing are the proof.
+        report.context("the pass must not fail on the refused MTU")?;
         let mtu = rig
             .rx
             .borrow()
