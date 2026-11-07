@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# A throwaway probe: does the CI runner's kernel carry the PPP modules M3's lab needs, and can
+# the harness user reach /dev/ppp? Lives on its own branch; delete the branch when answered.
+name: probe-ppp
+on:
+  push:
+    branches: [ "probe/ci-ppp-modules" ]
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: kernel and modules
+        run: |
+          uname -r
+          sudo modprobe ppp_generic && echo "ppp_generic ok"
+          sudo modprobe pppoe && echo "pppoe ok"
+          sudo modprobe ppp_async && echo "ppp_async ok"
+          sudo modprobe pppox && echo "pppox ok"
+          lsmod | grep -E '^(ppp|pppoe|pppox)' || true
+          ls -l /dev/ppp || true
+          sudo chmod 666 /dev/ppp && ls -l /dev/ppp
+          id
+      - name: userland
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ppp pppoe
+          pppd --version 2>&1 | head -2
+          pppoe-server -h 2>&1 | head -3
+          ls -l /etc/ppp
