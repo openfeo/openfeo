@@ -151,4 +151,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ppp_lcp"
+path = "fuzz_targets/ppp_lcp.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
