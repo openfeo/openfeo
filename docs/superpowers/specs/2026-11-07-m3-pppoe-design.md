@@ -461,8 +461,15 @@ what every PPPoE client does and what the AC expects).
 - The exact `fsm` trait and whether `statig` buys anything over the enum machine (the
   enum machine is the default, matching the other cores).
 - The MD5 module's placement (`openfeo-proto-ppp::md5`, 70 lines, RFC 1321 vectors).
-- The ioctl constants: `libc` where it has them, otherwise the numbers from
-  `linux/ppp-ioctl.h` (`_IOW('t', 56..)` family) with the header line quoted.
+- The ioctl and address constants: `libc` 0.2.191 has none of `AF_PPPOX`, `PX_PROTO_OE`,
+  `sockaddr_pppox`, `pppoe_addr` or the `PPPIOC*` numbers, so `sys.rs` defines them from
+  `linux/if_pppox.h` and `linux/ppp-ioctl.h` (`AF_PPPOX` 24, `PX_PROTO_OE` 0, the packed
+  `sockaddr_pppox { sa_family: u16, sa_protocol: u32, pppoe_addr { sid: u16 network order,
+  remote: [u8; 6], dev: [u8; 16] } }`, `PPPIOCNEWUNIT` `_IOWR('t', 62, int)`, `PPPIOCGCHAN`
+  `_IOR('t', 55, int)`, `PPPIOCATTCHAN` `_IOW('t', 56, int)`, `PPPIOCCONNECT` `_IOW('t', 58,
+  int)`, `PPPIOCSMRU` `_IOW('t', 82, int)`) through nix's `ioctl_*!` macros, each checked
+  against the pinned UAPI headers (`OPENFEO_UAPI_INCLUDE`) in a unit test that parses the
+  header's `#define` lines.
 - How `DesiredAddr`'s `peer` reaches `rtnetlink`'s address builder (`IFA_LOCAL` ours,
   `IFA_ADDRESS` the peer) and how the cache compares a point-to-point address.
 - Whether `pppoe-server` 4.0 can offer PPP-Max-Payload; the two scenario shapes are given above
