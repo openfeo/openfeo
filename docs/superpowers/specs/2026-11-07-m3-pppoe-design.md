@@ -225,11 +225,14 @@ fresh; a reply with an unknown identifier is dropped.
   O_RDWR | O_NONBLOCK | O_CLOEXEC)` and `PPPIOCNEWUNIT` on it (the unit fd; the kernel names the
   netdev `pppN`, N returned); `PPPIOCGCHAN` on the PPPoX socket, a second `/dev/ppp` fd with
   `PPPIOCATTCHAN` (the channel fd) and `PPPIOCCONNECT(N)` on it at once, as `pppd` does.
-  Control frames arrive where the kernel puts them: on the channel fd only while the channel is
-  not connected to a unit, on the unit fd afterwards (`ppp_receive_nonmp_frame` queues every
-  frame of a protocol that is not a network protocol to the unit's reader), so the driver reads
-  and writes control frames on the unit fd and keeps the channel fd open for the channel's
-  life; SPEC §7.2's sentence saying "the channel fd" is amended to say so. `PPPIOCSMRU` on the
+  Control frames arrive where the kernel puts them (`ppp_input` in `ppp_generic.c`): every
+  frame whose protocol is `0xc000` or above (LCP, PAP, CHAP) is queued to the **channel** fd
+  whether or not the channel is connected, and the network control protocols below it (IPCP,
+  IPV6CP) go through the unit and are queued to the **unit** fd once the channel is
+  connected. The driver therefore polls both fds (`pppd` does the same, reading the channel
+  first "since LCP packets come in there") and writes a frame to the fd its protocol class
+  belongs to: `0xc000` and above to the channel, the rest to the unit. SPEC §7.2's sentence
+  ("read and written as frames on the channel fd") is amended to name both. `PPPIOCSMRU` on the
   unit fd when LCP settles the MRU. Both fds are `AsyncFd`s; frames are read as `[protocol:
   u16 BE][payload]`. Dropping the `Session` closes the three descriptors, which the kernel
   answers by removing the unit and its netdev.
@@ -265,7 +268,23 @@ One supervised task per `[wans.pppoe]` WAN, after the shape of the DHCPv4 and DH
 
 The World's `LinkFact` for `ppp-<wan>` (up, carrier, MTU) is the truth the reconcilers read;
 the fact carries what the kernel cannot show (addresses before they are applied, the peer, the
-resolvers, the identifiers, the session, up-since on the process clock).
+resolvers, the identifiers, the session, up-since on the process clock). **Nothing is desired
+for `ppp-<wan>` until `World.links` shows it**: the sysctl knobs, the addresses and routes, the
+rename itself all key on the link's presence, never on the fact alone, or an absent netdev
+would make every apply pass back off (the applier retries a missing interface for up to 30 s)
+for the whole router at every reconnect.
+
+**The IPv6 tasks over a session.** Every session is a new unit and so a new ifindex for
+`ppp-<wan>`. The `ipv6` and `dhcp6` tasks of M2 today end with an error when their port's
+index changes, and the supervisor's budget (three restarts in ten minutes marks a task dead,
+withholds the heartbeat and lets the watchdog reboot the box) would turn a line that retrains
+three times in ten minutes into a rebooting router. So: both tasks wait for the netdev with a
+variant of `wait_for_link` that needs no MAC (a PPP netdev has none), and treat an index change
+as a flap, in place: close the socket, feed the core `LinkDown`, wait for the new link, open a
+socket on it, feed `LinkUp`; the binding and the learned facts stay through it, as they do
+through carrier loss. The DUID and the DHCPv6 binding file's identity use the WAN's **port**
+MAC (`lowest_port_mac` and the port the WAN names), which a PPP netdev cannot supply and which
+is what "this WAN and this port" meant all along.
 
 ### Facts
 
@@ -290,12 +309,18 @@ up for SPEC §7.4's selection when its fact has `ipv4` (the probe of M6 refines 
 
 ### Routing, links, sysctl
 
-- **links**: the PPPoE WAN's port is a port with a role: up, no bridge, MTU 1508 wanted (1500
-  when the NIC refuses), `ipv6_stable_privacy` false (no IPv6 on the port itself). `DesiredLinks`
-  gains `ppp: BTreeMap<String, DesiredPpp { unit: u32, mtu: u32 }>` keyed by the netdev name;
-  the applier renames `ppp<unit>` to it (`link_set_name`), sets the MTU and brings it up, and
+- **links**: the PPPoE WAN's port is a port with a role: up, no bridge, MTU 1508 wanted (and
+  the parent port's too when the WAN is tagged: a sub-interface's MTU cannot exceed its
+  parent's; the applier's map order already puts `p0` before `p0.101`), `ipv6_stable_privacy`
+  false (no IPv6 on the port itself). A NIC that refuses 1508 is a tolerated op (the pass logs
+  it once and the port stays at 1500), not a permanent `degraded links`. `DesiredLinks` gains
+  `ppp: BTreeMap<String, DesiredPpp { unit: u32, mtu: u32 }>` keyed by the netdev name; the
+  applier renames `ppp<unit>` to it (`link_set_name`), sets the MTU and brings it up, and
   leaves a `ppp-*` link it does not desire alone (the task's drop removes it). No stray
-  deletion: a `ppp-*` the World shows without a fact is a task mid-restart.
+  deletion: a `ppp-*` the World shows without a fact is a task mid-restart. The address
+  applier's notion of a managed interface (`is_managed`, which leaves `ppp-*` alone today) is
+  widened to the netdev of a configured PPPoE WAN, so the addresses it adds there are its own
+  to remove.
 - **routing**: with `ipv4`: `local/32` on the netdev with the peer as the point-to-point address
   (`DesiredAddr` gains `peer: Option<IpAddr>`; the netlink applier sets `IFA_ADDRESS` to it), a
   default route `dev ppp-<wan>` (via the peer when known, metric the WAN's priority, protocol
@@ -434,10 +459,35 @@ what every PPPoE client does and what the AC expects).
   scenario over PPP); a reboot (`system_reset`) comes back with a fresh session and the same
   routed prefix; the console never shows the password (a scenario greps for it).
 
+## Parts and where each is proven
+
+This host cannot load a PPP module until it is rebooted (the running kernel's modules are
+gone from disk) and `/dev/ppp` is root-only; the cloud sandbox has no PPP modules; CI's runner
+kernel is believed to carry them but has not been asked. So the milestone is cut in two, each
+with its own branch, plan and PR, as M2 was:
+
+- **Part 1 (this run)**: everything provable without PPP in the kernel: `openfeo-proto-ppp`
+  entire with its fuzz targets, the config and validation, the fact, `wan_netdev` and every
+  reconciler change with its snapshots (the MSS clamp included), the links and routing applier
+  changes with their sandbox scenarios (a rename, a point-to-point address and a `dev` default
+  route need no PPP: a dummy or veth link stands in), the `ipv6` and `dhcp6` tasks' index-change
+  handling, the SPEC amendments and the ADRs. The task and the drivers are written and
+  unit-tested against the cores with the kernel calls behind a trait, and compiled into the
+  binary behind a configuration that no fixture of part 1 uses.
+- **Part 2**: the kernel plumbing proven live (`sys.rs`'s calls against `/dev/ppp` and
+  `AF_PPPOX`), the `pppoe` sandbox suite, the `m3` QEMU suite, `pppoe-server` in the lab,
+  check-env, CI and the cloud setup. It starts when a kernel with the PPP modules is at hand:
+  CI's, once a probe (a one-job workflow on a throwaway branch) shows `modprobe ppp_generic
+  pppoe ppp_async` and a writable `/dev/ppp` there, or this host after its reboot and the udev
+  rule. If CI's kernel lacks the modules, part 2 runs only on a rebooted development host and
+  CI skips the PPP scenarios with `OPENFEO_NO_SKIP` relaxed for them: a maintainer decision.
+
 ## SPEC amendments (the plan's first task)
 
-- §7.2 PPPoE: the control frames' fd (unit after connect); the port MTU 1508 for RFC 4638;
-  the backoff schedule and the authentication holdoff; the console lines; `service` and `ac`.
+- §7.2 PPPoE: the control frames' fds (LCP and the authentication protocols on the channel
+  fd, the network control protocols on the unit fd; both polled); the port MTU 1508 for
+  RFC 4638; the backoff schedule and the authentication holdoff; the console lines; `service`
+  and `ac`.
 - §8.2: `[wans.pppoe]` gains `service` and `ac`, with the comment that absent means any.
 - §7.5: the MSS clamp names its rule and that it applies to every WAN whose netdev MTU is
   below 1500.
@@ -490,9 +540,11 @@ what every PPPoE client does and what the AC expects).
 4. **IPV6CP's interface identifier is derived from the stable-privacy secret and the WAN name**
    (RFC 7217 style), so the router's link-local on the PPP link is stable. Cost: none visible;
    a random identifier would be as correct.
-5. **The channel is connected to the unit at once and control frames are read on the unit
-   fd**, which is what the kernel does and what `pppd` does; SPEC §7.2's wording is amended.
-   Cost: none; the alternative does not work.
+5. **The channel is connected to the unit at once; LCP, PAP and CHAP are read and written on
+   the channel fd, IPCP and IPV6CP on the unit fd**, which is what the kernel does
+   (`ppp_input` queues protocols `0xc000` and above to the channel) and what `pppd` does;
+   SPEC §7.2's wording is amended to name both. Cost: none; reading one fd alone never sees
+   the access concentrator's LCP.
 6. **Termination order**: ours is LCP Terminate-Request twice, then PADT, then the session is
    dropped; a PADT from the AC drops the session without LCP. Cost: an AC that wanted a PADT
    before the Terminate-Ack sees one a second later.
@@ -530,3 +582,18 @@ what every PPPoE client does and what the AC expects).
     DHCP WAN with a dead gateway is today.
 18. **No persistence of the session across a reboot** (discovery afresh), unlike the DHCP
     leases. Cost: none; PPPoE has no notion of a resumable session.
+19. **The milestone is split in two parts** (above): part 1 provable on this host, part 2 where
+    a kernel with PPP is. Cost: the first PR carries a task and drivers that no scenario runs
+    live yet, flagged as such in the PR; the second PR proves them or changes them.
+20. **An index change of `ppp-<wan>` is a flap to the `ipv6` and `dhcp6` tasks, never an
+    error**, and their identity is the port's MAC. Cost: a task that mishandles the in-place
+    reopen keeps a stale socket until the next change; the sandbox scenario for the reopen pins
+    it.
+21. **The 1500 half of §12's acceptance is proven in the harness if `pppoe-server` offers
+    PPP-Max-Payload** (the lab's ISP tap and the router's port at 1508); if it cannot, the
+    discovery core's tests prove the 1500 path against a synthetic PADS and the harness proves
+    1492 end to end, and §12's "unless stated" is invoked in the PR. Cost: an access
+    concentrator that mishandles 1500 in a way only a live exchange shows would be found on
+    the dogfooding line, which supports it.
+22. **ADR numbers** follow what is merged: ADR-0022 and 0023 assume PR #25 (ADR-0021) lands
+    first; they renumber if not. Cost: none.
