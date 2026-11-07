@@ -2,6 +2,7 @@
   "Dhcp6": {
     "interfaces-config": { "interfaces": [ "{{IFACE}}" ] },
     "lease-database": { "type": "memfile", "persist": false },
+    "server-id": { "type": "LL", "persist": false },
     "renew-timer": {{RENEW}},
     "rebind-timer": {{REBIND}},
     "preferred-lifetime": {{PREFERRED}},

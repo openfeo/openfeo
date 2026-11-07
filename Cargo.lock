@@ -1032,6 +1032,7 @@ dependencies = [
  "openfeo-nft",
  "openfeo-platform",
  "openfeo-proto-dhcp4",
+ "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
  "openfeo-proto-sntp",

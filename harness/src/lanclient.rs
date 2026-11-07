@@ -605,10 +605,11 @@ pub fn parse_udhcpc_output(stdout: &str) -> Vec<UdhcpcEvent> {
 }
 
 /// What busybox `udhcpc6 -l` (an Information-Request, the stateless reference client) was told:
-/// the resolvers (option 23) and the search list (option 24).
+/// the resolvers (option 23; busybox prints them in full, so they are parsed) and the search
+/// list (option 24).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Udhcpc6Info {
-    pub dns: Vec<String>,
+    pub dns: Vec<Ipv6Addr>,
     pub search: Vec<String>,
 }
 
@@ -662,8 +663,15 @@ pub fn udhcpc6_info(
             .map(|value| value.split_whitespace().map(str::to_owned).collect())
             .unwrap_or_default()
     };
+    let dns = list("dns")
+        .iter()
+        .map(|addr| {
+            addr.parse::<Ipv6Addr>()
+                .with_context(|| format!("udhcpc6 reported the resolver {addr:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(Udhcpc6Info {
-        dns: list("dns"),
+        dns,
         search: list("search"),
     })
 }
