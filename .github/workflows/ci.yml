@@ -79,6 +79,8 @@ jobs:
         run: sudo modprobe nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q
       - name: load the PPP modules and open /dev/ppp to the harness user (the runner has no reboot for a udev rule; SPEC §11)
         run: sudo modprobe ppp_generic pppox pppoe ppp_async && sudo chmod 666 /dev/ppp
+      - name: let the sandbox's mapped root run pppd (Ubuntu ships it setuid root:dip, mode 4754, so others cannot run it, and inside a user namespace root:dip is unmapped)
+        run: sudo chmod 0755 /usr/sbin/pppd
       - run: make kernel
       - run: make check-env
       - run: make test-harness

@@ -20,7 +20,7 @@ use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Match, Regex};
 use openfeo_harness::netns::NetNs;
 use openfeo_harness::sandbox;
-use openfeo_harness::scenario::{Scenario, run_all};
+use openfeo_harness::scenario::{Scenario, Skip, run_all};
 use openfeo_harness::vlanprobe;
 
 const SCENARIOS: &[Scenario] = &[
@@ -39,6 +39,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "pppoe_server_killed_is_keepalive_lost_and_the_session_returns",
         run: pppoe_server_killed_is_keepalive_lost_and_the_session_returns,
+    },
+    Scenario {
+        name: "the_access_concentrator_ending_the_session_is_reported_and_retried",
+        run: the_access_concentrator_ending_the_session_is_reported_and_retried,
     },
     Scenario {
         name: "carrier_loss_is_reported_and_the_session_returns_within_ten_seconds",
@@ -93,13 +97,14 @@ const ISP_HTTP: &str = "203.0.113.1:8080";
 const SOON: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `discovering on <port>`: the port goes to 1508 when its NIC takes it (virtio-net does), so
-/// the payload asked for is 1500 or, before the links applier got there, 1492. The router's
-/// port is `p0`, or `p0.<vid>` when the ISP's interface is `wan0.<vid>`.
-fn discovering(isp_iface: &str) -> String {
+/// `discovering on <port>` asking for `payload`: the router's port is `p0`, or `p0.<vid>` when the
+/// ISP's interface is `wan0.<vid>`. The port goes to 1508 (virtio-net takes it), so the session
+/// is always discovered asking for 1500: a discovery begun at 1492 before the links applier got
+/// there starts again once it has.
+fn discovering(isp_iface: &str, payload: &str) -> String {
     let port = isp_iface.replacen("wan0", "p0", 1);
     format!(
-        r"openfeo: pppoe wan0 discovering on {} \(service any, max payload (1492|1500)\)",
+        r"openfeo: pppoe wan0 discovering on {} \(service any, max payload {payload}\)",
         port.replace('.', r"\.")
     )
 }
@@ -144,6 +149,33 @@ fn fetch(ns: &NetNs, addr: &str) -> anyhow::Result<String> {
         .with_context(|| format!("GET http://{addr}/ from {}", ns.name))
 }
 
+/// The lab's access concentrator can run here, or the scenario skips with what is missing:
+/// `/dev/ppp` openable (from the sandbox, where `ppp_generic`'s `CAP_NET_ADMIN` check passes)
+/// and `pppd` and `pppoe-server` installed. CI sets `OPENFEO_NO_SKIP`, so a skip fails there.
+fn require_access_concentrator() -> anyhow::Result<()> {
+    if let Err(err) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/ppp")
+    {
+        return Err(Skip(format!(
+            "/dev/ppp: {err}: load ppp_generic and make it group-accessible \
+             (udev: KERNEL==\"ppp\", GROUP=\"<your group>\", MODE=\"0660\")"
+        ))
+        .into());
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for tool in ["pppd", "pppoe-server"] {
+        if !std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()) {
+            return Err(Skip(format!(
+                "{tool} is not installed (packages ppp and pppoe, or rp-pppoe)"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// What a PPPoE boot established.
 struct Booted {
     /// The console after the last PPP line waited for.
@@ -178,6 +210,7 @@ fn parse_iid(text: &str) -> anyhow::Result<u64> {
 /// every PPPoE line of the contract waited for in order: discovery, the session, LCP,
 /// authentication (unless none was asked), IPCP and IPV6CP. The LAN host is placed last.
 fn boot_pppoe(lab: &mut Lab, server: &PppoeServerConfig, config: &str) -> anyhow::Result<Booted> {
+    require_access_concentrator()?;
     lab.start_pppoe_server(server)?;
     lab.with_config(config)?;
     lab.boot("")?;
@@ -186,7 +219,7 @@ fn boot_pppoe(lab: &mut Lab, server: &PppoeServerConfig, config: &str) -> anyhow
     // their own order from the boot, and ready on its own.
     c.wait_for(&mut Cursor::default(), &re(READY), BOOT_TIMEOUT)?;
     let mut cur = Cursor::default();
-    c.wait_for(&mut cur, &re(&discovering(&server.iface)), SOON)?;
+    c.wait_for(&mut cur, &re(&discovering(&server.iface, "1500")), SOON)?;
     let session = c.wait_for(&mut cur, &re(SESSION), SOON)?;
     let session_id = u16::from_str_radix(&group(&session, 0)?, 16)?;
     c.wait_for(&mut cur, &re(LCP_UP), SOON)?;
@@ -376,16 +409,21 @@ fn carrier_loss_is_reported_and_the_session_returns_within_ten_seconds(
 /// Carrier lost while discovering (no access concentrator yet): discovery starts again when the
 /// link returns, with a fresh attempt, and the session comes up once the server does.
 fn carrier_loss_during_discovery_restarts_discovery(lab: &mut Lab) -> anyhow::Result<()> {
+    require_access_concentrator()?;
     lab.with_config(VM_PPPOE)?;
     lab.boot("")?;
     let c = lab.console()?;
     let mut cur = Cursor::default();
-    c.wait_for(&mut cur, &re(&discovering("wan0")), BOOT_TIMEOUT)?;
+    c.wait_for(
+        &mut cur,
+        &re(&discovering("wan0", "(1492|1500)")),
+        BOOT_TIMEOUT,
+    )?;
     let mut qmp = lab.qmp()?;
     qmp.set_link("p0", false)?;
     std::thread::sleep(Duration::from_secs(1));
     qmp.set_link("p0", true)?;
-    c.wait_for(&mut cur, &re(&discovering("wan0")), SOON)?;
+    c.wait_for(&mut cur, &re(&discovering("wan0", "(1492|1500)")), SOON)?;
     lab.start_pppoe_server(&PppoeServerConfig::isp("wan0", Auth::Chap))?;
     let c = lab.console()?;
     c.wait_for(&mut cur, &re(SESSION), Duration::from_secs(40))?;
@@ -601,6 +639,42 @@ fn a_reboot_comes_back_with_a_fresh_session_and_the_same_prefix(
     ensure!(
         after == before,
         "the same prefix after the reboot: {before} then {after}"
+    );
+    no_password_on_the_console(lab, "wan0")
+}
+
+/// The access concentrator ends the session itself (SIGTERM: `pppd` sends Terminate-Request and
+/// the server a PADT): the console says so with the ladder's first wait, never as a task
+/// failure, and a new session follows once the server is back (SPEC §12's M3 row).
+fn the_access_concentrator_ending_the_session_is_reported_and_retried(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let server = PppoeServerConfig::isp("wan0", Auth::Chap);
+    let booted = boot_pppoe(lab, &server, VM_PPPOE)?;
+    ensure!(lab.stop_pppoe_server(), "a server was running");
+    let c = lab.console()?;
+    let mut cur = booted.cur;
+    let down = c.wait_for(&mut cur, &re(DOWN), SOON)?;
+    let cause = group(&down, 0)?;
+    ensure!(
+        cause == "terminated by peer"
+            || cause == "padt from ac"
+            || cause.starts_with("session lost"),
+        "the concentrator's end, not a keepalive or a failure: {:?}",
+        down.line
+    );
+    ensure!(
+        group(&down, 2)? == "1",
+        "the first retry waits 1 s: {:?}",
+        down.line
+    );
+    lab.start_pppoe_server(&server)?;
+    let c = lab.console()?;
+    c.wait_for(&mut cur, &re(SESSION), Duration::from_secs(30))?;
+    c.wait_for(&mut cur, &re(IPCP_UP), SOON)?;
+    ensure!(
+        c.count(&re(r"task pppoe-wan0 (failed|panicked|restart)")) == 0,
+        "the supervisor saw no failure"
     );
     no_password_on_the_console(lab, "wan0")
 }

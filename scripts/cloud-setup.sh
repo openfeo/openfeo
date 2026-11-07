@@ -120,6 +120,11 @@ done
 if [ -e /dev/ppp ]; then
   $SUDO chmod 0666 /dev/ppp 2>/dev/null || true
 fi
+# Ubuntu's pppd is setuid root:dip, mode 4754: the sandbox's mapped root (whose root and dip are
+# unmapped) cannot run it.
+if [ -e /usr/sbin/pppd ]; then
+  $SUDO chmod 0755 /usr/sbin/pppd 2>/dev/null || true
+fi
 if [ -e /dev/kvm ]; then
   $SUDO chmod 0666 /dev/kvm 2>/dev/null || true
 fi

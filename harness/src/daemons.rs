@@ -604,6 +604,29 @@ pub fn pppd_plugin() -> Result<PathBuf> {
     )
 }
 
+/// What `pppoe-server -h` prints (on stderr, with a non-zero exit).
+fn pppoe_server_usage() -> String {
+    Command::new("pppoe-server")
+        .arg("-h")
+        .output()
+        .map(|out| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a usage text lists `option` as one of its own (`   -g path   -- ...`).
+#[must_use]
+pub fn usage_lists_option(usage: &str, option: &str) -> bool {
+    usage
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(option))
+}
+
 /// Where each session's `pppd` logs (`logfile`): its `Using interface pppN` and `local IP
 /// address` lines are what scenarios read.
 #[must_use]
@@ -637,11 +660,13 @@ fn pppoe_server_command(
     let _ = std::fs::remove_file(&pid);
     // Kernel mode (`-k`): the user-mode `pppoe` helper cannot drop privileges in a user
     // namespace with one uid mapped, and kernel PPPoE is what the router speaks anyway.
-    cmd.env("HOME", run_dir)
-        .arg("-k")
-        .arg("-g")
-        .arg(pppd_plugin()?)
-        .args(["-F", "-I", &config.iface, "-C", &config.ac_name]);
+    cmd.env("HOME", run_dir).arg("-k");
+    // rp-pppoe 4 takes the plugin's path (`-g`); 3.x (Ubuntu 24.04's) has none and uses the
+    // Debian path of pppd's own plugin, which is the right one there.
+    if usage_lists_option(&pppoe_server_usage(), "-g") {
+        cmd.arg("-g").arg(pppd_plugin()?);
+    }
+    cmd.args(["-F", "-I", &config.iface, "-C", &config.ac_name]);
     if !config.service.is_empty() {
         cmd.args(["-S", &config.service]);
     }
@@ -742,6 +767,16 @@ mod tests {
             secrets_line("openfeo@isp.example", "example-secret"),
             "\"openfeo@isp.example\" * \"example-secret\" *\n"
         );
+    }
+
+    #[test]
+    fn a_server_option_is_found_only_where_its_usage_lists_it() {
+        let v4 = "Options:\n   -I if_name     -- Specify interface\n   -g path        -- Specify full path to plugin\n";
+        let v3 = "Options:\n   -I if_name     -- Specify interface\n   -k             -- Use kernel-mode PPPoE.\n";
+        assert!(usage_lists_option(v4, "-g"));
+        assert!(!usage_lists_option(v3, "-g"));
+        assert!(usage_lists_option(v3, "-k"));
+        assert!(!usage_lists_option("   -gx  -- other", "-g"));
     }
 
     #[test]
