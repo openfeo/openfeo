@@ -208,14 +208,9 @@ fn ula_toward_the_wan_is_rejected_with_no_route(_lab: &mut Lab) -> anyhow::Resul
         nftlist::match_rights(&ruleset, "input", &ip6_saddr).contains(&&ula),
         "no ULA source drop in input: {ruleset}"
     );
-    let forward_text = listed(&ruleset, "rule", "forward", Some("openfeo"))
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
     ensure!(
-        forward_text.matches("\"reject\"").count() >= 2,
-        "the ULA rules reject: {forward_text}"
+        nftlist::count_verdict(&ruleset, "forward", "reject") >= 2,
+        "the ULA rules reject with no-route: {ruleset}"
     );
     let udp_dport = json!({"payload": {"protocol": "udp", "field": "dport"}});
     let input_ports = nftlist::match_rights(&ruleset, "input", &udp_dport);
