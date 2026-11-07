@@ -103,7 +103,32 @@ rules, records and upstreams take addresses of either family; the DNS forwarder 
 and answers AAAA over IPv6 (§7.3, §7.5, §7.7). The lab gains radvd, rdisc6 and an `ndp` sandbox
 suite; eight QEMU scenarios prove the part.
 
-Part 3 is scoped in SPEC §12: DHCPv6 and the other-ISP cases.
+**2026-11-07, [#36](https://github.com/openfeo/openfeo/pull/36), part 3: delegated prefixes,
+ULA and deprecation.** A WAN with `[wans.ipv6]` and no typed prefix runs a DHCPv6 client
+(`openfeo-proto-dhcp6`, a pure codec with dhcproto as the fuzz oracle, and a client core in the
+odhcp6c mould): Solicit with Rapid Commit for an IA_PD of `pd_hint` bits and an IA_NA, Renew at T1,
+Rebind at T2, and Rebind on Confirm's timing after a link flap or a reboot from the binding
+persisted in `leases/dhcp6-<wan>.toml`; each LAN takes the /64 at its `ipv6_index` (the typed
+value, or its position) inside every delegated prefix and inside a per-router ULA /48 generated
+once under `identity/ula`, and the router answers Information-Requests on every LAN with its
+addresses there (ULA first) and the search domain, so hosts that ignore RDNSS still find it;
+a prefix the ISP takes back, or whose WAN loses carrier or its IPv6 default, is advertised with
+preferred lifetime 0 for the lower of two hours and its own remaining valid lifetime, traffic from
+it is answered unreachable by a policy rule, and the list survives a reboot; every delegated
+prefix gets a source rule into its WAN's table, the main table is consulted first with its default
+suppressed, and the ULA never crosses a WAN (rejected with no route outward, dropped inward);
+resolvers learned over DHCPv6 join behind the IPv6 route like RDNSS ones (§7.3, §7.5, §7.7, §8.2).
+Lifetimes live on the process monotonic clock in the World and on the wall clock only in the file.
+The lab gains Kea's DHCPv6 server, busybox `udhcpc6` and a `dhcp6` sandbox suite; seven QEMU
+scenarios on `vm-pd.toml` prove the part, among them the ISP changing its prefix and the LAN
+renumbered within ten seconds. Fixed on the way: [#26](https://github.com/openfeo/openfeo/issues/26),
+[#28](https://github.com/openfeo/openfeo/issues/28), [#29](https://github.com/openfeo/openfeo/issues/29),
+[#30](https://github.com/openfeo/openfeo/issues/30), [#31](https://github.com/openfeo/openfeo/issues/31),
+[#33](https://github.com/openfeo/openfeo/issues/33) and [#34](https://github.com/openfeo/openfeo/issues/34);
+[#27](https://github.com/openfeo/openfeo/issues/27) (an address leaving the port when its preferred
+lifetime lapses) stays open, as the whole-branch review found and the design now records.
+
+M2 is complete; next is M3 (PPPoE).
 
 ## Tooling and process
 
