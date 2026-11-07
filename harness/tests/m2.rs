@@ -623,9 +623,24 @@ fn lan_client_configures_itself_from_the_lan_prefix_and_reaches_the_isp_over_ipv
         fetch(&lab.lan0, ISP_HTTP6)? == ISP_HTTP_BODY,
         "the LAN host reaches the ISP over IPv6"
     );
+    // Part 3: the ULA /64 beside the routed one, O = 1 for the stateless responder, and the
+    // router's ULA address first among the resolvers, since it survives renumbering.
+    wait_until(SOON, "the LAN host's ULA address", || {
+        Ok(lab
+            .lan0
+            .ip(&["-6", "addr", "show", "dev", "lan0", "scope", "global"])?
+            .contains("inet6 fd"))
+    })?;
     if rdisc6_installed() {
         let report = lanclient::rdisc6(&lab.lan0, "lan0", RDISC6_TIMEOUT)?;
-        anyhow::ensure!(report.rdnss == vec![ROUTER6], "RDNSS in {report:?}");
+        anyhow::ensure!(report.other == Some(true), "O flag in {report:?}");
+        anyhow::ensure!(report.managed == Some(false), "M flag in {report:?}");
+        anyhow::ensure!(
+            report.rdnss.len() == 2
+                && report.rdnss[0].segments()[0] & 0xfe00 == 0xfc00
+                && report.rdnss[1] == ROUTER6,
+            "RDNSS in {report:?}"
+        );
         anyhow::ensure!(
             report.dnssl == vec!["home.arpa".to_owned()],
             "DNSSL in {report:?}"

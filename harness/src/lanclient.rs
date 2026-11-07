@@ -1075,6 +1075,9 @@ pub struct Rdisc6Report {
     pub router: Option<Ipv6Addr>,
     /// `Router lifetime`, seconds.
     pub lifetime: Option<u32>,
+    /// `Stateful address conf.` (M) and `Stateful other conf.` (O).
+    pub managed: Option<bool>,
+    pub other: Option<bool>,
     /// Every prefix information option's prefix.
     pub prefixes: Vec<String>,
     /// The MTU option.
@@ -1132,6 +1135,8 @@ pub fn parse_rdisc6(stdout: &str) -> Rdisc6Report {
         let (label, value) = (label.trim(), value.trim());
         match label {
             "Router lifetime" => report.lifetime = leading_number(value),
+            "Stateful address conf." => report.managed = Some(value == "Yes"),
+            "Stateful other conf." => report.other = Some(value == "Yes"),
             "Prefix" => report.prefixes.push(value.to_owned()),
             "MTU" => report.mtu = leading_number(value),
             "Recursive DNS server" => report.rdnss.extend(value.parse::<Ipv6Addr>().ok()),
@@ -1172,6 +1177,7 @@ Retransmit time           :  unspecified (0x00000000)\n\
  from fe80::5054:ff:fefe:2\n";
         let report = parse_rdisc6(sample);
         assert_eq!(report.lifetime, Some(1800));
+        assert_eq!((report.managed, report.other), (Some(false), Some(false)));
         assert_eq!(report.prefixes, vec!["2001:db8:1:222::/64".to_owned()]);
         assert_eq!(report.mtu, Some(1500));
         assert_eq!(

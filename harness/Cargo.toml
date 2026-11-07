@@ -90,5 +90,10 @@ name = "m2"
 path = "tests/m2.rs"
 harness = false
 
+[[test]]
+name = "m2pd"
+path = "tests/m2pd.rs"
+harness = false
+
 [lints]
 workspace = true

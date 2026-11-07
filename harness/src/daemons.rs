@@ -271,6 +271,10 @@ pub struct RadvdConfig {
     pub min_interval: u16,
     /// `MaxRtrAdvInterval`, seconds.
     pub max_interval: u16,
+    /// `AdvManagedFlag` (M): the ISP tells hosts to get addresses over DHCPv6.
+    pub managed: bool,
+    /// `AdvOtherConfigFlag` (O): the ISP tells hosts to get other configuration over DHCPv6.
+    pub other: bool,
 }
 
 impl RadvdConfig {
@@ -286,6 +290,8 @@ impl RadvdConfig {
             dnssl: vec![ISP_DNS_ZONE.to_owned()],
             min_interval: 3,
             max_interval: 4,
+            managed: false,
+            other: false,
         }
     }
 
@@ -296,6 +302,12 @@ impl RadvdConfig {
             "interface {}\n{{\n    AdvSendAdvert on;\n    MinRtrAdvInterval {};\n    MaxRtrAdvInterval {};\n    AdvDefaultLifetime {};\n    AdvLinkMTU 1500;\n",
             self.iface, self.min_interval, self.max_interval, self.lifetime
         );
+        if self.managed {
+            text.push_str("    AdvManagedFlag on;\n");
+        }
+        if self.other {
+            text.push_str("    AdvOtherConfigFlag on;\n");
+        }
         // Writing to a `String` cannot fail; the results are dropped on purpose.
         if let Some(prefix) = &self.prefix {
             let _ = write!(
@@ -420,6 +432,26 @@ mod tests {
             long.contains("\"valid-lifetime\": 600,")
                 && long.contains("\"preferred-lifetime\": 400,"),
             "{long}"
+        );
+    }
+
+    #[test]
+    fn radvd_renders_the_m_and_o_flags_only_when_set() {
+        let plain = RadvdConfig::isp("wan0").render();
+        assert!(
+            !plain.contains("AdvManagedFlag") && !plain.contains("AdvOtherConfigFlag"),
+            "{plain}"
+        );
+        let delegating = RadvdConfig {
+            managed: true,
+            other: true,
+            ..RadvdConfig::isp("wan0")
+        }
+        .render();
+        assert!(
+            delegating.contains("    AdvManagedFlag on;\n")
+                && delegating.contains("    AdvOtherConfigFlag on;\n"),
+            "{delegating}"
         );
     }
 
