@@ -29,8 +29,11 @@ pub mod errno {
     pub const EEXIST: i32 = 17;
     /// No such device.
     pub const ENODEV: i32 = 19;
-    /// Invalid argument (an MTU the device cannot take).
+    /// Invalid argument.
     pub const EINVAL: i32 = 22;
+    /// Numerical result out of range: an MTU outside the device's `min_mtu..=max_mtu`
+    /// (`dev_validate_mtu`).
+    pub const ERANGE: i32 = 34;
     /// Cannot assign requested address (deleting an address that is not there).
     pub const EADDRNOTAVAIL: i32 = 99;
 }
@@ -54,11 +57,12 @@ impl Error {
         self.errno() == Some(errno::EEXIST)
     }
 
-    /// The kernel said `EINVAL`: the request asks for something the device cannot do (an MTU
-    /// above what it carries).
+    /// The kernel said the request asks for something the device cannot do: `ERANGE` for an
+    /// MTU outside what it carries (`dev_validate_mtu`), `EINVAL` from drivers that check it
+    /// themselves.
     #[must_use]
     pub fn is_invalid(&self) -> bool {
-        self.errno() == Some(errno::EINVAL)
+        matches!(self.errno(), Some(errno::EINVAL | errno::ERANGE))
     }
 
     /// The kernel said the thing being removed is not there (`ENOENT`, `ESRCH`, `ENODEV`,
