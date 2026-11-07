@@ -36,21 +36,70 @@ pub const RDNSS_LIFETIME: u32 = 1_800;
 /// The hop limit hosts are told to use.
 const CUR_HOP_LIMIT: u8 = 64;
 
+/// Route information options are advertised with this lifetime (RFC 4191), refreshed by every
+/// advertisement.
+pub const ROUTE_INFO_LIFETIME: u32 = 1_800;
+
+/// A prefix lifetime: fixed, or the seconds left to a moment on the driver's clock, capped,
+/// so a deprecated prefix counts down at every advertisement (RFC 7084 L-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifetime {
+    Fixed(u32),
+    Until { at: Timestamp, cap: u32 },
+}
+
+impl Lifetime {
+    /// The seconds to advertise at `now`: the fixed value, or what is left (rounded up to a
+    /// whole second, never below 0, never above the cap).
+    #[must_use]
+    pub fn secs(self, now: Timestamp) -> u32 {
+        match self {
+            Lifetime::Fixed(secs) => secs,
+            Lifetime::Until { at, cap } => {
+                let left = at.saturating_sub(now).div_ceil(1000);
+                u32::try_from(left).map_or(cap, |secs| secs.min(cap))
+            }
+        }
+    }
+}
+
+/// One prefix information option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pio {
+    /// The /64.
+    pub prefix: Ipv6Net,
+    pub valid: Lifetime,
+    pub preferred: Lifetime,
+}
+
+/// One route information option (RFC 4191).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rio {
+    pub prefix: Ipv6Net,
+    pub lifetime: u32,
+    pub preference: Preference,
+}
+
 /// What one LAN's server advertises.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The LAN's /64.
-    pub prefix: Ipv6Net,
+    /// The LAN's prefixes, each with its lifetimes (SPEC §7.3).
+    pub prefixes: Vec<Pio>,
     /// The bridge's hardware address, sent as the source link-layer address.
     pub mac: [u8; 6],
-    /// The router's address in the LAN, the resolver hosts are pointed at.
-    pub router: Ipv6Addr,
+    /// The resolvers hosts are pointed at: the router's addresses in the LAN; empty sends no
+    /// RDNSS.
+    pub rdnss: Vec<Ipv6Addr>,
     /// The bridge's MTU, when known.
     pub mtu: Option<u32>,
     /// The search domain; empty sends no DNSSL.
     pub domain: String,
     /// 1800 while the WAN has an IPv6 route, 0 when it does not (SPEC §7.3).
     pub router_lifetime: u16,
+    /// The O flag: a stateless DHCPv6 responder answers on this LAN.
+    pub other: bool,
+    /// Route information options via this router.
+    pub routes: Vec<Rio>,
 }
 
 /// What the driver feeds in.
@@ -214,7 +263,7 @@ impl Server {
     /// Send the advertisement now and schedule the next periodic one: within 16 s while the
     /// initial ones remain, else at random within the configured bounds.
     fn advertise(&mut self, now: Timestamp, out: &mut Vec<Output>) {
-        out.push(Output::Advertise(self.message().encode()));
+        out.push(Output::Advertise(self.message(now).encode()));
         self.last_sent = Some(now);
         self.due_at = None;
         let mut interval = self.random(MIN_RTR_ADV_INTERVAL, MAX_RTR_ADV_INTERVAL);
@@ -231,7 +280,7 @@ impl Server {
         let State::Stopping(left) = self.state else {
             return;
         };
-        out.push(Output::Advertise(self.message().encode()));
+        out.push(Output::Advertise(self.message(now).encode()));
         self.last_sent = Some(now);
         if left <= 1 {
             self.state = State::Stopped;
@@ -243,34 +292,43 @@ impl Server {
         }
     }
 
-    fn message(&self) -> Message {
-        let mut options = vec![
-            NdOption::SourceLinkLayer(self.config.mac),
-            NdOption::PrefixInformation {
-                prefix: self.config.prefix.trunc(),
+    fn message(&self, now: Timestamp) -> Message {
+        let mut options = vec![NdOption::SourceLinkLayer(self.config.mac)];
+        for pio in &self.config.prefixes {
+            options.push(NdOption::PrefixInformation {
+                prefix: pio.prefix.trunc(),
                 on_link: true,
                 autonomous: true,
-                valid: PIO_VALID,
-                preferred: PIO_PREFERRED,
-            },
-        ];
+                valid: pio.valid.secs(now),
+                preferred: pio.preferred.secs(now),
+            });
+        }
         if let Some(mtu) = self.config.mtu {
             options.push(NdOption::Mtu(mtu));
         }
-        options.push(NdOption::Rdnss {
-            lifetime: RDNSS_LIFETIME,
-            addrs: vec![self.config.router],
-        });
+        if !self.config.rdnss.is_empty() {
+            options.push(NdOption::Rdnss {
+                lifetime: RDNSS_LIFETIME,
+                addrs: self.config.rdnss.clone(),
+            });
+        }
         if !self.config.domain.is_empty() {
             options.push(NdOption::Dnssl {
                 lifetime: RDNSS_LIFETIME,
                 names: vec![self.config.domain.clone()],
             });
         }
+        for route in &self.config.routes {
+            options.push(NdOption::RouteInformation {
+                prefix: route.prefix.trunc(),
+                preference: route.preference,
+                lifetime: route.lifetime,
+            });
+        }
         Message::RouterAdvertisement(RouterAdvertisement {
             cur_hop_limit: CUR_HOP_LIMIT,
             managed: false,
-            other: false,
+            other: self.config.other,
             preference: Preference::Medium,
             router_lifetime: self.config.router_lifetime,
             reachable_time: 0,
@@ -296,17 +354,163 @@ fn is_link_local(addr: Ipv6Addr) -> bool {
 mod tests {
     use super::*;
     use crate::wire::{Message, NdOption, Preference};
+    use ipnet::Ipv6Net;
     use std::net::Ipv6Addr;
 
     fn config(lifetime: u16) -> Config {
         Config {
-            prefix: "2001:db8:1:222::/64".parse().unwrap(),
+            prefixes: vec![Pio {
+                prefix: "2001:db8:1:222::/64".parse().unwrap(),
+                valid: Lifetime::Fixed(PIO_VALID),
+                preferred: Lifetime::Fixed(PIO_PREFERRED),
+            }],
             mac: [0x52, 0x54, 0, 0xfe, 0, 2],
-            router: "2001:db8:1:222::1".parse().unwrap(),
+            rdnss: vec!["2001:db8:1:222::1".parse().unwrap()],
             mtu: Some(1500),
             domain: "home.arpa".to_owned(),
             router_lifetime: lifetime,
+            other: false,
+            routes: Vec::new(),
         }
+    }
+
+    /// Two prefixes, one counting down, two resolvers, O set, two routes.
+    fn multi_config() -> Config {
+        let mut config = config(1800);
+        config.prefixes.push(Pio {
+            prefix: "2001:db8:100:1::/64".parse().unwrap(),
+            valid: Lifetime::Until {
+                at: 60_000,
+                cap: PIO_VALID,
+            },
+            preferred: Lifetime::Until {
+                at: 40_000,
+                cap: PIO_PREFERRED,
+            },
+        });
+        config.rdnss.push("fd12:3456:789a:1::1".parse().unwrap());
+        config.other = true;
+        config.routes = vec![
+            Rio {
+                prefix: "fd12:3456:789a::/48".parse().unwrap(),
+                lifetime: ROUTE_INFO_LIFETIME,
+                preference: Preference::Medium,
+            },
+            Rio {
+                prefix: "2001:db8:100::/56".parse().unwrap(),
+                lifetime: ROUTE_INFO_LIFETIME,
+                preference: Preference::Medium,
+            },
+        ];
+        config
+    }
+
+    #[test]
+    fn an_advertisement_carries_every_prefix_rdnss_the_o_flag_and_the_routes() {
+        let mut s = Server::new(multi_config(), 7);
+        let ra = adverts(&s.handle(Input::Start, 10_000)).remove(0);
+        assert!(ra.other && !ra.managed);
+        let pios: Vec<(Ipv6Net, u32, u32)> = ra
+            .options
+            .iter()
+            .filter_map(|o| match o {
+                NdOption::PrefixInformation {
+                    prefix,
+                    valid,
+                    preferred,
+                    on_link,
+                    autonomous,
+                } => {
+                    assert!(*on_link && *autonomous);
+                    Some((*prefix, *valid, *preferred))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pios,
+            vec![
+                (
+                    "2001:db8:1:222::/64".parse().unwrap(),
+                    PIO_VALID,
+                    PIO_PREFERRED
+                ),
+                ("2001:db8:100:1::/64".parse().unwrap(), 50, 30),
+            ],
+            "the second prefix's lifetimes are what is left at 10 s"
+        );
+        assert!(ra.options.contains(&NdOption::Rdnss {
+            lifetime: RDNSS_LIFETIME,
+            addrs: vec![
+                "2001:db8:1:222::1".parse().unwrap(),
+                "fd12:3456:789a:1::1".parse().unwrap(),
+            ],
+        }));
+        let rios: Vec<(Ipv6Net, u32)> = ra
+            .options
+            .iter()
+            .filter_map(|o| match o {
+                NdOption::RouteInformation {
+                    prefix,
+                    preference,
+                    lifetime,
+                } => {
+                    assert_eq!(*preference, Preference::Medium);
+                    Some((*prefix, *lifetime))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rios,
+            vec![
+                ("fd12:3456:789a::/48".parse().unwrap(), 1800),
+                ("2001:db8:100::/56".parse().unwrap(), 1800),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_delegated_prefix_counts_down_between_advertisements() {
+        let mut s = Server::new(multi_config(), 7);
+        let _ = s.handle(Input::Start, 10_000);
+        let later = adverts(&s.handle(Input::Timeout, s.next_timeout().unwrap())).remove(0);
+        let delegated = later
+            .options
+            .iter()
+            .find_map(|o| match o {
+                NdOption::PrefixInformation {
+                    prefix,
+                    valid,
+                    preferred,
+                    ..
+                } if prefix.to_string() == "2001:db8:100:1::/64" => Some((*valid, *preferred)),
+                _ => None,
+            })
+            .unwrap();
+        assert!(delegated.0 < 50 && delegated.1 < 30, "{delegated:?}");
+    }
+
+    #[test]
+    fn a_lifetime_counts_down_rounds_up_and_caps() {
+        let until = Lifetime::Until {
+            at: 5_000,
+            cap: 7200,
+        };
+        assert_eq!(until.secs(0), 5);
+        assert_eq!(until.secs(4_100), 1, "900 ms left rounds up to a second");
+        assert_eq!(until.secs(5_000), 0);
+        assert_eq!(until.secs(6_000), 0, "never negative");
+        assert_eq!(
+            Lifetime::Until {
+                at: u64::MAX,
+                cap: 100
+            }
+            .secs(0),
+            100,
+            "capped"
+        );
+        assert_eq!(Lifetime::Fixed(42).secs(1_000_000), 42);
     }
 
     fn server(lifetime: u16) -> Server {

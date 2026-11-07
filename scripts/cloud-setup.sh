@@ -57,7 +57,7 @@ $SUDO apt-get update -qq
 $SUDO apt-get install -y -qq --no-install-recommends \
   build-essential ca-certificates curl git xz-utils kmod procps rsync \
   musl-tools pkg-config bison flex bc libelf-dev libssl-dev ccache zstd cpio e2fsprogs \
-  qemu-system-x86 kea-dhcp4-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate radvd ndisc6 \
+  qemu-system-x86 kea-dhcp4-server kea-dhcp6-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate radvd ndisc6 \
   iproute2 iputils-ping python3
 
 log "Rust toolchain (rust-toolchain.toml: stable, musl target, clippy, rustfmt)"
@@ -111,6 +111,7 @@ $SUDO sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null ||
 $SUDO sysctl -q -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
 # Ubuntu's kea profile pins its config to /etc/kea; the lab writes its own (ADR-0006).
 $SUDO apparmor_parser -R /etc/apparmor.d/usr.sbin.kea-dhcp4 2>/dev/null || true
+$SUDO apparmor_parser -R /etc/apparmor.d/usr.sbin.kea-dhcp6 2>/dev/null || true
 # Autoload from a user namespace is not guaranteed; load what the sandboxed scenarios use.
 for m in nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q; do
   $SUDO modprobe "$m" 2>/dev/null || true

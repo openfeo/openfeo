@@ -49,7 +49,12 @@ const SCENARIOS: &[Scenario] = &[
         name: "generated_public_ruleset_is_accepted_by_libnftables",
         run: generated_public_ruleset_is_accepted_by_libnftables,
     },
+    Scenario {
+        name: "ula_toward_the_wan_is_rejected_with_no_route",
+        run: ula_toward_the_wan_is_rejected_with_no_route,
+    },
 ];
+const VM_PD: &str = include_str!("../fixtures/vm-pd.toml");
 
 const VM_PUBLIC: &str = include_str!("../fixtures/vm-public.toml");
 const VM_IPV6: &str = include_str!("../fixtures/vm-ipv6.toml");
@@ -170,6 +175,55 @@ fn the_ipv6_ruleset_applies_on_the_pinned_nftables(_lab: &mut Lab) -> anyhow::Re
     ensure!(
         nftlist::match_rights(&ruleset, "rpfilter", &ip6_saddr).contains(&&link_local),
         "link-local sources are not exempt from the reverse-path check: {ruleset}"
+    );
+    Ok(())
+}
+
+/// The delegated-prefix ruleset (SPEC §7.3, §7.5): the pinned libnftables and this kernel
+/// accept the ULA rules (a unique local source or destination leaving by a WAN is rejected
+/// with ICMPv6 no-route, one arriving on a WAN is dropped), the DHCPv6 client's port 546 on the
+/// WAN input and port 547 among the LAN services, and the listing keeps their shapes.
+fn ula_toward_the_wan_is_rejected_with_no_route(_lab: &mut Lab) -> anyhow::Result<()> {
+    nftprobe::require_expressions()?;
+    let config = openfeo_config::file::parse(VM_PD)?;
+    let mut world = World::new(config, lab_portmap4());
+    world.ula = Some("fd12:3456:789a::/48".parse()?);
+    let desired = nft(&world);
+    let mut nft = Nft::new()?;
+    let applied = nft.apply(&desired.ruleset);
+    let listed_ruleset = nft.list_ruleset();
+    drop_table(&mut nft, "openfeo");
+    applied.context("apply the delegated-prefix ruleset")?;
+    let ruleset = listed_ruleset?;
+    let ula = json!({"prefix": {"addr": "fc00::", "len": 7}});
+    for field in ["saddr", "daddr"] {
+        let ip6 = json!({"payload": {"protocol": "ip6", "field": field}});
+        ensure!(
+            nftlist::match_rights(&ruleset, "forward", &ip6).contains(&&ula),
+            "no ULA {field} rule in forward: {ruleset}"
+        );
+    }
+    let ip6_saddr = json!({"payload": {"protocol": "ip6", "field": "saddr"}});
+    ensure!(
+        nftlist::match_rights(&ruleset, "input", &ip6_saddr).contains(&&ula),
+        "no ULA source drop in input: {ruleset}"
+    );
+    ensure!(
+        nftlist::count_verdict(&ruleset, "forward", "reject") >= 2,
+        "the ULA rules reject with no-route: {ruleset}"
+    );
+    let udp_dport = json!({"payload": {"protocol": "udp", "field": "dport"}});
+    let input_ports = nftlist::match_rights(&ruleset, "input", &udp_dport);
+    ensure!(
+        input_ports.iter().any(|right| right.as_u64() == Some(546)),
+        "udp 546 is not accepted on the WAN input: {input_ports:?}"
+    );
+    ensure!(
+        input_ports.iter().any(|right| right
+            .get("set")
+            .and_then(Value::as_array)
+            .is_some_and(|set| set.contains(&json!(547)))),
+        "udp 547 is not among the LAN services: {input_ports:?}"
     );
     Ok(())
 }

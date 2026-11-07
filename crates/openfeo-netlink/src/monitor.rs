@@ -19,12 +19,13 @@ use netlink_packet_route::link::{
     InfoData, InfoKind, InfoVlan, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
 };
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteType};
+use netlink_packet_route::rule::{RuleAction as NlRuleAction, RuleAttribute, RuleMessage};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
-use rtnetlink::{Handle, MulticastGroup, RouteMessageBuilder};
+use rtnetlink::{Handle, IpVersion, MulticastGroup, RouteMessageBuilder};
 use tokio::sync::watch;
 use tracing::debug;
 
-use crate::types::{Addr, Cache, Link, LinkKind, Route, RouteKind};
+use crate::types::{Addr, Cache, Link, LinkKind, Route, RouteKind, Rule, RuleAction};
 
 /// Errors from the connection and from requests.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +89,8 @@ impl Netlink {
                 MulticastGroup::Ipv6Ifaddr,
                 MulticastGroup::Ipv4Route,
                 MulticastGroup::Ipv6Route,
+                MulticastGroup::Ipv4Rule,
+                MulticastGroup::Ipv6Rule,
             ])?;
         tokio::spawn(monitor_connection);
         let (request_connection, request_handle, _unsolicited) = rtnetlink::new_connection()?;
@@ -132,11 +135,22 @@ impl Netlink {
         {
             apply_route(&mut cache, &msg, true);
         }
+        for version in [IpVersion::V4, IpVersion::V6] {
+            let mut rules = monitor_handle.rule().get(version).execute();
+            while let Some(msg) = rules
+                .try_next()
+                .await
+                .map_err(|e| request_error("dump rules", e))?
+            {
+                apply_rule(&mut cache, &msg, true);
+            }
+        }
         debug!(
-            "netlink: initial dump: {} links, {} addresses, {} routes",
+            "netlink: initial dump: {} links, {} addresses, {} routes, {} rules",
             cache.links.len(),
             cache.addrs.len(),
-            cache.routes.len()
+            cache.routes.len(),
+            cache.rules.len()
         );
 
         let (tx, _rx) = watch::channel(Arc::new(cache.clone()));
@@ -186,6 +200,8 @@ fn apply(cache: &mut Cache, msg: &RouteNetlinkMessage) -> bool {
         RouteNetlinkMessage::DelAddress(m) => apply_addr(cache, m, false),
         RouteNetlinkMessage::NewRoute(m) => apply_route(cache, m, true),
         RouteNetlinkMessage::DelRoute(m) => apply_route(cache, m, false),
+        RouteNetlinkMessage::NewRule(m) => apply_rule(cache, m, true),
+        RouteNetlinkMessage::DelRule(m) => apply_rule(cache, m, false),
         _ => false,
     }
 }
@@ -227,6 +243,58 @@ fn apply_route(cache: &mut Cache, msg: &RouteMessage, present: bool) -> bool {
     } else {
         cache.remove_route(&route)
     }
+}
+
+fn apply_rule(cache: &mut Cache, msg: &RuleMessage, present: bool) -> bool {
+    let Some(rule) = rule_from(msg) else {
+        return false;
+    };
+    if present {
+        cache.rules.insert(rule)
+    } else {
+        cache.rules.remove(&rule)
+    }
+}
+
+/// A rule in the shape the applier compares; `None` for a family or an action this crate does
+/// not model (the kernel's `blackhole` and `prohibit` rules, `goto`, `nop`).
+fn rule_from(msg: &RuleMessage) -> Option<Rule> {
+    let v6 = match msg.header.family {
+        AddressFamily::Inet => false,
+        AddressFamily::Inet6 => true,
+        _ => return None,
+    };
+    let mut table = u32::from(msg.header.table);
+    let mut src_addr = None;
+    let mut priority = 0;
+    let mut suppress_prefixlen = None;
+    let mut protocol = 0;
+    for attr in &msg.attributes {
+        match attr {
+            RuleAttribute::Table(t) => table = *t,
+            RuleAttribute::Source(ip) => src_addr = Some(*ip),
+            RuleAttribute::Priority(p) => priority = *p,
+            RuleAttribute::SuppressPrefixLen(len) => {
+                suppress_prefixlen = u8::try_from(*len).ok().filter(|len| *len <= 128);
+            }
+            RuleAttribute::Protocol(p) => protocol = u8::from(*p),
+            _ => {}
+        }
+    }
+    let action = match msg.header.action {
+        NlRuleAction::ToTable => RuleAction::ToTable(table),
+        NlRuleAction::Unreachable => RuleAction::Unreachable,
+        _ => return None,
+    };
+    let src = src_addr.and_then(|ip| IpNet::new(ip, msg.header.src_len).ok());
+    Some(Rule {
+        v6,
+        priority,
+        src,
+        action,
+        suppress_prefixlen,
+        protocol,
+    })
 }
 
 fn link_from(msg: &LinkMessage) -> Link {
@@ -319,6 +387,7 @@ fn route_from(msg: &RouteMessage) -> Option<Route> {
         priority: 0,
         kind: match msg.header.kind {
             RouteType::BlackHole => RouteKind::Blackhole,
+            RouteType::Unreachable => RouteKind::Unreachable,
             _ => RouteKind::Unicast,
         },
         pref_src: None,
@@ -337,9 +406,9 @@ fn route_from(msg: &RouteMessage) -> Option<Route> {
             _ => {}
         }
     }
-    // The kernel reports an IPv6 blackhole with `lo` as its device where the IPv4 one has none
-    // (ADR-0020); a blackhole has no interface either way.
-    if route.kind == RouteKind::Blackhole {
+    // The kernel reports an IPv6 blackhole or unreachable route with `lo` as its device where
+    // the IPv4 one has none (ADR-0020); neither has an interface either way.
+    if route.kind != RouteKind::Unicast {
         route.oif = None;
     }
     Some(route)

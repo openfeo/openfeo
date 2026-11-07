@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openfeo_config::load::STATE_FILE_MODE;
-use openfeo_net::ndp::{ALL_ROUTERS, NdpSocket, Role};
+use openfeo_net::ndp::{ALL_ROUTERS, NdpSocket, RESEND_AFTER, Resend, Role, tentative_link_local};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_platform::atomic;
 use openfeo_proto_dhcp4::identity::{from_hex, hex};
@@ -149,7 +149,7 @@ async fn run(
     let mut buf = vec![0u8; RECEIVE_BUFFER];
     let mut carrier = true;
     announce_link_local(task, &world_rx, &mut link_local);
-    act(
+    let mut pending = act(
         task,
         publisher,
         &socket,
@@ -162,6 +162,16 @@ async fn run(
             .next_timeout()
             .map(|at| start + Duration::from_millis(at));
         let outputs = tokio::select! {
+            () = wait_until(pending.as_ref().map(|resend| resend.at)) => {
+                // The link-local address was tentative a second ago (#34).
+                if let Some(resend) = pending.take() {
+                    match resend.retry(&socket) {
+                        Ok(next) => pending = next,
+                        Err(err) => warn!("ipv6 {}: solicit: {err}", task.wan),
+                    }
+                }
+                Vec::new()
+            }
             received = socket.recv(&mut buf) => {
                 let received = received.map_err(failed)?;
                 client.handle(
@@ -201,7 +211,9 @@ async fn run(
                 client.handle(if up { Input::LinkUp } else { Input::LinkDown }, now(start))
             }
         };
-        act(task, publisher, &socket, &mut sends, &mut last, outputs);
+        if let Some(resend) = act(task, publisher, &socket, &mut sends, &mut last, outputs) {
+            pending = Some(resend);
+        }
     }
 }
 
@@ -231,7 +243,8 @@ fn announce_link_local(task: &WanTask, world_rx: &WorldRx, known: &mut Option<Ip
 
 /// What the core says to do: solicitations sent (a failure logged once per window: the port has
 /// no link-local address yet, and the core's next timer tries again), the learned set published
-/// as the WAN's fact and told on the console, notes told.
+/// as the WAN's fact and told on the console, notes told. A solicitation refused while the
+/// link-local address is tentative comes back as a [`Resend`] for the loop to retry (#34).
 fn act(
     task: &WanTask,
     publisher: &Publisher,
@@ -239,11 +252,21 @@ fn act(
     sends: &mut Throttle,
     last: &mut Learned,
     outputs: Vec<Output>,
-) {
+) -> Option<Resend> {
+    let mut pending = None;
     for output in outputs {
         match output {
             Output::Solicit(bytes) => {
                 if let Err(err) = socket.send(ALL_ROUTERS, &bytes) {
+                    if let Some(after) = send_retry(&err) {
+                        debug!(
+                            "ipv6 {}: solicit: {err}; again in {} s",
+                            task.wan,
+                            after.as_secs()
+                        );
+                        pending = Some(Resend::new(ALL_ROUTERS, bytes));
+                        continue;
+                    }
                     let line = format!("ipv6 {}: solicit: {err}", task.wan);
                     if let Some(line) = sends.line(Instant::now(), &line) {
                         warn!("{line}");
@@ -274,6 +297,13 @@ fn act(
             }
         }
     }
+    pending
+}
+
+/// How long to wait before sending again, when `err` is the kernel refusing a link-local
+/// source it has not finished checking (#34); `None` for every other failure.
+pub(crate) fn send_retry(err: &openfeo_net::dhcp4::DriverError) -> Option<Duration> {
+    tentative_link_local(err).then_some(RESEND_AFTER)
 }
 
 /// The learned set as the reconcilers see it.
@@ -388,6 +418,22 @@ mod tests {
         assert_eq!(fact.dns, learned.dns);
         assert_eq!(fact.search, learned.search);
         assert_eq!(fact.mtu, Some(1492));
+    }
+
+    #[test]
+    fn eaddrnotavail_schedules_a_retry_instead_of_a_warning() {
+        use openfeo_net::dhcp4::DriverError;
+        // EADDRNOTAVAIL is 99 and ENETDOWN 100 on Linux.
+        let tentative = DriverError::Io {
+            what: "send ICMPv6",
+            source: std::io::Error::from_raw_os_error(99),
+        };
+        assert_eq!(send_retry(&tentative), Some(RESEND_AFTER));
+        let down = DriverError::Io {
+            what: "send ICMPv6",
+            source: std::io::Error::from_raw_os_error(100),
+        };
+        assert_eq!(send_retry(&down), None);
     }
 
     /// The console contract the harness scenarios match.

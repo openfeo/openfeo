@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dhcp4;
+pub mod dhcp6;
 pub mod health;
 pub mod ipv6;
 pub mod leases;
@@ -20,6 +21,7 @@ pub mod time;
 pub mod world;
 
 pub use dhcp4::Dhcp4Fact;
+pub use dhcp6::{Deprecated, Lifetimed, WanDhcp6Fact};
 pub use ipv6::{DefaultRoute, Preference, WanIpv6Fact};
 pub use leases::LeaseFact;
 pub use mac::MacAddr;

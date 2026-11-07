@@ -23,6 +23,10 @@ pub const ISP0_ADDR: &str = "203.0.113.1/24";
 pub const ISP0_ADDR6: &str = "2001:db8:ffff::1/64";
 /// The prefix the lab's ISP routes to the router (`vm-ipv6.toml`).
 pub const ROUTED_PREFIX6: &str = "2001:db8:1::/48";
+/// The lab's first delegation pool (`vm-pd.toml`): Kea cuts /56s from it.
+pub const PD_POOL_A: &str = "2001:db8:100::/48";
+/// The second pool: the ISP that changed its mind (the renumbering scenario).
+pub const PD_POOL_B: &str = "2001:db8:200::/48";
 /// ISP A's only link-local on `wan0`, the source of its advertisements: what the router learns
 /// as its default router, and what a typed `gateway` names.
 pub const ISP0_LINK_LOCAL6: &str = "fe80::1/64";
@@ -261,6 +265,42 @@ impl Lab {
         )?;
         self.daemons.push(radvd);
         Ok(())
+    }
+
+    /// Start Kea's DHCPv6 server on ISP A's `wan0` with `config` (`daemons::kea_dhcp6`); the
+    /// ISP's addresses come from [`Lab::start_radvd`], which runs first. Returns once Kea
+    /// announces itself. The daemon joins [`Lab::daemons`], named `kea-dhcp6`.
+    ///
+    /// # Errors
+    ///
+    /// When Kea cannot be started or does not come up within 15 s.
+    pub fn start_kea6(&mut self, config: &daemons::Kea6Config) -> Result<()> {
+        let kea = daemons::kea_dhcp6(&self.isp0, config, &self.run_dir)?;
+        kea.log.wait_for(
+            &mut Cursor::default(),
+            &Regex::new("DHCP6_STARTED").context("regex")?,
+            Duration::from_secs(15),
+        )?;
+        self.daemons.push(kea);
+        Ok(())
+    }
+
+    /// Stop the lab's Kea DHCPv6 server; `true` when one was running. Its leases go with it
+    /// (memfile, not persisted): the ISP that forgot the delegation.
+    pub fn stop_kea6(&mut self) -> bool {
+        let before = self.daemons.len();
+        self.daemons.retain(|daemon| daemon.name != "kea-dhcp6");
+        self.daemons.len() != before
+    }
+
+    /// Stop Kea's DHCPv6 server and start it again with `config`: the ISP changing its mind.
+    ///
+    /// # Errors
+    ///
+    /// As [`Lab::start_kea6`].
+    pub fn restart_kea6(&mut self, config: &daemons::Kea6Config) -> Result<()> {
+        self.stop_kea6();
+        self.start_kea6(config)
     }
 
     /// Stop the lab's radvd (its final advertisements carry lifetime 0, as a router going away

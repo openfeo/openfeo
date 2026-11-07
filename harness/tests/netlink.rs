@@ -26,7 +26,10 @@ use openfeo_harness::lab::Lab;
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::scenario::{Scenario, run_all};
 use openfeo_harness::{daemons, lanclient, netns, nftlist, nftprobe, sandbox, vlanprobe};
-use openfeo_netlink::{Cache, LinkKind, Netlink, RTPROT_OPENFEO, Route, RouteKind, TABLE_MAIN};
+use openfeo_netlink::{
+    Cache, LinkKind, Netlink, RTPROT_OPENFEO, RULE_PRIORITY_MAIN_SUPPRESS, RULE_PRIORITY_SOURCE,
+    Route, RouteKind, Rule, RuleAction, TABLE_MAIN,
+};
 use openfeo_nft::Nft;
 use openfeo_platform::sysctl;
 use openfeo_reconcile::nft::nft;
@@ -35,6 +38,22 @@ use openfeo_world::{Dhcp4Fact, LinkFact, MacAddr, TimeFact, WanIpv6Fact, World};
 use tokio::sync::watch;
 
 const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "a_suppress_main_rule_and_a_source_rule_are_added_dumped_and_removed",
+        run: a_suppress_main_rule_and_a_source_rule_are_added_dumped_and_removed,
+    },
+    Scenario {
+        name: "an_unreachable_rule_answers_with_no_route",
+        run: an_unreachable_rule_answers_with_no_route,
+    },
+    Scenario {
+        name: "an_unreachable_default_in_table_100_is_added_and_dumped",
+        run: an_unreachable_default_in_table_100_is_added_and_dumped,
+    },
+    Scenario {
+        name: "a_rule_added_behind_the_monitors_back_is_cached",
+        run: a_rule_added_behind_the_monitors_back_is_cached,
+    },
     Scenario {
         name: "ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_removed",
         run: ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_removed,
@@ -430,19 +449,21 @@ fn ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_re
             },
         )
         .await?;
-        // A box that drops [wans.ipv6] loses the default, the blackhole and its loopback
-        // address: nothing of this scenario outlives it in the shared namespace.
+        // A box that drops [wans.ipv6] loses the default in `main` and in the WAN's table, the
+        // blackhole, its loopback address and the suppress-main rule (SPEC §7.4): nothing of
+        // this scenario outlives it in the shared namespace.
         config.wans[0].ipv6 = None;
         let ops = routing_pass(&mut rig, &config).await?;
         ensure!(
-            ops == 3,
-            "dropping [wans.ipv6] removed {ops} things, not three"
+            ops == 5,
+            "dropping [wans.ipv6] removed {ops} things, not five"
         );
         wait_until(&mut rig.rx, "no IPv6 of ours left", |c| {
             !c.routes
                 .iter()
                 .any(|r| r.v6 && r.protocol == RTPROT_OPENFEO)
                 && !c.addrs.iter().any(|a| a.net == lo6)
+                && !c.rules.iter().any(|r| r.protocol == RTPROT_OPENFEO)
         })
         .await?;
         anyhow::Ok(())
@@ -859,6 +880,8 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         time: TimeFact::default(),
         ipv6: Arc::new(BTreeMap::new()),
         routes: Arc::new(std::collections::BTreeSet::new()),
+        dhcp6: Arc::new(BTreeMap::new()),
+        ula: None,
     }
 }
 
@@ -1083,6 +1106,7 @@ fn partial_failure_still_applies_the_rest(_lab: &mut Lab) -> anyhow::Result<()> 
             reaches: Vec::new(),
             ipv6: String::new(),
             ra: None,
+            ipv6_index: 0,
         });
         let mut rig = Rig::connect().await?;
         let cache = rig.rx.borrow_and_update().clone();
@@ -1388,6 +1412,249 @@ fn routing_applier_adds_a_host_route_before_an_off_link_default(
                 })
             },
         )
+        .await?;
+        anyhow::Ok(())
+    })?
+}
+
+/// Policy rules (SPEC §7.4): the 1500 `from all lookup main suppress_prefixlength 0` rule and a
+/// 2000 source rule into a WAN's table, both protocol 200, added, seen in the cache with every
+/// field, shown by `ip`, and removed.
+fn a_suppress_main_rule_and_a_source_rule_are_added_dumped_and_removed(
+    _lab: &mut Lab,
+) -> anyhow::Result<()> {
+    block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let suppress = Rule {
+            v6: true,
+            priority: RULE_PRIORITY_MAIN_SUPPRESS,
+            src: None,
+            action: RuleAction::ToTable(TABLE_MAIN),
+            suppress_prefixlen: Some(0),
+            protocol: RTPROT_OPENFEO,
+        };
+        let source = Rule {
+            v6: true,
+            priority: RULE_PRIORITY_SOURCE,
+            src: Some("2001:db8:100::/56".parse()?),
+            action: RuleAction::ToTable(100),
+            suppress_prefixlen: None,
+            protocol: RTPROT_OPENFEO,
+        };
+        for rule in [&suppress, &source] {
+            let _ = nl.rule_del(rule).await; // left by an interrupted run
+        }
+        nl.rule_add(&suppress).await?;
+        nl.rule_add(&source).await?;
+        wait_until(&mut rx, "both rules cached", |c| {
+            c.rules.contains(&suppress) && c.rules.contains(&source)
+        })
+        .await?;
+        let shown = netns::ip(&["-6", "rule", "show"])?;
+        ensure!(
+            shown.contains("suppress_prefixlength 0"),
+            "ip rule: {shown}"
+        );
+        ensure!(
+            shown.contains("from 2001:db8:100::/56 lookup 100"),
+            "ip rule: {shown}"
+        );
+        ensure!(
+            openfeo_netlink::describe_rule(&source)
+                == "rule 2000 from 2001:db8:100::/56 lookup 100 proto 200",
+            "describe: {}",
+            openfeo_netlink::describe_rule(&source)
+        );
+        ensure!(
+            openfeo_netlink::describe_rule(&suppress)
+                == "rule 1500 from all lookup main suppress_prefixlength 0 proto 200",
+            "describe: {}",
+            openfeo_netlink::describe_rule(&suppress)
+        );
+        ensure!(
+            nl.rule_add(&source).await.is_err_and(|e| e.is_exist()),
+            "adding the same rule twice is EEXIST"
+        );
+        nl.rule_del(&suppress).await?;
+        nl.rule_del(&source).await?;
+        wait_until(&mut rx, "rules gone", |c| {
+            !c.rules.iter().any(|r| r.protocol == RTPROT_OPENFEO)
+        })
+        .await?;
+        ensure!(
+            rx.borrow()
+                .rules
+                .iter()
+                .any(|r| r.v6 && r.protocol != RTPROT_OPENFEO),
+            "the kernel's own IPv6 rules stay cached: {:?}",
+            rx.borrow().rules
+        );
+        anyhow::Ok(())
+    })?
+}
+
+/// A `from <prefix> unreachable` rule (the deprecation rule of SPEC §7.3): a lookup from a
+/// source in the prefix fails where the same lookup from another source finds the default.
+fn an_unreachable_rule_answers_with_no_route(_lab: &mut Lab) -> anyhow::Result<()> {
+    block_on(async {
+        let _ = netns::ip(&["link", "del", "r0"]);
+        netns::ip(&["link", "add", "r0", "type", "veth", "peer", "name", "r1"])?;
+        netns::ip(&["link", "set", "r0", "up"])?;
+        netns::ip(&["link", "set", "r1", "up"])?;
+        netns::ip(&["-6", "route", "replace", "default", "dev", "r0"])?;
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let rule = Rule {
+            v6: true,
+            priority: RULE_PRIORITY_SOURCE,
+            src: Some("2001:db8:200::/56".parse()?),
+            action: RuleAction::Unreachable,
+            suppress_prefixlen: None,
+            protocol: RTPROT_OPENFEO,
+        };
+        let _ = nl.rule_del(&rule).await;
+        let lookup = || {
+            netns::ip(&[
+                "-6",
+                "route",
+                "get",
+                "2001:db8:ffff::1",
+                "from",
+                "2001:db8:200::1",
+                "iif",
+                "r0",
+            ])
+        };
+        let before = lookup();
+        ensure!(
+            before.as_ref().is_ok_and(|text| text.contains("dev r0")),
+            "without the rule the default answers: {before:?}"
+        );
+        nl.rule_add(&rule).await?;
+        wait_until(&mut rx, "unreachable rule cached", |c| {
+            c.rules.contains(&rule)
+        })
+        .await?;
+        let Err(after) = lookup() else {
+            anyhow::bail!("with the rule the lookup should fail");
+        };
+        let text = format!("{after:#}");
+        ensure!(
+            text.contains("unreachable") || text.contains("Unreachable"),
+            "the kernel says unreachable: {text}"
+        );
+        let other = netns::ip(&[
+            "-6",
+            "route",
+            "get",
+            "2001:db8:ffff::1",
+            "from",
+            "2001:db8:100::1",
+            "iif",
+            "r0",
+        ]);
+        ensure!(
+            other.as_ref().is_ok_and(|text| text.contains("dev r0")),
+            "another source still finds the default: {other:?}"
+        );
+        ensure!(
+            openfeo_netlink::describe_rule(&rule)
+                == "rule 2000 from 2001:db8:200::/56 unreachable proto 200",
+            "describe: {}",
+            openfeo_netlink::describe_rule(&rule)
+        );
+        nl.rule_del(&rule).await?;
+        wait_until(&mut rx, "unreachable rule gone", |c| {
+            !c.rules.contains(&rule)
+        })
+        .await?;
+        netns::ip(&["link", "del", "r0"])?;
+        anyhow::Ok(())
+    })?
+}
+
+/// An `unreachable default` in a WAN's table (SPEC §7.3, §7.4): added, cached with its kind
+/// and no device (the kernel reports `lo`, as for a blackhole: ADR-0020), shown by `ip`,
+/// removed.
+fn an_unreachable_default_in_table_100_is_added_and_dumped(_lab: &mut Lab) -> anyhow::Result<()> {
+    block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let route = Route {
+            v6: true,
+            table: 100,
+            dst: None,
+            gateway: None,
+            oif: None,
+            protocol: RTPROT_OPENFEO,
+            priority: 1000,
+            kind: RouteKind::Unreachable,
+            pref_src: None,
+        };
+        let _ = nl.route_del(&route).await;
+        nl.route_add(&route).await?;
+        wait_until(&mut rx, "unreachable default cached", |c| {
+            c.routes.contains(&route)
+        })
+        .await?;
+        let shown = netns::ip(&["-6", "route", "show", "table", "100"])?;
+        ensure!(shown.contains("unreachable default"), "ip route: {shown}");
+        ensure!(
+            openfeo_netlink::describe(&route)
+                == "unreachable default proto 200 metric 1000 table 100",
+            "describe: {}",
+            openfeo_netlink::describe(&route)
+        );
+        nl.route_del(&route).await?;
+        wait_until(&mut rx, "unreachable default gone", |c| {
+            !c.routes.contains(&route)
+        })
+        .await?;
+        anyhow::Ok(())
+    })?
+}
+
+/// A rule added with `ip` while the monitor runs lands in the cache, and the applier can
+/// remove a protocol-200 rule it did not add itself.
+fn a_rule_added_behind_the_monitors_back_is_cached(_lab: &mut Lab) -> anyhow::Result<()> {
+    block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let expected = Rule {
+            v6: true,
+            priority: 2001,
+            src: Some("2001:db8:300::/56".parse()?),
+            action: RuleAction::ToTable(101),
+            suppress_prefixlen: None,
+            protocol: RTPROT_OPENFEO,
+        };
+        let _ = nl.rule_del(&expected).await;
+        netns::ip(&[
+            "-6",
+            "rule",
+            "add",
+            "priority",
+            "2001",
+            "from",
+            "2001:db8:300::/56",
+            "lookup",
+            "101",
+            "protocol",
+            "200",
+        ])?;
+        wait_until(&mut rx, "foreign rule cached", |c| {
+            c.rules.contains(&expected)
+        })
+        .await?;
+        nl.rule_del(&expected).await?;
+        wait_until(&mut rx, "foreign rule gone", |c| {
+            !c.rules.contains(&expected)
+        })
         .await?;
         anyhow::Ok(())
     })?

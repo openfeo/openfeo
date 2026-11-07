@@ -395,11 +395,22 @@ impl Client {
     }
 
     fn learned(&self) -> Learned {
-        let router = self
-            .routers
-            .iter()
-            .max_by_key(|(_, r)| (r.preference, r.seen))
-            .map(|(addr, _)| *addr);
+        // The best preference wins; among equals the current router stays, so an equal
+        // newcomer's every advertisement does not flip the default route (#26); with no current
+        // one among them, the most recent.
+        let best = self.routers.values().map(|r| r.preference).max();
+        let current = self.last.router.filter(|addr| {
+            self.routers
+                .get(addr)
+                .is_some_and(|r| Some(r.preference) == best)
+        });
+        let router = current.or_else(|| {
+            self.routers
+                .iter()
+                .filter(|(_, r)| Some(r.preference) == best)
+                .max_by_key(|(_, r)| r.seen)
+                .map(|(addr, _)| *addr)
+        });
         Learned {
             router,
             addresses: self
@@ -844,16 +855,58 @@ mod tests {
         assert_eq!(learned(&out).unwrap().router, Some(ll(2)));
         let out = c.handle(advert(ll(3), &high), 2);
         assert_eq!(
+            learned(&out),
+            None,
+            "an equal-preference newcomer does not displace the current router (#26)"
+        );
+        let out = c.handle(advert(ll(2), &ra(0, vec![])), 3);
+        assert_eq!(
             learned(&out).unwrap().router,
             Some(ll(3)),
-            "the most recent high one"
+            "withdrawn: the other high one"
         );
-        let out = c.handle(advert(ll(3), &ra(0, vec![])), 3);
+    }
+
+    #[test]
+    fn an_equal_preference_newcomer_does_not_displace_the_current_router() {
+        let mut c = client();
+        up(&mut c);
+        c.handle(advert(ll(1), &ra(1800, vec![])), 0);
+        for now in 1..5 {
+            let out = c.handle(advert(ll(2), &ra(1800, vec![])), now);
+            assert_eq!(learned(&out), None, "{now}: nothing changed");
+        }
+        let out = c.handle(advert(ll(1), &ra(1800, vec![])), 5);
+        assert_eq!(
+            learned(&out),
+            None,
+            "a refresh of the current one changes nothing"
+        );
+        let out = c.handle(advert(ll(1), &ra(0, vec![])), 6);
         assert_eq!(
             learned(&out).unwrap().router,
             Some(ll(2)),
-            "withdrawn: the other high one"
+            "gone: the other one"
         );
+    }
+
+    #[test]
+    fn a_higher_preference_newcomer_does() {
+        let mut c = client();
+        up(&mut c);
+        c.handle(advert(ll(1), &ra(1800, vec![])), 0);
+        let high = RouterAdvertisement {
+            preference: Preference::High,
+            ..ra(1800, vec![])
+        };
+        let out = c.handle(advert(ll(2), &high), 1);
+        assert_eq!(learned(&out).unwrap().router, Some(ll(2)));
+        let low = RouterAdvertisement {
+            preference: Preference::Low,
+            ..ra(1800, vec![])
+        };
+        let out = c.handle(advert(ll(3), &low), 2);
+        assert_eq!(learned(&out), None, "a lower one changes nothing");
     }
 
     #[test]

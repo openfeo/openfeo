@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The lab's delegated-prefix configuration (M2 part 3): the DHCPv4 WAN of vm-dhcp.toml with
+# [wans.ipv6] and no typed prefix, so the WAN asks the ISP's DHCPv6 server for a /56 and an
+# address; lan0 on p2 and lan1 on p3 take index 1 and 2 of every delegated prefix and of the
+# router's ULA and may reach each other; upstreams empty, so the resolver the ISP hands out
+# over DHCPv6 is what answers. Used by the m2pd scenarios and the reconcile snapshot tests.
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+ntp_servers = ["ntp.isp.example"]
+
+[[wans]]
+name = "wan0"
+port = "p0"
+priority = 10
+[wans.dhcp]
+hostname = "openfeo-lab"
+[wans.ipv6]
+pd_hint = 56
+
+[[lans]]
+name = "lan0"
+ports = ["p2"]
+ipv4 = "192.168.1.1/24"
+ipv6_index = 1
+reaches = ["wan", "lan1"]
+[lans.dhcp]
+range = ["192.168.1.100", "192.168.1.200"]
+lease_secs = 43200
+[[lans.dhcp.static]]
+mac = "52:54:00:fe:10:10"
+ip = "192.168.1.10"
+hostname = "nas"
+
+[[lans]]
+name = "lan1"
+ports = ["p3"]
+ipv4 = "192.168.2.1/24"
+ipv6_index = 2
+reaches = ["wan", "lan0"]
+[lans.dhcp]
+range = ["192.168.2.100", "192.168.2.200"]
+
+[dns]
+upstreams = []
+
+[firewall]
+wan_ping = true

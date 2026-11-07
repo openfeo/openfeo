@@ -1,0 +1,66 @@
+---
+source: crates/openfeo-reconcile/src/routing.rs
+expression: "routing(&fixtures::pd_world())"
+---
+addrs:
+  - ifname: br-lan0
+    net: 192.168.1.1/24
+  - ifname: br-lan0
+    net: "2001:db8:100:1::1/64"
+  - ifname: br-lan0
+    net: "fd12:3456:789a:1::1/64"
+  - ifname: br-lan1
+    net: 192.168.2.1/24
+  - ifname: br-lan1
+    net: "2001:db8:100:2::1/64"
+  - ifname: br-lan1
+    net: "fd12:3456:789a:2::1/64"
+  - ifname: lo
+    net: "2001:db8:100::1/128"
+  - ifname: lo
+    net: "fd12:3456:789a::1/128"
+  - ifname: p0
+    net: "2001:db8:ffff::1a4/128"
+routes:
+  - ifname: ~
+    dst: "2001:db8:100::/56"
+    gateway: ~
+    table: 254
+    protocol: 200
+    priority: 1000
+    kind: Blackhole
+    pref_src: ~
+  - ifname: p0
+    dst: ~
+    gateway: "fe80::1"
+    table: 100
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: "2001:db8:100::1"
+  - ifname: p0
+    dst: ~
+    gateway: "fe80::1"
+    table: 254
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: "2001:db8:100::1"
+rules:
+  - v6: true
+    priority: 1500
+    src: ~
+    action:
+      ToTable: 254
+    suppress_prefixlen: 0
+  - v6: true
+    priority: 2000
+    src: "2001:db8:100::/56"
+    action:
+      ToTable: 100
+    suppress_prefixlen: ~
+ipv6_owned:
+  - br-lan0
+  - br-lan1
+  - lo
+  - p0

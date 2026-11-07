@@ -1,0 +1,25 @@
+{
+  "Dhcp6": {
+    "interfaces-config": { "interfaces": [ "{{IFACE}}" ] },
+    "lease-database": { "type": "memfile", "persist": false },
+    "server-id": { "type": "LL", "persist": false },
+    "renew-timer": {{RENEW}},
+    "rebind-timer": {{REBIND}},
+    "preferred-lifetime": {{PREFERRED}},
+    "valid-lifetime": {{VALID}},
+    "subnet6": [
+      {
+        "id": 1,
+        "subnet": "2001:db8:ffff::/64",
+        "interface": "{{IFACE}}",
+        "rapid-commit": true,
+        "pools": [ { "pool": "2001:db8:ffff::100 - 2001:db8:ffff::1ff" } ],
+        "pd-pools": [ {{PD_POOLS}} ],
+        "option-data": [
+          { "name": "dns-servers", "data": "2001:db8:ffff::1" },
+          { "name": "domain-search", "data": "isp.example" }
+        ]
+      }
+    ]
+  }
+}

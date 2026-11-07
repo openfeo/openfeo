@@ -480,6 +480,10 @@ const WAN_LINK_LOCAL: &str = r"openfeo: wan wan0 ipv6 link-local (fe80:[0-9a-f:]
 const WAN_ADDRESS6: &str = r"openfeo: wan wan0 ipv6 address (2001:db8:ffff:[0-9a-f:]+)/64";
 /// The router learned ISP A, at its link-local, as its default router from radvd.
 const ROUTER_LEARNED: &str = r"openfeo: wan wan0 ipv6 router fe80::1 \(learned\)";
+/// The routing applier installing the WAN's IPv6 default in the main table (the one in the
+/// WAN's own table ends with `table 100`).
+const DEFAULT6_INSTALLED: &str =
+    r"openfeo: add route default via fe80::1 dev p0 src [0-9a-f:]+ proto 200 metric 10$";
 /// The ISP's resolver logging a query the router sent over IPv6: from its loopback address.
 const FROM_ROUTER_LOOPBACK6: &str = r"from 2001:db8:1::1\s*$";
 /// How long one `dig` from the LAN host may take in all.
@@ -623,9 +627,24 @@ fn lan_client_configures_itself_from_the_lan_prefix_and_reaches_the_isp_over_ipv
         fetch(&lab.lan0, ISP_HTTP6)? == ISP_HTTP_BODY,
         "the LAN host reaches the ISP over IPv6"
     );
+    // Part 3: the ULA /64 beside the routed one, O = 1 for the stateless responder, and the
+    // router's ULA address first among the resolvers, since it survives renumbering.
+    wait_until(SOON, "the LAN host's ULA address", || {
+        Ok(lab
+            .lan0
+            .ip(&["-6", "addr", "show", "dev", "lan0", "scope", "global"])?
+            .contains("inet6 fd"))
+    })?;
     if rdisc6_installed() {
         let report = lanclient::rdisc6(&lab.lan0, "lan0", RDISC6_TIMEOUT)?;
-        anyhow::ensure!(report.rdnss == vec![ROUTER6], "RDNSS in {report:?}");
+        anyhow::ensure!(report.other == Some(true), "O flag in {report:?}");
+        anyhow::ensure!(report.managed == Some(false), "M flag in {report:?}");
+        anyhow::ensure!(
+            report.rdnss.len() == 2
+                && report.rdnss[0].segments()[0] & 0xfe00 == 0xfc00
+                && report.rdnss[1] == ROUTER6,
+            "RDNSS in {report:?}"
+        );
         anyhow::ensure!(
             report.dnssl == vec!["home.arpa".to_owned()],
             "DNSSL in {report:?}"
@@ -838,11 +857,10 @@ fn isp_names_resolve_to_aaaa_through_a_learned_ipv6_upstream(lab: &mut Lab) -> a
     let c = lab.console()?;
     let mut cur = Cursor::default();
     c.wait_for(&mut cur, &re(ROUTER_LEARNED), SOON)?;
-    c.wait_for(
-        &mut cur,
-        &re(r"openfeo: apply routing generation=\d+ ops=\d+"),
-        SOON,
-    )?;
+    // The anchor is the default route's own op in the main table: the reconcilers act on the
+    // kernel's route the moment the monitor reports it, which can be before the routing pass
+    // logs its summary.
+    c.wait_for(&mut cur, &re(DEFAULT6_INSTALLED), SOON)?;
     let routed = cur;
     let announced =
         re(r"openfeo: dns upstreams 203\.0\.113\.1 2001:db8:ffff::1 \(learned from wan0\)");

@@ -666,6 +666,7 @@ dependencies = [
  "libfuzzer-sys",
  "openfeo-config",
  "openfeo-proto-dhcp4",
+ "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
  "openfeo-proto-sntp",
@@ -684,6 +685,15 @@ dependencies = [
 name = "openfeo-proto-dhcp4"
 version = "0.1.0"
 dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "openfeo-proto-dhcp6"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "openfeo-proto-ndp",
  "thiserror",
 ]
 

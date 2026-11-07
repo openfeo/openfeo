@@ -969,6 +969,7 @@ dependencies = [
  "openfeo-nft",
  "openfeo-platform",
  "openfeo-proto-dhcp4",
+ "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
  "openfeo-proto-sntp",
@@ -1031,6 +1032,7 @@ dependencies = [
  "openfeo-nft",
  "openfeo-platform",
  "openfeo-proto-dhcp4",
+ "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
  "openfeo-proto-sntp",
@@ -1060,6 +1062,7 @@ dependencies = [
  "libc",
  "nix",
  "openfeo-proto-dhcp4",
+ "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
  "openfeo-proto-sntp",
@@ -1106,6 +1109,16 @@ version = "0.1.0"
 dependencies = [
  "dhcproto",
  "ipnet",
+ "thiserror",
+]
+
+[[package]]
+name = "openfeo-proto-dhcp6"
+version = "0.1.0"
+dependencies = [
+ "dhcproto",
+ "ipnet",
+ "openfeo-proto-ndp",
  "thiserror",
 ]
 

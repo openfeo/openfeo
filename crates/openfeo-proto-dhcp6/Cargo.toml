@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+[package]
+name = "openfeo-proto-dhcp6"
+description = "OpenFeO DHCPv6 without sockets or clocks: the wire format, the WAN client core (IA_PD and IA_NA) and the stateless responder (SPEC §7.3, §13)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+ipnet.workspace = true
+thiserror.workspace = true
+# The in-tree SHA-256 behind the IAID derivation (SPEC §7.3); a pure crate like this one.
+openfeo-proto-ndp = { path = "../openfeo-proto-ndp" }
+
+[dev-dependencies]
+# A second, independent DHCPv6 codec as the oracle for ours (the pattern of DHCPv4 and of
+# ADR-0018 for NDP); tests and fuzzing only, never shipped.
+dhcproto.workspace = true
+
+[lints]
+workspace = true

@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_world::{
-    DefaultRoute, Dhcp4Fact, LeaseFact, LinkFact, MacAddr, TimeFact, WanIpv6Fact, World,
+    DefaultRoute, Dhcp4Fact, LeaseFact, Lifetimed, LinkFact, MacAddr, TimeFact, WanDhcp6Fact,
+    WanIpv6Fact, World,
 };
 
 pub const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
@@ -18,6 +19,7 @@ pub const VM_DHCP: &str = include_str!("../../../harness/fixtures/vm-dhcp.toml")
 pub const VM_VLANS: &str = include_str!("../../../harness/fixtures/vm-vlans.toml");
 pub const VM_PUBLIC: &str = include_str!("../../../harness/fixtures/vm-public.toml");
 pub const VM_IPV6: &str = include_str!("../../../harness/fixtures/vm-ipv6.toml");
+pub const VM_PD: &str = include_str!("../../../harness/fixtures/vm-pd.toml");
 
 pub fn portmap() -> PortMap {
     PortMap {
@@ -64,6 +66,8 @@ fn world(config: Config) -> World {
         time: TimeFact::default(),
         ipv6: Arc::new(BTreeMap::new()),
         routes: Arc::new(std::collections::BTreeSet::new()),
+        dhcp6: Arc::new(BTreeMap::new()),
+        ula: None,
     }
 }
 
@@ -228,12 +232,81 @@ pub fn ipv6_world_without_route() -> World {
     }
     world.links = Arc::new(links);
     world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), ipv6_fact())]));
+    world.ula = Some(ULA.parse().expect("a prefix"));
     world
 }
 
 /// [`ipv6_world_without_route`] once the kernel holds both of `wan0`'s default routes.
 pub fn ipv6_world() -> World {
     let mut world = ipv6_world_without_route();
+    world.routes = Arc::new(std::collections::BTreeSet::from([
+        DefaultRoute {
+            v6: false,
+            ifname: "p0".to_owned(),
+        },
+        DefaultRoute {
+            v6: true,
+            ifname: "p0".to_owned(),
+        },
+    ]));
+    world
+}
+
+/// The lab router's ULA /48 (`identity/ula`), the same on every IPv6 world.
+pub const ULA: &str = "fd12:3456:789a::/48";
+
+/// A DHCPv6 binding of `prefix` and the address `2001:db8:ffff::1a4`, obtained at 10 s with
+/// preferred 40 s and valid 60 s (the lab's Kea lifetimes), the ISP's resolver and domain.
+pub fn dhcp6_fact_with(prefix: &str) -> WanDhcp6Fact {
+    let lease = |net: &str| Lifetimed {
+        net: net.parse().expect("a prefix"),
+        obtained_ms: 10_000,
+        preferred_secs: 40,
+        valid_secs: 60,
+    };
+    WanDhcp6Fact {
+        prefixes: vec![lease(prefix)],
+        addresses: vec![lease("2001:db8:ffff::1a4/128")],
+        deprecated: Vec::new(),
+        dns: vec!["2001:db8:ffff::1".parse().expect("an address")],
+        search: vec!["isp.example".to_owned()],
+        server: vec![0, 3, 0, 1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    }
+}
+
+/// [`dhcp6_fact_with`] for the lab's first delegation pool, `2001:db8:100::/56`.
+pub fn dhcp6_fact() -> WanDhcp6Fact {
+    dhcp6_fact_with("2001:db8:100::/56")
+}
+
+/// `vm-pd.toml` on the four-port lab: p0 up with carrier, the advertisement facts of
+/// [`ipv6_fact`] and the delegation of [`dhcp6_fact`], the bridges `br-lan0` and `br-lan1`
+/// known with MTU 1500, the ULA loaded, and both of `wan0`'s default routes in the kernel.
+pub fn pd_world() -> World {
+    let mut world = world4(VM_PD);
+    let mut links = link_facts4();
+    if let Some(p0) = links.get_mut("p0") {
+        p0.up = true;
+        p0.carrier = true;
+    }
+    for (name, index) in [("br-lan0", 10), ("br-lan1", 11)] {
+        links.insert(
+            name.to_owned(),
+            LinkFact {
+                index,
+                name: name.to_owned(),
+                up: true,
+                carrier: true,
+                mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x02])),
+                mtu: 1500,
+                link_local6: None,
+            },
+        );
+    }
+    world.links = Arc::new(links);
+    world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), ipv6_fact())]));
+    world.dhcp6 = Arc::new(BTreeMap::from([("wan0".to_owned(), dhcp6_fact())]));
+    world.ula = Some(ULA.parse().expect("a prefix"));
     world.routes = Arc::new(std::collections::BTreeSet::from([
         DefaultRoute {
             v6: false,

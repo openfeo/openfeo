@@ -1,0 +1,60 @@
+---
+source: crates/openfeo-reconcile/src/ra.rs
+expression: "desired(&fixtures::pd_world())"
+---
+- ifname: br-lan0
+  wan: wan0
+  lan: lan0
+  prefixes:
+    - prefix: "2001:db8:100:1::/64"
+      source:
+        Delegated:
+          wan: wan0
+          parent: "2001:db8:100::/56"
+      lifetimes:
+        FromDelegation:
+          obtained_ms: 10000
+          preferred_secs: 40
+          valid_secs: 60
+    - prefix: "fd12:3456:789a:1::/64"
+      source: Ula
+      lifetimes: Static
+  rdnss:
+    - "fd12:3456:789a:1::1"
+    - "2001:db8:100:1::1"
+  mac: "52:54:00:fe:00:02"
+  mtu: 1500
+  domain: home.arpa
+  router_lifetime: 1800
+  other: true
+  routes:
+    - "fd12:3456:789a::/48"
+    - "2001:db8:100::/56"
+- ifname: br-lan1
+  wan: wan0
+  lan: lan1
+  prefixes:
+    - prefix: "2001:db8:100:2::/64"
+      source:
+        Delegated:
+          wan: wan0
+          parent: "2001:db8:100::/56"
+      lifetimes:
+        FromDelegation:
+          obtained_ms: 10000
+          preferred_secs: 40
+          valid_secs: 60
+    - prefix: "fd12:3456:789a:2::/64"
+      source: Ula
+      lifetimes: Static
+  rdnss:
+    - "fd12:3456:789a:2::1"
+    - "2001:db8:100:2::1"
+  mac: "52:54:00:fe:00:02"
+  mtu: 1500
+  domain: home.arpa
+  router_lifetime: 1800
+  other: true
+  routes:
+    - "fd12:3456:789a::/48"
+    - "2001:db8:100::/56"

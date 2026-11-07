@@ -17,6 +17,11 @@ pub const TABLE_MAIN: u32 = 254;
 pub const SCOPE_UNIVERSE: u8 = 0;
 /// `RT_SCOPE_LINK`: a link-local address, kernel-originated, never ours.
 pub const SCOPE_LINK: u8 = 253;
+/// The policy rule that looks `main` up for every packet but suppresses a default route found
+/// there, so the source rules below it decide the egress (SPEC §7.4).
+pub const RULE_PRIORITY_MAIN_SUPPRESS: u32 = 1500;
+/// The IPv6 source-prefix rules: into a WAN's table, or `unreachable` for a deprecated prefix.
+pub const RULE_PRIORITY_SOURCE: u32 = 2000;
 
 /// What a link is, from `IFLA_INFO_KIND`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,6 +81,37 @@ pub enum RouteKind {
     Unicast,
     /// `RTN_BLACKHOLE`: silently dropped, no interface.
     Blackhole,
+    /// `RTN_UNREACHABLE`: dropped with an ICMP destination unreachable, no interface (a down
+    /// WAN's default, SPEC §7.3).
+    Unreachable,
+}
+
+/// What a policy rule does with a packet it matches (`FR_ACT_*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuleAction {
+    /// Look the table up; a miss falls through to the next rule.
+    ToTable(u32),
+    /// Answer with ICMP destination unreachable.
+    Unreachable,
+}
+
+/// One policy rule (`ip rule`), as far as OpenFeO uses them (SPEC §7.4): a priority, an
+/// optional source prefix, the action, the `suppress_prefixlength` of the main lookup, and
+/// the protocol that says who owns it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rule {
+    /// IPv6 rule.
+    pub v6: bool,
+    /// Lower runs first.
+    pub priority: u32,
+    /// `from <prefix>`; `None` is `from all`.
+    pub src: Option<IpNet>,
+    pub action: RuleAction,
+    /// `FRA_SUPPRESS_PREFIXLEN`: a route found in the table with a prefix length at or below
+    /// this is ignored and the lookup goes on.
+    pub suppress_prefixlen: Option<u8>,
+    /// `FRA_PROTOCOL`; ours is [`RTPROT_OPENFEO`].
+    pub protocol: u8,
 }
 
 /// One route.
@@ -111,6 +147,8 @@ pub struct Cache {
     pub addrs: BTreeSet<Addr>,
     /// Every route (all tables, both families).
     pub routes: BTreeSet<Route>,
+    /// Every policy rule, both families, the kernel's own included.
+    pub rules: BTreeSet<Rule>,
 }
 
 impl Cache {

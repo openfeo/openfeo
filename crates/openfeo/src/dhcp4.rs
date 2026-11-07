@@ -355,7 +355,7 @@ pub(crate) async fn wait_for_link(
 }
 
 /// The MAC of the lowest-numbered port that has one: what the DUID is made from.
-fn lowest_port_mac(world: &World) -> Option<[u8; 6]> {
+pub(crate) fn lowest_port_mac(world: &World) -> Option<[u8; 6]> {
     world
         .ports
         .names()

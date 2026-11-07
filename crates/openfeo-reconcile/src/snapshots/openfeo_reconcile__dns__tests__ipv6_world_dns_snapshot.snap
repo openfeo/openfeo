@@ -1,15 +1,18 @@
 ---
 source: crates/openfeo-reconcile/src/dns.rs
-assertion_line: 426
 expression: "desired(&fixtures::ipv6_world())"
 ---
 listeners:
   - ifname: br-lan0
     address: 192.168.1.1
-    address6: "2001:db8:1:222::1"
+    address6:
+      - "2001:db8:1:222::1"
+      - "fd12:3456:789a:1::1"
   - ifname: br-dmz
     address: 192.0.2.233
-    address6: "2001:db8:1:232::1"
+    address6:
+      - "2001:db8:1:232::1"
+      - "fd12:3456:789a:2::1"
 upstreams:
   - 203.0.113.1
   - "2001:db8:ffff::1"
@@ -23,8 +26,11 @@ router_addrs:
   - 192.168.1.1
   - 192.0.2.233
   - "2001:db8:1:222::1"
+  - "fd12:3456:789a:1::1"
   - "2001:db8:1:232::1"
+  - "fd12:3456:789a:2::1"
   - "2001:db8:1::1"
+  - "fd12:3456:789a::1"
 wan_addrs:
   - 203.0.113.10
 lan_subnets:

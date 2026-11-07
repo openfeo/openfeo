@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::io::{IoSlice, IoSliceMut};
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+use std::time::Duration;
 
 use nix::cmsg_space;
 use nix::sys::socket::{
@@ -140,6 +141,64 @@ impl NdpSocket {
         )
         .map(drop)
         .map_err(socket_err("send ICMPv6"))
+    }
+}
+
+/// How long a send refused while the interface's link-local address is tentative waits
+/// before trying again (RFC 4862's duplicate address detection takes about a second), and
+/// how many times it tries (#34).
+pub const RESEND_AFTER: Duration = Duration::from_secs(1);
+pub const RESEND_TRIES: u8 = 5;
+
+/// Whether `err` is the kernel refusing to source from a link-local address it has not
+/// finished checking (`EADDRNOTAVAIL`): the one send failure that answers itself in a second.
+#[must_use]
+pub fn tentative_link_local(err: &DriverError) -> bool {
+    match err {
+        DriverError::Socket { source, .. } => *source == nix::Error::EADDRNOTAVAIL,
+        DriverError::Io { source, .. } => source.raw_os_error() == Some(libc::EADDRNOTAVAIL),
+        DriverError::Address(_) | DriverError::Bind { .. } => false,
+    }
+}
+
+/// A message to send again after a tentative failure.
+#[derive(Debug)]
+pub struct Resend {
+    pub to: Ipv6Addr,
+    pub bytes: Vec<u8>,
+    pub tries_left: u8,
+    /// When to try next.
+    pub at: tokio::time::Instant,
+}
+
+impl Resend {
+    /// The first retry of `bytes` to `to`, due in [`RESEND_AFTER`].
+    #[must_use]
+    pub fn new(to: Ipv6Addr, bytes: Vec<u8>) -> Resend {
+        Resend {
+            to,
+            bytes,
+            tries_left: RESEND_TRIES,
+            at: tokio::time::Instant::now() + RESEND_AFTER,
+        }
+    }
+
+    /// Try once more on `socket`: `Ok(None)` when sent, `Ok(Some)` when it failed tentatively
+    /// again with tries left, `Err` when it failed for good or the tries ran out.
+    ///
+    /// # Errors
+    ///
+    /// The send error, when it is not tentative or no tries remain.
+    pub fn retry(mut self, socket: &NdpSocket) -> Result<Option<Resend>, DriverError> {
+        match socket.send(self.to, &self.bytes) {
+            Ok(()) => Ok(None),
+            Err(err) if tentative_link_local(&err) && self.tries_left > 1 => {
+                self.tries_left -= 1;
+                self.at = tokio::time::Instant::now() + RESEND_AFTER;
+                Ok(Some(self))
+            }
+            Err(err) => Err(err),
+        }
     }
 }
 

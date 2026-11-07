@@ -131,6 +131,57 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
 
     let portmap = name_ports(&nl, &cache_rx).await?;
     let config = load_config(&portmap);
+    let Identity { ipv6_secret, ula } = load_identity();
+
+    let (publisher, world_rx) = Publisher::new(World::new(config, portmap));
+    let publisher = Arc::new(publisher);
+    publisher.update(|world| {
+        let cache = cache_rx.borrow();
+        world.links = Arc::new(link_facts(&cache));
+        world.routes = Arc::new(default_routes(&cache));
+        world.ula = ula;
+    });
+
+    {
+        let publisher = publisher.clone();
+        let cache_rx = cache_rx.clone();
+        supervisor.spawn("netlink-facts", move || {
+            netlink_facts_task(publisher.clone(), cache_rx.clone())
+        });
+    }
+    crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
+    crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
+    crate::dhcp6::spawn_all(&supervisor, &publisher, &world_rx);
+    crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
+    crate::dns::spawn(&supervisor, &publisher, &world_rx);
+    crate::ra::spawn(&supervisor, &publisher, &world_rx);
+    crate::dhcp6_server::spawn(&supervisor, &publisher, &world_rx);
+    crate::time::spawn(&supervisor, &publisher, &world_rx);
+    {
+        let health = health.clone();
+        supervisor.spawn("apply", move || {
+            apply_task(
+                world_rx.clone(),
+                cache_rx.clone(),
+                nl.clone(),
+                health.clone(),
+                ipv6_secret,
+            )
+        });
+    }
+
+    std::future::pending().await
+}
+
+/// What `/state/identity/` holds for IPv6, loaded before the World exists.
+struct Identity {
+    /// The stable-privacy secret the links applier writes to a WAN port before it comes up.
+    ipv6_secret: Option<[u8; 16]>,
+    /// The ULA /48 every LAN takes a /64 from once a WAN carries IPv6.
+    ula: Option<ipnet::Ipv6Net>,
+}
+
+fn load_identity() -> Identity {
     // The IPv6 stable-privacy secret (SPEC §5.2, §7.3): the links applier writes it to a WAN
     // port before the port comes up, so it is settled before the World exists.
     let ipv6_secret: Option<[u8; 16]> = match crate::ipv6::load_or_create_ipv6_secret(
@@ -148,42 +199,20 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             None
         }
     };
-
-    let (publisher, world_rx) = Publisher::new(World::new(config, portmap));
-    let publisher = Arc::new(publisher);
-    publisher.update(|world| {
-        let cache = cache_rx.borrow();
-        world.links = Arc::new(link_facts(&cache));
-        world.routes = Arc::new(default_routes(&cache));
-    });
-
-    {
-        let publisher = publisher.clone();
-        let cache_rx = cache_rx.clone();
-        supervisor.spawn("netlink-facts", move || {
-            netlink_facts_task(publisher.clone(), cache_rx.clone())
-        });
-    }
-    crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
-    crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
-    crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
-    crate::dns::spawn(&supervisor, &publisher, &world_rx);
-    crate::ra::spawn(&supervisor, &publisher, &world_rx);
-    crate::time::spawn(&supervisor, &publisher, &world_rx);
-    {
-        let health = health.clone();
-        supervisor.spawn("apply", move || {
-            apply_task(
-                world_rx.clone(),
-                cache_rx.clone(),
-                nl.clone(),
-                health.clone(),
-                ipv6_secret,
-            )
-        });
-    }
-
-    std::future::pending().await
+    // The ULA /48 (SPEC §5.2, §7.3): every LAN takes a /64 from it once a WAN carries IPv6.
+    let ula = match crate::identity::load_or_create_ula(std::path::Path::new(
+        crate::identity::ULA_PATH,
+    )) {
+        Ok((ula, created)) => {
+            info!("{}", crate::identity::ula_line(ula, created));
+            Some(ula)
+        }
+        Err(err) => {
+            warn!("identity: ula: {err}; no unique local addresses this boot");
+            None
+        }
+    };
+    Identity { ipv6_secret, ula }
 }
 
 /// `tracing` into the 8 MiB ring and `/dev/kmsg` (stderr when that is not openable).

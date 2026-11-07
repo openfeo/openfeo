@@ -147,6 +147,9 @@ message Ipv6Wan {
   // A typed default gateway on the WAN link, link-local or global; empty means the default
   // router is learned from the ISP's advertisements.
   string gateway = 3;
+  // The delegation length the DHCPv6 client asks for on a WAN without a typed `prefix`
+  // (SPEC §7.3): 48 to 64; 0 means absent, 56.
+  uint32 pd_hint = 4;
 }
 
 // Address, gateway and DNS from config (SPEC §7.2 "Static").
@@ -203,6 +206,46 @@ message Dhcp4Lease {
   string broadcast = 15;
 }
 
+// One prefix or address a DHCPv6 server bound to the router, with the lifetimes it gave.
+message Dhcp6Binding {
+  // "2001:db8:100::/56" for a delegated prefix, "2001:db8:ffff::1a4/128" for an address.
+  string net = 1;
+  uint32 preferred_secs = 2;
+  uint32 valid_secs = 3;
+}
+
+// The file format of `/state/leases/dhcp6-<wan>.toml`: the last DHCPv6 binding a WAN's client
+// held, rebound after a reboot while its lifetimes last (SPEC §7.3). Ignored when `wan` or
+// `mac` differ from the WAN reading it.
+message Dhcp6Lease {
+  string wan = 1;
+  // The port's hardware address when the binding was taken, "52:54:00:fe:00:00".
+  string mac = 2;
+  // The server's DUID, lowercase hex.
+  string server_duid = 3;
+  // IA_PD prefixes.
+  repeated Dhcp6Binding prefixes = 4;
+  // IA_NA addresses.
+  repeated Dhcp6Binding addresses = 5;
+  uint32 t1_secs = 6;
+  uint32 t2_secs = 7;
+  repeated string dns = 8;
+  repeated string search = 9;
+  // Wall-clock seconds when the Reply arrived; the lifetimes count from here.
+  uint64 obtained_unix = 10;
+  // Prefixes being deprecated when the file was written (SPEC §7.3), so a reboot inside the
+  // window keeps answering for them.
+  repeated Dhcp6Deprecated deprecated = 11;
+}
+
+// A delegated prefix the ISP took back, advertised as deprecated until `until_unix`.
+message Dhcp6Deprecated {
+  // "2001:db8:100::/56".
+  string net = 1;
+  // Wall-clock seconds when the deprecation ends.
+  uint64 until_unix = 2;
+}
+
 // A LAN is a bridge of one or more members (SPEC §7.1): a port untagged ("p6") or a tagged VLAN
 // on a port ("p6.224", ADR-0017).
 message Lan {
@@ -217,11 +260,17 @@ message Lan {
   // empty means ["wan"] (SPEC §7.5).
   repeated string reaches = 5;
   // The router's IPv6 address and the LAN's /64, "2001:db8:1:222::1/64", inside the routed
-  // prefix of `[wans.ipv6]` and not its first /64 (SPEC §7.3). Empty means no IPv6 on this LAN.
+  // prefix of `[wans.ipv6]` and not its first /64 (SPEC §7.3); or the word "none" for a LAN
+  // that carries no IPv6 at all. Empty means no routed /64: the LAN still takes its /64 from
+  // every delegated prefix and from the ULA once a WAN carries `[wans.ipv6]`.
   string ipv6 = 6;
-  // Whether the router advertises the LAN's prefix (SPEC §7.3). Absent means true; false is for
-  // hosts placed by hand. Only with `ipv6`.
+  // Whether the router advertises the LAN's prefixes (SPEC §7.3). Absent means true; false is
+  // for hosts placed by hand. Only on a LAN that carries IPv6.
   optional bool ra = 7;
+  // This LAN's /64 inside every delegated prefix and inside the ULA /48: the subnet id below
+  // the prefix, 1 to 65535, unique among the LANs (SPEC §7.3). 0 means absent: the LAN's
+  // 1-based position among the LANs. Index 0 is the router's own.
+  uint32 ipv6_index = 8;
 }
 
 // The DHCPv4 server of one LAN (SPEC §7.6; `[lans.dhcp]` in §8.2).

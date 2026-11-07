@@ -1,6 +1,5 @@
 ---
 source: crates/openfeo-reconcile/src/routing.rs
-assertion_line: 394
 expression: desired
 ---
 addrs:
@@ -8,12 +7,18 @@ addrs:
     net: 192.0.2.233/29
   - ifname: br-dmz
     net: "2001:db8:1:232::1/64"
+  - ifname: br-dmz
+    net: "fd12:3456:789a:2::1/64"
   - ifname: br-lan0
     net: 192.168.1.1/24
   - ifname: br-lan0
     net: "2001:db8:1:222::1/64"
+  - ifname: br-lan0
+    net: "fd12:3456:789a:1::1/64"
   - ifname: lo
     net: "2001:db8:1::1/128"
+  - ifname: lo
+    net: "fd12:3456:789a::1/128"
   - ifname: p0
     net: 203.0.113.10/24
 routes:
@@ -44,11 +49,26 @@ routes:
   - ifname: p0
     dst: ~
     gateway: "fe80::1"
+    table: 100
+    protocol: 200
+    priority: 10
+    kind: Unicast
+    pref_src: "2001:db8:1::1"
+  - ifname: p0
+    dst: ~
+    gateway: "fe80::1"
     table: 254
     protocol: 200
     priority: 10
     kind: Unicast
     pref_src: "2001:db8:1::1"
+rules:
+  - v6: true
+    priority: 1500
+    src: ~
+    action:
+      ToTable: 254
+    suppress_prefixlen: 0
 ipv6_owned:
   - br-dmz
   - br-lan0

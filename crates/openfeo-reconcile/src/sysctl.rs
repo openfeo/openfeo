@@ -10,6 +10,7 @@ use openfeo_world::World;
 use serde::Serialize;
 
 use crate::bridge_name;
+use crate::lan6;
 
 /// IPv4 forwarding.
 pub const IP_FORWARD: &str = "net/ipv4/ip_forward";
@@ -44,16 +45,26 @@ pub fn sysctl(world: &World, forwarding: bool) -> DesiredSysctl {
             for key in ["accept_ra", "autoconf", "accept_redirects"] {
                 entries.insert(ipv6_conf(&ifname, key), "0".to_owned());
             }
-            if let Some(mtu) = world.ipv6.get(&wan.name).and_then(|fact| fact.mtu) {
-                let link_mtu = world.links.get(&ifname).map_or(mtu, |link| link.mtu);
-                entries.insert(ipv6_conf(&ifname, "mtu"), mtu.min(link_mtu).to_string());
+            // The advertised MTU, never above the link's; without one, the link's, so a knob a
+            // past advertisement lowered is restored (#29).
+            let link_mtu = world.links.get(&ifname).map(|link| link.mtu);
+            let advertised = world.ipv6.get(&wan.name).and_then(|fact| fact.mtu);
+            let mtu = match (advertised, link_mtu) {
+                (Some(mtu), Some(link)) => Some(mtu.min(link)),
+                (Some(mtu), None) | (None, Some(mtu)) => Some(mtu),
+                (None, None) => None,
+            };
+            if let Some(mtu) = mtu {
+                entries.insert(ipv6_conf(&ifname, "mtu"), mtu.to_string());
             }
         }
     }
+    let lan6 = lan6::prefixes(world);
     for lan in &world.config.lans {
         let bridge = bridge_name(&lan.name);
         entries.insert(send_redirects(&bridge), "0".to_owned());
-        if !lan.ipv6.is_empty() {
+        let carries_ipv6 = lan6.prefixes.iter().any(|prefix| prefix.lan == lan.name);
+        if carries_ipv6 {
             for key in ["accept_ra", "accept_redirects"] {
                 entries.insert(ipv6_conf(&bridge, key), "0".to_owned());
             }
@@ -76,6 +87,32 @@ pub fn send_redirects(ifname: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_lan_that_carries_ipv6_gets_its_knobs() {
+        let entries = sysctl(&crate::fixtures::pd_world(), true).entries;
+        for bridge in ["br-lan0", "br-lan1"] {
+            for key in ["accept_ra", "accept_redirects"] {
+                assert_eq!(
+                    entries
+                        .get(&format!("net/ipv6/conf/{bridge}/{key}"))
+                        .map(String::as_str),
+                    Some("0"),
+                    "{bridge} {key}: a LAN with only a delegated and a ULA /64 carries IPv6"
+                );
+            }
+        }
+        let mut world = crate::fixtures::pd_world();
+        let mut config = (*world.config).clone();
+        config.lans[1].ipv6 = "none".to_owned();
+        config.lans[1].ipv6_index = 0;
+        world.config = std::sync::Arc::new(config);
+        let entries = sysctl(&world, true).entries;
+        assert!(
+            !entries.contains_key("net/ipv6/conf/br-lan1/accept_ra"),
+            "an IPv4-only LAN is left to the kernel"
+        );
+    }
 
     #[test]
     fn the_ipv6_wan_gets_its_knobs_and_the_advertised_mtu_capped_at_the_link() {
@@ -116,11 +153,13 @@ mod tests {
         );
         fact.mtu = None;
         world.ipv6 = std::sync::Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
-        assert!(
-            !sysctl(&world, true)
+        assert_eq!(
+            sysctl(&world, true)
                 .entries
-                .contains_key("net/ipv6/conf/p0/mtu"),
-            "no option, no key"
+                .get("net/ipv6/conf/p0/mtu")
+                .map(String::as_str),
+            Some("1500"),
+            "no option: the link MTU, so a knob once lowered is restored (#29)"
         );
         let static_entries = sysctl(&crate::fixtures::static_world(), true).entries;
         assert!(

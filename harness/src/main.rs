@@ -189,6 +189,7 @@ fn check() -> Result<ExitCode> {
         "qemu-system-x86_64",
         "ip",
         "kea-dhcp4",
+        "kea-dhcp6",
         "busybox",
         "dnsmasq",
         "dig",
@@ -205,17 +206,34 @@ fn check() -> Result<ExitCode> {
     ] {
         report(bin, on_path(bin), "");
     }
-    match kea_config_check() {
-        Ok(()) => report("kea-dhcp4 reads our config", true, ""),
-        Err(detail) => report(
-            "kea-dhcp4 reads our config",
-            false,
-            &format!(
-                " ({detail}; if Kea cannot open the file on Ubuntu: unload \
-                 /etc/apparmor.d/usr.sbin.kea-dhcp4, ADR-0006)"
-            ),
+    for (daemon, rendered) in [
+        ("kea-dhcp4", daemons::render_kea_dhcp4("lo")),
+        (
+            "kea-dhcp6",
+            daemons::render_kea_dhcp6(&daemons::Kea6Config {
+                iface: "lo".to_owned(),
+                ..daemons::Kea6Config::isp("2001:db8:100::/48".parse().ok())
+            }),
         ),
+    ] {
+        let what = format!("{daemon} reads our config");
+        match kea_config_check(daemon, &rendered) {
+            Ok(()) => report(&what, true, ""),
+            Err(detail) => report(
+                &what,
+                false,
+                &format!(
+                    " ({detail}; if Kea cannot open the file on Ubuntu: unload \
+                     /etc/apparmor.d/usr.sbin.{daemon}, ADR-0006)"
+                ),
+            ),
+        }
     }
+    report(
+        "busybox udhcpc6 applet",
+        busybox_has("udhcpc6"),
+        " (the stateless DHCPv6 reference client)",
+    );
     report(
         "unprivileged user namespaces",
         sandbox_works()?,
@@ -247,21 +265,21 @@ fn check() -> Result<ExitCode> {
 /// `kea-dhcp4 -t` on the lab's config written outside `/etc/kea`, as the harness does. Fails
 /// under Ubuntu's stock AppArmor profile for Kea, and on a Kea that rejects something in the
 /// template; the error carries Kea's own message so the cause is on the console.
-fn kea_config_check() -> Result<(), String> {
+fn kea_config_check(daemon: &str, rendered: &str) -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!("openfeo-harness-check-{}", std::process::id()));
-    let config = dir.join("kea-dhcp4.json");
+    let config = dir.join(format!("{daemon}.json"));
     let result = (|| {
         std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        std::fs::write(&config, daemons::render_kea_dhcp4("lo"))
+        std::fs::write(&config, rendered)
             .map_err(|e| format!("write {}: {e}", config.display()))?;
-        let output = Command::new("kea-dhcp4")
+        let output = Command::new(daemon)
             .arg("-t")
             .arg(&config)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .output()
-            .map_err(|e| format!("run kea-dhcp4: {e}"))?;
+            .map_err(|e| format!("run {daemon}: {e}"))?;
         if output.status.success() {
             return Ok(());
         }
@@ -289,6 +307,21 @@ fn kea_error_line(output: &str) -> String {
         line
     };
     message.trim().to_owned()
+}
+
+/// Whether the installed busybox carries `applet` (Ubuntu's `busybox-static` and Arch's
+/// `busybox` both carry `udhcpc6`).
+fn busybox_has(applet: &str) -> bool {
+    Command::new("busybox")
+        .arg("--list")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim() == applet)
+        })
 }
 
 fn on_path(bin: &str) -> bool {

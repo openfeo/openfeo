@@ -27,6 +27,16 @@ pub fn match_rights<'a>(ruleset: &'a Value, chain: &str, left: &Value) -> Vec<&'
         .collect()
 }
 
+/// How many rules of `chain` end in (or contain) the statement `verdict`: `"accept"`, `"drop"`,
+/// `"reject"`, `"jump"` and the like, the key the listing gives the statement. A rule object
+/// names its chain under `chain`, not `name`, so this is the way to count verdicts.
+#[must_use]
+pub fn count_verdict(ruleset: &Value, chain: &str, verdict: &str) -> usize {
+    expressions(ruleset, chain)
+        .filter(|expr| expr.get(verdict).is_some())
+        .count()
+}
+
 /// Every expression of every rule of `chain`, in listing order.
 fn expressions<'a>(ruleset: &'a Value, chain: &str) -> impl Iterator<Item = &'a Value> {
     ruleset
@@ -72,6 +82,27 @@ mod tests {
     /// exemption: the RFC 4890 types are a set of numbers, `echo-request` is `128`, and only
     /// the prefix keeps its text.
     const IPV6_LISTING: &str = r#"[{"metainfo":{"json_schema_version":1,"release_name":"Commodore Bullmoose #8","version":"1.1.7"}},{"table":{"family":"inet","handle":13,"name":"openfeo"}},{"chain":{"family":"inet","handle":22,"hook":"prerouting","name":"rpfilter","policy":"accept","prio":-300,"table":"openfeo","type":"filter"}},{"chain":{"family":"inet","handle":28,"hook":"input","name":"input","policy":"drop","prio":0,"table":"openfeo","type":"filter"}},{"rule":{"chain":"rpfilter","expr":[{"match":{"left":{"payload":{"field":"saddr","protocol":"ip6"}},"op":"==","right":{"prefix":{"addr":"fe80::","len":10}}}},{"accept":null}],"family":"inet","handle":26,"table":"openfeo"}},{"rule":{"chain":"input","expr":[{"match":{"left":{"meta":{"key":"iifname"}},"op":"==","right":"@wan_if"}},{"match":{"left":{"payload":{"field":"type","protocol":"icmpv6"}},"op":"==","right":{"set":[1,2,3,4,130,131,132,134,135,136,143]}}},{"accept":null}],"family":"inet","handle":45,"table":"openfeo"}},{"rule":{"chain":"input","expr":[{"match":{"left":{"meta":{"key":"iifname"}},"op":"==","right":"@wan_if"}},{"match":{"left":{"payload":{"field":"type","protocol":"icmpv6"}},"op":"==","right":128}},{"limit":{"burst":100,"per":"second","rate":50}},{"accept":null}],"family":"inet","handle":47,"table":"openfeo"}}]"#;
+
+    #[test]
+    fn count_verdict_counts_a_statement_in_one_chains_rules() {
+        let listing: Value = serde_json::from_str(LISTING).unwrap();
+        assert_eq!(count_verdict(&listing, "input", "accept"), 1);
+        assert_eq!(count_verdict(&listing, "input", "drop"), 0);
+        assert_eq!(count_verdict(&listing, "forward", "accept"), 0);
+        // Two ULA rules of a forward chain, as the delegated-prefix ruleset lists them.
+        let forward = json!([
+            {"rule": {"family": "inet", "table": "openfeo", "chain": "forward", "handle": 3, "expr": [
+                {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": {"prefix": {"addr": "fc00::", "len": 7}}}},
+                {"reject": {"type": "icmpv6", "expr": "no-route"}}]}},
+            {"rule": {"family": "inet", "table": "openfeo", "chain": "forward", "handle": 4, "expr": [
+                {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": {"prefix": {"addr": "fc00::", "len": 7}}}},
+                {"reject": {"type": "icmpv6", "expr": "no-route"}}]}},
+            {"rule": {"family": "inet", "table": "openfeo", "chain": "input", "handle": 5, "expr": [{"drop": null}]}}
+        ]);
+        assert_eq!(count_verdict(&forward, "forward", "reject"), 2);
+        assert_eq!(count_verdict(&forward, "forward", "drop"), 0);
+        assert_eq!(count_verdict(&forward, "input", "drop"), 1);
+    }
 
     #[test]
     fn match_rights_gives_every_right_hand_side_of_a_shape_in_listing_order() {

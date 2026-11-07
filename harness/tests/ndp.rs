@@ -267,12 +267,18 @@ fn learn(
 
 fn server_config(lifetime: u16, mac: [u8; 6]) -> server::Config {
     server::Config {
-        prefix: LAN_NET,
+        prefixes: vec![server::Pio {
+            prefix: LAN_NET,
+            valid: server::Lifetime::Fixed(server::PIO_VALID),
+            preferred: server::Lifetime::Fixed(server::PIO_PREFERRED),
+        }],
         mac,
-        router: ROUTER6,
+        rdnss: vec![ROUTER6],
         mtu: Some(1500),
         domain: "home.arpa".to_owned(),
         router_lifetime: lifetime,
+        other: true,
+        routes: Vec::new(),
     }
 }
 

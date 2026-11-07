@@ -20,6 +20,7 @@ regex.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+ipnet.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -28,11 +29,11 @@ openfeo-apply = { path = "../crates/openfeo-apply" }
 openfeo-config = { path = "../crates/openfeo-config" }
 openfeo-netlink = { path = "../crates/openfeo-netlink" }
 openfeo-platform = { path = "../crates/openfeo-platform" }
+openfeo-proto-dhcp6 = { path = "../crates/openfeo-proto-dhcp6" }
 openfeo-proto-dns = { path = "../crates/openfeo-proto-dns" }
 openfeo-proto-ndp = { path = "../crates/openfeo-proto-ndp" }
 openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
 openfeo-world = { path = "../crates/openfeo-world" }
-ipnet.workspace = true
 
 [[test]]
 name = "netlink"
@@ -52,6 +53,11 @@ harness = false
 [[test]]
 name = "dhcp4_server"
 path = "tests/dhcp4_server.rs"
+harness = false
+
+[[test]]
+name = "dhcp6"
+path = "tests/dhcp6.rs"
 harness = false
 
 [[test]]
@@ -82,6 +88,11 @@ harness = false
 [[test]]
 name = "m2"
 path = "tests/m2.rs"
+harness = false
+
+[[test]]
+name = "m2pd"
+path = "tests/m2pd.rs"
 harness = false
 
 [lints]
