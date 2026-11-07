@@ -972,6 +972,7 @@ dependencies = [
  "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
+ "openfeo-proto-ppp",
  "openfeo-proto-sntp",
  "openfeo-reconcile",
  "openfeo-runtime",

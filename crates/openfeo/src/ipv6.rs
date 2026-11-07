@@ -28,7 +28,7 @@ use openfeo_world::{Preference, WanIpv6Fact};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::dhcp4::wait_for_link;
+use crate::dhcp4::{LinkChange, link_change, wait_for_link, wait_for_netdev};
 
 /// The ICMPv6 message buffer; advertisements are far smaller.
 const RECEIVE_BUFFER: usize = 1500;
@@ -99,6 +99,7 @@ pub fn spawn_all(
         let task = WanTask {
             wan: wan.name.clone(),
             port: openfeo_reconcile::wan_ifname(wan),
+            netdev: openfeo_reconcile::wan_netdev(wan),
             gateway: ipv6.gateway.parse().ok(),
             secret: secret.unwrap_or([0; 16]),
         };
@@ -116,7 +117,10 @@ pub fn spawn_all(
 #[derive(Debug, Clone)]
 struct WanTask {
     wan: String,
+    /// The WAN's port (or VLAN sub-interface): where the MAC comes from.
     port: String,
+    /// The interface the WAN's IPv6 runs on: the port, or `ppp-<wan>` over PPPoE (ADR-0023).
+    netdev: String,
     /// A typed default (SPEC §7.3): logged once; the routing reconciler uses it.
     gateway: Option<Ipv6Addr>,
     secret: [u8; 16],
@@ -129,12 +133,19 @@ async fn run(
     publisher: &Publisher,
     mut world_rx: WorldRx,
 ) -> Result<(), TaskError> {
-    let (ifindex, mac) = wait_for_link(&mut world_rx, &task.port).await?;
+    // Over PPPoE the netdev has no MAC and a new index every session; the solicitations then
+    // carry no link-layer option (RFC 4861 §4.1).
+    let (mut ifindex, mac) = if task.netdev == task.port {
+        let (index, mac) = wait_for_link(&mut world_rx, &task.port).await?;
+        (index, Some(mac))
+    } else {
+        (wait_for_netdev(&mut world_rx, &task.netdev).await?, None)
+    };
     let failed =
         |err: openfeo_net::dhcp4::DriverError| TaskError::from(format!("ipv6 {}: {err}", task.wan));
-    let socket = NdpSocket::open(ifindex, &task.port, Role::Client).map_err(failed)?;
+    let mut socket = NdpSocket::open(ifindex, &task.netdev, Role::Client).map_err(failed)?;
     let mut client = Client::new(Config {
-        ifname: task.port.clone(),
+        ifname: task.netdev.clone(),
         secret: task.secret,
         mac,
     });
@@ -187,28 +198,35 @@ async fn run(
             changed = world_rx.changed() => {
                 changed.map_err(|_| "world publisher gone")?;
                 announce_link_local(task, &world_rx, &mut link_local);
-                let (up, index) = {
-                    let world = world_rx.borrow_and_update();
-                    let link = world.links.get(&task.port);
-                    (
-                        link.is_some_and(|link| link.up && link.carrier),
-                        link.map(|link| link.index),
-                    )
-                };
-                if let Some(index) = index
-                    && index != ifindex
-                {
-                    return Err(format!(
-                        "ipv6 {}: {} changed index {ifindex} -> {index}; restarting",
-                        task.wan, task.port
-                    )
-                    .into());
+                let change = link_change(
+                    (ifindex, carrier),
+                    world_rx.borrow_and_update().links.get(&task.netdev),
+                );
+                match change {
+                    LinkChange::None => continue,
+                    LinkChange::Down => {
+                        carrier = false;
+                        client.handle(Input::LinkDown, now(start))
+                    }
+                    LinkChange::Up => {
+                        carrier = true;
+                        client.handle(Input::LinkUp, now(start))
+                    }
+                    LinkChange::Reopen(index) => {
+                        info!("{}", replaced_line(&task.wan, &task.netdev, index));
+                        let mut outputs = if carrier {
+                            client.handle(Input::LinkDown, now(start))
+                        } else {
+                            Vec::new()
+                        };
+                        socket = NdpSocket::open(index, &task.netdev, Role::Client).map_err(failed)?;
+                        ifindex = index;
+                        carrier = true;
+                        pending = None;
+                        outputs.extend(client.handle(Input::LinkUp, now(start)));
+                        outputs
+                    }
                 }
-                if up == carrier {
-                    continue;
-                }
-                carrier = up;
-                client.handle(if up { Input::LinkUp } else { Input::LinkDown }, now(start))
             }
         };
         if let Some(resend) = act(task, publisher, &socket, &mut sends, &mut last, outputs) {
@@ -225,13 +243,19 @@ async fn wait_until(at: Option<Instant>) {
     }
 }
 
+/// `wan wan0 ipv6 ppp-wan0 replaced (index 9)`: a new netdev under the WAN's name (a PPP
+/// session's new unit); the client starts over on it with its learned facts kept.
+fn replaced_line(wan: &str, netdev: &str, index: u32) -> String {
+    format!("wan {wan} ipv6 {netdev} replaced (index {index})")
+}
+
 /// `wan0 ipv6 link-local fe80::…`, once the kernel has made the port's address and whenever it
 /// changes.
 fn announce_link_local(task: &WanTask, world_rx: &WorldRx, known: &mut Option<Ipv6Addr>) {
     let current = world_rx
         .borrow()
         .links
-        .get(&task.port)
+        .get(&task.netdev)
         .and_then(|link| link.link_local6);
     if current.is_some() && current != *known {
         *known = current;
@@ -446,6 +470,10 @@ mod tests {
         assert_eq!(
             gateway_line("wan0", ll(1)),
             "wan wan0 ipv6 gateway fe80::1 (configured)"
+        );
+        assert_eq!(
+            replaced_line("wan0", "ppp-wan0", 9),
+            "wan wan0 ipv6 ppp-wan0 replaced (index 9)"
         );
         let learned = Learned {
             router: Some(ll(1)),

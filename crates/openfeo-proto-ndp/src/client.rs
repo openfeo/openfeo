@@ -42,8 +42,10 @@ pub struct Config {
     pub ifname: String,
     /// The persisted stable-privacy secret.
     pub secret: [u8; 16],
-    /// The interface's hardware address, sent in solicitations.
-    pub mac: [u8; 6],
+    /// The interface's hardware address, sent in solicitations as the Source Link-Layer
+    /// Address option; `None` on a PPP netdev, which has none (the option is optional, RFC 4861
+    /// §4.1).
+    pub mac: Option<[u8; 6]>,
 }
 
 /// What the driver feeds in.
@@ -282,7 +284,12 @@ impl Client {
     /// to the cap (RFC 7559).
     fn solicit(&mut self, now: Timestamp, out: &mut Vec<Output>) {
         let rs = Message::RouterSolicitation {
-            options: vec![NdOption::SourceLinkLayer(self.config.mac)],
+            options: self
+                .config
+                .mac
+                .map(NdOption::SourceLinkLayer)
+                .into_iter()
+                .collect(),
         };
         out.push(Output::Solicit(rs.encode()));
         self.solicitations += 1;
@@ -486,7 +493,7 @@ mod tests {
         Client::new(Config {
             ifname: "p0".to_owned(),
             secret: SECRET,
-            mac: MAC,
+            mac: Some(MAC),
         })
     }
 
@@ -540,6 +547,35 @@ mod tests {
 
     fn up(c: &mut Client) -> Vec<Output> {
         c.handle(Input::LinkUp, 0)
+    }
+
+    /// A PPP netdev has no hardware address (ADR-0023): its solicitations carry no Source
+    /// Link-Layer Address option, which RFC 4861 §4.1 allows; a port's carry it as before.
+    #[test]
+    fn a_solicitation_without_a_mac_carries_no_source_link_layer_option() {
+        use crate::wire::Message;
+        let mut over_ppp = Client::new(Config {
+            ifname: "ppp-wan0".to_owned(),
+            secret: SECRET,
+            mac: None,
+        });
+        let out = up(&mut over_ppp);
+        let Output::Solicit(bytes) = &out[0] else {
+            panic!("no solicitation: {out:?}");
+        };
+        let Ok(Message::RouterSolicitation { options }) = Message::decode(bytes) else {
+            panic!("not a solicitation: {bytes:?}");
+        };
+        assert!(options.is_empty(), "{options:?}");
+        let mut over_port = client();
+        let out = up(&mut over_port);
+        let Output::Solicit(bytes) = &out[0] else {
+            panic!("no solicitation: {out:?}");
+        };
+        let Ok(Message::RouterSolicitation { options }) = Message::decode(bytes) else {
+            panic!("not a solicitation: {bytes:?}");
+        };
+        assert_eq!(options, vec![NdOption::SourceLinkLayer(MAC)]);
     }
 
     #[test]
