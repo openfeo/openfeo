@@ -66,7 +66,10 @@ pub enum Output {
     /// Tell the kernel the MRU LCP settled.
     Mru(u16),
     LcpUp {
+        /// What we may receive: the netdev's MTU is the lesser of this and `mru_theirs`.
         mru: u16,
+        /// What the peer may receive.
+        mru_theirs: u16,
         auth: Option<AuthProto>,
     },
     /// Authenticated, by `"pap"` or `"chap"`.
@@ -322,6 +325,7 @@ impl Session {
         out.push(Output::Mru(negotiated.mru_ours));
         out.push(Output::LcpUp {
             mru: negotiated.mru_ours,
+            mru_theirs: negotiated.mru_theirs,
             auth: negotiated.auth,
         });
         if self.lcp.options().auth_unsupported() {
@@ -353,6 +357,11 @@ impl Session {
 
     fn lcp_down(&mut self, now: Timestamp, out: &mut Vec<Output>) {
         self.keepalive.stop();
+        // A renegotiated LCP authenticates again (RFC 1661 §3.5): the flag and the clients of
+        // the last round must not make the next Success a no-op.
+        self.authenticated = false;
+        self.pap = None;
+        self.chap = None;
         self.networks_down(out);
         self.ncp_event(false, Event::Down, now, out);
         self.ncp_event(true, Event::Down, now, out);
@@ -836,7 +845,8 @@ mod tests {
                 o,
                 Output::LcpUp {
                     mru: 1492,
-                    auth: Some(AuthProto::ChapMd5)
+                    auth: Some(AuthProto::ChapMd5),
+                    ..
                 }
             )),
             "{out:?}"
@@ -935,6 +945,100 @@ mod tests {
             "{out:?}"
         );
         assert_eq!(session.phase(), Phase::Dead);
+    }
+
+    /// The peer's MRU travels with `LcpUp`: the task sizes the netdev to the lesser of the two,
+    /// as pppd does, so nothing larger than the peer said it takes is ever sent.
+    #[test]
+    fn lcp_up_carries_the_peers_mru_for_the_netdev() {
+        let mut session = new_session();
+        let mut now = 1_000;
+        let mut all = session.handle(Input::Start, now);
+        let ours = sent(&all, LCP, code::CONFIGURE_REQUEST).expect("our LCP request");
+        now += 10;
+        all.extend(session.handle(
+            frame(
+                LCP,
+                &Packet {
+                    code: code::CONFIGURE_ACK,
+                    id: ours.id,
+                    data: ours.data,
+                },
+            ),
+            now,
+        ));
+        now += 10;
+        all.extend(session.handle(
+            frame(
+                LCP,
+                &Packet {
+                    code: code::CONFIGURE_REQUEST,
+                    id: 1,
+                    data: Lcp::encode(&[LcpOpt::Mru(1480), LcpOpt::Magic(0x0bad_cafe)]),
+                },
+            ),
+            now,
+        ));
+        assert!(
+            has(&all, |o| matches!(
+                o,
+                Output::LcpUp {
+                    mru: 1492,
+                    mru_theirs: 1480,
+                    auth: None
+                }
+            )),
+            "{all:?}"
+        );
+    }
+
+    /// RFC 1661 §3.5: the concentrator may renegotiate LCP in the Network phase (a BRAS
+    /// restarting PPP on the same PPPoE session). The networks go down with LCP, authentication
+    /// runs again, and the Network phase is reached again; it never sticks in Authenticate.
+    #[test]
+    fn an_lcp_renegotiation_with_chap_reaches_network_again() {
+        let (mut session, mut now, _) = up();
+        now += 100;
+        let out = session.handle(
+            frame(
+                LCP,
+                &Packet {
+                    code: code::CONFIGURE_REQUEST,
+                    id: 7,
+                    data: Lcp::encode(&[
+                        LcpOpt::Magic(0x0bad_cafe),
+                        LcpOpt::Auth(AuthProto::ChapMd5),
+                    ]),
+                },
+            ),
+            now,
+        );
+        assert!(
+            has(&out, |o| matches!(o, Output::Ipv4Down)),
+            "the networks go down with LCP: {out:?}"
+        );
+        let ours = sent(&out, LCP, code::CONFIGURE_REQUEST).expect("our LCP request again");
+        now += 10;
+        let out = session.handle(
+            frame(
+                LCP,
+                &Packet {
+                    code: code::CONFIGURE_ACK,
+                    id: ours.id,
+                    data: ours.data,
+                },
+            ),
+            now,
+        );
+        assert!(has(&out, |o| matches!(o, Output::LcpUp { .. })), "{out:?}");
+        assert_eq!(session.phase(), Phase::Authenticate);
+        let out = authenticate_chap(&mut session, &mut now);
+        assert!(has(&out, |o| *o == Output::AuthOk("chap")), "{out:?}");
+        assert_eq!(session.phase(), Phase::Network);
+        assert!(
+            sent(&out, IPCP, code::CONFIGURE_REQUEST).is_some(),
+            "IPCP starts again: {out:?}"
+        );
     }
 
     #[test]

@@ -198,11 +198,10 @@ impl Options for Lcp {
                     (OPT_ACFC, []) => Opt::Acfc,
                     (OPT_CALLBACK, [operation, ..]) => Opt::Callback(*operation),
                     (OPT_MRRU, [hi, lo]) => Opt::Mrru(u16::from_be_bytes([*hi, *lo])),
-                    (
-                        OPT_MRU | OPT_AUTH | OPT_QUALITY | OPT_MAGIC | OPT_PFC | OPT_ACFC
-                        | OPT_CALLBACK | OPT_MRRU,
-                        _,
-                    ) => return bad,
+                    (OPT_MRU | OPT_AUTH | OPT_MAGIC, _) => return bad,
+                    // An option we reject whatever it says (Quality, PFC, ACFC, Callback, MRRU)
+                    // in a shape not drawn above is kept verbatim, so the Configure-Reject can
+                    // echo it instead of the whole request being dropped.
                     (kind, data) => Opt::Unknown {
                         kind,
                         data: data.to_vec(),
@@ -588,6 +587,37 @@ mod tests {
             0,
             "no magic: echoes carry zero"
         );
+    }
+
+    /// An option we reject whatever its value decodes whatever its shape (Quality-Protocol with
+    /// LQR's reporting period, RFC 1989; a bare Callback; PFC with data), so the request is
+    /// answered with a Configure-Reject echoing it rather than dropped, which would leave LCP
+    /// never opening with that concentrator. MRU and Magic-Number keep their strict shapes.
+    #[test]
+    fn rejected_options_of_any_shape_decode_so_they_can_be_rejected() {
+        let mut bytes = Vec::new();
+        put_option(&mut bytes, OPT_QUALITY, &[0xc0, 0x25, 0, 0, 0, 100]);
+        put_option(&mut bytes, OPT_CALLBACK, &[]);
+        put_option(&mut bytes, OPT_PFC, &[1]);
+        put_option(&mut bytes, OPT_MRU, &[0x05, 0xdc]);
+        let opts = Lcp::decode(&bytes).expect("decodes");
+        assert_eq!(opts.len(), 4);
+        let mut lcp = new_lcp();
+        let Judgement::Reject(rejected) = lcp.judge(&opts) else {
+            panic!("expected a Reject");
+        };
+        assert_eq!(rejected.len(), 3);
+        assert_eq!(
+            Lcp::encode(&rejected),
+            bytes[..bytes.len() - 4],
+            "echoed as received"
+        );
+        let mut bad = Vec::new();
+        put_option(&mut bad, OPT_MRU, &[1]);
+        assert!(Lcp::decode(&bad).is_err());
+        let mut bad = Vec::new();
+        put_option(&mut bad, OPT_MAGIC, &[1, 2]);
+        assert!(Lcp::decode(&bad).is_err());
     }
 
     #[test]

@@ -393,7 +393,8 @@ async fn run_session(
     let mut pending = ppp.handle(Input::Start, millis(start));
     loop {
         for output in pending.drain(..) {
-            if let Some((reason, uptime_ms)) = act(task, publisher, kernel, &mut auth, output) {
+            if let Some((reason, uptime_ms)) = act(task, publisher, kernel, mtu, &mut auth, output)
+            {
                 return Ok(Ended {
                     cause: cause.take().unwrap_or(Cause::Session(reason)),
                     uptime: Duration::from_millis(uptime_ms),
@@ -451,6 +452,7 @@ fn act(
     task: &WanTask,
     publisher: &Publisher,
     kernel: &KernelSession,
+    granted: u16,
     auth: &mut Option<AuthProto>,
     output: Output,
 ) -> Option<(Reason, u64)> {
@@ -466,9 +468,15 @@ fn act(
                 warn!("pppoe {wan}: set mru {mru}: {err}");
             }
         }
-        Output::LcpUp { mru, auth: proto } => {
+        Output::LcpUp {
+            mru,
+            mru_theirs,
+            auth: proto,
+        } => {
             *auth = proto;
             info!("{}", lcp_line(wan, mru, proto));
+            let netdev = netdev_mtu(granted, mru_theirs);
+            update_fact(publisher, wan, |fact| fact.mtu = u32::from(netdev));
         }
         Output::AuthOk(proto) => info!("{}", auth_ok_line(wan, proto, &task.username)),
         Output::Ipv4Up(up) => {
@@ -523,6 +531,12 @@ fn port_has_carrier(world_rx: &mut WorldRx, port: &str) -> bool {
         .links
         .get(port)
         .is_some_and(|link| link.up && link.carrier)
+}
+
+/// The netdev's MTU once LCP is up: the payload the session was granted, but never more than the
+/// peer said it can receive (its MRU), as pppd sizes its interface.
+fn netdev_mtu(granted: u16, mru_theirs: u16) -> u16 {
+    granted.min(mru_theirs)
 }
 
 /// The PPP payload to ask for with PPP-Max-Payload: `min(1500, port MTU − 8)` when that is
@@ -898,6 +912,12 @@ mod tests {
             "pppoe wan0 down: lcp failed after 3 s; retry in 2 s"
         );
         assert_eq!(stopped_line("wan0"), "pppoe wan0 stopped");
+        assert_eq!(
+            netdev_mtu(1500, 1480),
+            1480,
+            "the peer's MRU caps the netdev"
+        );
+        assert_eq!(netdev_mtu(1492, 1500), 1492);
         assert_eq!(offered_payload(1500), None, "a 1500-byte port carries 1492");
         assert_eq!(offered_payload(1508), Some(1500));
         assert_eq!(

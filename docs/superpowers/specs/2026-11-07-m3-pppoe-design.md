@@ -597,3 +597,14 @@ PR, as M2 was, and part 2 is proven on CI (and on this host once rebooted):
     the dogfooding line, which supports it.
 22. **ADR numbers** follow what is merged: ADR-0022 and 0023 assume PR #25 (ADR-0021) lands
     first; they renumber if not. Cost: none.
+
+## After the whole-branch review (2026-11-07)
+
+Three findings changed the code in the fix pass: a renegotiated LCP (RFC 1661 §3.5) authenticates
+again and reaches the Network phase again (the session's authenticated flag and auth clients are
+cleared when LCP goes down); an option the client rejects whatever it says (Quality-Protocol,
+PFC, ACFC, Callback, MRRU) decodes in any shape, so the Configure-Request is answered with a
+Configure-Reject echoing it rather than dropped; and `LcpUp` carries the peer's MRU, so the task
+sizes `ppp-<wan>` to the lesser of the granted payload and that MRU, as `pppd` does. The kernel
+calls stay without a trait seam in part 1 (the task's pure parts are unit-tested and part 2's
+live suite exercises the loop); the review's minors are recorded in the pull request.
