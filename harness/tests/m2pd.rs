@@ -71,6 +71,10 @@ const READY: &str = r"openfeo: ready generation=\d+";
 const KERNEL_BANNER: &str = r"Linux version 6\.18\.59-openfeo";
 const WAN_LINK_LOCAL: &str = r"openfeo: wan wan0 ipv6 link-local (fe80:[0-9a-f:]+)";
 const ROUTER_LEARNED: &str = r"openfeo: wan wan0 ipv6 router fe80::1 \(learned\)";
+/// The routing applier installing the WAN's IPv6 default in the main table (the one in the
+/// WAN's own table ends with `table 100`).
+const DEFAULT6_INSTALLED: &str =
+    r"openfeo: add route default via fe80::1 dev p0 src [0-9a-f:]+ proto 200 metric 10$";
 /// The delegation and the WAN's address as the console reports them, from either pool.
 const BOUND: &str = r"openfeo: dhcp6 wan0 bound prefix (2001:db8:[0-9a-f:]+/56) \(preferred \d+ s, valid \d+ s\) address (2001:db8:ffff:[0-9a-f:]+) t1=10s t2=16s from [0-9a-f]+";
 /// The same, from pool B only.
@@ -712,11 +716,10 @@ fn isp_resolvers_learned_over_dhcpv6_join_after_the_route(lab: &mut Lab) -> anyh
     let c = lab.console()?;
     let mut cur = Cursor::default();
     c.wait_for(&mut cur, &re(ROUTER_LEARNED), SOON)?;
-    c.wait_for(
-        &mut cur,
-        &re(r"openfeo: apply routing generation=\d+ ops=\d+"),
-        SOON,
-    )?;
+    // The anchor is the default route's own op in the main table: the reconcilers act on the
+    // kernel's route the moment the monitor reports it, which can be before the routing pass
+    // logs its summary.
+    c.wait_for(&mut cur, &re(DEFAULT6_INSTALLED), SOON)?;
     let routed = cur;
     let announced =
         re(r"openfeo: dns upstreams 203\.0\.113\.1 2001:db8:ffff::1 \(learned from wan0\)");

@@ -480,6 +480,10 @@ const WAN_LINK_LOCAL: &str = r"openfeo: wan wan0 ipv6 link-local (fe80:[0-9a-f:]
 const WAN_ADDRESS6: &str = r"openfeo: wan wan0 ipv6 address (2001:db8:ffff:[0-9a-f:]+)/64";
 /// The router learned ISP A, at its link-local, as its default router from radvd.
 const ROUTER_LEARNED: &str = r"openfeo: wan wan0 ipv6 router fe80::1 \(learned\)";
+/// The routing applier installing the WAN's IPv6 default in the main table (the one in the
+/// WAN's own table ends with `table 100`).
+const DEFAULT6_INSTALLED: &str =
+    r"openfeo: add route default via fe80::1 dev p0 src [0-9a-f:]+ proto 200 metric 10$";
 /// The ISP's resolver logging a query the router sent over IPv6: from its loopback address.
 const FROM_ROUTER_LOOPBACK6: &str = r"from 2001:db8:1::1\s*$";
 /// How long one `dig` from the LAN host may take in all.
@@ -853,11 +857,10 @@ fn isp_names_resolve_to_aaaa_through_a_learned_ipv6_upstream(lab: &mut Lab) -> a
     let c = lab.console()?;
     let mut cur = Cursor::default();
     c.wait_for(&mut cur, &re(ROUTER_LEARNED), SOON)?;
-    c.wait_for(
-        &mut cur,
-        &re(r"openfeo: apply routing generation=\d+ ops=\d+"),
-        SOON,
-    )?;
+    // The anchor is the default route's own op in the main table: the reconcilers act on the
+    // kernel's route the moment the monitor reports it, which can be before the routing pass
+    // logs its summary.
+    c.wait_for(&mut cur, &re(DEFAULT6_INSTALLED), SOON)?;
     let routed = cur;
     let announced =
         re(r"openfeo: dns upstreams 203\.0\.113\.1 2001:db8:ffff::1 \(learned from wan0\)");
