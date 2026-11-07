@@ -84,33 +84,76 @@ impl Daemon {
         i32::try_from(self.child.id()).unwrap_or(i32::MAX)
     }
 
-    /// Send `signal` to the daemon, and to everything it forked when it leads a group; after a
-    /// signal that ends processes, wait up to five seconds for them to be gone.
+    /// Send `signal` to the daemon, and to every process it forked when it was spawned with
+    /// [`Daemon::spawn_group`] (found through `/proc`, since `pppd` makes a session of its own
+    /// with `setsid`, so a process-group signal misses it); after a signal that ends
+    /// processes, wait up to five seconds for all of them to be gone.
     pub fn signal(&mut self, signal: Signal) {
-        let target = if self.group { -self.pid() } else { self.pid() };
-        let _ = kill(Pid::from_raw(target), signal);
+        let mut pids = if self.group {
+            descendants(self.pid())
+        } else {
+            Vec::new()
+        };
+        pids.push(self.pid());
+        for pid in &pids {
+            let _ = kill(Pid::from_raw(*pid), signal);
+        }
         if matches!(signal, Signal::SIGTERM | Signal::SIGKILL) {
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 let _ = self.child.try_wait();
-                if kill(Pid::from_raw(target), None).is_err() {
+                if pids.iter().all(|pid| is_gone(*pid)) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
+}
 
-    /// Still alive?
+impl Daemon {
+    /// Whether the daemon itself still runs.
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+/// Every process below `pid`, children before their own children, from each thread's
+/// `/proc/<pid>/task/<tid>/children`.
+fn descendants(pid: i32) -> Vec<i32> {
+    let mut found = Vec::new();
+    let mut queue = vec![pid];
+    while let Some(parent) = queue.pop() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{parent}/task")) else {
+            continue;
+        };
+        for task in tasks.flatten() {
+            let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+                continue;
+            };
+            for child in children.split_whitespace().filter_map(|c| c.parse().ok()) {
+                found.push(child);
+                queue.push(child);
+            }
+        }
+    }
+    found
+}
+
+/// Whether `pid` no longer runs: gone, or a zombie awaiting its parent.
+fn is_gone(pid: i32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')),
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
         if self.group {
-            self.signal(Signal::SIGTERM);
+            // Teardown needs no goodbye: a scenario that wants one stops the daemon itself.
             self.signal(Signal::SIGKILL);
             let _ = self.child.wait();
             return;
@@ -465,7 +508,8 @@ impl PppoeServerConfig {
     }
 }
 
-/// The `pppd` options file the server passes to each session's `pppd` (`-O`).
+/// The `pppd` options file the server passes to each session's `pppd` (`-O`). `nodetach` keeps
+/// each `pppd` in the server's process group, so stopping or killing the group ends it too.
 #[must_use]
 pub fn render_pppd_options(config: &PppoeServerConfig, log: &Path) -> String {
     let auth = match config.auth {
@@ -474,7 +518,7 @@ pub fn render_pppd_options(config: &PppoeServerConfig, log: &Path) -> String {
         Auth::Chap => "require-chap",
     };
     let mut out = format!(
-        "debug\nlogfile {}\n{auth}\nms-dns {PPP_ISP_ADDR}\nlcp-echo-interval {}\nlcp-echo-failure 3\nmtu {}\nmru {}\n",
+        "nodetach\ndebug\nlogfile {}\n{auth}\nms-dns {PPP_ISP_ADDR}\nlcp-echo-interval {}\nlcp-echo-failure 3\nmtu {}\nmru {}\n",
         log.display(),
         config.echo_interval_secs,
         config.mtu,
@@ -683,7 +727,7 @@ mod tests {
         };
         assert_eq!(
             render_pppd_options(&config, Path::new("/run/x/pppd-wan0.log")),
-            "debug\nlogfile /run/x/pppd-wan0.log\nrequire-chap\nms-dns 203.0.113.1\nlcp-echo-interval 5\nlcp-echo-failure 3\nmtu 1500\nmru 1500\n+ipv6\nipv6 ::1,::2\n"
+            "nodetach\ndebug\nlogfile /run/x/pppd-wan0.log\nrequire-chap\nms-dns 203.0.113.1\nlcp-echo-interval 5\nlcp-echo-failure 3\nmtu 1500\nmru 1500\n+ipv6\nipv6 ::1,::2\n"
         );
         let plain = PppoeServerConfig {
             ipv6: false,

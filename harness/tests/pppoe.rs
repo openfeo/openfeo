@@ -10,6 +10,7 @@
 //! live unit are part 2's scenarios. `harness = false`: this binary is its own runner; an
 //! optional first argument filters scenarios by substring.
 
+use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,7 +27,9 @@ use openfeo_proto_ppp::Timestamp;
 use openfeo_proto_ppp::discovery::{Client, Config, Input, Output, Reason};
 use openfeo_proto_ppp::lcp::AuthProto;
 use openfeo_proto_ppp::pppoe::{self, BROADCAST, Code, Tag};
-use openfeo_proto_ppp::session::{self, Input as PppInput, Output as PppOutput};
+use openfeo_proto_ppp::session::{
+    self, Input as PppInput, Output as PppOutput, Reason as PppReason,
+};
 use tokio::runtime::Runtime;
 
 const SCENARIOS: &[Scenario] = &[
@@ -53,6 +56,22 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "chap_authenticates_too",
         run: chap_authenticates_too,
+    },
+    Scenario {
+        name: "a_wrong_password_is_auth_failed_with_pppds_message",
+        run: a_wrong_password_is_auth_failed_with_pppds_message,
+    },
+    Scenario {
+        name: "pppoe_server_killed_is_keepalive_lost_within_forty_seconds",
+        run: pppoe_server_killed_is_keepalive_lost_within_forty_seconds,
+    },
+    Scenario {
+        name: "pppoe_server_stopped_by_sigterm_is_terminated_by_peer",
+        run: pppoe_server_stopped_by_sigterm_is_terminated_by_peer,
+    },
+    Scenario {
+        name: "a_padt_from_the_ac_ends_the_session",
+        run: a_padt_from_the_ac_ends_the_session,
     },
 ];
 
@@ -534,6 +553,8 @@ struct PppBench {
     padt_seen: bool,
     /// When the session's `Down` came, if it has.
     down_at: Option<Instant>,
+    /// The PPPoE session id discovery bound.
+    session_id: u16,
     log: std::path::PathBuf,
 }
 
@@ -560,6 +581,7 @@ impl PppBench {
             dbuf: vec![0u8; 1600],
             padt_seen: false,
             down_at: None,
+            session_id: *id,
             log: daemons::pppd_log_path(&lab.run_dir, AC_IF),
         })
     }
@@ -653,6 +675,17 @@ fn has(outputs: &[PppOutput], what: impl Fn(&PppOutput) -> bool) -> bool {
 
 fn is_ipv4_up(output: &PppOutput) -> bool {
     matches!(output, PppOutput::Ipv4Up(_))
+}
+
+fn is_down(output: &PppOutput) -> bool {
+    matches!(output, PppOutput::Down { .. })
+}
+
+fn down_reason(outputs: &[PppOutput]) -> Option<&PppReason> {
+    outputs.iter().find_map(|output| match output {
+        PppOutput::Down { reason, .. } => Some(reason),
+        _ => None,
+    })
 }
 
 /// `ping -c <count>` from this namespace out of `ifname`; how many answered.
@@ -766,6 +799,170 @@ fn chap_authenticates_too(lab: &mut Lab) -> anyhow::Result<()> {
         ensure!(
             has(&outputs, |o| *o == PppOutput::AuthOk("chap")),
             "{outputs:?}"
+        );
+        anyhow::Ok(())
+    })
+}
+
+/// The session, as far as `until`: discovery, LCP, authentication with `password`, and on.
+async fn up_over_pppd(
+    rig: &Rig,
+    lab: &Lab,
+    password: &str,
+    until: impl FnMut(&PppOutput) -> bool,
+) -> anyhow::Result<(PppBench, Vec<PppOutput>)> {
+    let config = session_config(daemons::PPP_USERNAME, password, 1492);
+    let mut bench = PppBench::connect(rig, lab, config).await?;
+    let outputs = bench.run_until(Duration::from_secs(20), until).await?;
+    Ok((bench, outputs))
+}
+
+/// A wrong password: `pppd` refuses with its message, the session is down with
+/// `auth failed: <message>`; PAP and CHAP both.
+fn a_wrong_password_is_auth_failed_with_pppds_message(lab: &mut Lab) -> anyhow::Result<()> {
+    require_dev_ppp()?;
+    for auth in [Auth::Pap, Auth::Chap] {
+        let rig = Rig::create_isp(lab)?;
+        let mut server = rig.server(lab, &PppoeServerConfig::isp(AC_IF, auth))?;
+        runtime()?.block_on(async {
+            let (_bench, outputs) = up_over_pppd(&rig, lab, "not-the-secret", is_down).await?;
+            let Some(PppReason::AuthFailed(message)) = down_reason(&outputs) else {
+                anyhow::bail!("{auth:?}: not an auth failure: {outputs:?}");
+            };
+            ensure!(!message.is_empty(), "{auth:?}: pppd's message is carried");
+            anyhow::Ok(())
+        })?;
+        server.signal(nix::sys::signal::Signal::SIGKILL);
+    }
+    Ok(())
+}
+
+/// The server and its `pppd` killed outright: nothing says goodbye, the router's three echoes go
+/// unanswered, and the session is down with `keepalive lost` thirty to forty seconds later.
+fn pppoe_server_killed_is_keepalive_lost_within_forty_seconds(lab: &mut Lab) -> anyhow::Result<()> {
+    require_dev_ppp()?;
+    let rig = Rig::create_isp(lab)?;
+    let mut server = rig.server(lab, &PppoeServerConfig::isp(AC_IF, Auth::Pap))?;
+    runtime()?.block_on(async {
+        let (mut bench, _) = up_over_pppd(&rig, lab, daemons::PPP_PASSWORD, is_ipv4_up).await?;
+        server.signal(nix::sys::signal::Signal::SIGKILL);
+        let killed = Instant::now();
+        let outputs = bench.run_until(Duration::from_secs(45), is_down).await?;
+        let took = bench.down_at.map(|at| at - killed);
+        ensure!(
+            down_reason(&outputs) == Some(&PppReason::KeepaliveLost),
+            "{outputs:?}"
+        );
+        ensure!(
+            took.is_some_and(
+                |took| took >= Duration::from_secs(25) && took <= Duration::from_secs(41)
+            ),
+            "keepalive lost after {took:?}"
+        );
+        anyhow::Ok(())
+    })
+}
+
+/// SIGTERM to the server: `pppd` sends Terminate-Request, the session is down with `terminated
+/// by peer`, IPv4 going down first; and when the ISP stops while IPCP is still negotiating, no
+/// IPv4 is ever reported.
+fn pppoe_server_stopped_by_sigterm_is_terminated_by_peer(lab: &mut Lab) -> anyhow::Result<()> {
+    require_dev_ppp()?;
+    let rig = Rig::create_isp(lab)?;
+    let mut server = rig.server(lab, &PppoeServerConfig::isp(AC_IF, Auth::Pap))?;
+    runtime()?.block_on(async {
+        let (mut bench, _) = up_over_pppd(&rig, lab, daemons::PPP_PASSWORD, is_ipv4_up).await?;
+        server.signal(nix::sys::signal::Signal::SIGTERM);
+        let outputs = bench.run_until(Duration::from_secs(10), is_down).await?;
+        ensure!(
+            matches!(
+                down_reason(&outputs),
+                Some(PppReason::TerminatedByPeer | PppReason::CarrierLost)
+            ),
+            "{outputs:?}"
+        );
+        let down4 = outputs.iter().position(|o| *o == PppOutput::Ipv4Down);
+        let down = outputs.iter().position(is_down);
+        ensure!(
+            down4.is_some() && down4 < down,
+            "IPv4 goes down first: {outputs:?}"
+        );
+        anyhow::Ok(())
+    })?;
+    drop(server);
+    drop(rig);
+    let rig = Rig::create_isp(lab)?;
+    let mut server = rig.server(lab, &PppoeServerConfig::isp(AC_IF, Auth::Pap))?;
+    runtime()?.block_on(async {
+        let (mut bench, before) = up_over_pppd(&rig, lab, daemons::PPP_PASSWORD, |o| {
+            matches!(o, PppOutput::AuthOk(_))
+        })
+        .await?;
+        server.signal(nix::sys::signal::Signal::SIGTERM);
+        let outputs = bench.run_until(Duration::from_secs(10), is_down).await?;
+        let all: Vec<&PppOutput> = before.iter().chain(&outputs).collect();
+        ensure!(
+            !all.iter()
+                .any(|o| matches!(o, PppOutput::Ipv4Up(_) | PppOutput::Ipv4Down)),
+            "nothing of IPv4 when IPCP never finished: {all:?}"
+        );
+        ensure!(down_reason(&outputs).is_some(), "{outputs:?}");
+        anyhow::Ok(())
+    })
+}
+
+/// A PADT for `session_id` from the ISP's end, as an access concentrator ending a session
+/// without LCP (a raw frame sent from the ISP namespace; our codec builds it).
+fn inject_padt(rig: &Rig, session_id: u16) -> anyhow::Result<()> {
+    let ns = rig.isp.as_ref().context("an ISP namespace")?;
+    let payload = pppoe::Discovery {
+        code: Code::Padt,
+        session_id,
+        tags: vec![],
+    }
+    .encode();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&rig.client.1);
+    frame.extend_from_slice(&rig.ac.1);
+    frame.extend_from_slice(&pppoe::ETH_P_PPP_DISC.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    let hex = frame.iter().fold(String::new(), |mut hex, b| {
+        let _ = write!(hex, "{b:02x}");
+        hex
+    });
+    let mut cmd = ns.command("python3")?;
+    cmd.args([
+        "-c",
+        "import socket,sys; s=socket.socket(socket.AF_PACKET, socket.SOCK_RAW); s.bind((sys.argv[1], 0)); s.send(bytes.fromhex(sys.argv[2]))",
+        AC_IF,
+        &hex,
+    ]);
+    netns::run(&mut cmd)?;
+    Ok(())
+}
+
+/// The access concentrator's PADT alone ends the session at once: the kernel's PPPoE tears its
+/// side down and the session core is down, never waiting for the keepalive.
+fn a_padt_from_the_ac_ends_the_session(lab: &mut Lab) -> anyhow::Result<()> {
+    require_dev_ppp()?;
+    let rig = Rig::create_isp(lab)?;
+    let _server = rig.server(lab, &PppoeServerConfig::isp(AC_IF, Auth::Pap))?;
+    runtime()?.block_on(async {
+        let (mut bench, _) = up_over_pppd(&rig, lab, daemons::PPP_PASSWORD, is_ipv4_up).await?;
+        inject_padt(&rig, bench.session_id)?;
+        let sent = Instant::now();
+        let outputs = bench.run_until(Duration::from_secs(5), is_down).await?;
+        ensure!(
+            matches!(
+                down_reason(&outputs),
+                Some(PppReason::CarrierLost | PppReason::TerminatedByPeer)
+            ),
+            "{outputs:?} (padt seen on the discovery socket: {})",
+            bench.padt_seen
+        );
+        ensure!(
+            sent.elapsed() < Duration::from_secs(5),
+            "at once, not by keepalive"
         );
         anyhow::Ok(())
     })
