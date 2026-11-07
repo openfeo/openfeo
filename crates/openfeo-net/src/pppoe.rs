@@ -31,6 +31,9 @@ use crate::sys;
 
 /// The device the PPP units and channels come from.
 pub const DEV_PPP: &str = "/dev/ppp";
+/// The step whose ENXIO means no `ppp_generic` behind the node; later, ENXIO is a channel or
+/// unit the kernel flushed (the port's MTU or address changed), which is the session's problem.
+const OPEN_DEV_PPP: &str = "open /dev/ppp";
 /// Protocols from this number up are link-layer control (LCP, PAP, CHAP): the channel's.
 const CONTROL_PROTOCOLS: u16 = 0xc000;
 /// How long a transient socket error (the port down or gone) rests before the next read.
@@ -238,14 +241,14 @@ impl Session {
 #[must_use]
 pub fn dev_ppp_unavailable(err: &DriverError) -> bool {
     match err {
-        DriverError::Io { source, .. } => {
+        DriverError::Io { what, source } => {
             matches!(
                 source.kind(),
                 ErrorKind::NotFound | ErrorKind::PermissionDenied
             ) || matches!(
                 source.raw_os_error(),
-                Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::ENXIO)
-            )
+                Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT)
+            ) || (*what == OPEN_DEV_PPP && source.raw_os_error() == Some(libc::ENXIO))
         }
         _ => false,
     }
@@ -259,7 +262,7 @@ fn open_dev_ppp() -> Result<OwnedFd, DriverError> {
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(DEV_PPP)
         .map(OwnedFd::from)
-        .map_err(io_err("open /dev/ppp"))
+        .map_err(io_err(OPEN_DEV_PPP))
 }
 
 /// One frame from a ready descriptor: `Some((protocol, payload length))` with the payload moved
@@ -310,6 +313,18 @@ mod tests {
             "a session already connected is this session's problem"
         );
         assert!(!dev_ppp_unavailable(&DriverError::Address(7)));
+        assert!(
+            !dev_ppp_unavailable(&io_err("PPPIOCATTCHAN")(std::io::Error::from_raw_os_error(
+                libc::ENXIO
+            ))),
+            "a channel the kernel flushed (the port's MTU changed) is this session's problem"
+        );
+        assert!(
+            dev_ppp_unavailable(&io_err("open /dev/ppp")(std::io::Error::from_raw_os_error(
+                libc::ENXIO
+            ))),
+            "ENXIO at the open: no ppp_generic behind the node"
+        );
     }
 
     #[test]
