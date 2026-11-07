@@ -2056,6 +2056,7 @@ mod tests {
         for text in [
             include_str!("../../../harness/fixtures/vm-pppoe.toml"),
             include_str!("../../../harness/fixtures/vm-pppoe-pd.toml"),
+            include_str!("../../../harness/fixtures/vm-pppoe-vlan.toml"),
         ] {
             let cfg = crate::file::parse(text).expect("the fixture parses");
             assert!(

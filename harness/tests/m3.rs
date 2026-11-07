@@ -20,6 +20,7 @@ use openfeo_harness::lines::{Cursor, Match, Regex};
 use openfeo_harness::netns::NetNs;
 use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
+use openfeo_harness::vlanprobe;
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
@@ -34,6 +35,26 @@ const SCENARIOS: &[Scenario] = &[
         name: "the_console_never_shows_the_password",
         run: the_console_never_shows_the_password,
     },
+    Scenario {
+        name: "pppoe_server_killed_is_keepalive_lost_and_the_session_returns",
+        run: pppoe_server_killed_is_keepalive_lost_and_the_session_returns,
+    },
+    Scenario {
+        name: "carrier_loss_is_reported_and_the_session_returns_within_ten_seconds",
+        run: carrier_loss_is_reported_and_the_session_returns_within_ten_seconds,
+    },
+    Scenario {
+        name: "carrier_loss_during_discovery_restarts_discovery",
+        run: carrier_loss_during_discovery_restarts_discovery,
+    },
+    Scenario {
+        name: "pap_authenticates_too",
+        run: pap_authenticates_too,
+    },
+    Scenario {
+        name: "the_tagged_wan_runs_pppoe_over_a_vlan",
+        run: the_tagged_wan_runs_pppoe_over_a_vlan,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -45,11 +66,9 @@ fn main() -> ExitCode {
 }
 
 const VM_PPPOE: &str = include_str!("../fixtures/vm-pppoe.toml");
+const VM_PPPOE_VLAN: &str = include_str!("../fixtures/vm-pppoe-vlan.toml");
 const READY: &str = r"openfeo: ready generation=\d+";
-/// The port goes to 1508 when its NIC takes it (virtio-net does), so the payload asked for is
-/// 1500 or, before the links applier got there, 1492.
-const DISCOVERING: &str =
-    r"openfeo: pppoe wan0 discovering on p0 \(service any, max payload (1492|1500)\)";
+const DOWN: &str = r"openfeo: pppoe wan0 down: (.*?) after \d+ s(; retry in (\d+) s)?$";
 const SESSION: &str = r#"openfeo: pppoe wan0 session 0x([0-9a-f]{4}) with ([0-9a-f:]{17}) ac "isp" max payload 1492 \(no RFC 4638\)"#;
 const LCP_UP: &str = r"openfeo: pppoe wan0 lcp up mru 1492 auth (chap|pap|none)";
 const AUTH_OK: &str = r"openfeo: pppoe wan0 auth (chap|pap) ok as openfeo@isp\.example";
@@ -59,6 +78,17 @@ const IPV6CP_UP: &str = r"openfeo: pppoe wan0 ipv6cp up local ([0-9a-f:]{19}) pe
 const ISP_HTTP: &str = "203.0.113.1:8080";
 const SOON: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `discovering on <port>`: the port goes to 1508 when its NIC takes it (virtio-net does), so
+/// the payload asked for is 1500 or, before the links applier got there, 1492. The router's
+/// port is `p0`, or `p0.<vid>` when the ISP's interface is `wan0.<vid>`.
+fn discovering(isp_iface: &str) -> String {
+    let port = isp_iface.replacen("wan0", "p0", 1);
+    format!(
+        r"openfeo: pppoe wan0 discovering on {} \(service any, max payload (1492|1500)\)",
+        port.replace('.', r"\.")
+    )
+}
 
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|err| panic!("bad test regex {pattern:?}: {err}"))
@@ -101,7 +131,7 @@ fn fetch(ns: &NetNs, addr: &str) -> anyhow::Result<String> {
 }
 
 /// What a PPPoE boot established.
-#[allow(dead_code)] // the cursor and identifier are read by the loss and IPv6 scenarios
+#[allow(dead_code)] // the identifier is read by the IPv6 scenarios
 struct Booted {
     /// The console after the last PPP line waited for.
     cur: Cursor,
@@ -144,7 +174,7 @@ fn boot_pppoe(lab: &mut Lab, server: &PppoeServerConfig, config: &str) -> anyhow
     // their own order from the boot, and ready on its own.
     c.wait_for(&mut Cursor::default(), &re(READY), BOOT_TIMEOUT)?;
     let mut cur = Cursor::default();
-    c.wait_for(&mut cur, &re(DISCOVERING), SOON)?;
+    c.wait_for(&mut cur, &re(&discovering(&server.iface)), SOON)?;
     let session = c.wait_for(&mut cur, &re(SESSION), SOON)?;
     let session_id = u16::from_str_radix(&group(&session, 0)?, 16)?;
     c.wait_for(&mut cur, &re(LCP_UP), SOON)?;
@@ -275,4 +305,106 @@ fn mss_server(ns: &NetNs, bind: &str, port: u16) -> anyhow::Result<Daemon> {
 fn the_console_never_shows_the_password(lab: &mut Lab) -> anyhow::Result<()> {
     boot_pppoe(lab, &PppoeServerConfig::isp("wan0", Auth::Chap), VM_PPPOE)?;
     no_password_on_the_console(lab, "wan0")
+}
+
+/// The ISP's server and its `pppd` killed outright: the router's echoes go unanswered and the
+/// console says `keepalive lost` within the three echo intervals plus one, with the ladder's
+/// first wait; the server back, a new session and IPCP follow.
+fn pppoe_server_killed_is_keepalive_lost_and_the_session_returns(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let server = PppoeServerConfig::isp("wan0", Auth::Chap);
+    let booted = boot_pppoe(lab, &server, VM_PPPOE)?;
+    lab.kill_pppoe_server();
+    let c = lab.console()?;
+    let mut cur = booted.cur;
+    let down = c.wait_for(&mut cur, &re(DOWN), Duration::from_secs(45))?;
+    ensure!(
+        group(&down, 0)? == "keepalive lost (3 echoes)",
+        "{:?}",
+        down.line
+    );
+    ensure!(
+        group(&down, 2)? == "1",
+        "the first retry waits 1 s: {:?}",
+        down.line
+    );
+    lab.start_pppoe_server(&server)?;
+    let c = lab.console()?;
+    let session = c.wait_for(&mut cur, &re(SESSION), Duration::from_secs(70))?;
+    let id = u16::from_str_radix(&group(&session, 0)?, 16)?;
+    ensure!(id != 0, "a new session");
+    c.wait_for(&mut cur, &re(IPCP_UP), SOON)?;
+    no_password_on_the_console(lab, "wan0")
+}
+
+/// The WAN port's carrier goes: `carrier lost`, no retry wait (carrier's return is the retry);
+/// it comes back, and a session is up again within ten seconds.
+fn carrier_loss_is_reported_and_the_session_returns_within_ten_seconds(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let booted = boot_pppoe(lab, &PppoeServerConfig::isp("wan0", Auth::Chap), VM_PPPOE)?;
+    let mut qmp = lab.qmp()?;
+    qmp.set_link("p0", false)?;
+    let c = lab.console()?;
+    let mut cur = booted.cur;
+    let down = c.wait_for(&mut cur, &re(DOWN), SOON)?;
+    ensure!(group(&down, 0)? == "carrier lost", "{:?}", down.line);
+    ensure!(
+        group(&down, 1).is_err(),
+        "no retry wait after carrier loss: {:?}",
+        down.line
+    );
+    qmp.set_link("p0", true)?;
+    c.wait_for(&mut cur, &re(SESSION), SOON)?;
+    c.wait_for(&mut cur, &re(IPCP_UP), SOON)?;
+    Ok(())
+}
+
+/// Carrier lost while discovering (no access concentrator yet): discovery starts again when the
+/// link returns, with a fresh attempt, and the session comes up once the server does.
+fn carrier_loss_during_discovery_restarts_discovery(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.with_config(VM_PPPOE)?;
+    lab.boot("")?;
+    let c = lab.console()?;
+    let mut cur = Cursor::default();
+    c.wait_for(&mut cur, &re(&discovering("wan0")), BOOT_TIMEOUT)?;
+    let mut qmp = lab.qmp()?;
+    qmp.set_link("p0", false)?;
+    std::thread::sleep(Duration::from_secs(1));
+    qmp.set_link("p0", true)?;
+    c.wait_for(&mut cur, &re(&discovering("wan0")), SOON)?;
+    lab.start_pppoe_server(&PppoeServerConfig::isp("wan0", Auth::Chap))?;
+    let c = lab.console()?;
+    c.wait_for(&mut cur, &re(SESSION), Duration::from_secs(40))?;
+    c.wait_for(&mut cur, &re(IPCP_UP), SOON)?;
+    Ok(())
+}
+
+/// The concentrator asks for PAP: `auth pap ok`, and the LAN reaches the ISP.
+fn pap_authenticates_too(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_pppoe(lab, &PppoeServerConfig::isp("wan0", Auth::Pap), VM_PPPOE)?;
+    let c = lab.console()?;
+    let auth = c.wait_for(&mut Cursor::default(), &re(AUTH_OK), SOON)?;
+    ensure!(group(&auth, 0)? == "pap", "{:?}", auth.line);
+    let body = "openfeo isp target over pap";
+    let _server = http_target(lab, &lab.isp0, "203.0.113.1", 8080, body)?;
+    ensure!(fetch(&lab.lan0, ISP_HTTP)? == body);
+    no_password_on_the_console(lab, "wan0")
+}
+
+/// PPPoE on VLAN 101 of the WAN port (`vm-pppoe-vlan.toml`): discovery on `p0.101` against the
+/// ISP's tagged interface, and the LAN reaches the ISP through it.
+fn the_tagged_wan_runs_pppoe_over_a_vlan(lab: &mut Lab) -> anyhow::Result<()> {
+    vlanprobe::require_vlan_links()?;
+    let tagged = lab.isp0_tagged(101)?;
+    boot_pppoe(
+        lab,
+        &PppoeServerConfig::isp(&tagged, Auth::Chap),
+        VM_PPPOE_VLAN,
+    )?;
+    let body = "openfeo isp target over a tagged ppp";
+    let _server = http_target(lab, &lab.isp0, "203.0.113.1", 8080, body)?;
+    ensure!(fetch(&lab.lan0, ISP_HTTP)? == body);
+    no_password_on_the_console(lab, &tagged)
 }
