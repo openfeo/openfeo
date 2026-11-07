@@ -34,7 +34,8 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::dhcp4::{
-    DUID_PATH, LEASES_DIR, load_or_create_duid, lowest_port_mac, mac_text, seed, wait_for_link,
+    DUID_PATH, LEASES_DIR, LinkChange, link_change, load_or_create_duid, lowest_port_mac, mac_text,
+    seed, wait_for_link, wait_for_netdev,
 };
 use crate::state;
 
@@ -67,6 +68,7 @@ pub fn spawn_all(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: 
         let task = WanTask {
             wan: wan.name.clone(),
             port: openfeo_reconcile::wan_ifname(wan),
+            netdev: openfeo_reconcile::wan_netdev(wan),
             pd_hint: rules::pd_hint(ipv6),
         };
         let publisher = publisher.clone();
@@ -83,7 +85,10 @@ pub fn spawn_all(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: 
 #[derive(Debug, Clone)]
 struct WanTask {
     wan: String,
+    /// The WAN's port (or VLAN sub-interface): the binding's identity is its MAC.
     port: String,
+    /// The interface the client runs on: the port, or `ppp-<wan>` over PPPoE (ADR-0023).
+    netdev: String,
     pd_hint: u8,
 }
 
@@ -365,7 +370,14 @@ async fn run(
     publisher: &Publisher,
     mut world_rx: WorldRx,
 ) -> Result<(), TaskError> {
-    let (ifindex, mac) = wait_for_link(&mut world_rx, &task.port).await?;
+    // The identity is the port's MAC even over PPPoE, whose netdev has none and comes and goes
+    // with every session (ADR-0023).
+    let (port_index, mac) = wait_for_link(&mut world_rx, &task.port).await?;
+    let mut ifindex = if task.netdev == task.port {
+        port_index
+    } else {
+        wait_for_netdev(&mut world_rx, &task.netdev).await?
+    };
     let lowest = lowest_port_mac(&world_rx.borrow()).unwrap_or(mac);
     let duid = match load_or_create_duid(Path::new(DUID_PATH), lowest) {
         Ok((duid, _)) => duid,
@@ -380,7 +392,7 @@ async fn run(
     let failed = |err: openfeo_net::dhcp4::DriverError| {
         TaskError::from(format!("dhcp6 {}: {err}", task.wan))
     };
-    let socket = ClientSocket::open(ifindex, &task.port).map_err(failed)?;
+    let socket = ClientSocket::open(ifindex, &task.netdev).map_err(failed)?;
     let path = lease_path(&task.wan);
     let mut run = Run {
         task,
@@ -449,29 +461,37 @@ async fn run(
             }
             changed = world_rx.changed() => {
                 changed.map_err(|_| "world publisher gone")?;
-                let (up, index) = {
-                    let world = world_rx.borrow_and_update();
-                    let link = world.links.get(&task.port);
-                    (
-                        link.is_some_and(|link| link.up && link.carrier),
-                        link.map(|link| link.index),
-                    )
-                };
-                if let Some(index) = index
-                    && index != ifindex
-                {
-                    return Err(format!(
-                        "dhcp6 {}: {} changed index {ifindex} -> {index}; restarting",
-                        task.wan, task.port
-                    )
-                    .into());
-                }
-                if up == carrier {
-                    Vec::new()
-                } else {
-                    carrier = up;
-                    run.down_since = (!up).then(Instant::now);
-                    client.handle(if up { Input::LinkUp } else { Input::LinkDown }, clock::uptime_ms())
+                let change = link_change(
+                    (ifindex, carrier),
+                    world_rx.borrow_and_update().links.get(&task.netdev),
+                );
+                match change {
+                    LinkChange::None => Vec::new(),
+                    LinkChange::Down => {
+                        carrier = false;
+                        run.down_since = Some(Instant::now());
+                        client.handle(Input::LinkDown, clock::uptime_ms())
+                    }
+                    LinkChange::Up => {
+                        carrier = true;
+                        run.down_since = None;
+                        client.handle(Input::LinkUp, clock::uptime_ms())
+                    }
+                    LinkChange::Reopen(index) => {
+                        // A new netdev under the same name (a PPP session's new unit): a flap in
+                        // place, the binding kept.
+                        let mut outputs = if carrier {
+                            client.handle(Input::LinkDown, clock::uptime_ms())
+                        } else {
+                            Vec::new()
+                        };
+                        run.socket = ClientSocket::open(index, &task.netdev).map_err(failed)?;
+                        ifindex = index;
+                        carrier = true;
+                        run.down_since = None;
+                        outputs.extend(client.handle(Input::LinkUp, clock::uptime_ms()));
+                        outputs
+                    }
                 }
             }
         };

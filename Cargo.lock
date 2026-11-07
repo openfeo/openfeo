@@ -972,6 +972,7 @@ dependencies = [
  "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
+ "openfeo-proto-ppp",
  "openfeo-proto-sntp",
  "openfeo-reconcile",
  "openfeo-runtime",
@@ -1035,6 +1036,7 @@ dependencies = [
  "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
+ "openfeo-proto-ppp",
  "openfeo-proto-sntp",
  "openfeo-reconcile",
  "openfeo-world",
@@ -1065,6 +1067,7 @@ dependencies = [
  "openfeo-proto-dhcp6",
  "openfeo-proto-dns",
  "openfeo-proto-ndp",
+ "openfeo-proto-ppp",
  "openfeo-proto-sntp",
  "thiserror",
  "tokio",
@@ -1137,6 +1140,15 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "smoltcp",
+ "thiserror",
+]
+
+[[package]]
+name = "openfeo-proto-ppp"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "openfeo-proto-ndp",
  "thiserror",
 ]
 

@@ -1,6 +1,5 @@
 ---
 source: crates/openfeo-reconcile/src/links.rs
-assertion_line: 248
 expression: desired
 ---
 bridges:
@@ -35,3 +34,4 @@ ports:
     master: br-lan0
     mtu: ~
     ipv6_stable_privacy: false
+ppp: {}

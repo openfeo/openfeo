@@ -131,6 +131,7 @@ message Wan {
   oneof kind {
     StaticWan static = 5;
     DhcpWan dhcp = 6;
+    PppoeWan pppoe = 8;
   }
   // Present when the WAN carries IPv6 (SPEC §7.3); at most one WAN may, until M6.
   Ipv6Wan ipv6 = 7;
@@ -168,6 +169,18 @@ message DhcpWan {
   string hostname = 1;
   // Option 60, the vendor class identifier, printable ASCII up to 255 bytes; empty = not sent.
   string vendor_class = 2;
+}
+
+// A WAN that speaks PPPoE to the ISP's access concentrator (SPEC §7.2, `[wans.pppoe]`).
+message PppoeWan {
+  // The account, as PAP's peer-id and CHAP's name: 1 to 255 bytes, no NUL.
+  string username = 1;
+  // The password, as PAP's password and CHAP's secret: 1 to 255 bytes, no NUL.
+  string password = 2;
+  // A service name to insist on in discovery; empty = any.
+  string service = 3;
+  // An access-concentrator name to insist on in discovery; empty = any.
+  string ac = 4;
 }
 
 // One classless static route of a lease (RFC 3442).

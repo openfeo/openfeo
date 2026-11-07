@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use openfeo_config::portname::{parse_port_ref, vlan_ifname};
+use openfeo_config::rules;
 use openfeo_config::wan;
 use openfeo_world::{MacAddr, World};
 use serde::Serialize;
@@ -66,6 +67,21 @@ pub struct DesiredPort {
 /// The MTU a DHCP WAN port returns to when its lease (and the MTU it carried) is gone.
 pub const DEFAULT_MTU: u32 = 1500;
 
+/// The MTU a PPPoE WAN's port (and a tagged one's parent) is asked for, so a 1500-byte PPP
+/// payload fits under the 8 bytes of PPPoE and PPP (RFC 4638); a NIC that refuses stays at 1500
+/// and nothing above 1492 is offered (SPEC §7.2).
+pub const PPPOE_PORT_MTU: u32 = 1508;
+
+/// A PPPoE session's netdev: the kernel's `ppp<unit>`, to be renamed `ppp-<wan>`, sized and
+/// brought up by the applier (ADR-0023).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesiredPpp {
+    /// The kernel's unit number: the netdev is `ppp<unit>` until renamed.
+    pub unit: u32,
+    /// The negotiated PPP payload: the netdev's MTU.
+    pub mtu: u32,
+}
+
 /// Everything the links applier makes true.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct DesiredLinks {
@@ -73,6 +89,8 @@ pub struct DesiredLinks {
     pub bridges: BTreeMap<String, DesiredBridge>,
     /// Every known port by name.
     pub ports: BTreeMap<String, DesiredPort>,
+    /// PPPoE sessions' netdevs by their final name (`ppp-<wan>`).
+    pub ppp: BTreeMap<String, DesiredPpp>,
 }
 
 /// VLAN sub-interfaces by name: the physical port and the id.
@@ -121,11 +139,13 @@ pub fn links(world: &World) -> DesiredLinks {
         );
     }
     let wans = wan_interfaces(world, &known, &mut vlans);
+    // A PPPoE WAN's port carries no IPv6 of its own: the stable-privacy address belongs to the
+    // PPP netdev's link-local, which IPV6CP settles.
     let ipv6_ports: BTreeSet<String> = world
         .config
         .wans
         .iter()
-        .filter(|wan| known.contains(wan.port.as_str()))
+        .filter(|wan| known.contains(wan.port.as_str()) && !rules::is_pppoe(wan))
         .filter(|wan| {
             wan.ipv6
                 .as_ref()
@@ -133,6 +153,20 @@ pub fn links(world: &World) -> DesiredLinks {
         })
         .map(crate::wan_ifname)
         .collect();
+    for wan in &world.config.wans {
+        if !known.contains(wan.port.as_str()) || !rules::is_pppoe(wan) {
+            continue;
+        }
+        if let Some(fact) = world.pppoe.get(&wan.name) {
+            desired.ppp.insert(
+                rules::ppp_ifname(&wan.name),
+                DesiredPpp {
+                    unit: fact.unit,
+                    mtu: fact.mtu,
+                },
+            );
+        }
+    }
     for port in world.ports.names() {
         let master = master_of.get(port).cloned();
         let has_upper = vlans.values().any(|(parent, _)| parent == port);
@@ -187,13 +221,23 @@ fn wan_interfaces(
         {
             vlans.insert(ifname.clone(), (wan.port.clone(), id));
         }
-        let mtu = matches!(wan.kind, Some(wan::Kind::Dhcp(_))).then(|| {
-            world
-                .dhcp4
-                .get(&wan.name)
-                .and_then(|fact| fact.mtu)
-                .unwrap_or(DEFAULT_MTU)
-        });
+        let mtu = match &wan.kind {
+            Some(wan::Kind::Dhcp(_)) => Some(
+                world
+                    .dhcp4
+                    .get(&wan.name)
+                    .and_then(|fact| fact.mtu)
+                    .unwrap_or(DEFAULT_MTU),
+            ),
+            // The port, and a tagged WAN's parent, carry 1508-byte frames for RFC 4638.
+            Some(wan::Kind::Pppoe(_)) => {
+                if ifname != wan.port {
+                    wans.insert(wan.port.clone(), Some(PPPOE_PORT_MTU));
+                }
+                Some(PPPOE_PORT_MTU)
+            }
+            Some(wan::Kind::Static(_)) | None => None,
+        };
         wans.insert(ifname, mtu);
     }
     wans
@@ -201,6 +245,52 @@ fn wan_interfaces(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wan_netdev_is_the_port_or_ppp_dash_wan() {
+        let world = crate::fixtures::pppoe_world();
+        assert_eq!(crate::wan_ifname(&world.config.wans[0]), "p0");
+        assert_eq!(crate::wan_netdev(&world.config.wans[0]), "ppp-wan0");
+        let world = crate::fixtures::static_world();
+        assert_eq!(crate::wan_netdev(&world.config.wans[0]), "p0");
+    }
+
+    #[test]
+    fn a_pppoe_wan_port_wants_1508_and_its_unit_netdev_is_desired() {
+        let desired = links(&crate::fixtures::pppoe_world());
+        assert_eq!(
+            desired.ports["p0"].mtu,
+            Some(1508),
+            "room for a 1500-byte payload"
+        );
+        assert!(desired.ports["p0"].up);
+        assert!(
+            !desired.ports["p0"].ipv6_stable_privacy,
+            "no IPv6 on the port itself"
+        );
+        assert_eq!(
+            desired.ppp.get("ppp-wan0"),
+            Some(&DesiredPpp { unit: 0, mtu: 1492 })
+        );
+        let without = links(&crate::fixtures::pppoe_world_without_link());
+        assert_eq!(
+            without.ppp.get("ppp-wan0"),
+            Some(&DesiredPpp { unit: 0, mtu: 1492 }),
+            "the rename is wanted as soon as the unit exists"
+        );
+        insta::assert_yaml_snapshot!(desired);
+    }
+
+    #[test]
+    fn a_tagged_pppoe_wan_raises_the_parent_to_1508_too() {
+        let mut world = crate::fixtures::pppoe_world();
+        let mut config = (*world.config).clone();
+        config.wans[0].vlan = 101;
+        world.config = std::sync::Arc::new(config);
+        let desired = links(&world);
+        assert_eq!(desired.ports["p0"].mtu, Some(1508));
+        assert_eq!(desired.ports["p0.101"].mtu, Some(1508));
+    }
+
     use super::*;
 
     #[test]

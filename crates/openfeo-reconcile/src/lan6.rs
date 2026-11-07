@@ -15,7 +15,7 @@ use openfeo_world::{Deprecated, Lifetimed, World};
 use serde::Serialize;
 
 use crate::routing::router_address;
-use crate::{bridge_name, wan_ifname};
+use crate::{bridge_name, wan_netdev};
 
 /// Where a LAN's /64 comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -90,7 +90,7 @@ pub fn ipv6_wan(world: &World) -> Option<&Wan> {
 /// kernel through it.
 #[must_use]
 pub fn wan_usable(world: &World, wan: &Wan) -> bool {
-    let ifname = wan_ifname(wan);
+    let ifname = wan_netdev(wan);
     world.links.get(&ifname).is_some_and(|link| link.carrier) && world.has_default(true, &ifname)
 }
 
@@ -245,6 +245,14 @@ fn cut(parent: Ipv6Net, index: u32, lan: &str, lowest: Option<&str>) -> Cut {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pppoe_wan_is_usable_through_its_netdev() {
+        let world = fixtures::pppoe_world();
+        let wan = ipv6_wan(&world).expect("wan0 carries IPv6");
+        assert!(wan_usable(&world, wan));
+        assert!(!wan_usable(&fixtures::pppoe_world_without_link(), wan));
+    }
+
     use super::*;
     use crate::fixtures;
     use openfeo_world::WanDhcp6Fact;

@@ -251,11 +251,11 @@ What the reconcilers and protocol cores must do. Kernel names: physical ports `p
 
 **PPPoE** — a full PPP client:
 
-- *Discovery* over AF_PACKET (`ETH_P_PPP_DISC`): PADI/PADO/PADR/PADS/PADT; optional service-name and AC-name filters; Host-Uniq; **RFC 4638 PPP-Max-Payload** requesting 1500 (AAISP supports it), falling back to 1492.
-- *Kernel plumbing*: `socket(AF_PPPOX, SOCK_STREAM, PX_PROTO_OE)` + `connect(sockaddr_pppox{session, remote MAC, device})`; `open("/dev/ppp")` → `PPPIOCNEWUNIT`; a second `/dev/ppp` fd for the channel: `PPPIOCGCHAN` on the PPPoX socket, `PPPIOCATTCHAN`, `PPPIOCCONNECT` to the unit; MRU via `PPPIOCSMRU`, MTU via netlink. Control protocols (LCP, PAP/CHAP, IPCP, IPV6CP) are read and written as frames on the channel fd; IP and IPv6 flow through the `ppp-<wan>` netdev in kernel.
+- *Discovery* over AF_PACKET (`ETH_P_PPP_DISC`): PADI/PADO/PADR/PADS/PADT; optional service-name and AC-name filters (`service` and `ac` in `[wans.pppoe]`, absent = any); Host-Uniq; **RFC 4638 PPP-Max-Payload** requesting `min(1500, port MTU − 8)` when the port carries 1508-byte frames (the links reconciler asks for MTU 1508 on a PPPoE WAN's port and its parent; a NIC that refuses stays at 1500 and nothing above 1492 is offered; AAISP supports 1500), falling back to 1492; a PADS without the tag means 1492.
+- *Kernel plumbing*: `socket(AF_PPPOX, SOCK_STREAM, PX_PROTO_OE)` + `connect(sockaddr_pppox{session, remote MAC, device})`; `open("/dev/ppp")` → `PPPIOCNEWUNIT`; a second `/dev/ppp` fd for the channel: `PPPIOCGCHAN` on the PPPoX socket, `PPPIOCATTCHAN`, `PPPIOCCONNECT` to the unit; MRU via `PPPIOCSMRU`, MTU via netlink. LCP and the authentication protocols (every protocol `0xc000` and above) are read and written as frames on the channel fd, the network control protocols (IPCP, IPV6CP) on the unit fd once the channel is connected, both polled; IP and IPv6 flow through the `ppp-<wan>` netdev in kernel: the kernel's unit, renamed, sized and brought up by the links applier (ADR-0023).
 - *LCP*: MRU, magic number, authentication-protocol negotiation, echo request/reply keepalive (default 10 s interval, 3 failures), terminate. *Auth*: PAP and CHAP-MD5 (MS-CHAP not in MVP). *IPCP*: address plus primary/secondary DNS options. *IPV6CP*: interface identifier, after which the binary adds `fe80::<local-iid>/64` to the interface and a route to the peer's link-local address.
-- Reconnect with exponential backoff; handle AC-initiated PADT and LCP Terminate; publish session id, addresses, DNS, MTU and uptime as facts.
-- MSS clamping (`tcp flags syn tcp option maxseg size set rt mtu`) is generated for any WAN whose MTU is below 1500.
+- Reconnect with exponential backoff (1 s doubling to 60 s between attempts, back to 1 s after a minute up, at once when carrier returns; 60 s after an authentication failure, since an AC may lock the account); handle AC-initiated PADT and LCP Terminate (our own termination is two Terminate-Requests, then PADT); publish session id, the AC, addresses, DNS, MTU, the interface identifiers and up-since as facts. The console says `pppoe wan0 session 0x0001 with 52:54:00:fe:00:01 ac "isp" max payload 1500`, `pppoe wan0 lcp up mru 1500 auth chap`, `pppoe wan0 auth chap ok as openfeo@isp.example`, `pppoe wan0 ipcp up 203.0.113.100 peer 203.0.113.1 dns 203.0.113.1`, `pppoe wan0 ipv6cp up local <iid> peer <iid>`, `pppoe wan0 down: keepalive lost (3 echoes) after 1234 s; retry in 1 s`; the password never.
+- MSS clamping: `tcp flags syn tcp option maxseg size set rt mtu` in the forward chain, in both directions (`oifname` and `iifname`) of every WAN whose netdev the kernel shows with an MTU below 1500, PPPoE or not.
 
 **VLAN-tagged WAN**: `vlan = V` on a WAN runs it on the `p0.101`-style sub-interface `pN.V`, under any of the above; everything downstream (routing, the DHCP client, the firewall zone, the console) names the sub-interface.
 
@@ -363,6 +363,8 @@ priority = 10
 [wans.pppoe]
 username = "..."
 password = "..."
+# service = ""             # a service name to insist on; absent = any
+# ac = ""                  # an access-concentrator name to insist on; absent = any
 # [wans.static]            # a static WAN instead: address = "203.0.113.10/24", gateway = "203.0.113.1", dns = ["203.0.113.1"]
 # [wans.dhcp]              # a DHCP WAN instead; optional hostname = "myrouter", vendor_class = "OpenFeO" (sent only when set)
 [wans.ipv6]
@@ -494,7 +496,7 @@ Vue 3 + TypeScript, built with Vite, embedded into the binary at build time. Pag
 
 - **Unit**: sans-IO cores against synthesised and recorded packets (`tests/fixtures/*.pcap`; no credentials committed); property tests (`proptest`) on parsers; reconcilers against World fixtures with `insta` snapshots of desired state (ruleset JSON, route sets, RA contents).
 - **Fuzzing**: `cargo fuzz` targets for every parser (DHCPv4, DHCPv6, ND/RA, PPPoE, LCP/IPCP/IPV6CP/PAP/CHAP, DNS, config TOML), run in a nightly CI job with a checked-in corpus.
-- **Harness** (`harness/`): the router runs in QEMU (KVM when the runner has it, TCG otherwise; i6300esb watchdog; virtio-net ports `p0` = WAN A, `p1` = WAN B, `p2` = LAN, and `p3` = a second LAN namespace `lan1` for the scenarios that ask for two LANs) attached through tap devices to network namespaces on the CI host. ISP namespaces run **reference daemons**: Kea (DHCPv4; DHCPv6 IA_NA and IA_PD), radvd, `pppoe-server` + pppd (PAP/CHAP, IPCP, IPV6CP, RFC 4638) with odhcpd or Kea for PD over PPP, plus HTTP and DNS targets. The LAN namespace runs a Rust test client (DHCPv4, SLAAC/DHCPv6, DNS, HTTP); for SLAAC the namespace's own kernel is the reference client and `rdisc6` (ndisc6) reads the advertisements' options, while radvd advertises on the ISP side; for stateless DHCPv6 busybox's `udhcpc6` is the reference client; the prefix-change scenario restarts Kea with another delegation pool, so the router's Renew meets a server with no binding. Scenarios: link flap, lease expiry, prefix change, PADT, ISP down/up, power cut during update, broken-image rollback.
+- **Harness** (`harness/`): the router runs in QEMU (KVM when the runner has it, TCG otherwise; i6300esb watchdog; virtio-net ports `p0` = WAN A, `p1` = WAN B, `p2` = LAN, and `p3` = a second LAN namespace `lan1` for the scenarios that ask for two LANs) attached through tap devices to network namespaces on the CI host. ISP namespaces run **reference daemons**: Kea (DHCPv4; DHCPv6 IA_NA and IA_PD), radvd, `pppoe-server` + pppd (PAP/CHAP, IPCP, IPV6CP, RFC 4638), with radvd and Kea's DHCPv6 server started on the ISP's PPP interface once a session is up for RA and PD over PPP (the sandbox mounts a tmpfs over `/etc/ppp` for pppd's secrets, and `/dev/ppp` must be open to the user: CI grants it), plus HTTP and DNS targets. The LAN namespace runs a Rust test client (DHCPv4, SLAAC/DHCPv6, DNS, HTTP); for SLAAC the namespace's own kernel is the reference client and `rdisc6` (ndisc6) reads the advertisements' options, while radvd advertises on the ISP side; for stateless DHCPv6 busybox's `udhcpc6` is the reference client; the prefix-change scenario restarts Kea with another delegation pool, so the router's Renew meets a server with no binding. Scenarios: link flap, lease expiry, prefix change, PADT, ISP down/up, power cut during update, broken-image rollback.
 - **Panel**: Playwright end-to-end tests against the harness VM.
 - **CI matrix**: `cargo test`, `cargo clippy -D warnings`, `cargo deny check`, `buf lint` and `buf breaking`, kernel build (cached), image build, harness scenarios for every completed milestone, nightly fuzz.
 
@@ -581,7 +583,7 @@ Coding rules (repeated in `CLAUDE.md`):
 - [x] M2: NDP codec in-tree, smoltcp as the test oracle (ADR-0018, 3 November 2026); learned WAN facts act only once the kernel shows their route (ADR-0019, 3 November 2026).
 - [ ] M3: record a sanitised AAISP PPPoE session pcap for fixtures (credentials stripped).
 - [ ] M7: RB5009 boot/update ADR after studying OpenWrt's mvebu MikroTik sysupgrade path.
-- [ ] Harness: confirm Kea or odhcpd for DHCPv6-PD over PPP.
+- [x] Harness: Kea for DHCPv6-PD over PPP, started on the ISP's PPP interface once the session is up (M3 design, 7 November 2026).
 
 ## Appendix A — Post-MVP context (do not implement)
 

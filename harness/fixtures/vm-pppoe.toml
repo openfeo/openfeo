@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The lab's PPPoE configuration (M3): WAN A on p0 speaks PPPoE to the access concentrator on
+# isp0 with the documentation credentials, a routed /48 behind it as the dogfooding line has,
+# and lan0 on p2 numbered from it. Used by the m3 scenarios and the reconcile snapshot tests.
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+ntp_servers = ["ntp.isp.example"]
+
+[[wans]]
+name = "wan0"
+port = "p0"
+priority = 10
+[wans.pppoe]
+username = "openfeo@isp.example"
+password = "example-secret"
+[wans.ipv6]
+prefix = "2001:db8:1::/48"
+
+[[lans]]
+name = "lan0"
+ports = ["p2"]
+ipv4 = "192.168.1.1/24"
+ipv6 = "2001:db8:1:222::1/64"
+[lans.dhcp]
+range = ["192.168.1.100", "192.168.1.200"]
+lease_secs = 43200
+
+[firewall]
+wan_ping = true

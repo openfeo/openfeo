@@ -16,6 +16,7 @@ mod dns;
 mod heartbeat;
 mod identity;
 mod ipv6;
+mod pppoe;
 mod ra;
 mod router;
 mod state;

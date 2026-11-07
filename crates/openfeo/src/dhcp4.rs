@@ -26,7 +26,7 @@ use openfeo_proto_dhcp4::{ClientConfig, Lease, Unbound};
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{Publisher, Supervisor};
-use openfeo_world::{Dhcp4Fact, World};
+use openfeo_world::{Dhcp4Fact, LinkFact, World};
 use tracing::{debug, info, warn};
 
 use crate::state;
@@ -354,6 +354,68 @@ pub(crate) async fn wait_for_link(
     }
 }
 
+/// A netdev's index once it is up with carrier: the PPP netdev of a PPPoE WAN, which has no MAC
+/// of its own (ADR-0023).
+pub(crate) async fn wait_for_netdev(world_rx: &mut WorldRx, name: &str) -> Result<u32, TaskError> {
+    loop {
+        let ready = world_rx
+            .borrow_and_update()
+            .links
+            .get(name)
+            .filter(|link| link.up && link.carrier)
+            .map(|link| link.index);
+        if let Some(index) = ready {
+            return Ok(index);
+        }
+        world_rx
+            .changed()
+            .await
+            .map_err(|_| "world publisher gone")?;
+    }
+}
+
+/// What a World change means for a task bound to a netdev.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkChange {
+    /// Nothing the task cares about.
+    None,
+    /// Carrier went (or the netdev itself did).
+    Down,
+    /// Carrier came back on the same netdev.
+    Up,
+    /// A new netdev under the same name is up with carrier (a PPP session's new unit,
+    /// ADR-0023; a NIC re-plugged): the task reopens its socket on this index, as a flap in
+    /// place, never as a failure that spends the supervisor's restart budget.
+    Reopen(u32),
+}
+
+/// What the World now says about the netdev a task runs on at `index`, having last seen
+/// `carrier`.
+pub(crate) fn link_change((index, carrier): (u32, bool), now: Option<&LinkFact>) -> LinkChange {
+    let Some(link) = now else {
+        return if carrier {
+            LinkChange::Down
+        } else {
+            LinkChange::None
+        };
+    };
+    let ready = link.up && link.carrier;
+    if link.index != index {
+        return if ready {
+            LinkChange::Reopen(link.index)
+        } else if carrier {
+            LinkChange::Down
+        } else {
+            LinkChange::None
+        };
+    }
+    match (carrier, ready) {
+        (true, false) => LinkChange::Down,
+        (false, true) => LinkChange::Up,
+        _ => LinkChange::None,
+    }
+}
+
 /// The MAC of the lowest-numbered port that has one: what the DUID is made from.
 pub(crate) fn lowest_port_mac(world: &World) -> Option<[u8; 6]> {
     world
@@ -571,6 +633,61 @@ mod tests {
         assert_eq!(
             lease_path("wan0").to_str(),
             Some("/state/leases/dhcp4-wan0.toml")
+        );
+    }
+
+    /// A netdev replaced under the same name (a PPP session's new unit, ADR-0023; a NIC
+    /// re-plugged) is a flap in place for the task bound to it, never an error: the supervisor's
+    /// restart budget is for faults, not for a line that retrains.
+    #[test]
+    fn a_new_index_is_a_reopen_not_an_error() {
+        let link = |index, up, carrier| openfeo_world::LinkFact {
+            index,
+            name: "ppp-wan0".to_owned(),
+            up,
+            carrier,
+            mac: None,
+            mtu: 1492,
+            link_local6: None,
+        };
+        assert_eq!(
+            link_change((7, true), Some(&link(7, true, true))),
+            LinkChange::None
+        );
+        assert_eq!(
+            link_change((7, true), Some(&link(7, true, false))),
+            LinkChange::Down
+        );
+        assert_eq!(
+            link_change((7, false), Some(&link(7, true, true))),
+            LinkChange::Up
+        );
+        assert_eq!(
+            link_change((7, false), Some(&link(7, false, false))),
+            LinkChange::None
+        );
+        assert_eq!(
+            link_change((7, true), None),
+            LinkChange::Down,
+            "the netdev went: carrier went with it"
+        );
+        assert_eq!(link_change((7, false), None), LinkChange::None);
+        assert_eq!(
+            link_change((7, true), Some(&link(9, true, true))),
+            LinkChange::Reopen(9)
+        );
+        assert_eq!(
+            link_change((7, false), Some(&link(9, true, true))),
+            LinkChange::Reopen(9)
+        );
+        assert_eq!(
+            link_change((7, true), Some(&link(9, false, false))),
+            LinkChange::Down,
+            "a new netdev still down is a loss until it comes up"
+        );
+        assert_eq!(
+            link_change((7, false), Some(&link(9, false, false))),
+            LinkChange::None
         );
     }
 

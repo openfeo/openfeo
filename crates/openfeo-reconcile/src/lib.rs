@@ -36,11 +36,24 @@ pub fn bridge_name(lan: &str) -> String {
 }
 
 /// The kernel interface a WAN runs on (SPEC §7.2): its port, or the 802.1Q sub-interface `pN.V`
-/// when `vlan` is set (ADR-0017).
+/// when `vlan` is set (ADR-0017). For a PPPoE WAN this is the port the PPPoE frames cross;
+/// its IP interface is [`wan_netdev`].
 #[must_use]
 pub fn wan_ifname(wan: &openfeo_config::Wan) -> String {
     match u16::try_from(wan.vlan) {
         Ok(id) if id != 0 => openfeo_config::portname::vlan_ifname(&wan.port, id),
         _ => wan.port.clone(),
+    }
+}
+
+/// The interface a WAN's IP traffic flows through: `ppp-<wan>` for a PPPoE WAN (the kernel's
+/// unit, renamed, ADR-0023), the port or sub-interface for every other kind. Every reconciler
+/// that means "the WAN's IP interface" reads this one.
+#[must_use]
+pub fn wan_netdev(wan: &openfeo_config::Wan) -> String {
+    if openfeo_config::rules::is_pppoe(wan) {
+        openfeo_config::rules::ppp_ifname(&wan.name)
+    } else {
+        wan_ifname(wan)
     }
 }

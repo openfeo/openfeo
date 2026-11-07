@@ -29,6 +29,11 @@ pub mod errno {
     pub const EEXIST: i32 = 17;
     /// No such device.
     pub const ENODEV: i32 = 19;
+    /// Invalid argument.
+    pub const EINVAL: i32 = 22;
+    /// Numerical result out of range: an MTU outside the device's `min_mtu..=max_mtu`
+    /// (`dev_validate_mtu`).
+    pub const ERANGE: i32 = 34;
     /// Cannot assign requested address (deleting an address that is not there).
     pub const EADDRNOTAVAIL: i32 = 99;
 }
@@ -50,6 +55,14 @@ impl Error {
     #[must_use]
     pub fn is_exist(&self) -> bool {
         self.errno() == Some(errno::EEXIST)
+    }
+
+    /// The kernel said the request asks for something the device cannot do: `ERANGE` for an
+    /// MTU outside what it carries (`dev_validate_mtu`), `EINVAL` from drivers that check it
+    /// themselves.
+    #[must_use]
+    pub fn is_invalid(&self) -> bool {
+        matches!(self.errno(), Some(errno::EINVAL | errno::ERANGE))
     }
 
     /// The kernel said the thing being removed is not there (`ENOENT`, `ESRCH`, `ENODEV`,
@@ -216,6 +229,60 @@ impl Netlink {
             .execute()
             .await
             .map_err(|e| request_error(format!("add addr {net} dev {index}"), e))
+    }
+
+    /// `ip addr add <local> peer <peer> dev <index>`: a point-to-point address (a PPP netdev's),
+    /// ours as `IFA_LOCAL` and the far end as `IFA_ADDRESS`, with `local`'s prefix length.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses (`EEXIST` when already present).
+    pub async fn addr_add_peer(&self, index: u32, local: IpNet, peer: IpAddr) -> Result<(), Error> {
+        let mut request = self
+            .handle
+            .address()
+            .add(index, local.addr(), local.prefix_len());
+        let message = request.message_mut();
+        message.attributes.retain(|attr| {
+            !matches!(
+                attr,
+                AddressAttribute::Address(_) | AddressAttribute::Local(_)
+            )
+        });
+        message
+            .attributes
+            .push(AddressAttribute::Local(local.addr()));
+        message.attributes.push(AddressAttribute::Address(peer));
+        request
+            .execute()
+            .await
+            .map_err(|e| request_error(format!("add addr {local} peer {peer} dev {index}"), e))
+    }
+
+    /// `ip addr del <local> peer <peer> dev <index>`: the kernel matches a point-to-point address
+    /// by both ends, so one added with [`Netlink::addr_add_peer`] goes with its peer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses (`EADDRNOTAVAIL` when not present).
+    pub async fn addr_del_peer(&self, index: u32, local: IpNet, peer: IpAddr) -> Result<(), Error> {
+        let mut message = AddressMessage::default();
+        message.header.index = index;
+        message.header.prefix_len = local.prefix_len();
+        message.header.family = match local {
+            IpNet::V4(_) => AddressFamily::Inet,
+            IpNet::V6(_) => AddressFamily::Inet6,
+        };
+        message
+            .attributes
+            .push(AddressAttribute::Local(local.addr()));
+        message.attributes.push(AddressAttribute::Address(peer));
+        self.handle
+            .address()
+            .del(message)
+            .execute()
+            .await
+            .map_err(|e| request_error(format!("del addr {local} peer {peer} dev {index}"), e))
     }
 
     /// `ip addr del <net> dev <index>`.

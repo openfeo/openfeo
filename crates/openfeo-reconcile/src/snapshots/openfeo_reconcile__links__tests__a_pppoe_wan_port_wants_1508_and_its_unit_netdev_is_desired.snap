@@ -1,0 +1,38 @@
+---
+source: crates/openfeo-reconcile/src/links.rs
+expression: desired
+---
+bridges:
+  br-lan0:
+    name: br-lan0
+    vlan_filtering: true
+    mac: "52:54:00:fe:00:02"
+    members:
+      - p2
+    up: true
+ports:
+  p0:
+    name: p0
+    kind: Physical
+    up: true
+    master: ~
+    mtu: 1508
+    ipv6_stable_privacy: false
+  p1:
+    name: p1
+    kind: Physical
+    up: false
+    master: ~
+    mtu: ~
+    ipv6_stable_privacy: false
+  p2:
+    name: p2
+    kind: Physical
+    up: true
+    master: br-lan0
+    mtu: ~
+    ipv6_stable_privacy: false
+ppp:
+  ppp-wan0:
+    unit: 0
+    mtu: 1492

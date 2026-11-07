@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# The lab's PPPoE configuration with a delegated prefix (M3): as vm-pppoe.toml, but the ISP
+# delegates a /56 over the PPP link instead of routing a fixed prefix.
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+ntp_servers = ["ntp.isp.example"]
+
+[[wans]]
+name = "wan0"
+port = "p0"
+priority = 10
+[wans.pppoe]
+username = "openfeo@isp.example"
+password = "example-secret"
+[wans.ipv6]
+pd_hint = 56
+
+[[lans]]
+name = "lan0"
+ports = ["p2"]
+ipv4 = "192.168.1.1/24"
+[lans.dhcp]
+range = ["192.168.1.100", "192.168.1.200"]
+lease_secs = 43200
+
+[firewall]
+wan_ping = true

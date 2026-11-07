@@ -16,7 +16,7 @@ fuzz_target!(|data: &[u8]| {
     let mut client = Client::new(Config {
         ifname: "p0".to_owned(),
         secret: [7; 16],
-        mac: [0x52, 0x54, 0, 0xfe, 0, 0],
+        mac: Some([0x52, 0x54, 0, 0xfe, 0, 0]),
     });
     let _ = client.handle(Input::LinkUp, 0);
     let _ = client.handle(

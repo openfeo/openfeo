@@ -217,7 +217,7 @@ fn learn(
         let mut client = Client::new(client::Config {
             ifname: WAN_IF.to_owned(),
             secret: [7; 16],
-            mac,
+            mac: Some(mac),
         });
         let start = Instant::now();
         let deadline = start + timeout;

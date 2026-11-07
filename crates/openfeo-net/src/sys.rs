@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-//! The one unsafe module of this crate (ADR-0013): addresses for `AF_PACKET` sockets, the
-//! registration of an owned descriptor with tokio, `adjtimex`, and the three calls the ICMPv6
-//! neighbour-discovery socket needs that nix does not name: the raw ICMPv6 socket itself, the
-//! `ICMP6_FILTER` option and the interface-scoped multicast join. nix offers no safe way to build
-//! a `sockaddr_ll`, and a packet socket not bound to its interface would copy every IPv4 frame
-//! of every port to userspace; tokio makes the caller vouch that a registered descriptor stays
-//! open, which an `OwnedFd` guarantees.
+//! The one unsafe module of this crate (ADR-0013): addresses for `AF_PACKET` sockets and the
+//! sockets themselves for the Ethernet protocols nix does not name, the registration of an owned
+//! descriptor with tokio, `adjtimex`, the three calls the ICMPv6 neighbour-discovery socket
+//! needs that nix does not name (the raw ICMPv6 socket itself, the `ICMP6_FILTER` option and the
+//! interface-scoped multicast join), and the PPP plumbing (SPEC §7.2): the `AF_PPPOX` socket,
+//! its `sockaddr_pppox`, and the `/dev/ppp` ioctls that make a unit and a channel, whose
+//! numbers come from the pinned `linux/ppp-ioctl.h` (a unit test reads them back from it). nix
+//! offers no safe way to build a `sockaddr_ll`, and a packet socket not bound to its interface
+//! would copy every IPv4 frame of every port to userspace; tokio makes the caller vouch that a
+//! registered descriptor stays open, which an `OwnedFd` guarantees.
 
 use std::io;
 use std::mem::size_of;
@@ -225,6 +228,230 @@ fn adjtimex(tx: &mut libc::timex) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `PX_PROTO_OE`: the PPPoE protocol of an `AF_PPPOX` socket (`linux/if_pppox.h`).
+const PX_PROTO_OE: libc::c_int = 0;
+
+/// `IFNAMSIZ`: the device name field of `pppoe_addr`, its NUL included.
+const IFNAMSIZ: usize = 16;
+
+/// `sizeof(struct sockaddr_pppox)` for PPPoE: `sa_family` (2), `sa_protocol` (4), `sid` (2),
+/// `remote` (6), `dev` (16); the struct is packed.
+const SOCKADDR_PPPOX_LEN: usize = 30;
+
+/// The PPP ioctls' type byte, `'t'` (`linux/ppp-ioctl.h`).
+const PPP_IOC_TYPE: u32 = 0x74;
+/// `_IOC_WRITE` and `_IOC_READ` (`asm-generic/ioctl.h`).
+const IOC_WRITE: u32 = 1;
+const IOC_READ: u32 = 2;
+/// `sizeof(int)`, the argument of every PPP ioctl used here.
+const INT_SIZE: u32 = 4;
+
+/// `_IOC(dir, type, nr, size)` as `asm-generic/ioctl.h` lays it out on every target this project
+/// builds for: nr in bits 0..8, type in 8..16, size in 16..30, direction in 30..32.
+const fn ioc(dir: u32, kind: u32, nr: u32, size: u32) -> u32 {
+    (dir << 30) | (size << 16) | (kind << 8) | nr
+}
+
+/// `PPPIOCNEWUNIT`, `_IOWR('t', 62, int)`: make a unit, the number in and out.
+pub(crate) const PPPIOCNEWUNIT: u32 = ioc(IOC_READ | IOC_WRITE, PPP_IOC_TYPE, 62, INT_SIZE);
+/// `PPPIOCGCHAN`, `_IOR('t', 55, int)`: an `AF_PPPOX` socket's channel index.
+pub(crate) const PPPIOCGCHAN: u32 = ioc(IOC_READ, PPP_IOC_TYPE, 55, INT_SIZE);
+/// `PPPIOCATTCHAN`, `_IOW('t', 56, int)`: attach a `/dev/ppp` descriptor to a channel.
+pub(crate) const PPPIOCATTCHAN: u32 = ioc(IOC_WRITE, PPP_IOC_TYPE, 56, INT_SIZE);
+/// `PPPIOCCONNECT`, `_IOW('t', 58, int)`: connect a channel to a unit.
+pub(crate) const PPPIOCCONNECT: u32 = ioc(IOC_WRITE, PPP_IOC_TYPE, 58, INT_SIZE);
+/// `PPPIOCSMRU`, `_IOW('t', 82, int)`: a unit's maximum receive unit.
+pub(crate) const PPPIOCSMRU: u32 = ioc(IOC_WRITE, PPP_IOC_TYPE, 82, INT_SIZE);
+
+/// The raw ioctl functions nix generates from the numbers above; each is called from one safe
+/// function below and nowhere else.
+mod ioctl {
+    nix::ioctl_readwrite_bad!(new_unit, super::PPPIOCNEWUNIT, libc::c_int);
+    nix::ioctl_read_bad!(channel_index, super::PPPIOCGCHAN, libc::c_int);
+    nix::ioctl_write_ptr_bad!(attach_channel, super::PPPIOCATTCHAN, libc::c_int);
+    nix::ioctl_write_ptr_bad!(connect_unit, super::PPPIOCCONNECT, libc::c_int);
+    nix::ioctl_write_ptr_bad!(set_mru, super::PPPIOCSMRU, libc::c_int);
+}
+
+/// `socket(AF_PACKET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, htons(protocol))` for an
+/// Ethernet `protocol` nix does not name (PPPoE discovery): the kernel delivers that protocol's
+/// frames with the Ethernet header stripped and the source address in the `sockaddr_ll`.
+///
+/// # Errors
+///
+/// When the kernel refuses (no `CAP_NET_RAW`).
+pub fn packet_socket(protocol: u16) -> io::Result<OwnedFd> {
+    // SAFETY: socket(2) takes three integers and returns a descriptor or -1.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::c_int::from(protocol.to_be()),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned open by the kernel and nothing else owns or closes it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `socket(AF_PPPOX, SOCK_STREAM | SOCK_CLOEXEC, PX_PROTO_OE)`: the PPPoE session socket. No
+/// data of ours crosses it (frames go through the `/dev/ppp` descriptors), so it stays blocking.
+///
+/// # Errors
+///
+/// When the kernel refuses: `EAFNOSUPPORT` without the `pppox` module, `EPROTONOSUPPORT`
+/// without `pppoe`.
+pub fn pppox_socket() -> io::Result<OwnedFd> {
+    // SAFETY: socket(2) takes three integers and returns a descriptor or -1.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PPPOX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            PX_PROTO_OE,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned open by the kernel and nothing else owns or closes it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// A `sockaddr_pppox` as the kernel reads it (`linux/if_pppox.h`, packed): `AF_PPPOX`,
+/// `PX_PROTO_OE`, the session id in network order, the access concentrator's MAC and the port's
+/// name NUL-padded to `IFNAMSIZ`. `None` when the name does not fit with its NUL.
+pub(crate) fn pppox_address_bytes(
+    session_id: u16,
+    ac_mac: [u8; 6],
+    dev: &str,
+) -> Option<[u8; SOCKADDR_PPPOX_LEN]> {
+    if dev.is_empty() || dev.len() >= IFNAMSIZ {
+        return None;
+    }
+    let mut bytes = [0u8; SOCKADDR_PPPOX_LEN];
+    bytes[..2].copy_from_slice(&u16::try_from(libc::AF_PPPOX).ok()?.to_ne_bytes());
+    bytes[2..6].copy_from_slice(&u32::try_from(PX_PROTO_OE).ok()?.to_ne_bytes());
+    bytes[6..8].copy_from_slice(&session_id.to_be_bytes());
+    bytes[8..14].copy_from_slice(&ac_mac);
+    bytes[14..14 + dev.len()].copy_from_slice(dev.as_bytes());
+    Some(bytes)
+}
+
+/// The address bytes at the alignment `sockaddr` wants.
+#[repr(C, align(4))]
+struct PppoxAddress([u8; SOCKADDR_PPPOX_LEN]);
+
+/// `connect(2)` the PPPoE socket to session `session_id` with `ac_mac` on the port `dev`: from
+/// then on the kernel owns the session's frames (`ETH_P_PPP_SES`) on that port.
+///
+/// # Errors
+///
+/// When the name does not fit `IFNAMSIZ`, or the kernel refuses (`ENODEV` for a port it does
+/// not know, `EBUSY` for a session already connected).
+pub fn pppoe_connect(
+    fd: BorrowedFd<'_>,
+    session_id: u16,
+    ac_mac: [u8; 6],
+    dev: &str,
+) -> io::Result<()> {
+    let address = PppoxAddress(pppox_address_bytes(session_id, ac_mac, dev).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("port name {dev:?} does not fit IFNAMSIZ"),
+        )
+    })?);
+    let len = libc::socklen_t::try_from(SOCKADDR_PPPOX_LEN)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `address` is the packed `sockaddr_pppox` the kernel expects for `AF_PPPOX`, `len`
+    // is exactly its size, and it lives for the whole call; the kernel copies the bytes and
+    // keeps no pointer to them.
+    let rc = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            std::ptr::from_ref(&address).cast::<libc::sockaddr>(),
+            len,
+        )
+    };
+    if rc == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `PPPIOCNEWUNIT` on a fresh `/dev/ppp` descriptor: the kernel makes a unit with any free
+/// number, names its netdev `ppp<N>` and attaches the descriptor to it; `N`.
+///
+/// # Errors
+///
+/// When the kernel refuses (`ENOTTY` on a descriptor that is not `/dev/ppp`).
+pub fn ppp_new_unit(fd: BorrowedFd<'_>) -> io::Result<u32> {
+    let mut unit: libc::c_int = -1;
+    // SAFETY: `fd` is an open descriptor and `unit` is a live `c_int` the kernel reads (the
+    // number asked for, -1 for any) and writes (the number given) within the call.
+    unsafe { ioctl::new_unit(fd.as_raw_fd(), &raw mut unit) }.map_err(io::Error::from)?;
+    u32::try_from(unit)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("unit number {unit}")))
+}
+
+/// `PPPIOCGCHAN` on a connected PPPoE socket: the kernel's index of its channel.
+///
+/// # Errors
+///
+/// When the kernel refuses (`ENOTCONN` before `connect`).
+pub fn ppp_channel_index(fd: BorrowedFd<'_>) -> io::Result<libc::c_int> {
+    let mut index: libc::c_int = 0;
+    // SAFETY: `fd` is an open descriptor and `index` is a live `c_int` the kernel writes
+    // within the call.
+    unsafe { ioctl::channel_index(fd.as_raw_fd(), &raw mut index) }.map_err(io::Error::from)?;
+    Ok(index)
+}
+
+/// `PPPIOCATTCHAN(index)` on a fresh `/dev/ppp` descriptor: it becomes the channel's, where the
+/// link-layer control frames (protocols `0xc000` and above) are read and written.
+///
+/// # Errors
+///
+/// When the kernel refuses (`ENXIO` for an index that is not a channel).
+pub fn ppp_attach_channel(fd: BorrowedFd<'_>, index: libc::c_int) -> io::Result<()> {
+    // SAFETY: `fd` is an open descriptor and `index` lives for the whole call; the kernel reads
+    // it and keeps no pointer.
+    unsafe { ioctl::attach_channel(fd.as_raw_fd(), &raw const index) }
+        .map(drop)
+        .map_err(io::Error::from)
+}
+
+/// `PPPIOCCONNECT(unit)` on a channel descriptor: the channel's frames feed unit `unit`, and the
+/// unit's network frames go out through it.
+///
+/// # Errors
+///
+/// When the kernel refuses (`ENXIO` for a unit that does not exist, `EALREADY` when connected).
+pub fn ppp_connect_unit(fd: BorrowedFd<'_>, unit: u32) -> io::Result<()> {
+    let unit = libc::c_int::try_from(unit)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("unit {unit}")))?;
+    // SAFETY: `fd` is an open descriptor and `unit` lives for the whole call; the kernel reads
+    // it and keeps no pointer.
+    unsafe { ioctl::connect_unit(fd.as_raw_fd(), &raw const unit) }
+        .map(drop)
+        .map_err(io::Error::from)
+}
+
+/// `PPPIOCSMRU(mru)` on the unit descriptor: the largest frame the unit accepts.
+///
+/// # Errors
+///
+/// When the kernel refuses.
+pub fn ppp_set_mru(fd: BorrowedFd<'_>, mru: u16) -> io::Result<()> {
+    let mru = libc::c_int::from(mru);
+    // SAFETY: `fd` is an open descriptor and `mru` lives for the whole call; the kernel reads it
+    // and keeps no pointer.
+    unsafe { ioctl::set_mru(fd.as_raw_fd(), &raw const mru) }
+        .map(drop)
+        .map_err(io::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +487,104 @@ mod icmp6_tests {
         assert_eq!(icmp6_filter_words(&[]), [u32::MAX; 8], "nothing passes");
         assert_eq!(icmp6_filter_words(&[0])[0], !1u32);
         assert_eq!(icmp6_filter_words(&[255])[7], !(1u32 << 31));
+    }
+}
+
+#[cfg(test)]
+mod ppp_tests {
+    use super::*;
+
+    /// `_IOC(dir, type, nr, size)` as `asm-generic/ioctl.h` lays it out (the layout musl's
+    /// `x86_64` and `aarch64` share): nr in bits 0..8, type in 8..16, size in 16..30, direction in
+    /// 30..32 with write 1 and read 2.
+    fn ioc(dir: u32, kind: u8, nr: u32, size: u32) -> u32 {
+        (dir << 30) | (size << 16) | (u32::from(kind) << 8) | nr
+    }
+
+    /// The request code a `#define NAME _IOxx('t', nr, int)` line of `linux/ppp-ioctl.h`
+    /// names, parsed from the header's text.
+    fn header_code(header: &str, name: &str) -> u32 {
+        let line = header
+            .lines()
+            .find(|line| {
+                let mut words = line.split_whitespace();
+                words.next() == Some("#define") && words.next() == Some(name)
+            })
+            .unwrap_or_else(|| panic!("{name} is not defined in ppp-ioctl.h"));
+        let macro_call = line
+            .split_whitespace()
+            .skip(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (kind_name, args) = macro_call
+            .split_once('(')
+            .unwrap_or_else(|| panic!("{name}: no macro call in {line:?}"));
+        let dir = match kind_name {
+            "_IO" => 0,
+            "_IOW" => 1,
+            "_IOR" => 2,
+            "_IOWR" => 3,
+            other => panic!("{name}: unknown macro {other}"),
+        };
+        let args: Vec<&str> = args
+            .split(')')
+            .next()
+            .unwrap()
+            .split(',')
+            .map(str::trim)
+            .collect();
+        assert_eq!(args[0], "'t'", "{name}: the type is 't'");
+        let nr: u32 = args[1].parse().unwrap();
+        let size = match args.get(2) {
+            Some(&"int") => 4,
+            None => 0,
+            Some(other) => panic!("{name}: unexpected size type {other}"),
+        };
+        ioc(dir, b't', nr, size)
+    }
+
+    /// The numbers `sys.rs` hands to `ioctl(2)` are the ones the pinned UAPI header defines
+    /// (ADR-0012): parsed from `linux/ppp-ioctl.h`, never trusted from memory.
+    #[test]
+    fn ppp_ioctl_numbers_match_the_pinned_uapi_headers() {
+        let include = std::env::var("OPENFEO_UAPI_INCLUDE")
+            .expect("OPENFEO_UAPI_INCLUDE is set by make (kernel UAPI headers, ADR-0012)");
+        let header = std::fs::read_to_string(format!("{include}/linux/ppp-ioctl.h"))
+            .expect("linux/ppp-ioctl.h under OPENFEO_UAPI_INCLUDE");
+        for (name, ours) in [
+            ("PPPIOCNEWUNIT", PPPIOCNEWUNIT),
+            ("PPPIOCGCHAN", PPPIOCGCHAN),
+            ("PPPIOCATTCHAN", PPPIOCATTCHAN),
+            ("PPPIOCCONNECT", PPPIOCCONNECT),
+            ("PPPIOCSMRU", PPPIOCSMRU),
+        ] {
+            assert_eq!(
+                u64::from(header_code(&header, name)),
+                u64::from(ours),
+                "{name}"
+            );
+        }
+    }
+
+    /// `sockaddr_pppox` is packed: 2 + 4 + (2 + 6 + 16) = 30 bytes, the session id in network
+    /// order right after the protocol, the device name NUL-padded (`linux/if_pppox.h`).
+    #[test]
+    fn the_pppox_address_is_laid_out_as_the_kernel_reads_it() {
+        let bytes = pppox_address_bytes(0x1234, [0x02, 0, 0, 0, 0, 0x42], "p0").unwrap();
+        assert_eq!(bytes.len(), 30);
+        assert_eq!(&bytes[..2], &24u16.to_ne_bytes(), "AF_PPPOX");
+        assert_eq!(&bytes[2..6], &0u32.to_ne_bytes(), "PX_PROTO_OE");
+        assert_eq!(
+            &bytes[6..8],
+            &[0x12, 0x34],
+            "the session id in network order"
+        );
+        assert_eq!(&bytes[8..14], &[0x02, 0, 0, 0, 0, 0x42]);
+        assert_eq!(&bytes[14..16], b"p0");
+        assert!(bytes[16..].iter().all(|b| *b == 0));
+        assert!(
+            pppox_address_bytes(1, [0; 6], "a-name-of-sixteen").is_none(),
+            "a name that does not fit IFNAMSIZ with its NUL is refused"
+        );
     }
 }

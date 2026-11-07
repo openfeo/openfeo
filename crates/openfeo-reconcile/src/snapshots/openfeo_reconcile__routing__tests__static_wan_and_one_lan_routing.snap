@@ -5,8 +5,10 @@ expression: desired
 addrs:
   - ifname: br-lan0
     net: 192.168.1.1/24
+    peer: ~
   - ifname: p0
     net: 203.0.113.10/24
+    peer: ~
 routes:
   - ifname: p0
     dst: ~

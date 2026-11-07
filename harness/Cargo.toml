@@ -32,6 +32,7 @@ openfeo-platform = { path = "../crates/openfeo-platform" }
 openfeo-proto-dhcp6 = { path = "../crates/openfeo-proto-dhcp6" }
 openfeo-proto-dns = { path = "../crates/openfeo-proto-dns" }
 openfeo-proto-ndp = { path = "../crates/openfeo-proto-ndp" }
+openfeo-proto-ppp = { path = "../crates/openfeo-proto-ppp" }
 openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
 openfeo-world = { path = "../crates/openfeo-world" }
 
@@ -93,6 +94,11 @@ harness = false
 [[test]]
 name = "m2pd"
 path = "tests/m2pd.rs"
+harness = false
+
+[[test]]
+name = "pppoe"
+path = "tests/pppoe.rs"
 harness = false
 
 [lints]

@@ -21,7 +21,8 @@ pub use error::ConfigError;
 pub use generated::{
     Config, Dhcp4Lease, Dhcp4Route, Dhcp4ServerLease, Dhcp4ServerLeases, Dhcp6Binding,
     Dhcp6Deprecated, Dhcp6Lease, DhcpWan, Dns, Firewall, Ipv6Wan, Lan, LanDhcp, PortForward,
-    PortMap, PortMapEntry, PublicIpv4, Record, Rule, StaticLease, StaticWan, System, Wan, wan,
+    PortMap, PortMapEntry, PppoeWan, PublicIpv4, Record, Rule, StaticLease, StaticWan, System, Wan,
+    wan,
 };
 
 #[cfg(test)]

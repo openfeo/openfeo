@@ -1,0 +1,33 @@
+---
+source: crates/openfeo-reconcile/src/dns.rs
+expression: with_route
+---
+listeners:
+  - ifname: br-lan0
+    address: 192.168.1.1
+    address6:
+      - "2001:db8:1:222::1"
+      - "fd12:3456:789a:1::1"
+upstreams:
+  - 203.0.113.1
+  - "2001:db8:ffff::1"
+learned_from: wan0
+wan_upstreams:
+  - 203.0.113.1
+  - "2001:db8:ffff::1"
+domain: home.arpa
+router_name: openfeo.home.arpa
+router_addrs:
+  - 192.168.1.1
+  - "2001:db8:1:222::1"
+  - "fd12:3456:789a:1::1"
+  - "2001:db8:1::1"
+  - "fd12:3456:789a::1"
+wan_addrs:
+  - 203.0.113.100
+lan_subnets:
+  - 192.168.1.0/24
+guard_subnets:
+  - 192.168.1.0/24
+local: []
+rebind_allow: []

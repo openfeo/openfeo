@@ -150,6 +150,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         });
     }
     crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
+    crate::pppoe::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
     crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
     crate::dhcp6::spawn_all(&supervisor, &publisher, &world_rx);
     crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
