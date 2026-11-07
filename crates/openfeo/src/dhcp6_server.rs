@@ -15,6 +15,7 @@ use openfeo_net::dhcp6::ServerSocket;
 use openfeo_proto_dhcp4::identity::duid_ll;
 use openfeo_proto_dhcp6::server::{Config, INFORMATION_REFRESH_TIME, reply};
 use openfeo_reconcile::dhcp6_server::{DesiredResponder, desired};
+use openfeo_reconcile::ra::wanted;
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{Publisher, Supervisor};
@@ -29,7 +30,7 @@ const RECEIVE_BUFFER: usize = 1500;
 
 /// The one responder task, when a LAN advertises.
 pub fn spawn(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    if desired(&publisher.current()).is_empty() {
+    if !wanted(&publisher.current()) {
         info!("dhcp6-server not started: no LAN advertises");
         return;
     }

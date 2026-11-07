@@ -639,3 +639,23 @@ Each with what it costs if wrong.
 17. **With only the address bound, the prefix is asked for again in each Renew and Rebind; the
     client keeps one exchange schedule.** Cost: a prefix that becomes available between renewals
     is learned at the next T1 rather than within SOL_MAX_RT.
+
+## After the whole-branch review (2026-11-07)
+
+- #27 is **not** fixed by this part after all: an address leaving the port when its preferred
+  lifetime lapses (the sentence under *Routing* above, and the SLAAC half in the RA client) was not
+  built, and installing addresses with kernel lifetimes is a day's work with its own failure modes.
+  SPEC §7.3 now describes what is built (an address leaves with its valid lifetime or a lifetime of
+  0) and #27 stays open.
+- A Reply that binds nothing is followed by another Solicit after thirty seconds, doubling to
+  `SOL_MAX_RT`, instead of one full `SOL_MAX_RT` later (SPEC §7.3 says so now): a subscriber the
+  ISP provisions a moment after the first Solicit is served within a minute, not an hour.
+- The client never sends straight out of a Reply: an answer that leaves T1 already due waits ten
+  seconds, and `NoBinding` is followed by a Request on the timer, so a server sets the pace of
+  nothing. T1 and T2 defaults skip leases with no preferred lifetime left. Only global unicast is
+  taken from a server. T2 of `u32::MAX` means never Rebind.
+- A binding restored from disk carries what is left of its lifetimes and counts from now, rather
+  than being wound back to before boot.
+- A delegation too short for a LAN's index is said once on the console
+  (`dhcp6 wan0 prefix 2001:db8:100::/60 is too short for lan1 (index 20)`), as promised above.
+- The RA and responder tasks start on the configuration, not on the facts at boot.

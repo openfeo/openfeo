@@ -20,7 +20,9 @@ use openfeo_proto_ndp::server::{
 };
 use openfeo_proto_ndp::wire::Preference;
 use openfeo_reconcile::lan6::Source;
-use openfeo_reconcile::ra::{DEPRECATION_SECS, DesiredPio, DesiredRa, PioLifetimes, desired};
+use openfeo_reconcile::ra::{
+    DEPRECATION_SECS, DesiredPio, DesiredRa, PioLifetimes, desired, wanted,
+};
 use openfeo_runtime::clock;
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
@@ -41,7 +43,7 @@ const MS: u64 = 1000;
 
 /// The one advertisement task, when a LAN advertises.
 pub fn spawn(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    if desired(&publisher.current()).is_empty() {
+    if !wanted(&publisher.current()) {
         info!("ra not started: no LAN advertises");
         return;
     }

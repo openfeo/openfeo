@@ -9,6 +9,7 @@
 //! its remaining valid lifetime, and a binding without carrier for two hours is dropped. Every
 //! line logged here is a contract with the harness scenarios.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_proto_dhcp4::identity::{duid_ll, from_hex, hex};
 use openfeo_proto_dhcp6::client::{Binding, Client, Config, Input, Lease6, Note, Output};
 use openfeo_proto_dhcp6::iaid;
+use openfeo_reconcile::lan6;
 use openfeo_runtime::clock;
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
@@ -223,12 +225,20 @@ pub fn binding_from_file(
         return None;
     }
     let age_secs = now_unix.saturating_sub(file.obtained_unix);
+    // What is left of a lifetime after the file's age; infinite stays infinite.
+    let left = |secs: u32| -> u32 {
+        if secs == u32::MAX {
+            secs
+        } else {
+            u32::try_from(u64::from(secs).saturating_sub(age_secs)).unwrap_or(0)
+        }
+    };
     let lease = |entry: &Dhcp6Binding| -> Option<Lease6> {
         let net: Ipv6Net = entry.net.parse().ok()?;
-        (entry.valid_secs == u32::MAX || u64::from(entry.valid_secs) > age_secs).then_some(Lease6 {
+        (left(entry.valid_secs) > 0).then_some(Lease6 {
             net,
-            preferred: entry.preferred_secs,
-            valid: entry.valid_secs,
+            preferred: left(entry.preferred_secs),
+            valid: left(entry.valid_secs),
         })
     };
     let prefixes: Vec<Lease6> = file.prefixes.iter().filter_map(lease).collect();
@@ -252,15 +262,17 @@ pub fn binding_from_file(
             server: from_hex(&file.server_duid).unwrap_or_default(),
             prefixes,
             addresses,
-            t1: file.t1_secs,
-            t2: file.t2_secs,
+            t1: left(file.t1_secs),
+            t2: left(file.t2_secs),
             dns: file
                 .dns
                 .iter()
                 .filter_map(|text| text.parse().ok())
                 .collect(),
             search: file.search.clone(),
-            bound_at: now_ms.saturating_sub(age_secs * MS),
+            // The lifetimes above already carry the age, so the binding counts from now: a
+            // process clock a few seconds old cannot be wound back to before boot.
+            bound_at: now_ms,
         },
         deprecated,
     ))
@@ -341,6 +353,8 @@ struct Run<'a> {
     pending: Option<(Vec<u8>, u8, Instant)>,
     /// When carrier went, for the two-hour drop.
     down_since: Option<Instant>,
+    /// Delegations too short for a LAN's index already said on the console.
+    left_out_said: BTreeSet<(Ipv6Net, String)>,
 }
 
 /// The task: wait for the port, restore the binding from disk, run the client on the port's
@@ -379,6 +393,7 @@ async fn run(
         deprecations: Deprecations::default(),
         pending: None,
         down_since: None,
+        left_out_said: BTreeSet::new(),
     };
     let restored = read_binding(&run.path, &task.wan, mac);
     if let Some((binding, deprecated)) = &restored {
@@ -543,6 +558,29 @@ impl Run<'_> {
         .await;
         self.binding = Some(binding);
         self.publish();
+        self.say_left_out();
+    }
+
+    /// A delegation too short for a LAN's index is said once per prefix and LAN (SPEC §7.3):
+    /// the LAN keeps its other prefixes and the owner learns why this one gave it nothing.
+    fn say_left_out(&mut self) {
+        let world = self.publisher.current();
+        let lan6 = lan6::prefixes(&world);
+        let indexes: BTreeMap<String, u32> = world
+            .config
+            .lans
+            .iter()
+            .enumerate()
+            .map(|(position, lan)| (lan.name.clone(), lan6::lan_index(lan, position + 1)))
+            .collect();
+        for line in left_out_lines(
+            &self.task.wan,
+            &lan6.left_out,
+            &indexes,
+            &mut self.left_out_said,
+        ) {
+            warn!("{line}");
+        }
     }
 
     fn gone(&mut self, nets: &[Ipv6Net]) {
@@ -705,6 +743,27 @@ fn restored_line(wan: &str, binding: &Binding) -> String {
 }
 
 /// `dhcp6 wan0 prefix 2001:db8:100::/56 gone: deprecated for 55 s`.
+/// `dhcp6 wan0 prefix 2001:db8:100::/60 is too short for lan1 (index 20)`: once per prefix and
+/// LAN while the prefix is held; one that leaves and comes back is said again.
+fn left_out_lines(
+    wan: &str,
+    left_out: &[(Ipv6Net, String)],
+    indexes: &BTreeMap<String, u32>,
+    said: &mut BTreeSet<(Ipv6Net, String)>,
+) -> Vec<String> {
+    said.retain(|pair| left_out.contains(pair));
+    left_out
+        .iter()
+        .filter(|pair| said.insert((*pair).clone()))
+        .map(|(net, lan)| {
+            format!(
+                "dhcp6 {wan} prefix {net} is too short for {lan} (index {})",
+                indexes.get(lan).copied().unwrap_or(0)
+            )
+        })
+        .collect()
+}
+
 fn gone_line(wan: &str, net: Ipv6Net, secs: u64) -> String {
     format!("dhcp6 {wan} prefix {net} gone: deprecated for {secs} s")
 }
@@ -725,6 +784,7 @@ fn note_line(wan: &str, note: &Note) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const MAC: [u8; 6] = [0x52, 0x54, 0, 0xfe, 0, 0];
     const SERVER: [u8; 10] = [0, 3, 0, 1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
@@ -813,22 +873,83 @@ mod tests {
         let text = file::render_dhcp6_lease(&file).unwrap();
         let parsed = file::parse_dhcp6_lease(&text).unwrap();
         assert_eq!(parsed, file);
-        // Read back 20 s later: the leases keep their lifetimes, placed 25 s back on the new
-        // process clock, and the deprecation keeps its deadline.
+        // Read back 20 s later, on a process clock that has run a second and a half: the
+        // leases lose the 25 s since the Reply (the LANs are told what is left, RFC 7084 L-13),
+        // T1 and T2 are already due, the binding counts from now, and the deprecation keeps
+        // its deadline.
         let (restored, deprecated) =
-            binding_from_file(&parsed, "wan0", MAC, 1_800_000_020, 100_000).expect("restored");
-        assert_eq!(restored.prefixes, binding(0).prefixes);
-        assert_eq!(restored.addresses, binding(0).addresses);
-        assert_eq!(restored.bound_at, 75_000);
-        assert_eq!((restored.t1, restored.t2), (10, 16));
+            binding_from_file(&parsed, "wan0", MAC, 1_800_000_020, 1_500).expect("restored");
+        assert_eq!(
+            (restored.prefixes[0].preferred, restored.prefixes[0].valid),
+            (15, 35)
+        );
+        assert_eq!(
+            (restored.addresses[0].preferred, restored.addresses[0].valid),
+            (15, 35)
+        );
+        assert_eq!(
+            restored.bound_at, 1_500,
+            "counted from now, not from before boot"
+        );
+        assert_eq!(
+            (restored.t1, restored.t2),
+            (0, 0),
+            "25 s past a T1 of 10 and a T2 of 16"
+        );
         assert_eq!(restored.server, SERVER.to_vec());
         assert_eq!(restored.dns, binding(0).dns);
         assert_eq!(
             deprecated,
             vec![Deprecated {
                 net: net("2001:db8:200::/56"),
-                until_ms: 135_000
+                until_ms: 36_500
             }]
+        );
+    }
+
+    #[test]
+    fn a_restored_binding_keeps_infinite_lifetimes_infinite() {
+        let mut forever = binding(10_000);
+        forever.prefixes[0].valid = u32::MAX;
+        forever.prefixes[0].preferred = u32::MAX;
+        forever.t1 = u32::MAX;
+        forever.t2 = u32::MAX;
+        let file = binding_file("wan0", MAC, &forever, &[], 1_800_000_000, 15_000);
+        let (restored, _) =
+            binding_from_file(&file, "wan0", MAC, 1_800_900_000, 2_000).expect("restored");
+        assert_eq!(
+            (restored.prefixes[0].preferred, restored.prefixes[0].valid),
+            (u32::MAX, u32::MAX)
+        );
+        assert_eq!((restored.t1, restored.t2), (u32::MAX, u32::MAX));
+        assert!(
+            restored.addresses.is_empty(),
+            "the 60 s address lapsed ten days ago"
+        );
+    }
+
+    #[test]
+    fn a_short_delegation_is_said_once_per_lan() {
+        let mut said = BTreeSet::new();
+        let indexes = BTreeMap::from([("lan0".to_owned(), 1), ("lan1".to_owned(), 20)]);
+        let short = net("2001:db8:100::/60");
+        let left_out = vec![(short, "lan1".to_owned())];
+        assert_eq!(
+            left_out_lines("wan0", &left_out, &indexes, &mut said),
+            vec!["dhcp6 wan0 prefix 2001:db8:100::/60 is too short for lan1 (index 20)".to_owned()]
+        );
+        assert!(
+            left_out_lines("wan0", &left_out, &indexes, &mut said).is_empty(),
+            "said once"
+        );
+        // The prefix left the binding and came back: said again.
+        assert!(
+            left_out_lines("wan0", &[], &indexes, &mut said).is_empty(),
+            "nothing left out, nothing said"
+        );
+        assert_eq!(
+            left_out_lines("wan0", &left_out, &indexes, &mut said).len(),
+            1
         );
     }
 

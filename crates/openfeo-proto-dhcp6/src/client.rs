@@ -38,6 +38,14 @@ pub const CNF_MAX_RT: Timestamp = 4 * MS;
 pub const CNF_MAX_RD: Timestamp = 10 * MS;
 /// How long a Reply that failed outright (`UnspecFail`) holds the next Solicit off.
 pub const FAIL_HOLDOFF: Timestamp = 30 * MS;
+/// The least time between a Reply and the next exchange it calls for: a server whose answer
+/// leaves T1 already due (its own T1 and T2 of 0 with a lease that has next to no preferred
+/// lifetime) is asked again at this pace, never at its own response rate.
+pub const REPLY_HOLDOFF: Timestamp = 10 * MS;
+/// Only global unicast (`2000::/3`) is taken from a server, for prefixes and addresses alike.
+const GLOBAL_UNICAST: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3);
+/// The shortest delegation accepted; `MAX_DELEGATED_LEN` is the longest.
+const MIN_DELEGATED_LEN: u8 = 8;
 /// Prefixes and addresses kept from one binding; more are ignored.
 pub const MAX_PREFIXES: usize = 8;
 pub const MAX_ADDRESSES: usize = 8;
@@ -231,6 +239,9 @@ pub struct Client {
     /// where silence keeps the binding.
     rebind: Rebind,
     sol_max_rt: Timestamp,
+    /// How long to wait before Soliciting again after a Reply that bound nothing: doubles
+    /// from [`FAIL_HOLDOFF`] to `sol_max_rt`, back to the start once something is bound.
+    nothing_rt: Timestamp,
     /// The best Advertise so far, with its preference.
     advertise: Option<(u8, Message)>,
     /// The Advertise being requested.
@@ -258,6 +269,7 @@ impl Client {
             deadline: None,
             rebind: Rebind::Scheduled,
             sol_max_rt: SOL_MAX_RT,
+            nothing_rt: FAIL_HOLDOFF,
             advertise: None,
             offer: None,
             binding: None,
@@ -403,7 +415,10 @@ impl Client {
 
     fn renew(&mut self, now: Timestamp, out: &mut Vec<Output>) {
         self.begin(State::Renewing, now, REN_TIMEOUT);
-        self.deadline = self.binding.as_ref().and_then(Binding::t2_at);
+        self.deadline = self
+            .binding
+            .as_ref()
+            .and_then(|b| b.t2_at().or_else(|| b.first_expiry()));
         out.push(Output::Note(Note::Renewing));
         self.send_refresh(MessageType::Renew, now, out);
     }
@@ -525,13 +540,19 @@ impl Client {
                     out.push(Output::Note(Note::Restarting("no reply to the request")));
                     self.solicit(now, out);
                 } else {
-                    self.rt = self.next_rt(REQ_MAX_RT);
+                    // The first Request of an exchange begun by `NoBinding` goes at the
+                    // initial timeout; every later one backs off.
+                    if self.rc > 0 {
+                        self.rt = self.next_rt(REQ_MAX_RT);
+                    }
                     self.send_request(now, out);
                 }
             }
             State::Renewing => {
-                if self.deadline.is_some_and(|t2| now >= t2) {
-                    self.rebind(now, out);
+                if self.deadline.is_some_and(|end| now >= end) {
+                    // T2, or the valid lifetimes when T2 never comes: what follows is
+                    // whatever the binding calls for now.
+                    self.go_bound(now, out);
                 } else {
                     self.rt = self.next_rt(REN_MAX_RT);
                     self.send_refresh(MessageType::Renew, now, out);
@@ -585,24 +606,34 @@ impl Client {
             return;
         };
         match (binding.t1_at(), binding.t2_at(), binding.first_expiry()) {
-            (None, _, _) => {
+            // Nothing finite: nothing to do, ever.
+            (None, _, None) => {
                 self.state = State::Bound;
                 self.timeout = None;
             }
-            (Some(t1), _, _) if now < t1 => {
-                self.state = State::Bound;
-                self.timeout = Some(t1);
-            }
-            (_, Some(t2), _) if now < t2 => self.renew(now, out),
-            (_, _, Some(end)) if now < end => self.rebind(now, out),
-            (_, None, _) | (_, _, None) => self.rebind(now, out),
-            _ => {
+            // The valid lifetimes have run out: start over.
+            (_, _, Some(end)) if now >= end => {
                 let gone: Vec<Ipv6Net> = binding.nets().collect();
                 out.push(Output::Gone(gone));
                 self.binding = None;
                 out.push(Output::Note(Note::Restarting("the binding expired")));
                 self.solicit(now, out);
             }
+            // T1 never comes: wait for the expiry.
+            (None, _, Some(end)) => {
+                self.state = State::Bound;
+                self.timeout = Some(end);
+            }
+            (Some(t1), _, _) if now < t1 => {
+                self.state = State::Bound;
+                self.timeout = Some(t1);
+            }
+            // T1 has come: Renew until T2, or for as long as the leases last when T2 never
+            // comes (§21.4: an infinite T2 means never Rebind).
+            (_, Some(t2), _) if now < t2 => self.renew(now, out),
+            (_, None, _) => self.renew(now, out),
+            // T2 has come and the leases still stand: Rebind.
+            (_, Some(_), _) => self.rebind(now, out),
         }
     }
 
@@ -711,6 +742,7 @@ impl Client {
 
     #[allow(clippy::too_many_lines)]
     fn reply(&mut self, message: &Message, now: Timestamp, out: &mut Vec<Output>) {
+        let server = message.server_id().map(<[u8]>::to_vec).unwrap_or_default();
         if let Some((code, _)) = message.status()
             && code != StatusCode::Success
         {
@@ -719,7 +751,7 @@ impl Client {
                     // Everything already goes to the group; send it again.
                     self.resend(now, out);
                 }
-                StatusCode::NoBinding => self.request_binding(now, out),
+                StatusCode::NoBinding => self.request_binding(now, &server, out),
                 _ => {
                     out.push(Output::Note(Note::Restarting(
                         "the server reported a failure",
@@ -752,7 +784,7 @@ impl Client {
                     options,
                 } if *iaid == self.config.iaid_pd => match option.status() {
                     Some((StatusCode::NoBinding, _)) => {
-                        self.request_binding(now, out);
+                        self.request_binding(now, &server, out);
                         return;
                     }
                     Some((StatusCode::NoPrefixAvail, _)) => no_prefix = true,
@@ -770,7 +802,7 @@ impl Client {
                     options,
                 } if *iaid == self.config.iaid_na => match option.status() {
                     Some((StatusCode::NoBinding, _)) => {
-                        self.request_binding(now, out);
+                        self.request_binding(now, &server, out);
                         return;
                     }
                     Some((StatusCode::NoAddrsAvail, _)) => no_address = true,
@@ -844,12 +876,19 @@ impl Client {
         if prefixes.is_empty() && addresses.is_empty() {
             self.binding = None;
             self.offer = None;
-            // Nothing bound: keep asking, at the pace the server allows (§18.2.10).
-            self.solicit_after(now, self.sol_max_rt);
+            // Nothing bound: keep asking, backing off from the holdoff to the pace the
+            // server allows (§18.2.10), so a subscriber provisioned a moment later is served
+            // within a minute, not an hour.
+            let holdoff = self.nothing_rt;
+            self.nothing_rt = self
+                .nothing_rt
+                .saturating_mul(2)
+                .min(self.sol_max_rt.max(FAIL_HOLDOFF));
+            self.solicit_after(now, holdoff);
             return;
         }
+        self.nothing_rt = FAIL_HOLDOFF;
         let (t1, t2) = default_times(t1, t2, &prefixes, &addresses);
-        let server = message.server_id().map(<[u8]>::to_vec).unwrap_or_default();
         let binding = Binding {
             server,
             prefixes,
@@ -865,26 +904,46 @@ impl Client {
         self.offer = None;
         self.advertise = None;
         out.push(Output::Bound { binding, renewed });
-        self.go_bound(now, out);
+        self.settle(now, out);
+    }
+
+    /// After a Reply: arm the next exchange. One whose T1 is already due waits
+    /// [`REPLY_HOLDOFF`] first, so nothing is ever sent straight out of an answer.
+    fn settle(&mut self, now: Timestamp, out: &mut Vec<Output>) {
+        let due = self
+            .binding
+            .as_ref()
+            .and_then(Binding::t1_at)
+            .is_some_and(|t1| t1 <= now);
+        if due {
+            self.state = State::Bound;
+            self.timeout = Some(now.saturating_add(REPLY_HOLDOFF));
+        } else {
+            self.go_bound(now, out);
+        }
     }
 
     /// `NoBinding`: the server does not know the binding; ask for it with Request (§18.2.10.1),
     /// or start over when there is none to ask for.
-    fn request_binding(&mut self, now: Timestamp, out: &mut Vec<Output>) {
+    /// `server` is the one that answered: on a Rebind it may not be the one that bound us,
+    /// and a Request names the server it is for (§16.4). The Request goes out on the timer,
+    /// so a server that answers every Request with `NoBinding` sets the pace of nothing.
+    fn request_binding(&mut self, now: Timestamp, server: &[u8], out: &mut Vec<Output>) {
         let Some(binding) = self.binding.clone() else {
             self.solicit(now, out);
             return;
         };
         let mut offer = Message::new(MessageType::Advertise, 0);
-        offer
-            .options
-            .push(Dhcp6Option::ServerId(binding.server.clone()));
+        offer.options.push(Dhcp6Option::ServerId(server.to_vec()));
         offer.options.push(self.ia_pd(&binding.prefixes));
         offer.options.push(self.ia_na(&binding.addresses));
         out.push(Output::Note(Note::Restarting(
             "the server has no binding for us",
         )));
-        self.request(now, offer, out);
+        self.begin(State::Requesting, now, REQ_TIMEOUT);
+        self.offer = Some(offer);
+        self.last_sent = None;
+        self.timeout = Some(now.saturating_add(REQ_TIMEOUT));
     }
 
     fn resend(&mut self, now: Timestamp, out: &mut Vec<Output>) {
@@ -934,6 +993,14 @@ impl Client {
 /// The usable leases among an IA's options: valid lifetime above 0 and not below the
 /// preferred one (§21.22, §21.6), a delegated prefix no longer than [`MAX_DELEGATED_LEN`]; at
 /// most [`MAX_PREFIXES`] or [`MAX_ADDRESSES`].
+/// A delegation worth having: global unicast, between a /8 and a /64. Anything else (`::/0`,
+/// a ULA or multicast range, a link-local prefix) would become a blackhole route and a
+/// source rule the server has no business installing.
+fn delegation_is_sane(prefix: Ipv6Net) -> bool {
+    (MIN_DELEGATED_LEN..=MAX_DELEGATED_LEN).contains(&prefix.prefix_len())
+        && GLOBAL_UNICAST.contains(&prefix.trunc())
+}
+
 fn leases_in(options: &[Dhcp6Option], prefixes: bool) -> Vec<Lease6> {
     let limit = if prefixes {
         MAX_PREFIXES
@@ -948,7 +1015,7 @@ fn leases_in(options: &[Dhcp6Option], prefixes: bool) -> Vec<Lease6> {
                 preferred,
                 valid,
                 ..
-            } if prefixes && prefix.prefix_len() <= MAX_DELEGATED_LEN => Some(Lease6 {
+            } if prefixes && delegation_is_sane(*prefix) => Some(Lease6 {
                 net: prefix.trunc(),
                 preferred: *preferred,
                 valid: *valid,
@@ -958,7 +1025,7 @@ fn leases_in(options: &[Dhcp6Option], prefixes: bool) -> Vec<Lease6> {
                 preferred,
                 valid,
                 ..
-            } if !prefixes => Some(Lease6 {
+            } if !prefixes && GLOBAL_UNICAST.contains(addr) => Some(Lease6 {
                 net: Ipv6Net::from(*addr),
                 preferred: *preferred,
                 valid: *valid,
@@ -998,12 +1065,18 @@ fn merge_times(t1: u32, t2: u32, ia_t1: u32, ia_t2: u32) -> (u32, u32) {
 /// T1 and T2 as bound: the server's, or 0.5 and 0.8 of the shortest preferred lifetime
 /// (§21.4, §21.21); never T1 above T2; infinite when every lifetime is.
 fn default_times(t1: u32, t2: u32, prefixes: &[Lease6], addresses: &[Lease6]) -> (u32, u32) {
-    let shortest = prefixes
-        .iter()
-        .chain(addresses)
-        .map(|lease| lease.preferred)
-        .filter(|preferred| *preferred != INFINITE)
-        .min();
+    // The shortest preferred lifetime that is a lifetime at all: a lease the server hands back
+    // deprecated (preferred 0, valid still running, RFC 4192 renumbering) must not pull T1 to
+    // 0; with nothing preferred, the valid lifetimes stand in.
+    let shortest = |pick: fn(&Lease6) -> u32| {
+        prefixes
+            .iter()
+            .chain(addresses)
+            .map(pick)
+            .filter(|secs| *secs != INFINITE && *secs != 0)
+            .min()
+    };
+    let shortest = shortest(|lease| lease.preferred).or_else(|| shortest(|lease| lease.valid));
     let Some(shortest) = shortest else {
         return (INFINITE, INFINITE);
     };
@@ -1488,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn no_prefix_and_no_address_keeps_soliciting_at_the_cap() {
+    fn no_prefix_and_no_address_keeps_soliciting_after_a_holdoff() {
         let mut client = new_client();
         let out = client.handle(Input::Start { binding: None }, 0);
         let solicit = sent(&out);
@@ -1509,8 +1582,8 @@ mod tests {
             vec![Note::NoPrefixAvailable, Note::NoAddressAvailable]
         );
         assert_eq!(client.state(), State::Soliciting);
-        assert_eq!(client.next_timeout(), Some(5_000 + SOL_MAX_RT));
-        let out = client.handle(Input::Timeout, 5_000 + SOL_MAX_RT);
+        assert_eq!(client.next_timeout(), Some(5_000 + FAIL_HOLDOFF));
+        let out = client.handle(Input::Timeout, 5_000 + FAIL_HOLDOFF);
         assert_eq!(sent(&out).kind, MessageType::Solicit);
     }
 
@@ -1527,11 +1600,13 @@ mod tests {
             Vec::new(),
         );
         let out = client.handle(Input::Packet(reply), 15_100);
+        assert!(sends(&out).is_empty(), "the Request goes on the timer");
+        assert_eq!(client.state(), State::Requesting);
+        let out = client.handle(Input::Timeout, 15_100 + REQ_TIMEOUT);
         let request = sent(&out);
         assert_eq!(request.kind, MessageType::Request);
         assert_eq!(request.server_id(), Some(&SERVER[..]));
         assert!(request.options.contains(&ia_pd(PREFIX, 40, 60, 0, 0)));
-        assert_eq!(client.state(), State::Requesting);
         assert!(
             client.binding().is_some(),
             "kept until the server says otherwise"
@@ -1815,5 +1890,261 @@ mod tests {
             ),
             (INFINITE, INFINITE)
         );
+    }
+
+    #[test]
+    fn default_times_skip_a_lease_with_no_preferred_lifetime() {
+        let lease = |preferred, valid| Lease6 {
+            net: PREFIX.parse().unwrap(),
+            preferred,
+            valid,
+        };
+        // Graceful renumbering (RFC 4192): the old prefix comes back with preferred 0 and a
+        // valid lifetime still running; it must not pull T1 and T2 down to 0.
+        assert_eq!(
+            default_times(0, 0, &[lease(0, 1000), lease(100, 200)], &[]),
+            (50, 80)
+        );
+        // Nothing preferred at all: the valid lifetimes stand in.
+        assert_eq!(default_times(0, 0, &[lease(0, 1000)], &[]), (500, 800));
+    }
+
+    /// A Reply that leaves T1 already due (the server's own T1 and T2 of 0 with a lease that
+    /// has a second of preferred lifetime) is not answered with a Renew or Rebind at once: the
+    /// next exchange waits `REPLY_HOLDOFF`, so a server is asked at the client's pace, never
+    /// at its own response rate.
+    #[test]
+    fn a_reply_whose_t1_has_passed_waits_before_the_next_exchange() {
+        let mut client = new_client();
+        let out = client.handle(Input::Start { binding: None }, 0);
+        let solicit = sent(&out);
+        let reply = answer(
+            &solicit,
+            MessageType::Reply,
+            &SERVER,
+            vec![ia_pd(PREFIX, 1, 1000, 0, 0), ia_na(ADDRESS, 1, 1000, 0, 0)],
+            [vec![Dhcp6Option::RapidCommit], resolvers()].concat(),
+        );
+        let out = client.handle(Input::Packet(reply), 5_000);
+        let (binding, _) = bound_output(&out).expect("bound");
+        assert_eq!((binding.t1, binding.t2), (0, 0));
+        assert!(
+            sends(&out).is_empty(),
+            "no exchange straight out of a Reply: {out:?}"
+        );
+        assert_eq!(client.state(), State::Bound);
+        assert_eq!(client.next_timeout(), Some(5_000 + REPLY_HOLDOFF));
+        let out = client.handle(Input::Timeout, 5_000 + REPLY_HOLDOFF);
+        let refresh = sent(&out);
+        assert_eq!(refresh.kind, MessageType::Rebind, "T2 has passed too");
+        let reply = answer(
+            &refresh,
+            MessageType::Reply,
+            &SERVER,
+            vec![ia_pd(PREFIX, 1, 1000, 0, 0), ia_na(ADDRESS, 1, 1000, 0, 0)],
+            resolvers(),
+        );
+        let now = 5_000 + REPLY_HOLDOFF + 100;
+        let out = client.handle(Input::Packet(reply), now);
+        assert!(bound_output(&out).is_some_and(|(_, renewed)| renewed));
+        assert!(sends(&out).is_empty(), "still paced: {out:?}");
+        assert_eq!(client.next_timeout(), Some(now + REPLY_HOLDOFF));
+    }
+
+    /// `NoBinding` restarts with Request, but on the timer: a server that answers every
+    /// Request with `NoBinding` is asked once a second with the usual backoff, not in a loop.
+    #[test]
+    fn no_binding_is_requested_on_the_timer_not_at_the_servers_pace() {
+        let (mut client, _) = bound();
+        let out = client.handle(Input::Timeout, 15_000);
+        let renew = sent(&out);
+        let reply = answer(
+            &renew,
+            MessageType::Reply,
+            &SERVER,
+            vec![ia_status(0x11, true, StatusCode::NoBinding)],
+            Vec::new(),
+        );
+        let out = client.handle(Input::Packet(reply), 15_100);
+        assert!(
+            sends(&out).is_empty(),
+            "the Request waits for the timer: {out:?}"
+        );
+        assert_eq!(client.state(), State::Requesting);
+        assert_eq!(client.next_timeout(), Some(15_100 + REQ_TIMEOUT));
+        let out = client.handle(Input::Timeout, 15_100 + REQ_TIMEOUT);
+        let request = sent(&out);
+        assert_eq!(request.kind, MessageType::Request);
+        assert_eq!(request.server_id(), Some(&SERVER[..]));
+        assert!(request.options.contains(&ia_pd(PREFIX, 40, 60, 0, 0)));
+        let reply = answer(
+            &request,
+            MessageType::Reply,
+            &SERVER,
+            vec![ia_status(0x11, true, StatusCode::NoBinding)],
+            Vec::new(),
+        );
+        let now = 15_100 + REQ_TIMEOUT + 50;
+        let out = client.handle(Input::Packet(reply), now);
+        assert!(sends(&out).is_empty(), "paced again: {out:?}");
+        assert_eq!(client.next_timeout(), Some(now + REQ_TIMEOUT));
+        assert!(
+            client.binding().is_some(),
+            "kept until the server says otherwise"
+        );
+    }
+
+    /// A Rebind may be answered by a server other than the one that bound us; its `NoBinding`
+    /// is followed by a Request addressed to that server, not the old one (RFC 8415 §16.4).
+    #[test]
+    fn no_binding_from_another_server_on_rebind_is_requested_from_that_server() {
+        let (mut client, _) = bound();
+        let out = client.handle(Input::Timeout, 15_000);
+        assert_eq!(sent(&out).kind, MessageType::Renew);
+        let out = client.handle(Input::Timeout, 21_000);
+        let rebind = sent(&out);
+        assert_eq!(rebind.kind, MessageType::Rebind, "T2 at 21 s");
+        let reply = answer(
+            &rebind,
+            MessageType::Reply,
+            &OTHER_SERVER,
+            vec![ia_status(0x11, true, StatusCode::NoBinding)],
+            Vec::new(),
+        );
+        client.handle(Input::Packet(reply), 21_100);
+        let out = client.handle(Input::Timeout, 21_100 + REQ_TIMEOUT);
+        let request = sent(&out);
+        assert_eq!(request.kind, MessageType::Request);
+        assert_eq!(request.server_id(), Some(&OTHER_SERVER[..]));
+    }
+
+    /// T2 of `u32::MAX` means never Rebind (RFC 8415 §21.4): the client keeps Renewing past
+    /// where T2 would have been, and no timer is ever set in the past.
+    #[test]
+    fn an_infinite_t2_renews_and_never_rebinds() {
+        let (mut client, _) = bound_with(10, u32::MAX, 600);
+        let out = client.handle(Input::Timeout, 15_000);
+        assert_eq!(sent(&out).kind, MessageType::Renew);
+        let due = client.next_timeout().expect("retransmission timer");
+        assert!(due > 15_000, "due {due}");
+        let out = client.handle(Input::Timeout, 300_000);
+        assert_eq!(
+            sent(&out).kind,
+            MessageType::Renew,
+            "still renewing, never rebinding"
+        );
+        assert!(client.next_timeout().is_some_and(|at| at > 300_000));
+    }
+
+    /// With T2 infinite the valid lifetimes still end the binding: past them the client
+    /// starts over instead of Rebinding toward a deadline in the past.
+    #[test]
+    fn a_lapsed_binding_with_infinite_t2_expires_and_solicits() {
+        let (mut client, binding) = bound_with(10, u32::MAX, 60);
+        let out = client.handle(Input::Timeout, 70_000);
+        assert_eq!(
+            gone_output(&out).cloned(),
+            Some(binding.nets().collect::<Vec<_>>())
+        );
+        assert_eq!(client.state(), State::Soliciting);
+        assert!(client.next_timeout().is_some_and(|at| at > 70_000));
+    }
+
+    /// Only global unicast is accepted from a server: a delegation of `::/0`, a ULA, a
+    /// multicast or link-local range would otherwise become a blackhole default and a
+    /// catch-all source rule.
+    #[test]
+    fn a_delegation_outside_global_unicast_is_ignored() {
+        let prefix = |text: &str| Dhcp6Option::IaPrefix {
+            prefix: text.parse().unwrap(),
+            preferred: 40,
+            valid: 60,
+            options: Vec::new(),
+        };
+        let address = |text: &str| Dhcp6Option::IaAddr {
+            addr: text.parse().unwrap(),
+            preferred: 40,
+            valid: 60,
+            options: Vec::new(),
+        };
+        let mut client = new_client();
+        let out = client.handle(Input::Start { binding: None }, 0);
+        let solicit = sent(&out);
+        let reply = answer(
+            &solicit,
+            MessageType::Reply,
+            &SERVER,
+            vec![
+                Dhcp6Option::IaPd {
+                    iaid: 0x11,
+                    t1: 10,
+                    t2: 16,
+                    options: vec![
+                        prefix("::/0"),
+                        prefix("::/56"),
+                        prefix("fd00::/56"),
+                        prefix("ff05::/56"),
+                        prefix("fe80::/56"),
+                        prefix("2000::/3"),
+                        prefix(PREFIX),
+                    ],
+                },
+                Dhcp6Option::IaNa {
+                    iaid: 0x22,
+                    t1: 10,
+                    t2: 16,
+                    options: vec![address("fe80::1"), address("::1"), address(ADDRESS)],
+                },
+            ],
+            [vec![Dhcp6Option::RapidCommit], resolvers()].concat(),
+        );
+        let out = client.handle(Input::Packet(reply), 5_000);
+        let (binding, _) = bound_output(&out).expect("bound");
+        assert_eq!(
+            binding.prefixes.iter().map(|l| l.net).collect::<Vec<_>>(),
+            vec![PREFIX.parse::<Ipv6Net>().unwrap()]
+        );
+        assert_eq!(
+            binding.addresses.iter().map(|l| l.net).collect::<Vec<_>>(),
+            vec![Ipv6Net::from(ADDRESS.parse::<Ipv6Addr>().unwrap())]
+        );
+    }
+
+    /// A Reply that binds nothing is followed by another Solicit after `FAIL_HOLDOFF`, then
+    /// twice that, up to `SOL_MAX_RT`: a subscriber not yet provisioned at boot gets IPv6
+    /// within a minute of being provisioned, not an hour later.
+    #[test]
+    fn a_reply_that_binds_nothing_is_solicited_again_with_backoff() {
+        let mut client = new_client();
+        let out = client.handle(Input::Start { binding: None }, 0);
+        let mut solicit = sent(&out);
+        let mut now = 5_000;
+        let mut expected = FAIL_HOLDOFF;
+        for _ in 0..8 {
+            let reply = answer(
+                &solicit,
+                MessageType::Reply,
+                &SERVER,
+                vec![
+                    ia_status(0x11, true, StatusCode::NoPrefixAvail),
+                    ia_status(0x22, false, StatusCode::NoAddrsAvail),
+                ],
+                vec![Dhcp6Option::RapidCommit],
+            );
+            let out = client.handle(Input::Packet(reply), now);
+            assert!(sends(&out).is_empty(), "held off: {out:?}");
+            assert_eq!(
+                client.next_timeout(),
+                Some(now + expected),
+                "holdoff {expected}"
+            );
+            now += expected;
+            let out = client.handle(Input::Timeout, now);
+            solicit = sent(&out);
+            assert_eq!(solicit.kind, MessageType::Solicit);
+            expected = (expected * 2).min(SOL_MAX_RT);
+            now += 100;
+        }
+        assert_eq!(expected, SOL_MAX_RT, "the pace reached the cap");
     }
 }

@@ -13,6 +13,7 @@ use std::net::Ipv6Addr;
 
 use ipnet::Ipv6Net;
 use openfeo_config::load::DEFAULT_DOMAIN;
+use openfeo_config::rules;
 use openfeo_world::{MacAddr, World};
 use serde::Serialize;
 
@@ -80,6 +81,21 @@ pub struct DesiredRa {
 
 /// One advertisement per LAN that carries a prefix and does not say `ra = false`, in
 /// configuration order; nothing without a WAN that carries IPv6.
+/// Whether the configuration calls for advertising at all: a WAN with `[wans.ipv6]` whose port
+/// the map knows, and a LAN that is not IPv4-only and has not switched `ra` off. The tasks
+/// start on this rather than on what the facts hold at boot: a ULA that could not be written,
+/// or a delegation that has not arrived yet, must not leave the LANs unadvertised for the whole
+/// boot.
+#[must_use]
+pub fn wanted(world: &World) -> bool {
+    lan6::ipv6_wan(world).is_some()
+        && world
+            .config
+            .lans
+            .iter()
+            .any(|lan| !rules::lan_is_ipv4_only(lan) && lan.ra != Some(false))
+}
+
 #[must_use]
 pub fn desired(world: &World) -> Vec<DesiredRa> {
     let domain = world
@@ -185,6 +201,7 @@ fn resolvers(prefixes: &[&LanPrefix]) -> Vec<Ipv6Addr> {
 mod tests {
     use super::*;
     use crate::fixtures;
+    use openfeo_config::rules;
     use openfeo_world::MacAddr;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
@@ -343,6 +360,29 @@ mod tests {
             vec![net("fd12:3456:789a::/48")],
             "a stale delegation is no route to advertise"
         );
+    }
+
+    #[test]
+    fn wanted_follows_the_configuration_not_the_facts() {
+        let mut world = fixtures::pd_world();
+        world.ula = None;
+        world.dhcp6 = Arc::new(BTreeMap::new());
+        assert!(desired(&world).is_empty(), "nothing to advertise yet");
+        assert!(wanted(&world), "but the configuration calls for it");
+        assert!(!wanted(&fixtures::static_world()), "no [wans.ipv6]");
+        let mut config = (*world.config).clone();
+        for lan in &mut config.lans {
+            lan.ra = Some(false);
+        }
+        world.config = Arc::new(config);
+        assert!(!wanted(&world), "every LAN placed by hand");
+        let mut world = fixtures::pd_world();
+        let mut config = (*world.config).clone();
+        for lan in &mut config.lans {
+            lan.ipv6 = rules::IPV6_NONE.to_owned();
+        }
+        world.config = Arc::new(config);
+        assert!(!wanted(&world), "every LAN IPv4-only");
     }
 
     #[test]
