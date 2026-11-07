@@ -185,8 +185,36 @@ pub fn is_global_unicast_v4(net: Ipv4Net) -> bool {
     })
 }
 
+/// Whether the WAN speaks PPPoE (SPEC §7.2).
+#[must_use]
+pub fn is_pppoe(wan: &crate::Wan) -> bool {
+    matches!(wan.kind, Some(crate::wan::Kind::Pppoe(_)))
+}
+
+/// The netdev a PPPoE WAN's IP traffic flows through: `ppp-<wan>` (SPEC §7.2, §7.8).
+#[must_use]
+pub fn ppp_ifname(wan: &str) -> String {
+    format!("ppp-{wan}")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ppp_ifname_is_ppp_dash_wan_and_is_pppoe_reads_the_kind() {
+        assert_eq!(super::ppp_ifname("wan0"), "ppp-wan0");
+        let mut wan = crate::Wan {
+            name: "wan0".into(),
+            port: "p0".into(),
+            vlan: 0,
+            priority: 10,
+            kind: Some(crate::wan::Kind::Pppoe(crate::PppoeWan::default())),
+            ipv6: None,
+        };
+        assert!(super::is_pppoe(&wan));
+        wan.kind = Some(crate::wan::Kind::Dhcp(crate::DhcpWan::default()));
+        assert!(!super::is_pppoe(&wan));
+    }
+
     use super::*;
 
     #[test]

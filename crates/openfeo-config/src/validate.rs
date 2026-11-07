@@ -13,8 +13,8 @@ use ipnet::{Ipv4Net, Ipv6Net};
 
 use crate::rules;
 use crate::{
-    Config, DhcpWan, Dns, Firewall, Ipv6Wan, LanDhcp, PortMap, Record, StaticLease, StaticWan,
-    System, Wan, portname, wan,
+    Config, DhcpWan, Dns, Firewall, Ipv6Wan, LanDhcp, PortMap, PppoeWan, Record, StaticLease,
+    StaticWan, System, Wan, portname, wan,
 };
 
 /// What kind of rule a [`Violation`] breaks. Displays as its `snake_case` name.
@@ -106,6 +106,12 @@ pub enum Code {
     Ipv6Disabled,
     /// A `[wans.ipv6] pd_hint` outside 48 to 64.
     InvalidPdHint,
+    /// `[wans.pppoe].username` is empty, over 255 bytes or carries a NUL.
+    PppoeUsername,
+    /// `[wans.pppoe].password` is empty, over 255 bytes or carries a NUL.
+    PppoePassword,
+    /// `[wans.pppoe].service` or `.ac` is over 255 bytes.
+    PppoeFilter,
     /// A LAN `ipv6_index` above 65535.
     InvalidIpv6Index,
     /// Two LANs with the same `ipv6_index`.
@@ -143,6 +149,8 @@ pub const MAX_WAN_NAME: usize = 15 - "ppp-".len();
 pub const MAX_HOSTNAME: usize = 253;
 /// Longest vendor class sent as DHCP option 60 (one option's payload).
 pub const MAX_VENDOR_CLASS: usize = 255;
+/// The longest PPPoE credential or filter: PAP and CHAP count their strings in one byte.
+pub const MAX_PPPOE_STRING: usize = 255;
 // The DHCPv4 server's own limits, so the file and the server agree on them: the longest DNS
 // label (a static lease's hostname) and the shortest lease `[lans.dhcp] lease_secs` may ask for
 // (0 means the default).
@@ -232,6 +240,9 @@ impl Code {
             Code::InvalidIpv6Mode => "invalid_ipv6_mode",
             Code::Ipv6Disabled => "ipv6_disabled",
             Code::InvalidPdHint => "invalid_pd_hint",
+            Code::PppoeUsername => "pppoe_username",
+            Code::PppoePassword => "pppoe_password",
+            Code::PppoeFilter => "pppoe_filter",
             Code::InvalidIpv6Index => "invalid_ipv6_index",
             Code::Ipv6IndexTwice => "ipv6_index_twice",
             Code::Ipv6None => "ipv6_none",
@@ -333,10 +344,11 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
             None => report.push(
                 format!("{path}.kind"),
                 Code::MissingKind,
-                "a WAN needs exactly one of [wans.static], [wans.dhcp]".to_owned(),
+                "a WAN needs exactly one of [wans.static], [wans.dhcp], [wans.pppoe]".to_owned(),
             ),
             Some(wan::Kind::Dhcp(dhcp)) => dhcp_wan(&mut report, &path, dhcp),
             Some(wan::Kind::Static(s)) => static_wan(&mut report, &mut pools, &path, s),
+            Some(wan::Kind::Pppoe(pppoe)) => pppoe_wan(&mut report, &path, pppoe),
         }
     }
 
@@ -1077,6 +1089,36 @@ fn dhcp_wan(report: &mut Report, path: &str, dhcp: &DhcpWan) {
                 dhcp.vendor_class
             ),
         );
+    }
+}
+
+/// `wans[i].pppoe` (SPEC §7.2, §8.2): a username and a password of 1 to 255 bytes without a
+/// NUL (PAP and CHAP carry them as counted byte strings), and filters of at most 255 bytes.
+fn pppoe_wan(report: &mut Report, path: &str, pppoe: &PppoeWan) {
+    let credential =
+        |text: &str| !text.is_empty() && text.len() <= MAX_PPPOE_STRING && !text.contains('\0');
+    if !credential(&pppoe.username) {
+        report.push(
+            format!("{path}.pppoe.username"),
+            Code::PppoeUsername,
+            format!("the account name must be 1 to {MAX_PPPOE_STRING} bytes without a NUL"),
+        );
+    }
+    if !credential(&pppoe.password) {
+        report.push(
+            format!("{path}.pppoe.password"),
+            Code::PppoePassword,
+            format!("the password must be 1 to {MAX_PPPOE_STRING} bytes without a NUL"),
+        );
+    }
+    for (field, value) in [("service", &pppoe.service), ("ac", &pppoe.ac)] {
+        if value.len() > MAX_PPPOE_STRING || value.contains('\0') {
+            report.push(
+                format!("{path}.pppoe.{field}"),
+                Code::PppoeFilter,
+                format!("at most {MAX_PPPOE_STRING} bytes without a NUL; absent means any"),
+            );
+        }
     }
 }
 
@@ -1906,6 +1948,122 @@ mod tests {
 
     fn codes(cfg: &Config) -> Vec<Code> {
         found(cfg).into_iter().map(|(_, code)| code).collect()
+    }
+
+    fn pppoe_wan(username: &str, password: &str, service: &str, ac: &str) -> Wan {
+        Wan {
+            name: "wan0".into(),
+            port: "p0".into(),
+            vlan: 0,
+            priority: 10,
+            kind: Some(wan::Kind::Pppoe(PppoeWan {
+                username: username.into(),
+                password: password.into(),
+                service: service.into(),
+                ac: ac.into(),
+            })),
+            ipv6: None,
+        }
+    }
+
+    fn with_pppoe(wan: Wan) -> Config {
+        Config {
+            wans: vec![wan],
+            ..base()
+        }
+    }
+
+    #[test]
+    fn a_pppoe_wan_needs_a_username_and_a_password() {
+        let ok = with_pppoe(pppoe_wan("openfeo@isp.example", "example-secret", "", ""));
+        assert_eq!(found(&ok), vec![]);
+        let no_user = with_pppoe(pppoe_wan("", "example-secret", "", ""));
+        assert_eq!(
+            found(&no_user),
+            vec![("wans[0].pppoe.username".to_owned(), Code::PppoeUsername)]
+        );
+        let no_password = with_pppoe(pppoe_wan("openfeo@isp.example", "", "", ""));
+        assert_eq!(
+            found(&no_password),
+            vec![("wans[0].pppoe.password".to_owned(), Code::PppoePassword)]
+        );
+    }
+
+    #[test]
+    fn pppoe_strings_are_at_most_255_bytes_without_nul() {
+        let long = "x".repeat(256);
+        let fine = "x".repeat(255);
+        assert_eq!(
+            found(&with_pppoe(pppoe_wan(&fine, &fine, &fine, &fine))),
+            vec![]
+        );
+        assert_eq!(
+            codes(&with_pppoe(pppoe_wan(&long, "pw", "", ""))),
+            vec![Code::PppoeUsername]
+        );
+        assert_eq!(
+            codes(&with_pppoe(pppoe_wan("user", &long, "", ""))),
+            vec![Code::PppoePassword]
+        );
+        assert_eq!(
+            codes(&with_pppoe(pppoe_wan("user", "p\0w", "", ""))),
+            vec![Code::PppoePassword],
+            "a NUL cannot cross PAP or CHAP"
+        );
+        assert_eq!(
+            found(&with_pppoe(pppoe_wan("user", "pw", &long, &long))),
+            vec![
+                ("wans[0].pppoe.service".to_owned(), Code::PppoeFilter),
+                ("wans[0].pppoe.ac".to_owned(), Code::PppoeFilter),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pppoe_wan_may_carry_ipv6_in_every_shape() {
+        let mut routed = pppoe_wan("openfeo@isp.example", "example-secret", "", "");
+        routed.ipv6 = Some(Ipv6Wan {
+            prefix: "2001:db8:1::/48".into(),
+            ..Default::default()
+        });
+        let mut cfg = with_pppoe(routed);
+        cfg.lans[0].ipv6 = "2001:db8:1:222::1/64".into();
+        assert_eq!(found(&cfg), vec![], "a routed prefix over PPP");
+        let mut delegated = pppoe_wan("openfeo@isp.example", "example-secret", "", "");
+        delegated.ipv6 = Some(Ipv6Wan {
+            pd_hint: 56,
+            ..Default::default()
+        });
+        assert_eq!(
+            found(&with_pppoe(delegated)),
+            vec![],
+            "a delegation over PPP"
+        );
+        let mut gateway = pppoe_wan("openfeo@isp.example", "example-secret", "", "");
+        gateway.ipv6 = Some(Ipv6Wan {
+            gateway: "fe80::1".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            found(&with_pppoe(gateway)),
+            vec![],
+            "a typed gateway over PPP"
+        );
+    }
+
+    #[test]
+    fn the_pppoe_fixtures_validate() {
+        for text in [
+            include_str!("../../../harness/fixtures/vm-pppoe.toml"),
+            include_str!("../../../harness/fixtures/vm-pppoe-pd.toml"),
+        ] {
+            let cfg = crate::file::parse(text).expect("the fixture parses");
+            assert!(
+                matches!(cfg.wans[0].kind, Some(wan::Kind::Pppoe(_))),
+                "the fixture's WAN is PPPoE"
+            );
+            assert_eq!(found(&cfg), vec![]);
+        }
     }
 
     #[test]

@@ -168,6 +168,9 @@ pub fn routing(world: &World) -> DesiredRouting {
             ipv6_routing(world, wan_config, ipv6, &ifname, index, &lan6, &mut desired);
         }
         match &wan_config.kind {
+            // A PPPoE WAN's addresses and routes come from its session fact (M3 part 1, the
+            // fact and reconciler task).
+            Some(wan::Kind::Pppoe(_)) => {}
             Some(wan::Kind::Static(static_wan)) => {
                 if let Ok(net) = static_wan.address.parse::<IpNet>() {
                     desired.addrs.insert(DesiredAddr {

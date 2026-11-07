@@ -247,7 +247,8 @@ fn wan_dns(world: &World, wan: &Wan) -> Vec<IpAddr> {
             .get(&wan.name)
             .map(|lease| lease.dns.iter().copied().map(IpAddr::V4).collect())
             .unwrap_or_default(),
-        Some(wan::Kind::Dhcp(_)) | None => Vec::new(),
+        // A PPPoE WAN's resolvers come from IPCP (M3 part 1, the fact and reconciler task).
+        Some(wan::Kind::Dhcp(_) | wan::Kind::Pppoe(_)) | None => Vec::new(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .dns
             .iter()
@@ -291,6 +292,8 @@ fn wan_addresses(world: &World, wan: &Wan) -> Vec<IpAddr> {
             .map(|lease| IpAddr::V4(lease.address.addr()))
             .into_iter()
             .collect(),
+        // A PPPoE WAN's address comes from IPCP (M3 part 1, the fact and reconciler task).
+        Some(wan::Kind::Pppoe(_)) => Vec::new(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .address
             .parse::<Ipv4Net>()
