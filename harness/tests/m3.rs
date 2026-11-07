@@ -13,8 +13,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
-use openfeo_harness::daemons::{self, Auth, Daemon, PppoeServerConfig, RadvdConfig};
-use openfeo_harness::lab::{BOOT_TIMEOUT, Lab, ROUTED_PREFIX6};
+use ipnet::Ipv6Net;
+use openfeo_harness::daemons::{self, Auth, Daemon, Kea6Config, PppoeServerConfig, RadvdConfig};
+use openfeo_harness::lab::{BOOT_TIMEOUT, Lab, PD_POOL_A, ROUTED_PREFIX6};
 use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Match, Regex};
 use openfeo_harness::netns::NetNs;
@@ -59,6 +60,14 @@ const SCENARIOS: &[Scenario] = &[
         name: "ipv6_over_ppp_gives_the_lan_a_gua_and_reaches_the_isp",
         run: ipv6_over_ppp_gives_the_lan_a_gua_and_reaches_the_isp,
     },
+    Scenario {
+        name: "pd_over_ppp_binds_a_prefix_and_the_lan_takes_a_gua_from_it",
+        run: pd_over_ppp_binds_a_prefix_and_the_lan_takes_a_gua_from_it,
+    },
+    Scenario {
+        name: "a_reboot_comes_back_with_a_fresh_session_and_the_same_prefix",
+        run: a_reboot_comes_back_with_a_fresh_session_and_the_same_prefix,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -71,6 +80,7 @@ fn main() -> ExitCode {
 
 const VM_PPPOE: &str = include_str!("../fixtures/vm-pppoe.toml");
 const VM_PPPOE_VLAN: &str = include_str!("../fixtures/vm-pppoe-vlan.toml");
+const VM_PPPOE_PD: &str = include_str!("../fixtures/vm-pppoe-pd.toml");
 const READY: &str = r"openfeo: ready generation=\d+";
 const DOWN: &str = r"openfeo: pppoe wan0 down: (.*?) after \d+ s(; retry in (\d+) s)?$";
 const SESSION: &str = r#"openfeo: pppoe wan0 session 0x([0-9a-f]{4}) with ([0-9a-f:]{17}) ac "isp" max payload 1492 \(no RFC 4638\)"#;
@@ -463,5 +473,134 @@ fn ipv6_over_ppp_gives_the_lan_a_gua_and_reaches_the_isp(lab: &mut Lab) -> anyho
     let _server = http_target(lab, &lab.isp0, "2001:db8:ffff::1", 8080, body)?;
     let got = fetch(&lab.lan0, "[2001:db8:ffff::1]:8080")?;
     ensure!(got == body, "unexpected body {got:?}");
+    no_password_on_the_console(lab, "wan0")
+}
+
+/// The router's delegation over PPP: `dhcp6 wan0 bound prefix <the /56>`.
+const BOUND: &str =
+    r"openfeo: dhcp6 wan0 (?:bound|renewed|restored) prefix (2001:db8:[0-9a-f:]+/56) ";
+
+/// The ISP's IPv6 on the session's `ppp<N>`: radvd with M and O set (the delegation's shape) and
+/// Kea's DHCPv6 server delegating from `PD_POOL_A`, and the pool routed to the router's IPV6CP
+/// link-local through `ppp<N>`. Returns the interface.
+fn isp_delegates_over(lab: &mut Lab, booted: &Booted) -> anyhow::Result<String> {
+    let ppp = lab.isp_ppp_ifname("wan0", SOON)?;
+    lab.start_radvd_on(&RadvdConfig {
+        managed: true,
+        other: true,
+        ..RadvdConfig::isp(&ppp)
+    })?;
+    // Kea takes the far end of pppd's point-to-point link-local (`fe80::1 peer fe80::2`) for its
+    // own and cannot bind it: the ISP's unit gets a plain fe80::1/64 instead.
+    lab.isp0.ip(&[
+        "-6", "addr", "del", "fe80::1", "peer", "fe80::2", "dev", &ppp,
+    ])?;
+    lab.isp0
+        .ip(&["-6", "addr", "add", "fe80::1/64", "dev", &ppp, "nodad"])?;
+    lab.start_kea6(&Kea6Config {
+        iface: ppp.clone(),
+        ..Kea6Config::isp(Some(PD_POOL_A.parse()?))
+    })?;
+    lab.isp_route_block6_on(PD_POOL_A, &booted.link_local(), &ppp)?;
+    Ok(ppp)
+}
+
+/// The LAN host's global address in `net`, once it has one that is not tentative.
+fn lan_host_takes(lab: &Lab, net: Ipv6Net) -> anyhow::Result<()> {
+    let wanted = net.to_string();
+    let head = wanted.trim_end_matches("/64").trim_end_matches("::");
+    lab.lan0.ip(&["link", "set", "lan0", "down"])?;
+    Lab::host(&lab.lan0, "lan0", "192.168.1.2/24", "192.168.1.1")?;
+    wait_until(SOON, &format!("the LAN host's address in {net}"), || {
+        Ok(lab
+            .lan0
+            .ip(&["-6", "addr", "show", "dev", "lan0", "scope", "global"])?
+            .lines()
+            .any(|line| line.contains(&format!("inet6 {head}:")) && !line.contains("tentative")))
+    })
+}
+
+/// Prefix delegation over PPP (`vm-pppoe-pd.toml`): Kea's DHCPv6 server on the ISP's `ppp<N>`
+/// delegates a /56, the router binds it on `ppp-wan0`, the LAN host takes an address from
+/// lan0's /64 of it, and fetches the ISP's target over IPv6.
+fn pd_over_ppp_binds_a_prefix_and_the_lan_takes_a_gua_from_it(lab: &mut Lab) -> anyhow::Result<()> {
+    let booted = boot_pppoe(
+        lab,
+        &PppoeServerConfig::isp("wan0", Auth::Chap),
+        VM_PPPOE_PD,
+    )?;
+    isp_delegates_over(lab, &booted)?;
+    let c = lab.console()?;
+    let bound = c.wait_for(&mut Cursor::default(), &re(BOUND), Duration::from_secs(20))?;
+    let prefix: Ipv6Net = group(&bound, 0)?.parse()?;
+    ensure!(
+        PD_POOL_A.parse::<Ipv6Net>()?.contains(&prefix),
+        "{prefix} from the ISP's pool"
+    );
+    let lan0 = openfeo_reconcile::lan6::subnet(prefix, 1).context("lan0's /64")?;
+    lan_host_takes(lab, lan0)?;
+    let body = "openfeo isp target over a delegation over ppp";
+    let _server = http_target(lab, &lab.isp0, "2001:db8:ffff::1", 8080, body)?;
+    ensure!(fetch(&lab.lan0, "[2001:db8:ffff::1]:8080")? == body);
+    no_password_on_the_console(lab, "wan0")
+}
+
+/// A reboot over PPP: a fresh session (the old one lingers at the ISP until its echoes fail, so
+/// the new one is another unit there), the ISP's IPv6 moved to the new unit, and the same prefix
+/// delegated again.
+fn a_reboot_comes_back_with_a_fresh_session_and_the_same_prefix(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let booted = boot_pppoe(
+        lab,
+        &PppoeServerConfig::isp("wan0", Auth::Chap),
+        VM_PPPOE_PD,
+    )?;
+    let old_ppp = isp_delegates_over(lab, &booted)?;
+    let c = lab.console()?;
+    let mut reset_at = Cursor::default();
+    let bound = c.wait_for(&mut reset_at, &re(BOUND), Duration::from_secs(20))?;
+    let before: Ipv6Net = group(&bound, 0)?.parse()?;
+    lab.qmp()?.system_reset()?;
+    let c = lab.console()?;
+    // `ready` and the new session come in either order after the reset.
+    c.wait_for(&mut { reset_at }, &re(READY), BOOT_TIMEOUT)?;
+    let mut after_reset = reset_at;
+    let session = c.wait_for(&mut after_reset, &re(SESSION), BOOT_TIMEOUT)?;
+    let id = u16::from_str_radix(&group(&session, 0)?, 16)?;
+    ensure!(
+        id != booted.session_id,
+        "a fresh session, not {id:#06x} again"
+    );
+    let mut ppp = lab.isp_ppp_ifname("wan0", SOON)?;
+    let deadline = std::time::Instant::now() + SOON;
+    while ppp == old_ppp {
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "no new unit at the ISP"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        ppp = lab.isp_ppp_ifname("wan0", SOON)?;
+    }
+    lab.daemons
+        .retain(|daemon| daemon.name != format!("radvd-{old_ppp}"));
+    lab.stop_kea6();
+    let c = lab.console()?;
+    let ipv6cp = c.wait_for(&mut reset_at, &re(IPV6CP_UP), SOON)?;
+    let rebooted = Booted {
+        cur: after_reset,
+        session_id: id,
+        address: booted.address,
+        local_iid: parse_iid(&group(&ipv6cp, 0)?)?,
+    };
+    isp_delegates_over(lab, &rebooted)?;
+    let c = lab.console()?;
+    let mut since_reset = reset_at;
+    let bound = c.wait_for(&mut since_reset, &re(BOUND), Duration::from_secs(30))?;
+    let after: Ipv6Net = group(&bound, 0)?.parse()?;
+    ensure!(
+        after == before,
+        "the same prefix after the reboot: {before} then {after}"
+    );
     no_password_on_the_console(lab, "wan0")
 }
