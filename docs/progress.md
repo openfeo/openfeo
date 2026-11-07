@@ -128,7 +128,29 @@ renumbered within ten seconds. Fixed on the way: [#26](https://github.com/openfe
 [#27](https://github.com/openfeo/openfeo/issues/27) (an address leaving the port when its preferred
 lifetime lapses) stays open, as the whole-branch review found and the design now records.
 
-M2 is complete; next is M3 (PPPoE).
+M2 is complete; M3 (PPPoE) follows.
+
+## M3 PPPoE
+
+**2026-11-07, [#46](https://github.com/openfeo/openfeo/pull/46), part 1: the cores and the
+wiring.** Everything of PPPoE (§7.2) that can be proven without PPP in the kernel, in the pure crate
+`openfeo-proto-ppp`: the discovery codec and client (RFC 2516, RFC 4638), the PPP frame, the RFC 1661
+automaton once over an `Options` trait, LCP with keepalives, PAP and CHAP-MD5, IPCP and IPV6CP (its
+identifier from the stable-privacy secret, RFC 7217) and the session orchestrator, with seven fuzz
+targets and no external codec (ADR-0022). Around it: `[wans.pppoe]` in the schema, the `PppoeFact`,
+`wan_netdev` as the name every reconciler reads for a WAN's IP interface, the links reconciler asking
+1508 on a PPPoE port and desiring `ppp-<wan>` for the kernel's unit (ADR-0023), point-to-point
+addresses with their peer through netlink and the routing applier, the links applier's rename, MTU and
+raise of the unit's netdev, a TCP MSS clamp on every WAN netdev below 1500 (§7.5), the discovery
+socket and the `/dev/ppp` plumbing in `openfeo-net` with the ioctl numbers checked against the pinned
+UAPI header, the WAN task with the design's console lines and backoff, and the `ipv6` and `dhcp6`
+tasks taking a session's new netdev as a flap in place rather than a restart. Proven here: the
+reconciler snapshots, the `netlink` scenarios for the point-to-point address, the rename and a refused
+port MTU, and the new `pppoe` sandbox suite, whose discovery runs against a scripted access
+concentrator over a veth pair and whose session attach makes a unit netdev wherever `/dev/ppp` is at
+hand (CI loads the PPP modules and opens it; a host without them skips with the udev rule to add).
+Part 2 proves the session live: `pppoe-server` in the lab, the `pppoe` suite's PPP scenarios, the `m3`
+QEMU suite, check-env and the cloud setup.
 
 ## Tooling and process
 
