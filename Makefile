@@ -37,7 +37,7 @@ kernel: bin kernel-src
 run: kernel
 	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage $(if $(CONFIG),--config $(CONFIG),)
 test-harness: kernel
-	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --no-fail-fast --test netlink --test nft --test dhcp4 --test dhcp4_server --test dhcp6 --test dns --test sntp --test ndp --test m0 --test m1 --test m2 --test m2pd -- $(FILTER)
+	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --no-fail-fast --test netlink --test nft --test dhcp4 --test dhcp4_server --test dhcp6 --test dns --test sntp --test ndp --test pppoe --test m0 --test m1 --test m2 --test m2pd -- $(FILTER)
 check-env: kernel-headers nft-src
 	OPENFEO_KERNEL=$(BUILD)/bzImage cargo run -q -p openfeo-harness -- check
 ci: lint test kernel test-harness
