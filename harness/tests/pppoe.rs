@@ -73,6 +73,14 @@ const SCENARIOS: &[Scenario] = &[
         name: "a_padt_from_the_ac_ends_the_session",
         run: a_padt_from_the_ac_ends_the_session,
     },
+    Scenario {
+        name: "ipv6cp_brings_the_identifiers_up_and_the_peer_answers_a_ping",
+        run: ipv6cp_brings_the_identifiers_up_and_the_peer_answers_a_ping,
+    },
+    Scenario {
+        name: "without_rfc_4638_the_session_runs_at_1492",
+        run: without_rfc_4638_the_session_runs_at_1492,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -963,6 +971,97 @@ fn a_padt_from_the_ac_ends_the_session(lab: &mut Lab) -> anyhow::Result<()> {
         ensure!(
             sent.elapsed() < Duration::from_secs(5),
             "at once, not by keepalive"
+        );
+        anyhow::Ok(())
+    })
+}
+
+/// `ping -6 -c <count>` from this namespace to a link-local `target` on `ifname`; how many
+/// answered.
+fn ping6_link_local(ifname: &str, target: &str, count: u32) -> anyhow::Result<u32> {
+    let output = std::process::Command::new("ping")
+        .args([
+            "-6",
+            "-n",
+            "-c",
+            &count.to_string(),
+            "-W",
+            "1",
+            "-i",
+            "0.2",
+            &format!("{target}%{ifname}"),
+        ])
+        .output()
+        .context("run ping -6")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .find_map(|line| {
+            let (_, rest) = line.split_once("transmitted, ")?;
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .unwrap_or(0))
+}
+
+/// IPV6CP against `pppd`'s `ipv6 ::1,::2`: the ISP keeps `::1` and suggests `::2` to us, which
+/// the core takes as is; with `fe80::2` on our unit, the ISP's `fe80::1` answers a ping.
+fn ipv6cp_brings_the_identifiers_up_and_the_peer_answers_a_ping(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    require_dev_ppp()?;
+    let rig = Rig::create_isp(lab)?;
+    let _server = rig.server(lab, &PppoeServerConfig::isp(AC_IF, Auth::None))?;
+    runtime()?.block_on(async {
+        let (bench, outputs) = up_over_pppd(&rig, lab, daemons::PPP_PASSWORD, |o| {
+            matches!(o, PppOutput::Ipv6Up(_))
+        })
+        .await?;
+        let Some(PppOutput::Ipv6Up(up)) = outputs.last() else {
+            anyhow::bail!("{outputs:?}");
+        };
+        ensure!(up.local_iid == 2 && up.peer_iid == 1, "{up:?}");
+        let ifname = bench.ifname();
+        netns::ip(&["-6", "addr", "add", "fe80::2/64", "dev", &ifname, "nodad"])?;
+        netns::ip(&["link", "set", &ifname, "up"])?;
+        let answered = ping6_link_local(&ifname, "fe80::1", 3)?;
+        ensure!(answered >= 1, "fe80::1 did not answer over {ifname}");
+        anyhow::Ok(())
+    })
+}
+
+/// A 1500-byte PPP payload asked for on a port that carries it, from a concentrator that cannot
+/// grant RFC 4638 (rp-pppoe 4.0's server has no such option): discovery reports no payload, and
+/// the session runs at 1492 both ways, `pppd`'s own MRU 1500 negotiated down.
+fn without_rfc_4638_the_session_runs_at_1492(lab: &mut Lab) -> anyhow::Result<()> {
+    require_dev_ppp()?;
+    let rig = Rig::create_isp(lab)?;
+    let config = PppoeServerConfig {
+        mtu: 1500,
+        ..PppoeServerConfig::isp(AC_IF, Auth::None)
+    };
+    let _server = rig.server(lab, &config)?;
+    runtime()?.block_on(async {
+        let mut discovery = Bench::start_client_only(&rig, Some(1500))?;
+        let outputs = discovery.run_until(SOON, is_session).await?;
+        let Some(Output::Session { max_payload, .. }) = outputs.last() else {
+            anyhow::bail!("no session: {outputs:?}");
+        };
+        ensure!(max_payload.is_none(), "no payload granted: {max_payload:?}");
+        drop(discovery);
+        let (_bench, outputs) = up_over_pppd(&rig, lab, daemons::PPP_PASSWORD, |o| {
+            matches!(o, PppOutput::LcpUp { .. })
+        })
+        .await?;
+        ensure!(
+            has(&outputs, |o| matches!(
+                o,
+                PppOutput::LcpUp {
+                    mru: 1492,
+                    mru_theirs: 1492,
+                    ..
+                }
+            )),
+            "{outputs:?}"
         );
         anyhow::Ok(())
     })
