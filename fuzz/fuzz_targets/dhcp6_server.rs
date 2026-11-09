@@ -17,7 +17,7 @@ fuzz_target!(|data: &[u8]| {
         domains: vec!["home.arpa".to_owned()],
         refresh_secs: INFORMATION_REFRESH_TIME,
     };
-    if let Some(answer) = reply(&config, data) {
+    if let Some(answer) = reply(&config, "fe80::1".parse().unwrap(), data) {
         let answer = Message::decode(&answer).expect("the responder encodes what decodes");
         assert_eq!(answer.kind, MessageType::Reply);
     }
