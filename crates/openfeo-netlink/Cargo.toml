@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+openfeo-runtime = { path = "../openfeo-runtime" }
 rtnetlink.workspace = true
 netlink-packet-route.workspace = true
 netlink-packet-core.workspace = true

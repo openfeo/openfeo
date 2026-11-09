@@ -73,6 +73,11 @@ pub struct Addr {
     /// The far end of a point-to-point address (`IFA_ADDRESS` when it differs from
     /// `IFA_LOCAL`): a PPP netdev's peer. `None` for an ordinary address.
     pub peer: Option<IpAddr>,
+    /// When the kernel stops preferring the address, on the process clock
+    /// (`openfeo_runtime::clock::uptime_ms`), from `IFA_CACHEINFO`; `None` is forever (#27).
+    pub preferred_until_ms: Option<u64>,
+    /// When the kernel drops the address, likewise.
+    pub valid_until_ms: Option<u64>,
 }
 
 /// A route's type (`RTN_*`): everything OpenFeO adds is unicast except the blackholes for
