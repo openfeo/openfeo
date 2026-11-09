@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# A pure trunk port (#15): p2 carries only the tagged guest LAN and no untagged LAN, so it holds
+# no address and sits in no bridge; lan0 is on p3 (the lab's lan1 tap). The WAN is untagged on
+# p0 (isp0's Kea on wan0). Used by the m2 scenario that sends an untagged ARP request on p2.
+config_version = 1
+
+[system]
+hostname = "openfeo"
+domain = "home.arpa"
+
+[[wans]]
+name = "wan0"
+port = "p0"
+priority = 10
+[wans.dhcp]
+hostname = "openfeo-lab"
+
+[[lans]]
+name = "lan0"
+ports = ["p3"]
+ipv4 = "192.168.1.1/24"
+reaches = ["wan"]
+[lans.dhcp]
+range = ["192.168.1.100", "192.168.1.200"]
+lease_secs = 43200
+
+[[lans]]
+name = "guest"
+ports = ["p2.223"]
+ipv4 = "192.168.2.1/24"
+[lans.dhcp]
+range = ["192.168.2.100", "192.168.2.200"]
+lease_secs = 43200
