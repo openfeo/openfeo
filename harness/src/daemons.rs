@@ -509,7 +509,9 @@ impl PppoeServerConfig {
 }
 
 /// The `pppd` options file the server passes to each session's `pppd` (`-O`). `nodetach` keeps
-/// each `pppd` in the server's process group, so stopping or killing the group ends it too.
+/// each `pppd` a direct child of the server, which is how the `/proc` walk in [`Daemon::signal`]
+/// finds it (`pppd` calls `setsid()` regardless, so a process-group signal alone would miss it);
+/// a `pppd` forked between the walk and the kill survives the kill, which no scenario has met.
 #[must_use]
 pub fn render_pppd_options(config: &PppoeServerConfig, log: &Path) -> String {
     let auth = match config.auth {
@@ -537,8 +539,13 @@ pub fn render_pppd_options(config: &PppoeServerConfig, log: &Path) -> String {
 ///
 /// # Errors
 ///
-/// When `/etc/ppp` cannot be written (no tmpfs over it: the sandbox was not entered).
+/// Outside the sandbox (no tmpfs over `/etc/ppp`: it would be the host's, #54), or when
+/// `/etc/ppp` cannot be written.
 pub fn write_ppp_secrets(username: &str, password: &str) -> Result<()> {
+    anyhow::ensure!(
+        crate::sandbox::is_inside(),
+        "not inside the sandbox: /etc/ppp would be the host's"
+    );
     let line = secrets_line(username, password);
     for name in ["pap-secrets", "chap-secrets"] {
         let path = Path::new("/etc/ppp").join(name);
@@ -644,6 +651,15 @@ pub fn last_ppp_ifname(log: &str) -> Option<String> {
 }
 
 /// The server's command line, shared by the namespace and sandbox variants.
+/// Keep one predecessor of `log` as `<log>.1` (#57): a scenario that restarts the server and
+/// then fails still has the first session's account.
+fn rotate_log(log: &Path) {
+    if log.exists() {
+        let kept = log.with_extension("log.1");
+        let _ = std::fs::rename(log, kept);
+    }
+}
+
 fn pppoe_server_command(
     mut cmd: Command,
     config: &PppoeServerConfig,
@@ -652,7 +668,7 @@ fn pppoe_server_command(
     std::fs::create_dir_all(run_dir).with_context(|| format!("mkdir {}", run_dir.display()))?;
     write_ppp_secrets(PPP_USERNAME, PPP_PASSWORD)?;
     let log = pppd_log_path(run_dir, &config.iface);
-    let _ = std::fs::remove_file(&log);
+    rotate_log(&log);
     let options = run_dir.join(format!("pppd-{}.options", config.iface));
     std::fs::write(&options, render_pppd_options(config, &log))
         .with_context(|| format!("write {}", options.display()))?;
@@ -766,6 +782,39 @@ mod tests {
         assert_eq!(
             secrets_line("openfeo@isp.example", "example-secret"),
             "\"openfeo@isp.example\" * \"example-secret\" *\n"
+        );
+    }
+
+    /// #54: the secrets go to `/etc/ppp` and rely on the sandbox's tmpfs over it; outside the
+    /// sandbox that would be the host's directory, so the call is refused.
+    #[test]
+    fn secrets_are_refused_outside_the_sandbox() {
+        if crate::sandbox::is_inside() {
+            return; // the suite itself runs inside: nothing to refuse
+        }
+        let err = write_ppp_secrets("u", "p").expect_err("refused outside the sandbox");
+        assert!(format!("{err:#}").contains("sandbox"), "{err:#}");
+    }
+
+    /// #57: a restarted server keeps its predecessor's pppd log as `.1` for a failure message.
+    #[test]
+    fn a_rotated_log_keeps_one_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("pppd-x.log");
+        rotate_log(&log);
+        assert!(!log.with_extension("log.1").exists(), "nothing to rotate");
+        std::fs::write(&log, "a").unwrap();
+        rotate_log(&log);
+        assert!(!log.exists());
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.1")).unwrap(),
+            "a"
+        );
+        std::fs::write(&log, "b").unwrap();
+        rotate_log(&log);
+        assert_eq!(
+            std::fs::read_to_string(log.with_extension("log.1")).unwrap(),
+            "b"
         );
     }
 
