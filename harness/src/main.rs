@@ -254,14 +254,7 @@ fn check() -> Result<ExitCode> {
     );
     // After the row that explains a "no" without user namespaces (#48).
     report_ppp(sandbox_ok)?;
-    match nft_expressions_work()? {
-        Ok(()) => report("nft ct/fib/nat expressions", true, ""),
-        Err(detail) => report("nft ct/fib/nat expressions", false, &format!(" ({detail})")),
-    }
-    match vlan_links_work()? {
-        Ok(()) => report("802.1Q VLAN links", true, ""),
-        Err(detail) => report("802.1Q VLAN links", false, &format!(" ({detail})")),
-    }
+    report_sandbox_probes(&mut report, sandbox_ok)?;
     match Lab::kernel_path() {
         Ok(path) => report("kernel image", true, &format!(" ({})", path.display())),
         Err(err) => report("kernel image", false, &format!(" ({err})")),
@@ -375,6 +368,29 @@ fn nft_expressions_work() -> Result<Result<(), String>> {
 
 fn vlan_links_work() -> Result<Result<(), String>> {
     probe_in_child("probe-vlan")
+}
+
+/// The nft and VLAN probes, which run in the sandbox: without user namespaces they are missing,
+/// said plainly rather than by an error on the way in (#48).
+fn report_sandbox_probes(
+    report: &mut impl FnMut(&str, bool, &str),
+    sandbox_ok: bool,
+) -> Result<()> {
+    let needs_userns = " (needs unprivileged user namespaces; see above)";
+    if sandbox_ok {
+        match nft_expressions_work()? {
+            Ok(()) => report("nft ct/fib/nat expressions", true, ""),
+            Err(detail) => report("nft ct/fib/nat expressions", false, &format!(" ({detail})")),
+        }
+        match vlan_links_work()? {
+            Ok(()) => report("802.1Q VLAN links", true, ""),
+            Err(detail) => report("802.1Q VLAN links", false, &format!(" ({detail})")),
+        }
+    } else {
+        report("nft ct/fib/nat expressions", false, needs_userns);
+        report("802.1Q VLAN links", false, needs_userns);
+    }
+    Ok(())
 }
 
 /// `/dev/ppp` and the PPPoE plugin, reported but not fatal: the PPPoE scenarios (M3) skip without

@@ -874,8 +874,9 @@ fn a_wrong_password_is_auth_failed_with_pppds_message(lab: &mut Lab) -> anyhow::
             };
             ensure!(!message.is_empty(), "{auth:?}: pppd's message is carried");
             // #51: after `auth failed` the core goes quiet; the task's backoff owns the next
-            // attempt.
-            let after = bench.run_for(Duration::from_secs(1)).await?;
+            // attempt. The window outlasts LCP's 3 s restart timer, the one timer a regression
+            // could leave live after the Down.
+            let after = bench.run_for(Duration::from_secs(4)).await?;
             ensure!(
                 !after.iter().any(|o| matches!(o, PppOutput::Send { .. })),
                 "{auth:?}: the core keeps talking after auth failed: {after:?}"

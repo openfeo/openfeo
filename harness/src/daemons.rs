@@ -650,9 +650,8 @@ pub fn last_ppp_ifname(log: &str) -> Option<String> {
         .map(|name| name.trim().to_owned())
 }
 
-/// The server's command line, shared by the namespace and sandbox variants.
 /// Keep one predecessor of `log` as `<log>.1` (#57): a scenario that restarts the server and
-/// then fails still has the first session's account.
+/// then fails still has the first session's account in the failure's diagnostics.
 fn rotate_log(log: &Path) {
     if log.exists() {
         let kept = log.with_extension("log.1");
@@ -660,6 +659,7 @@ fn rotate_log(log: &Path) {
     }
 }
 
+/// The server's command line, shared by the namespace and sandbox variants.
 fn pppoe_server_command(
     mut cmd: Command,
     config: &PppoeServerConfig,

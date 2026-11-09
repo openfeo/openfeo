@@ -257,8 +257,6 @@ fn no_password_on_the_console(lab: &Lab, iface: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The LAN host fetches from the ISP over the PPP link; the ISP sees the request from the
-/// address IPCP gave the router, never the LAN's.
 /// The IPCP resolver carries a real query (#55): the LAN host asks the router, the forwarder
 /// asks the ISP's resolver over the PPP session, and `www.isp.example` comes back.
 fn the_lan_resolves_a_name_through_the_ipcp_resolver_over_ppp(lab: &mut Lab) -> anyhow::Result<()> {
@@ -304,6 +302,8 @@ fn the_lan_resolves_a_name_through_the_ipcp_resolver_over_ppp(lab: &mut Lab) -> 
     Ok(())
 }
 
+/// The LAN host fetches from the ISP over the PPP link; the ISP sees the request from the
+/// address IPCP gave the router, never the LAN's.
 fn lan_fetches_isp_http_through_nat_over_ppp(lab: &mut Lab) -> anyhow::Result<()> {
     let booted = boot_pppoe(lab, &PppoeServerConfig::isp("wan0", Auth::Chap), VM_PPPOE)?;
     ensure!(booted.session_id != 0, "a session id");
