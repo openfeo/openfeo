@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ipnet::Ipv6Net;
 use openfeo_config::{Dhcp6Binding, Dhcp6Deprecated, Dhcp6Lease, file, rules};
 use openfeo_net::dhcp6::ClientSocket;
-use openfeo_net::ndp::{RESEND_AFTER, RESEND_TRIES, tentative_link_local};
+use openfeo_net::ndp::{RESEND_AFTER, RESEND_TRIES, transient_send_error};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_proto_dhcp4::identity::{duid_ll, from_hex, hex};
 use openfeo_proto_dhcp6::client::{Binding, Client, Config, Input, Lease6, Note, Output};
@@ -157,9 +157,10 @@ fn remaining_valid_ms(binding: Option<&Binding>, net: Ipv6Net, now_ms: u64) -> O
     )
 }
 
-/// The binding as the reconcilers see it, with the prefixes being deprecated.
+/// The binding as the reconcilers see it, with the prefixes being deprecated, and whether it
+/// was restored from disk and not yet confirmed (#44).
 #[must_use]
-pub fn fact_from(binding: &Binding, deprecated: &[Deprecated]) -> WanDhcp6Fact {
+pub fn fact_from(binding: &Binding, deprecated: &[Deprecated], restored: bool) -> WanDhcp6Fact {
     let lifetimed = |lease: &Lease6| Lifetimed {
         net: lease.net,
         obtained_ms: binding.bound_at,
@@ -173,6 +174,7 @@ pub fn fact_from(binding: &Binding, deprecated: &[Deprecated]) -> WanDhcp6Fact {
         dns: binding.dns.clone(),
         search: binding.search.clone(),
         server: binding.server.clone(),
+        restored,
     }
 }
 
@@ -360,6 +362,9 @@ struct Run<'a> {
     down_since: Option<Instant>,
     /// Delegations too short for a LAN's index already said on the console.
     left_out_said: BTreeSet<(Ipv6Net, String)>,
+    /// The binding came from disk and no Reply has confirmed it, nor has the Rebind's deadline
+    /// passed (#44).
+    restored: bool,
 }
 
 /// The task: wait for the port, restore the binding from disk, run the client on the port's
@@ -406,12 +411,14 @@ async fn run(
         pending: None,
         down_since: None,
         left_out_said: BTreeSet::new(),
+        restored: false,
     };
     let restored = read_binding(&run.path, &task.wan, mac);
     if let Some((binding, deprecated)) = &restored {
         info!("{}", restored_line(&task.wan, binding));
         run.binding = Some(binding.clone());
         run.deprecations.list.clone_from(deprecated);
+        run.restored = true;
         run.publish();
     }
     let config = Config {
@@ -520,6 +527,10 @@ impl Run<'_> {
                     } else {
                         debug!("dhcp6 {}: {note:?}", self.task.wan);
                     }
+                    if note == Note::RebindUnanswered && self.restored {
+                        self.restored = false;
+                        self.publish();
+                    }
                 }
             }
         }
@@ -527,7 +538,7 @@ impl Run<'_> {
 
     fn send(&mut self, bytes: Vec<u8>) {
         if let Err(err) = self.socket.send(&bytes) {
-            if tentative_link_local(&err) {
+            if transient_send_error(&err) {
                 debug!("dhcp6 {}: send: {err}; again in a second", self.task.wan);
                 self.pending = Some((bytes, RESEND_TRIES, Instant::now() + RESEND_AFTER));
                 return;
@@ -548,7 +559,7 @@ impl Run<'_> {
         };
         match self.socket.send(&bytes) {
             Ok(()) => {}
-            Err(err) if tentative_link_local(&err) && tries_left > 1 => {
+            Err(err) if transient_send_error(&err) && tries_left > 1 => {
                 self.pending = Some((bytes, tries_left - 1, Instant::now() + RESEND_AFTER));
             }
             Err(err) => warn!("dhcp6 {}: send: {err}", self.task.wan),
@@ -556,6 +567,7 @@ impl Run<'_> {
     }
 
     async fn bound(&mut self, binding: Binding, renewed: bool) {
+        self.restored = false;
         let nets: Vec<Ipv6Net> = binding.nets().collect();
         self.deprecations.revive(&nets);
         let same = self
@@ -661,7 +673,7 @@ impl Run<'_> {
                 deprecated: self.deprecations.list.clone(),
                 ..WanDhcp6Fact::default()
             },
-            |binding| fact_from(binding, &self.deprecations.list),
+            |binding| fact_from(binding, &self.deprecations.list, self.restored),
         );
         let wan = self.task.wan.clone();
         self.publisher.update(|world| {
@@ -795,6 +807,9 @@ fn note_line(wan: &str, note: &Note) -> Option<String> {
         Note::Requesting => format!("dhcp6 {wan} requesting"),
         Note::Renewing | Note::Ignored(_) => return None,
         Note::Rebinding => format!("dhcp6 {wan} rebinding"),
+        Note::RebindUnanswered => {
+            format!("dhcp6 {wan} rebind unanswered: binding kept until it lapses")
+        }
         Note::NoPrefixAvailable => format!("dhcp6 {wan} no prefix available"),
         Note::NoAddressAvailable => format!("dhcp6 {wan} no address available"),
         Note::Restarting(why) => format!("dhcp6 {wan} restarting: {why}"),
@@ -843,7 +858,7 @@ mod tests {
 
     #[test]
     fn fact_from_carries_lifetimes_relative_to_obtained() {
-        let fact = fact_from(&binding(10_000), &[deprecated(70_000)]);
+        let fact = fact_from(&binding(10_000), &[deprecated(70_000)], false);
         assert_eq!(
             fact.prefixes,
             vec![Lifetimed {
@@ -1069,6 +1084,18 @@ mod tests {
         assert_eq!(state.next_deadline(), None);
     }
 
+    /// #44: the World knows a restored binding from a confirmed one.
+    #[test]
+    fn fact_from_carries_the_restored_flag() {
+        let bound = binding(10_000);
+        assert!(fact_from(&bound, &[], true).restored);
+        assert!(!fact_from(&bound, &[], false).restored);
+        assert_eq!(
+            fact_from(&bound, &[], true).prefixes,
+            fact_from(&bound, &[], false).prefixes
+        );
+    }
+
     #[test]
     fn lines_follow_the_contract() {
         let bound = binding(10_000);
@@ -1124,6 +1151,10 @@ mod tests {
         assert_eq!(
             note_line("wan0", &Note::Restarting("the binding expired")),
             Some("dhcp6 wan0 restarting: the binding expired".to_owned())
+        );
+        assert_eq!(
+            note_line("wan0", &Note::RebindUnanswered),
+            Some("dhcp6 wan0 rebind unanswered: binding kept until it lapses".to_owned())
         );
         assert_eq!(note_line("wan0", &Note::Ignored("x")), None);
         assert_eq!(note_line("wan0", &Note::Renewing), None);

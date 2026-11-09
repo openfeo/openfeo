@@ -132,6 +132,10 @@ pub fn prefixes(world: &World) -> Lan6 {
         .and_then(|ipv6| ipv6.prefix.parse::<Ipv6Net>().ok())
         .map(|net| net.trunc());
     let fact = world.dhcp6.get(&wan.name);
+    // A binding restored at boot is live until its Rebind is answered or gives up (#44): the
+    // WAN's default route is still arriving, and a deprecating first advertisement would cost
+    // every host its address for the second that takes.
+    let live = usable || fact.is_some_and(|fact| fact.restored);
     let delegations: &[Lifetimed] = fact.map_or(&[], |fact| &fact.prefixes);
     let deprecated: &[Deprecated] = fact.map_or(&[], |fact| &fact.deprecated);
     let lans: Vec<(&Lan, u32)> = world
@@ -177,7 +181,7 @@ pub fn prefixes(world: &World) -> Lan6 {
         }
         for lifetimed in delegations {
             let parent = lifetimed.net.trunc();
-            let state = if usable {
+            let state = if live {
                 State::Live {
                     obtained_ms: lifetimed.obtained_ms,
                     preferred_secs: lifetimed.preferred_secs,
@@ -436,6 +440,34 @@ mod tests {
         let mut links = (*world.links).clone();
         links.get_mut("p0").unwrap().carrier = false;
         world.links = Arc::new(links);
+        assert!(matches!(
+            prefixes(&world).prefixes[0].state,
+            State::Stale { .. }
+        ));
+    }
+
+    /// #44: a binding restored at boot is advertised live until its Rebind is answered or
+    /// times out, so the first advertisement after a reboot deprecates nobody's address while
+    /// the WAN's default route is still arriving; the router lifetime still follows the route.
+    #[test]
+    fn a_restored_delegation_is_live_until_the_rebind_is_answered_or_times_out() {
+        let mut world = fixtures::pd_world();
+        world.routes = Arc::new(std::collections::BTreeSet::new());
+        let mut fact = fixtures::dhcp6_fact();
+        fact.restored = true;
+        with_fact(&mut world, fact);
+        assert_eq!(
+            prefixes(&world).prefixes[0].state,
+            State::Live {
+                obtained_ms: 10_000,
+                preferred_secs: 40,
+                valid_secs: 60,
+            }
+        );
+        assert!(!wan_usable(&world, &world.config.wans[0]));
+        let mut fact = fixtures::dhcp6_fact();
+        fact.restored = false;
+        with_fact(&mut world, fact);
         assert!(matches!(
             prefixes(&world).prefixes[0].state,
             State::Stale { .. }

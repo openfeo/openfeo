@@ -188,6 +188,9 @@ pub enum Note {
     Requesting,
     Renewing,
     Rebinding,
+    /// The Rebind that confirms a binding restored from disk went unanswered for `CNF_MAX_RD`:
+    /// the binding is kept with its timers (§18.2.12), and no longer counts as unconfirmed.
+    RebindUnanswered,
     /// The server had no prefix for us (said once until one arrives).
     NoPrefixAvailable,
     /// The server had no address for us (said once until one arrives).
@@ -560,8 +563,10 @@ impl Client {
             }
             State::Rebinding if self.rebind == Rebind::AfterLinkChange => {
                 if self.deadline.is_some_and(|end| now >= end) {
-                    // Silence keeps the binding with its timers as they were (§18.2.12).
+                    // Silence keeps the binding with its timers as they were (§18.2.12); the
+                    // task hears that the restored binding stays unconfirmed (#44).
                     self.rebind = Rebind::Scheduled;
+                    out.push(Output::Note(Note::RebindUnanswered));
                     self.go_bound(now, out);
                 } else {
                     self.rt = self.next_rt(CNF_MAX_RT);
@@ -1690,6 +1695,37 @@ mod tests {
         assert!(renewed);
         assert_eq!(binding.bound_at, 7_300);
         assert_eq!(client.next_timeout(), Some(67_300));
+    }
+
+    /// #44: silence after the restored binding's Rebind is said, so the task can stop treating
+    /// the binding as unconfirmed; the binding and its timers stay (§18.2.12).
+    #[test]
+    fn an_unanswered_rebind_after_start_says_so() {
+        let (_, binding) = bound_with(60, 90, 120);
+        let mut client = new_client();
+        let _ = client.handle(
+            Input::Start {
+                binding: Some(binding.clone()),
+            },
+            0,
+        );
+        let mut now = 0;
+        let mut said = false;
+        while now < CNF_MAX_RD {
+            now = client.next_timeout().expect("a timer");
+            let out = client.handle(Input::Timeout, now);
+            assert!(
+                bound_output(&out).is_none() && gone_output(&out).is_none(),
+                "{out:?}"
+            );
+            said |= notes(&out).contains(&Note::RebindUnanswered);
+        }
+        assert!(
+            said,
+            "the unanswered rebind is said once the deadline passes"
+        );
+        assert_eq!(client.state(), State::Bound);
+        assert_eq!(client.binding(), Some(&binding));
     }
 
     #[test]

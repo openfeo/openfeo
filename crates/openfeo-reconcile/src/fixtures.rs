@@ -276,6 +276,7 @@ pub fn dhcp6_fact_with(prefix: &str) -> WanDhcp6Fact {
         dns: vec!["2001:db8:ffff::1".parse().expect("an address")],
         search: vec!["isp.example".to_owned()],
         server: vec![0, 3, 0, 1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        restored: false,
     }
 }
 

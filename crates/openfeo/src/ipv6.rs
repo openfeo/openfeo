@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openfeo_config::load::STATE_FILE_MODE;
-use openfeo_net::ndp::{ALL_ROUTERS, NdpSocket, RESEND_AFTER, Resend, Role, tentative_link_local};
+use openfeo_net::ndp::{ALL_ROUTERS, NdpSocket, RESEND_AFTER, Resend, Role, transient_send_error};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_platform::atomic;
 use openfeo_proto_dhcp4::identity::{from_hex, hex};
@@ -327,7 +327,7 @@ fn act(
 /// How long to wait before sending again, when `err` is the kernel refusing a link-local
 /// source it has not finished checking (#34); `None` for every other failure.
 pub(crate) fn send_retry(err: &openfeo_net::dhcp4::DriverError) -> Option<Duration> {
-    tentative_link_local(err).then_some(RESEND_AFTER)
+    transient_send_error(err).then_some(RESEND_AFTER)
 }
 
 /// The learned set as the reconcilers see it.

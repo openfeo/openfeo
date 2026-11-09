@@ -150,13 +150,19 @@ impl NdpSocket {
 pub const RESEND_AFTER: Duration = Duration::from_secs(1);
 pub const RESEND_TRIES: u8 = 5;
 
-/// Whether `err` is the kernel refusing to source from a link-local address it has not
-/// finished checking (`EADDRNOTAVAIL`): the one send failure that answers itself in a second.
+/// Whether `err` is a send failure that answers itself within a second: the kernel refusing to
+/// source from a link-local address it has not finished checking (`EADDRNOTAVAIL`, #34), or an
+/// interface that has no usable source address yet, as a bridge at boot (`ENETUNREACH`, #37).
 #[must_use]
-pub fn tentative_link_local(err: &DriverError) -> bool {
+pub fn transient_send_error(err: &DriverError) -> bool {
     match err {
-        DriverError::Socket { source, .. } => *source == nix::Error::EADDRNOTAVAIL,
-        DriverError::Io { source, .. } => source.raw_os_error() == Some(libc::EADDRNOTAVAIL),
+        DriverError::Socket { source, .. } => {
+            matches!(source, nix::Error::EADDRNOTAVAIL | nix::Error::ENETUNREACH)
+        }
+        DriverError::Io { source, .. } => matches!(
+            source.raw_os_error(),
+            Some(libc::EADDRNOTAVAIL | libc::ENETUNREACH)
+        ),
         DriverError::Address(_) | DriverError::Bind { .. } => false,
     }
 }
@@ -192,7 +198,7 @@ impl Resend {
     pub fn retry(mut self, socket: &NdpSocket) -> Result<Option<Resend>, DriverError> {
         match socket.send(self.to, &self.bytes) {
             Ok(()) => Ok(None),
-            Err(err) if tentative_link_local(&err) && self.tries_left > 1 => {
+            Err(err) if transient_send_error(&err) && self.tries_left > 1 => {
                 self.tries_left -= 1;
                 self.at = tokio::time::Instant::now() + RESEND_AFTER;
                 Ok(Some(self))
@@ -225,4 +231,32 @@ fn receive(fd: i32, buf: &mut [u8]) -> std::io::Result<Option<Received>> {
         }),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #34 and #37: a tentative link-local source (`EADDRNOTAVAIL`) and a bridge without a
+    /// usable source yet (`ENETUNREACH`) both answer themselves within a second; a link that is
+    /// down or a refused socket does not.
+    #[test]
+    fn transient_send_errors_are_retried_a_second_later() {
+        let io = |code: i32| DriverError::Io {
+            what: "send ICMPv6",
+            source: std::io::Error::from_raw_os_error(code),
+        };
+        for code in [libc::EADDRNOTAVAIL, libc::ENETUNREACH] {
+            assert!(transient_send_error(&io(code)), "{code}");
+        }
+        for code in [libc::ENETDOWN, libc::EPERM] {
+            assert!(!transient_send_error(&io(code)), "{code}");
+        }
+        let socket = |err: nix::Error| DriverError::Socket {
+            what: "send ICMPv6",
+            source: err,
+        };
+        assert!(transient_send_error(&socket(nix::Error::ENETUNREACH)));
+        assert!(!transient_send_error(&socket(nix::Error::ENETDOWN)));
+    }
 }
