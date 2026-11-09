@@ -112,8 +112,10 @@ $SUDO sysctl -q -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
 # Ubuntu's kea profile pins its config to /etc/kea; the lab writes its own (ADR-0006).
 $SUDO apparmor_parser -R /etc/apparmor.d/usr.sbin.kea-dhcp4 2>/dev/null || true
 $SUDO apparmor_parser -R /etc/apparmor.d/usr.sbin.kea-dhcp6 2>/dev/null || true
-# Autoload from a user namespace is not guaranteed; load what the sandboxed scenarios use.
-for m in nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q ppp_generic pppox pppoe ppp_async; do
+# Autoload from a user namespace is not guaranteed; load what the sandboxed scenarios use (the
+# facts below list the same set, #56).
+MODULES="nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q ppp_generic pppox pppoe ppp_async"
+for m in $MODULES; do
   $SUDO modprobe "$m" 2>/dev/null || true
 done
 # The PPPoE scenarios (M3) open /dev/ppp as the harness user; a sandbox has no udev rule to wait for.
@@ -169,7 +171,7 @@ for dev in /dev/kvm /dev/net/tun /dev/ppp; do
 done
 if unshare -Urn true 2>/dev/null; then echo "unprivileged user+net namespaces: ok"; else echo "unprivileged user+net namespaces: REFUSED"; fi
 loaded=""
-for m in nf_conntrack nft_ct nft_fib_inet nft_nat nft_limit 8021q; do
+for m in $MODULES; do
   if grep -q "^$m " /proc/modules 2>/dev/null; then loaded="$loaded$m "; fi
 done
 echo "modules loaded: ${loaded:-none (built in, or unavailable: check-env tells which)}"
