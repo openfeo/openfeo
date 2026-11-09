@@ -12,7 +12,7 @@ use openfeo_config::{Config, PortMap};
 use ipnet::Ipv6Net;
 
 use crate::{
-    DefaultRoute, Dhcp4Fact, LeaseFact, MacAddr, PppoeFact, TimeFact, WanDhcp6Fact, WanIpv6Fact,
+    Dhcp4Fact, KernelRoute, LeaseFact, MacAddr, PppoeFact, TimeFact, WanDhcp6Fact, WanIpv6Fact,
 };
 
 /// What the netlink monitor knows about one interface (SPEC §7.1: link state is a fact).
@@ -55,7 +55,7 @@ pub struct World {
     /// What each WAN's router-advertisement client learned, keyed by WAN name (SPEC §7.3).
     pub ipv6: Arc<BTreeMap<String, WanIpv6Fact>>,
     /// The default routes the kernel holds in the main table (ADR-0019).
-    pub routes: Arc<BTreeSet<DefaultRoute>>,
+    pub routes: Arc<BTreeSet<KernelRoute>>,
     /// What each WAN's DHCPv6 client holds, keyed by WAN name (SPEC §7.3).
     pub dhcp6: Arc<BTreeMap<String, WanDhcp6Fact>>,
     /// Every PPPoE WAN's session, by WAN name, while it exists (SPEC §7.2).
@@ -90,7 +90,19 @@ impl World {
     pub fn has_default(&self, v6: bool, ifname: &str) -> bool {
         self.routes
             .iter()
-            .any(|route| route.v6 == v6 && route.ifname == ifname)
+            .any(|route| route.v6 == v6 && route.ifname == ifname && route.dst.is_none())
+    }
+
+    /// Whether the kernel can send to `addr` through `ifname`: a default route of its family
+    /// there, or any route that covers it (a classless-only DHCPv4 lease installs no default,
+    /// #32). The gate a learned resolver waits behind (ADR-0019).
+    #[must_use]
+    pub fn reaches(&self, addr: std::net::IpAddr, ifname: &str) -> bool {
+        self.routes.iter().any(|route| {
+            route.v6 == addr.is_ipv6()
+                && route.ifname == ifname
+                && route.dst.is_none_or(|dst| dst.contains(&addr))
+        })
     }
 
     /// The MAC of the named link, if the monitor has reported one.
@@ -110,13 +122,15 @@ mod tests {
         let mut w = World::new(Config::default(), PortMap::default());
         assert!(!w.has_default(true, "p0"));
         w.routes = Arc::new(BTreeSet::from([
-            DefaultRoute {
+            KernelRoute {
                 v6: true,
                 ifname: "p0".to_owned(),
+                dst: None,
             },
-            DefaultRoute {
+            KernelRoute {
                 v6: false,
                 ifname: "p1".to_owned(),
+                dst: None,
             },
         ]));
         assert!(w.has_default(true, "p0"));
@@ -124,6 +138,37 @@ mod tests {
         assert!(!w.has_default(true, "p1"), "the interface matters");
         assert!(w.has_default(false, "p1"));
         assert!(w.ipv6.is_empty(), "no WAN IPv6 facts yet");
+    }
+
+    /// #32: a resolver is reachable through a default route or through any route that covers
+    /// it (a classless-only DHCPv4 lease installs no default).
+    #[test]
+    fn reaches_needs_a_covering_or_default_route() {
+        let mut w = World::new(Config::default(), PortMap::default());
+        w.routes = Arc::new(BTreeSet::from([
+            KernelRoute {
+                v6: false,
+                ifname: "p0".to_owned(),
+                dst: None,
+            },
+            KernelRoute {
+                v6: false,
+                ifname: "p1".to_owned(),
+                dst: Some("198.51.100.0/24".parse().unwrap()),
+            },
+        ]));
+        let v4 = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        assert!(
+            w.reaches(v4("192.0.2.53"), "p0"),
+            "a default covers everything"
+        );
+        assert!(w.reaches(v4("198.51.100.53"), "p1"), "a covering route");
+        assert!(!w.reaches(v4("192.0.2.53"), "p1"), "outside the only route");
+        assert!(!w.reaches(v4("2001:db8::53"), "p0"), "the family matters");
+        assert!(
+            !w.reaches(v4("198.51.100.53"), "p2"),
+            "the interface matters"
+        );
     }
 
     #[test]

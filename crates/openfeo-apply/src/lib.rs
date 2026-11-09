@@ -195,7 +195,9 @@ mod tests {
         for name in ["p0.101", "p12.4094"] {
             assert!(is_managed(name), "{name}");
         }
-        for name in ["p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6", "p1.0", "p1.4095", "p1.01"] {
+        for name in [
+            "p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6", "p1.0", "p1.4095", "p1.01",
+        ] {
             assert!(!is_managed(name), "{name}");
         }
     }

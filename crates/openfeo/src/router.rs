@@ -32,7 +32,7 @@ use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{HealthTracker, Publisher, Supervisor};
 use openfeo_world::health::{Status, Subsystem};
 use openfeo_world::portmap::{PresentPort, assign};
-use openfeo_world::{DefaultRoute, LinkFact, MacAddr, World, rename};
+use openfeo_world::{KernelRoute, LinkFact, MacAddr, World, rename};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -138,7 +138,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     publisher.update(|world| {
         let cache = cache_rx.borrow();
         world.links = Arc::new(link_facts(&cache));
-        world.routes = Arc::new(default_routes(&cache));
+        world.routes = Arc::new(kernel_routes(&cache));
         world.ula = ula;
     });
 
@@ -449,22 +449,23 @@ fn link_facts(cache: &Cache) -> std::collections::BTreeMap<String, LinkFact> {
         .collect()
 }
 
-/// The default routes the kernel holds in the main table, by family and output interface,
-/// whoever installed them (ADR-0019). A blackhole has no interface and is no default.
-fn default_routes(cache: &Cache) -> std::collections::BTreeSet<DefaultRoute> {
+/// The unicast routes the kernel holds in the main table through an interface, by family,
+/// whoever installed them (ADR-0019): the default routes and, for a resolver a classless-only
+/// lease reaches without one, the routes that cover it (#32). A blackhole has no interface.
+fn kernel_routes(cache: &Cache) -> std::collections::BTreeSet<KernelRoute> {
     cache
         .routes
         .iter()
         .filter(|route| {
             route.table == openfeo_netlink::TABLE_MAIN
-                && route.dst.is_none()
                 && route.kind == openfeo_netlink::RouteKind::Unicast
         })
         .filter_map(|route| {
             let link = cache.links.get(&route.oif?)?;
-            Some(DefaultRoute {
+            Some(KernelRoute {
                 v6: route.v6,
                 ifname: link.name.clone(),
+                dst: route.dst,
             })
         })
         .collect()
@@ -480,7 +481,7 @@ async fn netlink_facts_task(
         cache_rx.changed().await.map_err(|_| "netlink cache gone")?;
         let (facts, routes) = {
             let cache = cache_rx.borrow_and_update();
-            (link_facts(&cache), default_routes(&cache))
+            (link_facts(&cache), kernel_routes(&cache))
         };
         let current = publisher.current();
         if *current.links == facts && *current.routes == routes {
@@ -642,7 +643,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_routes_from_the_cache_name_their_interface_and_skip_other_tables() {
+    fn kernel_routes_from_the_cache_name_their_interface_and_skip_other_tables() {
         use openfeo_netlink::{Link, Route, RouteKind, TABLE_MAIN};
         let mut cache = Cache::default();
         for (index, name) in [(2, "p0"), (3, "p1")] {
@@ -688,17 +689,27 @@ mod tests {
         cache
             .routes
             .insert(route(false, TABLE_MAIN, Some(9), RouteKind::Unicast));
-        let facts = default_routes(&cache);
+        let mut prefixed = route(false, TABLE_MAIN, Some(2), RouteKind::Unicast);
+        prefixed.dst = Some("198.51.100.0/24".parse().unwrap());
+        cache.routes.insert(prefixed);
+        let facts = kernel_routes(&cache);
         assert_eq!(
             facts,
             std::collections::BTreeSet::from([
-                DefaultRoute {
+                KernelRoute {
                     v6: false,
-                    ifname: "p0".to_owned()
+                    ifname: "p0".to_owned(),
+                    dst: None
                 },
-                DefaultRoute {
+                KernelRoute {
                     v6: true,
-                    ifname: "p0".to_owned()
+                    ifname: "p0".to_owned(),
+                    dst: None
+                },
+                KernelRoute {
+                    v6: false,
+                    ifname: "p0".to_owned(),
+                    dst: Some("198.51.100.0/24".parse().unwrap()),
                 },
             ])
         );

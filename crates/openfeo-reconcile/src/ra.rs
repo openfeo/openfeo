@@ -269,9 +269,10 @@ mod tests {
         world.links = Arc::new(links);
         assert_eq!(desired(&world)[0].router_lifetime, 0, "carrier gone");
         let mut world = fixtures::ipv6_world();
-        world.routes = Arc::new(BTreeSet::from([openfeo_world::DefaultRoute {
+        world.routes = Arc::new(BTreeSet::from([openfeo_world::KernelRoute {
             v6: false,
             ifname: "p0".to_owned(),
+            dst: None,
         }]));
         assert_eq!(
             desired(&world)[0].router_lifetime,

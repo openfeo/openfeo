@@ -7,7 +7,7 @@
 
 use std::net::Ipv6Addr;
 
-use ipnet::Ipv6Net;
+use ipnet::{IpNet, Ipv6Net};
 
 /// RFC 4191 router preference, as the client reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,10 +37,13 @@ pub struct WanIpv6Fact {
     pub mtu: Option<u32>,
 }
 
-/// A default route the kernel holds in the main table, whatever installed it.
+/// A unicast route the kernel holds in the main table through an interface, whatever installed
+/// it (ADR-0019). `dst: None` is a default route.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DefaultRoute {
+pub struct KernelRoute {
     pub v6: bool,
     /// The output interface's name.
     pub ifname: String,
+    /// The destination; `None` for a default route.
+    pub dst: Option<IpNet>,
 }

@@ -238,23 +238,31 @@ pub(crate) fn active_wan(world: &World) -> Option<&Wan> {
 
 /// The servers `wan` was given (a static WAN's `dns`, never gated) or learned (a DHCP WAN's
 /// lease over IPv4, the advertisements' RDNSS over IPv6), each learned family only while the
-/// kernel has a default route of that family through the WAN (ADR-0019).
+/// kernel holds a route through the WAN that reaches it (ADR-0019; a default, or for a
+/// classless-only DHCPv4 lease the route that covers the resolver, #32).
 fn wan_dns(world: &World, wan: &Wan) -> Vec<IpAddr> {
     let ifname = crate::wan_netdev(wan);
+    let reachable = |dns: &[Ipv4Addr]| -> Vec<IpAddr> {
+        dns.iter()
+            .copied()
+            .map(IpAddr::V4)
+            .filter(|server| world.reaches(*server, &ifname))
+            .collect()
+    };
     let mut servers: Vec<IpAddr> = match &wan.kind {
-        Some(wan::Kind::Dhcp(_)) if world.has_default(false, &ifname) => world
+        Some(wan::Kind::Dhcp(_)) => world
             .dhcp4
             .get(&wan.name)
-            .map(|lease| lease.dns.iter().copied().map(IpAddr::V4).collect())
+            .map(|lease| reachable(&lease.dns))
             .unwrap_or_default(),
         // IPCP's resolvers, behind the IPv4 route like a lease's (ADR-0019).
-        Some(wan::Kind::Pppoe(_)) if world.has_default(false, &ifname) => world
+        Some(wan::Kind::Pppoe(_)) => world
             .pppoe
             .get(&wan.name)
             .and_then(|fact| fact.ipv4.as_ref())
-            .map(|ipv4| ipv4.dns.iter().copied().map(IpAddr::V4).collect())
+            .map(|ipv4| reachable(&ipv4.dns))
             .unwrap_or_default(),
-        Some(wan::Kind::Dhcp(_) | wan::Kind::Pppoe(_)) | None => Vec::new(),
+        None => Vec::new(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .dns
             .iter()
@@ -471,6 +479,42 @@ mod tests {
             !d.wan_upstreams.is_empty(),
             "with the route, the lease's servers are used"
         );
+    }
+
+    /// #32: a lease with classless routes and no router option never installs a default, so the
+    /// gate opens for a resolver one of its routes covers, and stays shut for one none does.
+    #[test]
+    fn a_classless_only_lease_opens_the_gate_for_a_covered_resolver() {
+        let mut world = fixtures::dhcp_world();
+        let mut fact = fixtures::dhcp_fact();
+        fact.gateway = None;
+        fact.routes = vec![(
+            "198.51.100.0/24".parse().unwrap(),
+            "203.0.113.1".parse().unwrap(),
+        )];
+        fact.dns = vec![
+            "198.51.100.53".parse().unwrap(),
+            "192.0.2.53".parse().unwrap(),
+        ];
+        world.dhcp4 = std::sync::Arc::new(std::collections::BTreeMap::from([(
+            "wan0".to_owned(),
+            fact,
+        )]));
+        world.routes = std::sync::Arc::new(std::collections::BTreeSet::from([
+            openfeo_world::KernelRoute {
+                v6: false,
+                ifname: "p0".to_owned(),
+                dst: Some("198.51.100.0/24".parse().unwrap()),
+            },
+        ]));
+        let d = desired(&world);
+        assert_eq!(
+            d.wan_upstreams,
+            vec![ip("198.51.100.53")],
+            "the covered resolver joins, the other waits"
+        );
+        world.routes = std::sync::Arc::new(std::collections::BTreeSet::new());
+        assert_eq!(desired(&world).wan_upstreams, Vec::<IpAddr>::new());
     }
 
     /// RDNSS resolvers need a global source as well as a route: a `[wans.ipv6]` without a

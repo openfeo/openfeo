@@ -644,7 +644,10 @@ fn firewall_rules(report: &mut Report, firewall: &Firewall, lans: &[LanZone<'_>]
                 .iter()
                 .find(|entry| rules::parse_ports(std::slice::from_ref(entry)).is_none())
                 .map_or_else(
-                    || "ports must be at least one of \"1\"-\"65535\" or an \"a-b\" range".to_owned(),
+                    || {
+                        "ports must be at least one of \"1\"-\"65535\" or an \"a-b\" range"
+                            .to_owned()
+                    },
                     |entry| format!("{entry:?} is not a port (1-65535) or an \"a-b\" range"),
                 );
             report.push(format!("{path}.ports"), Code::InvalidRulePorts, message);

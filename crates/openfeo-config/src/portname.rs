@@ -69,7 +69,8 @@ mod tests {
             Some(("p12", Some(4094)))
         );
         for bad in [
-            "p1.", "p1.0", "p1.4095", "p1.1.2", "p1a", "br-lan0", ".5", "p1.01x", "", "p1.+1", "p1.0101",
+            "p1.", "p1.0", "p1.4095", "p1.1.2", "p1a", "br-lan0", ".5", "p1.01x", "", "p1.+1",
+            "p1.0101",
         ] {
             assert!(parse_port_ref(bad).is_none(), "{bad}");
         }
