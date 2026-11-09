@@ -564,6 +564,9 @@ struct PppBench {
     /// The PPPoE session id discovery bound.
     session_id: u16,
     log: std::path::PathBuf,
+    /// The kernel unit refused a read: the session is torn down, and the socket is polled no
+    /// more (a dead unit answers every read with an error at once).
+    kernel_dead: bool,
 }
 
 impl PppBench {
@@ -588,6 +591,7 @@ impl PppBench {
             buf: vec![0u8; 2048],
             dbuf: vec![0u8; 1600],
             padt_seen: false,
+            kernel_dead: false,
             down_at: None,
             session_id: *id,
             log: daemons::pppd_log_path(&lab.run_dir, AC_IF),
@@ -599,11 +603,29 @@ impl PppBench {
         self.pending.extend(outputs);
     }
 
-    /// Act on every output until `done` holds for one or `timeout` passes; the outputs seen.
+    /// Act on every output until `done` holds for one or `timeout` passes; the outputs seen. A
+    /// `Down` that `done` did not ask for ends the wait at once with an error (#52): waiting for
+    /// IPCP while the session dies must fail with the reason, not spin to the deadline.
     async fn run_until(
         &mut self,
         timeout: Duration,
         mut done: impl FnMut(&PppOutput) -> bool,
+    ) -> anyhow::Result<Vec<PppOutput>> {
+        self.drive(timeout, &mut done, true).await
+    }
+
+    /// Act on every output for `window`; the outputs seen. The window ending is the success
+    /// (what a scenario asserts is the silence, or what was sent, in it); a `Down` is an
+    /// output like any other.
+    async fn run_for(&mut self, window: Duration) -> anyhow::Result<Vec<PppOutput>> {
+        self.drive(window, &mut |_| false, false).await
+    }
+
+    async fn drive(
+        &mut self,
+        timeout: Duration,
+        done: &mut impl FnMut(&PppOutput) -> bool,
+        down_fails: bool,
     ) -> anyhow::Result<Vec<PppOutput>> {
         let deadline = Instant::now() + timeout;
         let mut seen = Vec::new();
@@ -620,12 +642,22 @@ impl PppBench {
                     _ => {}
                 }
                 let finished = done(&output);
+                let went_down = matches!(output, PppOutput::Down { .. });
                 seen.push(output);
                 if finished {
                     return Ok(seen);
                 }
+                if went_down && down_fails {
+                    anyhow::bail!(
+                        "session went down ({:?}) while waiting; outputs: {seen:?}",
+                        down_reason(&seen)
+                    );
+                }
             }
             if Instant::now() >= deadline {
+                if !down_fails {
+                    return Ok(seen);
+                }
                 let log = std::fs::read_to_string(&self.log).unwrap_or_default();
                 let tail: Vec<&str> = log.lines().rev().take(20).collect();
                 anyhow::bail!(
@@ -638,13 +670,16 @@ impl PppBench {
                 .map_or(deadline, |at| self.start + Duration::from_millis(at))
                 .min(deadline);
             tokio::select! {
-                received = self.kernel.recv(&mut self.buf) => match received {
-                    Ok((protocol, len)) => {
+                received = self.kernel.recv(&mut self.buf), if !self.kernel_dead => {
+                    if let Ok((protocol, len)) = received {
                         let payload = self.buf[..len].to_vec();
                         self.feed(PppInput::Frame { protocol, payload });
+                    } else {
+                        // Once, as carrier loss; a dead unit is not polled again (#52).
+                        self.kernel_dead = true;
+                        self.feed(PppInput::CarrierLost);
                     }
-                    Err(_) => self.feed(PppInput::CarrierLost),
-                },
+                }
                 received = self.near.recv(&mut self.dbuf) => {
                     let (from, len) = received?;
                     let bytes = self.dbuf[..len].to_vec();
@@ -833,11 +868,18 @@ fn a_wrong_password_is_auth_failed_with_pppds_message(lab: &mut Lab) -> anyhow::
         let rig = Rig::create_isp(lab)?;
         let mut server = rig.server(lab, &PppoeServerConfig::isp(AC_IF, auth))?;
         runtime()?.block_on(async {
-            let (_bench, outputs) = up_over_pppd(&rig, lab, "not-the-secret", is_down).await?;
+            let (mut bench, outputs) = up_over_pppd(&rig, lab, "not-the-secret", is_down).await?;
             let Some(PppReason::AuthFailed(message)) = down_reason(&outputs) else {
                 anyhow::bail!("{auth:?}: not an auth failure: {outputs:?}");
             };
             ensure!(!message.is_empty(), "{auth:?}: pppd's message is carried");
+            // #51: after `auth failed` the core goes quiet; the task's backoff owns the next
+            // attempt.
+            let after = bench.run_for(Duration::from_secs(1)).await?;
+            ensure!(
+                !after.iter().any(|o| matches!(o, PppOutput::Send { .. })),
+                "{auth:?}: the core keeps talking after auth failed: {after:?}"
+            );
             anyhow::Ok(())
         })?;
         server.signal(nix::sys::signal::Signal::SIGKILL);
@@ -914,7 +956,15 @@ fn pppoe_server_stopped_by_sigterm_is_terminated_by_peer(lab: &mut Lab) -> anyho
                 .any(|o| matches!(o, PppOutput::Ipv4Up(_) | PppOutput::Ipv4Down)),
             "nothing of IPv4 when IPCP never finished: {all:?}"
         );
-        ensure!(down_reason(&outputs).is_some(), "{outputs:?}");
+        ensure!(
+            matches!(
+                down_reason(&outputs),
+                Some(PppReason::TerminatedByPeer | PppReason::CarrierLost)
+            ),
+            "the ISP stopping mid-IPCP ends the session at once, by Terminate-Request or the \
+             kernel's teardown, never the keepalive: {:?}: {outputs:?}",
+            down_reason(&outputs)
+        );
         anyhow::Ok(())
     })
 }
@@ -968,9 +1018,11 @@ fn a_padt_from_the_ac_ends_the_session(lab: &mut Lab) -> anyhow::Result<()> {
             "{outputs:?} (padt seen on the discovery socket: {})",
             bench.padt_seen
         );
+        // #50: measured from the PADT to the Down, not against the wait's own deadline.
+        let took = bench.down_at.map(|at| at.duration_since(sent));
         ensure!(
-            sent.elapsed() < Duration::from_secs(5),
-            "at once, not by keepalive"
+            took.is_some_and(|took| took < Duration::from_secs(2)),
+            "the PADT ends the session at once, not by keepalive: {took:?}"
         );
         anyhow::Ok(())
     })
