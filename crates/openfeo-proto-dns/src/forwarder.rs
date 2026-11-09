@@ -520,7 +520,8 @@ impl Forwarder {
     /// TCP retry, which the upstream had already answered over UDP, or a send failed during the
     /// attempt, so the upstream was not asked for the whole wait), and it moves to the next
     /// upstream or fails. Every query whose retry is due is sent again to the same upstream under
-    /// the same id.
+    /// the same id, unless that upstream was marked down in the meantime: then it moves to one
+    /// that is up, as a timed-out attempt does (#35).
     fn timeout(&mut self, now: Timestamp) -> Vec<Output> {
         let expired: Vec<u16> = self
             .pending
@@ -567,6 +568,18 @@ impl Forwarder {
                 continue;
             };
             pending.retry_at = None;
+            if self.is_down(pending.upstream, now)
+                && pending.attempts < MAX_ATTEMPTS
+                && let Some(upstream) = self.pick_upstream(now, Some(pending.upstream))
+            {
+                pending.upstream = upstream;
+                pending.upstream_transport = Transport::Udp;
+                pending.deadline = now + UPSTREAM_TIMEOUT;
+                pending.attempts += 1;
+                pending.retried = false;
+                outputs.push(self.send_upstream(pending));
+                continue;
+            }
             outputs.push(self.send_upstream_as(uid, pending));
         }
         outputs
@@ -1639,6 +1652,97 @@ mod tests {
             20,
         ));
         assert_eq!((r.header.truncated, r.answers.len()), (false, 3));
+    }
+
+    /// #35: a TCP forward whose connect failed is retried like a UDP one whose send failed.
+    #[test]
+    fn a_failed_tcp_forward_is_retried_soon() {
+        let mut f = Forwarder::new(config(), 1);
+        let out = f.handle(
+            client(1, Transport::Tcp, q("big.isp.example", rtype::TXT)),
+            0,
+        );
+        let (upstream, _, fwd) = forwards(&out).remove(0);
+        let mut tc = Message::decode(&upstream_answer(&fwd, &[])).unwrap();
+        tc.header.truncated = true;
+        let out = f.handle(
+            Input::UpstreamReply {
+                upstream,
+                transport: Transport::Udp,
+                bytes: tc.encode(),
+            },
+            10,
+        );
+        let (_, _, fwd2) = forwards(&out).remove(0);
+        let out = f.handle(
+            Input::ForwardFailed {
+                upstream,
+                transport: Transport::Tcp,
+                bytes: fwd2.encode(),
+            },
+            11,
+        );
+        assert!(forwards(&out).is_empty(), "a failure answers with a timer");
+        assert_eq!(f.next_timeout(), Some(11 + FORWARD_RETRY));
+        let out = f.handle(Input::Timeout, 11 + FORWARD_RETRY);
+        let (upstream3, transport3, fwd3) = forwards(&out).remove(0);
+        assert_eq!((upstream3, transport3), (upstream, Transport::Tcp));
+        assert_eq!(fwd3.header.id, fwd2.header.id, "the same id");
+        let out = f.handle(Input::Timeout, 10 + UPSTREAM_TIMEOUT);
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, Output::Event(Event::UpstreamDown(_)))),
+            "a failed send is not silence: {out:?}"
+        );
+    }
+
+    /// #35: a retry that falls due after its upstream was marked down goes to one that is up.
+    #[test]
+    fn a_due_retry_moves_to_an_upstream_that_is_up() {
+        let mut cfg = config();
+        cfg.upstreams = vec![ipa("203.0.113.1"), ipa("203.0.113.2")];
+        let mut f = Forwarder::new(cfg, 1);
+        let out = f.handle(client(1, Transport::Udp, q("a.isp.example", rtype::A)), 0);
+        assert_eq!(forwards(&out)[0].0, ipa("203.0.113.1"));
+        let out = f.handle(
+            client(2, Transport::Udp, q("b.isp.example", rtype::A)),
+            1_900,
+        );
+        assert_eq!(forwards(&out)[0].0, ipa("203.0.113.2"));
+        let out = f.handle(
+            client(3, Transport::Udp, q("c.isp.example", rtype::A)),
+            1_900,
+        );
+        let (upstream, transport, fwd) = forwards(&out).remove(0);
+        assert_eq!(upstream, ipa("203.0.113.1"));
+        let out = f.handle(
+            Input::ForwardFailed {
+                upstream,
+                transport,
+                bytes: fwd.encode(),
+            },
+            1_900,
+        );
+        assert_eq!(forwards(&out).len(), 0, "{out:?}");
+        let out = f.handle(Input::Timeout, UPSTREAM_TIMEOUT);
+        assert!(
+            out.iter()
+                .any(|o| *o == Output::Event(Event::UpstreamDown(ipa("203.0.113.1")))),
+            "query 1's silence marks .1 down: {out:?}"
+        );
+        let out = f.handle(Input::Timeout, 1_900 + FORWARD_RETRY);
+        let retried = forwards(&out);
+        assert_eq!(retried.len(), 1, "{out:?}");
+        let (upstream2, transport2, fwd2) = &retried[0];
+        assert_eq!(
+            (*upstream2, *transport2),
+            (ipa("203.0.113.2"), Transport::Udp)
+        );
+        assert_ne!(
+            fwd2.header.id, fwd.header.id,
+            "a fresh id for another upstream"
+        );
+        assert_eq!(fwd2.questions, fwd.questions);
     }
 
     #[test]
