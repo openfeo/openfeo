@@ -1,35 +1,47 @@
 ---
 source: crates/openfeo-reconcile/src/routing.rs
+assertion_line: 875
 expression: "routing(&fixtures::pd_world())"
 ---
 addrs:
   - ifname: br-lan0
     net: 192.168.1.1/24
     peer: ~
+    lifetimes: ~
   - ifname: br-lan0
     net: "2001:db8:100:1::1/64"
     peer: ~
+    lifetimes: ~
   - ifname: br-lan0
     net: "fd12:3456:789a:1::1/64"
     peer: ~
+    lifetimes: ~
   - ifname: br-lan1
     net: 192.168.2.1/24
     peer: ~
+    lifetimes: ~
   - ifname: br-lan1
     net: "2001:db8:100:2::1/64"
     peer: ~
+    lifetimes: ~
   - ifname: br-lan1
     net: "fd12:3456:789a:2::1/64"
     peer: ~
+    lifetimes: ~
   - ifname: lo
     net: "2001:db8:100::1/128"
     peer: ~
+    lifetimes: ~
   - ifname: lo
     net: "fd12:3456:789a::1/128"
     peer: ~
+    lifetimes: ~
   - ifname: p0
     net: "2001:db8:ffff::1a4/128"
     peer: ~
+    lifetimes:
+      preferred_until_ms: 50000
+      valid_until_ms: 70000
 routes:
   - ifname: ~
     dst: "2001:db8:100::/56"

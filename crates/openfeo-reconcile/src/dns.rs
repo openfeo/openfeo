@@ -323,7 +323,11 @@ fn wan_addresses(world: &World, wan: &Wan) -> Vec<IpAddr> {
         None => Vec::new(),
     };
     if let Some(fact) = world.ipv6.get(&wan.name) {
-        addrs.extend(fact.addresses.iter().map(|net| IpAddr::V6(net.addr())));
+        addrs.extend(
+            fact.addresses
+                .iter()
+                .map(|addr| IpAddr::V6(addr.net.addr())),
+        );
     }
     if let Some(fact) = world.dhcp6.get(&wan.name) {
         addrs.extend(
@@ -532,7 +536,12 @@ mod tests {
             "no prefix and no address: nothing to send from"
         );
         let mut fact = fixtures::ipv6_fact();
-        fact.addresses = vec!["2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap()];
+        fact.addresses = vec![openfeo_world::Lifetimed {
+            net: "2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap(),
+            obtained_ms: 0,
+            preferred_secs: 1800,
+            valid_secs: 3600,
+        }];
         world.ipv6 = std::sync::Arc::new(std::collections::BTreeMap::from([(
             "wan0".to_owned(),
             fact,

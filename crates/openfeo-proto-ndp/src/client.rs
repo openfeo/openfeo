@@ -85,13 +85,27 @@ pub struct Route {
     pub preference: Preference,
 }
 
-/// Everything the WAN currently knows from advertisements. Emitted only when it changes.
+/// An address made from a prefix with the A flag (RFC 7217 stable identifier), with what is
+/// left of the lifetimes the advertisement gave it when this was emitted; `u32::MAX` is
+/// infinite. The kernel is told both, so it deprecates the address on time (#27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LearnedAddress {
+    /// The address with its /64.
+    pub net: Ipv6Net,
+    /// Seconds the address stays preferred (0: deprecated, kept for existing flows).
+    pub preferred: u32,
+    /// Seconds the address stays valid.
+    pub valid: u32,
+}
+
+/// Everything the WAN currently knows from advertisements. Emitted only when it changes, the
+/// addresses' lifetimes included, so one advertisement that refreshes them is one emission.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Learned {
     /// The best default router: highest preference, then most recent.
     pub router: Option<Ipv6Addr>,
-    /// Addresses from prefixes with the A flag, with their prefix length.
-    pub addresses: Vec<Ipv6Net>,
+    /// Addresses from prefixes with the A flag, with their lifetimes.
+    pub addresses: Vec<LearnedAddress>,
     /// Prefixes with the L flag.
     pub on_link: Vec<Ipv6Net>,
     pub routes: Vec<Route>,
@@ -133,8 +147,9 @@ pub struct Client {
     backoff: Timestamp,
     cap_noted: bool,
     routers: BTreeMap<Ipv6Addr, RouterEntry>,
-    /// Keyed by the /64 the address was made from.
-    addresses: BTreeMap<Ipv6Net, (Ipv6Addr, Expiry)>,
+    /// Keyed by the /64 the address was made from: the address, its preferred expiry and its
+    /// valid expiry.
+    addresses: BTreeMap<Ipv6Net, (Ipv6Addr, Expiry, Expiry)>,
     on_link: BTreeMap<Ipv6Net, Expiry>,
     routes: BTreeMap<(Ipv6Net, Ipv6Addr), (Preference, Expiry)>,
     dns: Vec<(Ipv6Addr, Expiry)>,
@@ -237,7 +252,7 @@ impl Client {
                 }
             }
         }
-        let learned = self.learned();
+        let learned = self.learned(now);
         if learned != self.last {
             self.last = learned.clone();
             out.push(Output::Learned(learned));
@@ -253,7 +268,7 @@ impl Client {
             .routers
             .values()
             .map(|r| r.expires)
-            .chain(self.addresses.values().filter_map(|(_, e)| *e))
+            .chain(self.addresses.values().filter_map(|(_, _, e)| *e))
             .chain(self.on_link.values().filter_map(|e| *e))
             .chain(self.routes.values().filter_map(|(_, e)| *e))
             .chain(self.dns.iter().filter_map(|(_, e)| *e))
@@ -310,13 +325,13 @@ impl Client {
                 on_link,
                 autonomous,
                 valid,
-                preferred: _,
+                preferred,
             } => {
                 if on_link {
                     set_lifetime(&mut self.on_link, prefix, valid, now);
                 }
                 if autonomous && prefix.prefix_len() == 64 {
-                    self.address_lifetime(prefix, valid, now);
+                    self.address_lifetime(prefix, preferred, valid, now);
                 }
             }
             NdOption::Mtu(mtu) => {
@@ -358,13 +373,15 @@ impl Client {
 
     /// RFC 4862 §5.5.3 (e): a received valid lifetime over two hours or over what remains is
     /// taken; otherwise what remains is cut to two hours, unless it is already below that, in
-    /// which case the option is ignored.
-    fn address_lifetime(&mut self, prefix: Ipv6Net, valid: u32, now: Timestamp) {
+    /// which case the option is ignored. The preferred lifetime is taken as received (§5.5.3
+    /// (c)), never above the valid one; 0 deprecates the address and keeps it (#27).
+    fn address_lifetime(&mut self, prefix: Ipv6Net, preferred: u32, valid: u32, now: Timestamp) {
         let addr = iid::stable_address(prefix, &self.config.ifname, &self.config.secret, 0);
         let received = expiry(now, valid);
-        let Some((_, remaining)) = self.addresses.get(&prefix) else {
+        let preferred = expiry(now, preferred.min(valid));
+        let Some((_, _, remaining)) = self.addresses.get(&prefix) else {
             if valid > 0 {
-                self.addresses.insert(prefix, (addr, received));
+                self.addresses.insert(prefix, (addr, preferred, received));
             }
             return;
         };
@@ -389,19 +406,26 @@ impl Client {
                 }
             }
         };
-        self.addresses.insert(prefix, (addr, taken));
+        // The preferred expiry never outlives the valid one the rule settled on.
+        let preferred = match (preferred, taken) {
+            (Some(p), Some(v)) => Some(p.min(v)),
+            (p, None) => p,
+            (None, Some(v)) => Some(v),
+        };
+        self.addresses.insert(prefix, (addr, preferred, taken));
     }
 
     fn expire(&mut self, now: Timestamp) {
         self.routers.retain(|_, r| r.expires > now);
-        self.addresses.retain(|_, (_, e)| e.is_none_or(|e| e > now));
+        self.addresses
+            .retain(|_, (_, _, e)| e.is_none_or(|e| e > now));
         self.on_link.retain(|_, e| e.is_none_or(|e| e > now));
         self.routes.retain(|_, (_, e)| e.is_none_or(|e| e > now));
         self.dns.retain(|(_, e)| e.is_none_or(|e| e > now));
         self.search.retain(|(_, e)| e.is_none_or(|e| e > now));
     }
 
-    fn learned(&self) -> Learned {
+    fn learned(&self, now: Timestamp) -> Learned {
         // The best preference wins; among equals the current router stays, so an equal
         // newcomer's every advertisement does not flip the default route (#26); with no current
         // one among them, the most recent.
@@ -423,7 +447,11 @@ impl Client {
             addresses: self
                 .addresses
                 .values()
-                .map(|(addr, _)| Ipv6Net::new_assert(*addr, 64))
+                .map(|(addr, preferred, valid)| LearnedAddress {
+                    net: Ipv6Net::new_assert(*addr, 64),
+                    preferred: seconds_left(*preferred, now),
+                    valid: seconds_left(*valid, now),
+                })
                 .collect(),
             on_link: self.on_link.keys().copied().collect(),
             routes: self
@@ -444,6 +472,13 @@ impl Client {
 
 fn is_link_local(addr: Ipv6Addr) -> bool {
     addr.segments()[0] & 0xffc0 == 0xfe80
+}
+
+/// What is left of an expiry in whole seconds; `u32::MAX` for infinity.
+fn seconds_left(expiry: Expiry, now: Timestamp) -> u32 {
+    expiry.map_or(u32::MAX, |at| {
+        u32::try_from(at.saturating_sub(now) / 1000).unwrap_or(u32::MAX)
+    })
 }
 
 /// `now + seconds`, or infinity for RFC 4861's all-ones lifetime.
@@ -670,7 +705,14 @@ mod tests {
         );
         let l = learned(&out).unwrap();
         let expected = crate::iid::stable_address(net("2001:db8:ffff::/64"), "p0", &SECRET, 0);
-        assert_eq!(l.addresses, vec![Ipv6Net::new_assert(expected, 64)]);
+        assert_eq!(
+            l.addresses,
+            vec![LearnedAddress {
+                net: Ipv6Net::new_assert(expected, 64),
+                preferred: 1800,
+                valid: 3600,
+            }]
+        );
         assert_eq!(l.on_link, vec![net("2001:db8:ffff::/64")]);
         assert_eq!(
             c.next_timeout(),
@@ -694,6 +736,42 @@ mod tests {
             vec![net("2001:db8:ffff::/64")],
             "no L flag, no on-link route"
         );
+    }
+
+    /// #27: an ISP deprecating its prefix (preferred 0, valid still running) leaves an address
+    /// the router no longer prefers for new flows, kept until its valid lifetime runs out.
+    #[test]
+    fn a_deprecating_advertisement_keeps_the_address_with_preferred_zero() {
+        let mut c = client();
+        up(&mut c);
+        let prefix = "2001:db8:ffff::/64";
+        let out = c.handle(
+            advert(ll(1), &ra(0, vec![pio(prefix, true, true, 3600, 1800)])),
+            0,
+        );
+        let l = learned(&out).unwrap();
+        assert_eq!(
+            (l.addresses[0].preferred, l.addresses[0].valid),
+            (1800, 3600)
+        );
+        let out = c.handle(
+            advert(ll(1), &ra(0, vec![pio(prefix, true, true, 3600, 0)])),
+            1_000,
+        );
+        let l = learned(&out).expect("a changed preferred lifetime is learned");
+        assert_eq!(l.addresses.len(), 1, "the address stays");
+        assert_eq!(
+            (l.addresses[0].preferred, l.addresses[0].valid),
+            (0, 3600),
+            "deprecated, with its new valid lifetime"
+        );
+        assert_eq!(
+            c.next_timeout(),
+            Some(1_000 + 3_600_000),
+            "the valid expiry"
+        );
+        let out = c.handle(Input::Timeout, 1_000 + 3_600_000);
+        assert_eq!(learned(&out).unwrap().addresses, vec![]);
     }
 
     #[test]

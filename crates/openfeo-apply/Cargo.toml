@@ -13,6 +13,7 @@ openfeo-netlink = { path = "../openfeo-netlink" }
 openfeo-nft = { path = "../openfeo-nft" }
 openfeo-platform = { path = "../openfeo-platform" }
 openfeo-reconcile = { path = "../openfeo-reconcile" }
+openfeo-runtime = { path = "../openfeo-runtime" }
 openfeo-world = { path = "../openfeo-world" }
 ipnet.workspace = true
 serde_json.workspace = true

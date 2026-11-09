@@ -34,6 +34,7 @@ openfeo-proto-dns = { path = "../crates/openfeo-proto-dns" }
 openfeo-proto-ndp = { path = "../crates/openfeo-proto-ndp" }
 openfeo-proto-ppp = { path = "../crates/openfeo-proto-ppp" }
 openfeo-reconcile = { path = "../crates/openfeo-reconcile" }
+openfeo-runtime = { path = "../crates/openfeo-runtime" }
 openfeo-world = { path = "../crates/openfeo-world" }
 
 [[test]]

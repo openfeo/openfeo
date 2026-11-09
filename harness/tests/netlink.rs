@@ -81,6 +81,10 @@ const SCENARIOS: &[Scenario] = &[
         run: addr_and_route_primitives,
     },
     Scenario {
+        name: "an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time",
+        run: an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time,
+    },
+    Scenario {
         name: "apply_builds_bridge_addrs_routes",
         run: apply_builds_bridge_addrs_routes,
     },
@@ -754,6 +758,73 @@ fn bridge_with_vlan_filtering_enslave_rename(_lab: &mut Lab) -> anyhow::Result<(
 }
 
 /// Address and route primitives, including the `EEXIST` a duplicate route add reports.
+/// #27: an address added with lifetimes is deprecated and then dropped by the kernel on its
+/// own, the cache shows the deadlines, and setting the lifetimes again moves them.
+fn an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time(
+    _lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "lv0"]);
+    netns::ip(&["link", "add", "lv0", "type", "veth", "peer", "name", "lv1"])?;
+    netns::ip(&["link", "set", "lv1", "up"])?;
+    netns::ip(&["link", "set", "lv0", "up"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let lv0 = rx.borrow().link_by_name("lv0").context("lv0")?.index;
+        let net: IpNet = "2001:db8:ffff::1/64".parse()?;
+        let cached = |c: &Cache| {
+            c.addrs
+                .iter()
+                .find(|a| a.ifindex == lv0 && a.net == net)
+                .map(|a| (a.preferred_until_ms, a.valid_until_ms))
+        };
+        let now = openfeo_runtime::clock::uptime_ms();
+        nl.addr_add_with_lifetimes(lv0, net, Some(2), Some(8))
+            .await?;
+        wait_until(&mut rx, "the address with its deadlines", |c| {
+            cached(c).is_some_and(|(p, v)| {
+                p.is_some_and(|p| p.abs_diff(now + 2_000) < 1_500)
+                    && v.is_some_and(|v| v.abs_diff(now + 8_000) < 1_500)
+            })
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let shown = netns::ip(&["-6", "addr", "show", "dev", "lv0"])?;
+        ensure!(
+            shown.contains("deprecated"),
+            "the kernel deprecates it at 2 s: {shown}"
+        );
+        let later = openfeo_runtime::clock::uptime_ms();
+        nl.addr_add_with_lifetimes(lv0, net, Some(600), Some(1200))
+            .await?;
+        wait_until(&mut rx, "the deadlines moved", |c| {
+            cached(c).is_some_and(|(p, _)| p.is_some_and(|p| p.abs_diff(later + 600_000) < 1_500))
+        })
+        .await?;
+        let shown = netns::ip(&["-6", "addr", "show", "dev", "lv0"])?;
+        ensure!(
+            !shown.contains("deprecated"),
+            "preferred again after the refresh: {shown}"
+        );
+        nl.addr_add_with_lifetimes(lv0, net, Some(0), Some(2))
+            .await?;
+        // The kernel drops it at 2 s, on its own timer: a little longer than the settle window.
+        let gone_by = tokio::time::Instant::now() + Duration::from_secs(6);
+        while cached(&rx.borrow_and_update()).is_some() {
+            ensure!(
+                tokio::time::Instant::now() < gone_by,
+                "the address outlived its valid lifetime: {:?}",
+                cached(&rx.borrow())
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "lv0"]);
+    result?
+}
+
 fn addr_and_route_primitives(_lab: &mut Lab) -> anyhow::Result<()> {
     let _ = netns::ip(&["link", "del", "rv0"]);
     netns::ip(&["link", "add", "rv0", "type", "veth", "peer", "name", "rv1"])?;
@@ -1732,6 +1803,7 @@ fn a_point_to_point_address_is_added_with_its_peer_and_removed(
                 ifname: "ppp-wan9".to_owned(),
                 net,
                 peer: Some(peer),
+                lifetimes: None,
             }]),
             ..DesiredRouting::default()
         };
