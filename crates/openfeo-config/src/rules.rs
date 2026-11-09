@@ -157,8 +157,21 @@ fn parse_port_range(text: &str) -> Option<(u16, u16)> {
     (a <= b).then_some((a, b))
 }
 
+/// A port in its canonical spelling: decimal digits with no sign and no leading zero, 1 to
+/// 65535 (so `"+80"` and `"0080"` are refused, not read as 80).
 fn parse_port(text: &str) -> Option<u16> {
+    if !is_canonical_decimal(text) {
+        return None;
+    }
     text.parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+/// Digits only, and no leading zero unless the number is `0` itself.
+#[must_use]
+pub fn is_canonical_decimal(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && (text.len() == 1 || !text.starts_with('0'))
 }
 
 /// Whether `net` lies entirely in global unicast space: not RFC 1918, not shared (100.64/10),
@@ -253,6 +266,9 @@ mod tests {
             vec!["70000".to_string()],
             vec!["90-80".to_string()],
             vec!["a".to_string()],
+            vec!["+80".to_string()],
+            vec!["0080".to_string()],
+            vec!["80-0090".to_string()],
             vec![],
         ] {
             assert!(parse_ports(&bad).is_none(), "{bad:?}");

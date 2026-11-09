@@ -106,6 +106,8 @@ pub enum Code {
     Ipv6Disabled,
     /// A `[wans.ipv6] pd_hint` outside 48 to 64.
     InvalidPdHint,
+    /// A `pd_hint` beside a typed `prefix`: a typed prefix asks for no delegation.
+    PdHintBesidePrefix,
     /// `[wans.pppoe].username` is empty, over 255 bytes or carries a NUL.
     PppoeUsername,
     /// `[wans.pppoe].password` is empty, over 255 bytes or carries a NUL.
@@ -240,6 +242,7 @@ impl Code {
             Code::InvalidIpv6Mode => "invalid_ipv6_mode",
             Code::Ipv6Disabled => "ipv6_disabled",
             Code::InvalidPdHint => "invalid_pd_hint",
+            Code::PdHintBesidePrefix => "pd_hint_beside_prefix",
             Code::PppoeUsername => "pppoe_username",
             Code::PppoePassword => "pppoe_password",
             Code::PppoeFilter => "pppoe_filter",
@@ -636,11 +639,15 @@ fn firewall_rules(report: &mut Report, firewall: &Firewall, lans: &[LanZone<'_>]
         }
         let wants_ports = matches!(rule.proto.as_str(), "tcp" | "udp");
         if wants_ports && rules::parse_ports(&rule.ports).is_none() {
-            report.push(
-                format!("{path}.ports"),
-                Code::InvalidRulePorts,
-                "ports must be at least one of \"1\"-\"65535\" or an \"a-b\" range".to_owned(),
-            );
+            let message = rule
+                .ports
+                .iter()
+                .find(|entry| rules::parse_ports(std::slice::from_ref(entry)).is_none())
+                .map_or_else(
+                    || "ports must be at least one of \"1\"-\"65535\" or an \"a-b\" range".to_owned(),
+                    |entry| format!("{entry:?} is not a port (1-65535) or an \"a-b\" range"),
+                );
+            report.push(format!("{path}.ports"), Code::InvalidRulePorts, message);
         } else if !wants_ports && !rule.ports.is_empty() {
             report.push(
                 format!("{path}.ports"),
@@ -882,6 +889,15 @@ fn ipv6_wan(
         }
     }
     if ipv6.pd_hint != 0 {
+        if !ipv6.prefix.is_empty() {
+            report.push(
+                format!("{path}.pd_hint"),
+                Code::PdHintBesidePrefix,
+                "a typed prefix asks for no delegation, so pd_hint would describe nothing; drop \
+                 one of them"
+                    .to_owned(),
+            );
+        }
         if !(48..=64).contains(&ipv6.pd_hint) {
             report.push(
                 format!("{path}.pd_hint"),
@@ -2543,6 +2559,19 @@ mod tests {
     }
 
     #[test]
+    fn a_port_list_entry_is_quoted_when_refused() {
+        let mut cfg = base();
+        let fw = cfg.firewall.get_or_insert_with(Default::default);
+        fw.rules = vec![rule("web", "wan", "192.168.1.10", "tcp", &["80", "+80"])];
+        let violations = validate(&cfg, &live());
+        let ports = violations
+            .iter()
+            .find(|v| v.code == Code::InvalidRulePorts)
+            .unwrap_or_else(|| panic!("no ports violation: {violations:?}"));
+        assert!(ports.message.contains("\"+80\""), "{}", ports.message);
+    }
+
+    #[test]
     fn rules_name_a_zone_a_target_inside_another_lan_a_proto_and_ports() {
         type Case<'a> = (&'a str, &'a str, &'a str, &'a str, &'a [&'a str], Code);
         let mut cfg = base();
@@ -3374,6 +3403,21 @@ mod ipv6_tests {
         );
         // `none` is fine without any IPv6 WAN too: it says the same thing the absence says.
         assert_eq!(found(&config("", "ipv6 = \"none\"\n", "")), vec![]);
+    }
+
+    #[test]
+    fn pd_hint_beside_a_typed_prefix_is_refused() {
+        let cfg = config(
+            "[wans.ipv6]\nprefix = \"2001:db8:1::/48\"\npd_hint = 56\n",
+            LAN0_V6,
+            "",
+        );
+        assert_eq!(
+            found(&cfg),
+            vec![("wans[0].ipv6.pd_hint".to_owned(), Code::PdHintBesidePrefix)]
+        );
+        let cfg = config(ROUTED, LAN0_V6, "");
+        assert!(found(&cfg).is_empty(), "{:?}", found(&cfg));
     }
 
     #[test]
