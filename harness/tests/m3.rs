@@ -29,6 +29,10 @@ const SCENARIOS: &[Scenario] = &[
         run: lan_fetches_isp_http_through_nat_over_ppp,
     },
     Scenario {
+        name: "the_lan_resolves_a_name_through_the_ipcp_resolver_over_ppp",
+        run: the_lan_resolves_a_name_through_the_ipcp_resolver_over_ppp,
+    },
+    Scenario {
         name: "the_mss_clamp_makes_the_server_send_segments_that_fit",
         run: the_mss_clamp_makes_the_server_send_segments_that_fit,
     },
@@ -255,6 +259,51 @@ fn no_password_on_the_console(lab: &Lab, iface: &str) -> anyhow::Result<()> {
 
 /// The LAN host fetches from the ISP over the PPP link; the ISP sees the request from the
 /// address IPCP gave the router, never the LAN's.
+/// The IPCP resolver carries a real query (#55): the LAN host asks the router, the forwarder
+/// asks the ISP's resolver over the PPP session, and `www.isp.example` comes back.
+fn the_lan_resolves_a_name_through_the_ipcp_resolver_over_ppp(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.start_dnsmasq()?;
+    let booted = boot_pppoe(lab, &PppoeServerConfig::isp("wan0", Auth::Chap), VM_PPPOE)?;
+    let mut cur = booted.cur;
+    let c = lab.console()?;
+    // m1's UPSTREAMS_LEARNED: the resolver joins once the route exists (ADR-0019).
+    c.wait_for(
+        &mut cur,
+        &re(r"openfeo: dns upstreams 203\.0\.113\.1 \(learned from wan0\)"),
+        SOON,
+    )?;
+    let answer = lanclient::dig(
+        &lab.lan0,
+        "192.168.1.1".parse()?,
+        "www.isp.example",
+        "A",
+        &[],
+        Duration::from_secs(6),
+    )?;
+    ensure!(answer.status == "NOERROR", "{answer:?}");
+    ensure!(
+        answer
+            .answers
+            .iter()
+            .any(|(_, _, rtype, value)| rtype == "A" && value == "198.51.100.10"),
+        "{answer:?}"
+    );
+    let dnsmasq = lab
+        .daemons
+        .iter()
+        .find(|d| d.name == "dnsmasq")
+        .context("dnsmasq")?;
+    ensure!(
+        dnsmasq
+            .log
+            .count(&re(r"auth\[A\] www\.isp\.example from 203\.0\.113\.100"))
+            >= 1,
+        "the query reached the ISP over PPP: {:?}",
+        dnsmasq.log.tail(8)
+    );
+    Ok(())
+}
+
 fn lan_fetches_isp_http_through_nat_over_ppp(lab: &mut Lab) -> anyhow::Result<()> {
     let booted = boot_pppoe(lab, &PppoeServerConfig::isp("wan0", Auth::Chap), VM_PPPOE)?;
     ensure!(booted.session_id != 0, "a session id");
