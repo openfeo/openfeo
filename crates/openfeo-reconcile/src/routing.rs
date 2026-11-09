@@ -44,6 +44,32 @@ pub struct DesiredAddr {
     pub net: IpNet,
     /// The far end of a point-to-point link (a PPP netdev's peer), `IFA_ADDRESS` to the kernel.
     pub peer: Option<IpAddr>,
+    /// The lifetimes the kernel is told (`IFA_CACHEINFO`), for an address the ISP gave with
+    /// lifetimes (a SLAAC address, a DHCPv6 address); `None` for the router's own addresses,
+    /// which are forever (#27).
+    pub lifetimes: Option<Lifetimes>,
+}
+
+/// When an address stops being preferred and when it stops being valid, as deadlines on the
+/// process clock; `None` is infinite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Lifetimes {
+    pub preferred_until_ms: Option<u64>,
+    pub valid_until_ms: Option<u64>,
+}
+
+impl Lifetimes {
+    /// The deadlines of a lease counted from when it was obtained; `u32::MAX` is infinite.
+    #[must_use]
+    pub fn of(lease: &openfeo_world::Lifetimed) -> Lifetimes {
+        let until = |secs: u32| {
+            (secs != u32::MAX).then(|| lease.obtained_ms.saturating_add(u64::from(secs) * 1000))
+        };
+        Lifetimes {
+            preferred_until_ms: until(lease.preferred_secs),
+            valid_until_ms: until(lease.valid_secs),
+        }
+    }
 }
 
 /// A route's type: unicast, or a blackhole for a declared public block (SPEC §7.4). Mirrors
@@ -185,6 +211,7 @@ pub fn routing(world: &World) -> DesiredRouting {
                         ifname: ifname.clone(),
                         net,
                         peer: None,
+                        lifetimes: None,
                     });
                 }
                 if let Ok(gateway) = static_wan.gateway.parse::<IpAddr>() {
@@ -199,6 +226,7 @@ pub fn routing(world: &World) -> DesiredRouting {
                     ifname: ifname.clone(),
                     net: IpNet::V4(lease.address),
                     peer: None,
+                    lifetimes: None,
                 });
                 // RFC 3442: classless routes replace the router option, and `0.0.0.0/0` among
                 // them is the default route. A gateway outside the leased subnet (a /32 lease,
@@ -263,6 +291,7 @@ fn lan_addresses(world: &World, lan6: &Lan6, desired: &mut DesiredRouting) {
                 ifname: bridge_name(&lan.name),
                 net,
                 peer: None,
+                lifetimes: None,
             });
         }
     }
@@ -271,6 +300,7 @@ fn lan_addresses(world: &World, lan6: &Lan6, desired: &mut DesiredRouting) {
             ifname: prefix.ifname.clone(),
             net: IpNet::V6(Ipv6Net::new_assert(prefix.router, 64)),
             peer: None,
+            lifetimes: None,
         });
     }
     let ipv6_wan = world.config.wans.iter().any(|wan| {
@@ -318,6 +348,7 @@ fn pppoe_routing(world: &World, wan_config: &Wan, ifname: &str, desired: &mut De
             ifname: ifname.to_owned(),
             net: IpNet::V4(Ipv4Net::from(ipv4.local)),
             peer: ipv4.peer.map(IpAddr::V4),
+            lifetimes: None,
         });
         desired
             .routes
@@ -329,6 +360,7 @@ fn pppoe_routing(world: &World, wan_config: &Wan, ifname: &str, desired: &mut De
             ifname: ifname.to_owned(),
             net: IpNet::V6(Ipv6Net::new_assert(link_local(ipv6.local_iid), 64)),
             peer: None,
+            lifetimes: None,
         });
         desired.routes.insert(route(
             Some(IpNet::V6(Ipv6Net::from(link_local(ipv6.peer_iid)))),
@@ -386,11 +418,12 @@ fn ipv6_routing(
     }
     let usable = |net: &Ipv6Net| learned_prefix_is_usable(*net, prefix, &own);
     if let Some(fact) = fact {
-        for addr in fact.addresses.iter().filter(|addr| usable(addr)) {
+        for addr in fact.addresses.iter().filter(|addr| usable(&addr.net)) {
             desired.addrs.insert(DesiredAddr {
                 ifname: ifname.to_owned(),
-                net: IpNet::V6(*addr),
+                net: IpNet::V6(addr.net),
                 peer: None,
+                lifetimes: Some(Lifetimes::of(addr)),
             });
         }
         for on_link in fact.on_link.iter().filter(|net| usable(net)) {
@@ -406,6 +439,7 @@ fn ipv6_routing(
                 ifname: ifname.to_owned(),
                 net: IpNet::V6(addr.net),
                 peer: None,
+                lifetimes: Some(Lifetimes::of(addr)),
             });
         }
         for delegated in fact6.prefixes.iter().chain_deprecated(fact6) {
@@ -419,7 +453,7 @@ fn ipv6_routing(
             || fact.is_some_and(|f| {
                 f.on_link
                     .iter()
-                    .chain(&f.addresses)
+                    .chain(f.addresses.iter().map(|addr| &addr.net))
                     .filter(|net| usable(net))
                     .any(|net| net.contains(&via))
             });
@@ -451,6 +485,7 @@ fn ipv6_routing(
             ifname: "lo".to_owned(),
             net: IpNet::V6(Ipv6Net::new_assert(router_address(prefix), 128)),
             peer: None,
+            lifetimes: None,
         });
         desired.routes.insert(blackhole(prefix));
     }
@@ -459,6 +494,7 @@ fn ipv6_routing(
             ifname: "lo".to_owned(),
             net: IpNet::V6(Ipv6Net::new_assert(*addr, 128)),
             peer: None,
+            lifetimes: None,
         });
     }
     desired.rules.insert(DesiredRule {
@@ -515,6 +551,7 @@ mod tests {
                 ifname: "ppp-wan0".to_owned(),
                 net: "203.0.113.100/32".parse().unwrap(),
                 peer: Some("203.0.113.1".parse().unwrap()),
+                lifetimes: None
             }),
             "{:?}",
             desired.addrs
@@ -547,6 +584,7 @@ mod tests {
                 ifname: "ppp-wan0".to_owned(),
                 net: "fe80::1234:5678:9abc:def0/64".parse().unwrap(),
                 peer: None,
+                lifetimes: None
             }),
             "{:?}",
             desired.addrs
@@ -984,11 +1022,63 @@ mod tests {
         );
     }
 
+    /// #27: the ISP's lifetimes reach the kernel; the router's own addresses are forever.
+    #[test]
+    fn the_wan_address_carries_its_lifetimes() {
+        let mut world = fixtures::ipv6_world();
+        let mut fact = fixtures::ipv6_fact();
+        fact.addresses = vec![openfeo_world::Lifetimed {
+            net: "2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap(),
+            obtained_ms: 10_000,
+            preferred_secs: 1800,
+            valid_secs: u32::MAX,
+        }];
+        world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        let desired = routing(&world);
+        let wan = desired
+            .addrs
+            .iter()
+            .find(|a| a.ifname == "p0" && a.net.addr().is_ipv6())
+            .expect("the WAN's SLAAC address");
+        assert_eq!(
+            wan.lifetimes,
+            Some(Lifetimes {
+                preferred_until_ms: Some(1_810_000),
+                valid_until_ms: None,
+            })
+        );
+        let lan = desired
+            .addrs
+            .iter()
+            .find(|a| a.ifname == "br-lan0" && a.net.addr().is_ipv6())
+            .expect("the LAN's address");
+        assert_eq!(lan.lifetimes, None);
+        let pd = routing(&fixtures::pd_world());
+        let na = pd
+            .addrs
+            .iter()
+            .find(|a| a.ifname == "p0" && a.net.addr().is_ipv6())
+            .expect("the DHCPv6 address");
+        assert_eq!(
+            na.lifetimes,
+            Some(Lifetimes {
+                preferred_until_ms: Some(50_000),
+                valid_until_ms: Some(70_000),
+            }),
+            "obtained at 10 s, preferred 40 s, valid 60 s"
+        );
+    }
+
     #[test]
     fn the_wan_facts_addresses_on_link_prefixes_and_routes_land_on_the_wan() {
         let mut world = fixtures::ipv6_world();
         let mut fact = fixtures::ipv6_fact();
-        fact.addresses = vec!["2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap()];
+        fact.addresses = vec![openfeo_world::Lifetimed {
+            net: "2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap(),
+            obtained_ms: 0,
+            preferred_secs: 1800,
+            valid_secs: 3600,
+        }];
         fact.on_link = vec!["2001:db8:ffff::/64".parse().unwrap()];
         fact.routes = vec![(
             "2001:db8:2::/48".parse().unwrap(),
@@ -1018,9 +1108,15 @@ mod tests {
     fn learned_prefixes_that_are_not_global_or_are_the_routers_own_are_ignored() {
         let mut world = fixtures::ipv6_world();
         let mut fact = fixtures::ipv6_fact();
+        let forever = |net: &str| openfeo_world::Lifetimed {
+            net: net.parse().unwrap(),
+            obtained_ms: 0,
+            preferred_secs: u32::MAX,
+            valid_secs: u32::MAX,
+        };
         fact.addresses = vec![
-            "2001:db8:1:222::abcd/64".parse().unwrap(),
-            "2001:db8:ffff:0:1234:5678:9abc:def0/64".parse().unwrap(),
+            forever("2001:db8:1:222::abcd/64"),
+            forever("2001:db8:ffff:0:1234:5678:9abc:def0/64"),
         ];
         fact.on_link = vec![
             "2001:db8:1::/48".parse().unwrap(),

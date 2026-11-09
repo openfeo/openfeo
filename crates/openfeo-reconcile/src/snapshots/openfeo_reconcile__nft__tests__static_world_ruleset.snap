@@ -1,5 +1,6 @@
 ---
 source: crates/openfeo-reconcile/src/nft.rs
+assertion_line: 1619
 expression: desired
 ---
 ruleset:
@@ -1039,6 +1040,65 @@ ruleset:
               op: "=="
               right: "@lan_pairs"
           - accept: ~
+        family: inet
+        table: openfeo
+  - add:
+      chain:
+        family: inet
+        hook: output
+        name: output
+        policy: accept
+        prio: 0
+        table: openfeo
+        type: filter
+  - add:
+      rule:
+        chain: output
+        expr:
+          - match:
+              left:
+                meta:
+                  key: oifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: saddr
+                  protocol: ip6
+              op: "=="
+              right:
+                prefix:
+                  addr: "fc00::"
+                  len: 7
+          - reject:
+              expr: no-route
+              type: icmpv6
+        family: inet
+        table: openfeo
+  - add:
+      rule:
+        chain: output
+        expr:
+          - match:
+              left:
+                meta:
+                  key: oifname
+              op: "=="
+              right: "@wan_if"
+          - match:
+              left:
+                payload:
+                  field: daddr
+                  protocol: ip6
+              op: "=="
+              right:
+                prefix:
+                  addr: "fc00::"
+                  len: 7
+          - reject:
+              expr: no-route
+              type: icmpv6
         family: inet
         table: openfeo
   - add:

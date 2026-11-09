@@ -11,7 +11,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M0 Harness and skeleton | done, 2026-10-30 | commits on `main`, before the repository took pull requests |
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
-| M3 PPPoE | done, 2026-11-09 | #46, #47 |
+| M3 PPPoE | done, 2026-11-09 | #46, #47; follow-up #58 |
 | M4 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -170,6 +170,26 @@ first discovery running before the port's MTU was raised (the router now asks 15
 ENXIO read as "no PPP" for a session the kernel refused. `make check-env` reports `pppd`, `pppoe-server`
 and `/dev/ppp`; CI and the cloud setup install and open them. SPEC §12's M3 row is met. M3 is complete;
 next is M4.
+
+## Follow-ups
+
+**2026-11-10, [#58](https://github.com/openfeo/openfeo/pull/58), router deferred minors.** The fifteen
+router-side issues deferred from the M2 and M3 reviews, each fixed test-first in one branch. The
+kernel now deprecates and drops the WAN's SLAAC address on the ISP's lifetimes: the RA client carries
+a prefix's preferred lifetime, the World fact and the routing reconciler carry both lifetimes as
+deadlines, and the netlink crate writes and reads them as `IFA_CACHEINFO`, for DHCPv6 addresses too
+(#27). A learned IPv4 resolver joins the forwarder once any kernel route through the WAN reaches it,
+so a classless-only lease with no router option opens ADR-0019's gate (#32). The first router
+advertisement after boot retries `ENETUNREACH` a second later instead of being lost, and a delegation
+restored from disk is advertised live until its Rebind is answered or gives up (#37, #44). DHCPv6
+follows RFC 8415 §18.2.10.1 for a lease a Reply omits, keeps the deprecated list on disk through an
+expiry or a dropped binding, rejects a lease file whose server DUID is corrupt, and answers
+Information-Requests from link-local sources only (#39 to #42). The forwarder retries a failed TCP
+connect and moves a due retry off a downed upstream (#35); `arp_ignore` is on for every interface so a
+pure trunk port answers no untagged ARP, proven by a new m2 scenario (#15); the WAN's IPv6 MTU never
+exceeds the lease MTU set in the same pass (#38); the router's own ULA-sourced or ULA-bound output
+toward a WAN is refused (#45); port and VLAN spellings are canonical and `pd_hint` beside a typed
+prefix is refused (#18, #43); the applier reads port names from openfeo-config's one grammar (#16).
 
 ## Tooling and process
 

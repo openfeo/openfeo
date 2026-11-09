@@ -23,7 +23,7 @@ pub mod world;
 
 pub use dhcp4::Dhcp4Fact;
 pub use dhcp6::{Deprecated, Lifetimed, WanDhcp6Fact};
-pub use ipv6::{DefaultRoute, Preference, WanIpv6Fact};
+pub use ipv6::{KernelRoute, Preference, WanIpv6Fact};
 pub use leases::LeaseFact;
 pub use mac::MacAddr;
 pub use pppoe::{PppIpv4, PppIpv6, PppoeFact};

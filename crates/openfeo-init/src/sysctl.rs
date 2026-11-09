@@ -20,6 +20,11 @@ pub const CORE: &[(&str, &str)] = &[
     // §7.4: reverse-path filtering is done in nftables, not by the kernel.
     ("net/ipv4/conf/all/rp_filter", "0"),
     ("net/ipv4/conf/default/rp_filter", "0"),
+    // §7.1: an interface answers ARP only for its own addresses, so a port carrying only
+    // tagged LANs (no address of its own) gives nothing away on its native VLAN (#15). The
+    // kernel takes the higher of `all` and the interface's, so one line covers every interface,
+    // present and future.
+    ("net/ipv4/conf/all/arp_ignore", "1"),
     // Router hygiene: never send or accept ICMP redirects.
     ("net/ipv4/conf/all/send_redirects", "0"),
     ("net/ipv4/conf/default/send_redirects", "0"),
@@ -46,6 +51,13 @@ pub fn apply(log: &Log) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// #15: a port carrying only tagged LANs holds no address, yet without this the kernel
+    /// would answer an untagged ARP request on it for any of the router's addresses.
+    #[test]
+    fn arp_ignore_is_on_for_every_interface() {
+        assert!(CORE.contains(&("net/ipv4/conf/all/arp_ignore", "1")));
+    }
 
     #[test]
     fn table_has_no_duplicates_or_leading_slashes() {

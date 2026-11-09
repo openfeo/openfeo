@@ -690,6 +690,13 @@ fn a_rebooted_router_keeps_its_delegation(lab: &mut Lab) -> anyhow::Result<()> {
             "the rebooted router must rebind the persisted binding, not solicit: {:?}",
             c.tail(30)
         );
+        // #37: the first advertisement after boot meets ENETUNREACH on the bridge and is sent
+        // again a second later, quietly; a warning here is a lost advertisement.
+        ensure!(
+            c.count_since(&reset, &re(r"openfeo: ra \S+: send:")) == 0,
+            "an advertisement was lost to a send error: {:?}",
+            c.tail(30)
+        );
         Ok(watched)
     })?;
     ensure!(

@@ -50,4 +50,7 @@ pub struct WanDhcp6Fact {
     pub search: Vec<String>,
     /// The server's DUID, for the console.
     pub server: Vec<u8>,
+    /// Restored from disk at boot and not yet confirmed by a Reply, nor given up on by the
+    /// Rebind's deadline: advertised live meanwhile, whatever the WAN's route says (#44).
+    pub restored: bool,
 }

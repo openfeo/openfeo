@@ -36,10 +36,11 @@ pub fn is_port_name(text: &str) -> bool {
         .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// A VLAN id written as plain digits and within 1..=4094.
+/// A VLAN id written as plain digits with no leading zero and within 1..=4094 (`p1.0101`
+/// would otherwise become the interface `p1.101`, a name the config never spelled).
 #[must_use]
 pub fn parse_vlan(text: &str) -> Option<u16> {
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+    if !crate::rules::is_canonical_decimal(text) {
         return None;
     }
     text.parse::<u16>()
@@ -69,6 +70,7 @@ mod tests {
         );
         for bad in [
             "p1.", "p1.0", "p1.4095", "p1.1.2", "p1a", "br-lan0", ".5", "p1.01x", "", "p1.+1",
+            "p1.0101",
         ] {
             assert!(parse_port_ref(bad).is_none(), "{bad}");
         }

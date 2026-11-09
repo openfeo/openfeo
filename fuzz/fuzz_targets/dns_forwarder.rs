@@ -99,7 +99,7 @@ fuzz_target!(|data: &[u8]| {
             if let Some(id) = reply.first_chunk_mut::<2>() {
                 *id = forwarded.header.id.to_be_bytes();
             }
-            let _ = forwarder.handle(
+            let answered = forwarder.handle(
                 Input::UpstreamReply {
                     upstream,
                     transport,
@@ -107,6 +107,29 @@ fuzz_target!(|data: &[u8]| {
                 },
                 reply_at,
             );
+            // A truncated reply moves the query to TCP: that forward fails too, and its retry
+            // falls due (#35).
+            for output in answered {
+                let Output::Forward {
+                    upstream,
+                    transport: Transport::Tcp,
+                    bytes,
+                } = output
+                else {
+                    continue;
+                };
+                let _ = forwarder.handle(
+                    Input::ForwardFailed {
+                        upstream,
+                        transport: Transport::Tcp,
+                        bytes,
+                    },
+                    reply_at,
+                );
+                if let Some(retry) = forwarder.next_timeout() {
+                    let _ = forwarder.handle(Input::Timeout, retry);
+                }
+            }
         }
     }
     assert!(forwarder.pending() <= MAX_PENDING);

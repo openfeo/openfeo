@@ -380,7 +380,7 @@ fn the_client_learns_router_prefix_mtu_rdnss_and_dnssl_from_radvd(
         learned
             .addresses
             .iter()
-            .any(|net| net.to_string().starts_with("2001:db8:ffff:")),
+            .any(|net| net.net.to_string().starts_with("2001:db8:ffff:")),
         "an address in the link prefix: {learned:?}"
     );
     ensure!(

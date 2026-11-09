@@ -1,11 +1,13 @@
 ---
 source: crates/openfeo-reconcile/src/routing.rs
+assertion_line: 1317
 expression: desired
 ---
 addrs:
   - ifname: br-lan0
     net: 192.168.1.1/24
     peer: ~
+    lifetimes: ~
 routes: []
 rules: []
 ipv6_owned:

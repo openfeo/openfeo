@@ -50,14 +50,15 @@ pub fn sysctl(world: &World, forwarding: bool) -> DesiredSysctl {
                 entries.insert(ipv6_conf(&ifname, key), "0".to_owned());
             }
             // The advertised MTU, never above the link's; without one, the link's, so a knob a
-            // past advertisement lowered is restored (#29).
+            // past advertisement lowered is restored (#29). Nor above the MTU the links
+            // applier is setting on the port in this same pass from the DHCPv4 lease, which the
+            // link fact does not show yet (#38).
             let link_mtu = world.links.get(&ifname).map(|link| link.mtu);
             let advertised = world.ipv6.get(&wan.name).and_then(|fact| fact.mtu);
-            let mtu = match (advertised, link_mtu) {
-                (Some(mtu), Some(link)) => Some(mtu.min(link)),
-                (Some(mtu), None) | (None, Some(mtu)) => Some(mtu),
-                (None, None) => None,
-            };
+            let mtu = [advertised, link_mtu, crate::links::wan_port_mtu(world, wan)]
+                .into_iter()
+                .flatten()
+                .min();
             if let Some(mtu) = mtu {
                 entries.insert(ipv6_conf(&ifname, "mtu"), mtu.to_string());
             }
@@ -138,6 +139,33 @@ mod tests {
         assert!(
             !entries.contains_key("net/ipv6/conf/br-lan1/accept_ra"),
             "an IPv4-only LAN is left to the kernel"
+        );
+    }
+
+    /// #38: the links applier sets the port to the lease's MTU in the same pass, before the
+    /// monitor has shown the change, so the IPv6 MTU must not trust the link fact alone.
+    #[test]
+    fn the_ipv6_mtu_never_exceeds_the_lease_mtu() {
+        let mut world = crate::fixtures::pd_world();
+        let mut fact = crate::fixtures::dhcp_fact();
+        fact.mtu = Some(1400);
+        world.dhcp4 = std::sync::Arc::new(BTreeMap::from([("wan0".to_owned(), fact.clone())]));
+        assert_eq!(
+            sysctl(&world, true)
+                .entries
+                .get("net/ipv6/conf/p0/mtu")
+                .map(String::as_str),
+            Some("1400"),
+            "the lease MTU wins over the link fact still at 1500"
+        );
+        fact.mtu = None;
+        world.dhcp4 = std::sync::Arc::new(BTreeMap::from([("wan0".to_owned(), fact)]));
+        assert_eq!(
+            sysctl(&world, true)
+                .entries
+                .get("net/ipv6/conf/p0/mtu")
+                .map(String::as_str),
+            Some("1500")
         );
     }
 

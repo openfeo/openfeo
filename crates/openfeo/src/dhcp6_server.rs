@@ -144,7 +144,7 @@ async fn serve(
             received = socket.recv(&mut buf) => {
                 let (from, len) = received
                     .map_err(|err| TaskError::from(format!("dhcp6-server {}: {err}", current.ifname)))?;
-                if let Some(answer) = reply(&config, &buf[..len]) {
+                if let Some(answer) = reply(&config, *from.ip(), &buf[..len]) {
                     match socket.send_to(from, &answer) {
                         Ok(()) => debug!("dhcp6-server {} answered {}", current.ifname, from.ip()),
                         Err(err) => debug!("dhcp6-server {}: send to {from}: {err}", current.ifname),

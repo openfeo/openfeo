@@ -169,6 +169,7 @@ pub fn nft(world: &World) -> DesiredNft {
     ruleset.extend(rpfilter_chain());
     ruleset.extend(input_chain(wan_ping));
     ruleset.extend(forward_chain(&mss_clamped(world)));
+    ruleset.extend(output_chain());
     ruleset.extend(dstnat_chain());
     ruleset.extend(srcnat_chain());
 
@@ -831,6 +832,24 @@ fn mss_clamp_rules(netdevs: &[String]) -> Vec<Value> {
         .collect()
 }
 
+/// The router's own traffic (#45): ULA never crosses a WAN (SPEC §7.5), and while source
+/// address selection never picks a unique local source for an off-link destination in practice,
+/// a rule makes it a guarantee, for both directions, with the same ICMPv6 no-route the forward
+/// chain answers.
+fn output_chain() -> Vec<Value> {
+    vec![
+        chain("output", "filter", "output", 0, "accept"),
+        rule(
+            "output",
+            vec![oifname_in("wan_if"), ula("saddr"), reject_no_route()],
+        ),
+        rule(
+            "output",
+            vec![oifname_in("wan_if"), ula("daddr"), reject_no_route()],
+        ),
+    ]
+}
+
 fn forward_chain(mss_clamped: &[String]) -> Vec<Value> {
     let mut rules = vec![
         chain("forward", "filter", "forward", 0, "drop"),
@@ -1243,6 +1262,28 @@ mod tests {
             .find(|r| mentions(r, "fc00::"))
             .expect("a ULA source from a WAN is dropped at the input too");
         assert!(mentions(dropped, "@wan_if") && mentions(dropped, "\"drop\""));
+        // The router's own output (#45): source address selection never picks a unique local
+        // source for an off-link destination in practice; the rule makes it a guarantee.
+        let output_chain = added(&d.ruleset, "chain")
+            .into_iter()
+            .find(|c| c["name"] == "output")
+            .expect("an output chain");
+        assert_eq!(output_chain.get("hook"), Some(&json!("output")));
+        assert_eq!(output_chain.get("policy"), Some(&json!("accept")));
+        let output = rules_of(&d.ruleset, "output");
+        let ula: Vec<_> = output
+            .iter()
+            .filter(|r| mentions(r, "\"fc00::\"") && mentions(r, "\"len\":7"))
+            .collect();
+        assert_eq!(ula.len(), 2, "{output:?}");
+        assert!(
+            ula.iter().all(|r| mentions(r, "@wan_if")
+                && mentions(r, "\"oifname\"")
+                && mentions(r, "\"reject\"")
+                && mentions(r, "\"no-route\"")),
+            "{ula:?}"
+        );
+        assert!(mentions(ula[0], "\"saddr\"") && mentions(ula[1], "\"daddr\""));
     }
 
     #[test]
@@ -1565,7 +1606,10 @@ mod tests {
             .iter()
             .map(|chain| chain["name"].as_str().unwrap())
             .collect();
-        assert_eq!(chains, ["rpfilter", "input", "forward", "dstnat", "srcnat"]);
+        assert_eq!(
+            chains,
+            ["rpfilter", "input", "forward", "output", "dstnat", "srcnat"]
+        );
         assert!(
             rules_of(&desired.ruleset, "input")
                 .iter()
