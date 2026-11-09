@@ -626,8 +626,27 @@ impl Client {
     /// Settle into the binding: wait for T1, or Renew, Rebind or start over, whichever `now`
     /// calls for.
     fn go_bound(&mut self, now: Timestamp, out: &mut Vec<Output>) {
-        let Some(binding) = self.binding.as_ref() else {
+        if self.binding.is_none() {
             self.solicit(now, out);
+            return;
+        }
+        // A lease whose valid lifetime ran out leaves alone (one the server stopped listing,
+        // aged past its end): it is gone, the rest stand. Only an empty binding starts over.
+        if let Some(binding) = self.binding.as_mut()
+            && binding.first_expiry().is_some_and(|end| now >= end)
+        {
+            let gone = binding.expire(now);
+            if !gone.is_empty() {
+                out.push(Output::Gone(gone));
+            }
+            if binding.is_empty() {
+                self.binding = None;
+                out.push(Output::Note(Note::Restarting("the binding expired")));
+                self.solicit(now, out);
+                return;
+            }
+        }
+        let Some(binding) = self.binding.as_ref() else {
             return;
         };
         match (binding.t1_at(), binding.t2_at(), binding.first_expiry()) {
@@ -636,22 +655,15 @@ impl Client {
                 self.state = State::Bound;
                 self.timeout = None;
             }
-            // The valid lifetimes have run out: start over.
-            (_, _, Some(end)) if now >= end => {
-                let gone: Vec<Ipv6Net> = binding.nets().collect();
-                out.push(Output::Gone(gone));
-                self.binding = None;
-                out.push(Output::Note(Note::Restarting("the binding expired")));
-                self.solicit(now, out);
-            }
             // T1 never comes: wait for the expiry.
             (None, _, Some(end)) => {
                 self.state = State::Bound;
                 self.timeout = Some(end);
             }
-            (Some(t1), _, _) if now < t1 => {
+            // Bound until T1, or until a lease lapses first.
+            (Some(t1), _, expiry) if now < t1 => {
                 self.state = State::Bound;
-                self.timeout = Some(t1);
+                self.timeout = Some(expiry.map_or(t1, |end| end.min(t1)));
             }
             // T1 has come: Renew until T2, or for as long as the leases last when T2 never
             // comes (§21.4: an infinite T2 means never Rebind).
@@ -767,6 +779,9 @@ impl Client {
 
     #[allow(clippy::too_many_lines)]
     fn reply(&mut self, message: &Message, now: Timestamp, out: &mut Vec<Output>) {
+        // Only a Renew or Rebind leaves an unlisted lease unchanged (§18.2.10.1); a Reply to a
+        // Solicit or a Request is the server's whole word, so what it does not list is gone.
+        let refreshing = matches!(self.state, State::Renewing | State::Rebinding);
         let server = message.server_id().map(<[u8]>::to_vec).unwrap_or_default();
         if let Some((code, _)) = message.status()
             && code != StatusCode::Success
@@ -841,38 +856,51 @@ impl Client {
                 _ => {}
             }
         }
-        // An IA the Reply does not mention keeps what it had (§18.2.10.1).
-        let prefixes = prefixes
-            .or_else(|| {
-                (!no_prefix).then(|| old.as_ref().map(|b| b.prefixes.clone()).unwrap_or_default())
-            })
-            .unwrap_or_default();
-        let addresses = addresses
-            .or_else(|| {
-                (!no_address).then(|| {
-                    old.as_ref()
-                        .map(|b| b.addresses.clone())
-                        .unwrap_or_default()
-                })
-            })
-            .unwrap_or_default();
-        // A lease the binding holds that the Reply neither lists nor zeroes is left unchanged
-        // (§18.2.10.1, #39): it stays with what is left of its lifetimes, counted from when it
-        // was obtained, and is gone only when nothing is left.
-        let (mut prefixes, mut addresses) = (prefixes, addresses);
+        // An IA the Reply does not mention keeps what it had (§18.2.10.1), its lifetimes still
+        // counting from when it was obtained: aged, never reset to the new binding's clock.
+        let elapsed = old.as_ref().map_or(0, |old| {
+            u32::try_from(now.saturating_sub(old.bound_at) / MS).unwrap_or(u32::MAX)
+        });
+        let carried = |held: &[Lease6], kept: &mut Vec<Lease6>, gone: &mut Vec<Ipv6Net>| {
+            for lease in held {
+                if kept.iter().any(|l| l.net == lease.net) || gone.contains(&lease.net) {
+                    continue;
+                }
+                match lease.aged(elapsed) {
+                    Some(aged) => kept.push(aged),
+                    None => gone.push(lease.net),
+                }
+            }
+        };
+        let (mut prefixes, pd_mentioned) = match prefixes {
+            Some(listed) => (listed, true),
+            None => (Vec::new(), false),
+        };
+        let (mut addresses, na_mentioned) = match addresses {
+            Some(listed) => (listed, true),
+            None => (Vec::new(), false),
+        };
         if let Some(old) = &old {
-            let elapsed = u32::try_from(now.saturating_sub(old.bound_at) / MS).unwrap_or(u32::MAX);
-            for (held, kept) in [
-                (&old.prefixes, &mut prefixes),
-                (&old.addresses, &mut addresses),
-            ] {
-                for lease in held {
-                    if kept.iter().any(|l| l.net == lease.net) || gone.contains(&lease.net) {
-                        continue;
-                    }
-                    match lease.aged(elapsed) {
-                        Some(aged) => kept.push(aged),
-                        None => gone.push(lease.net),
+            if !pd_mentioned && !no_prefix {
+                carried(&old.prefixes, &mut prefixes, &mut gone);
+            }
+            if !na_mentioned && !no_address {
+                carried(&old.addresses, &mut addresses, &mut gone);
+            }
+            // A lease the Renew or Rebind's Reply neither lists nor zeroes is left unchanged too
+            // (§18.2.10.1, #39); any other Reply's silence about a held lease means it is gone.
+            if refreshing {
+                if pd_mentioned {
+                    carried(&old.prefixes, &mut prefixes, &mut gone);
+                }
+                if na_mentioned {
+                    carried(&old.addresses, &mut addresses, &mut gone);
+                }
+            } else {
+                for net in old.nets() {
+                    let kept = prefixes.iter().chain(&addresses).any(|l| l.net == net);
+                    if !kept && !gone.contains(&net) {
+                        gone.push(net);
                     }
                 }
             }
@@ -1562,6 +1590,152 @@ mod tests {
             .find(|lease| lease.net == NEW_PREFIX.parse::<Ipv6Net>().unwrap())
             .expect("the renewed prefix");
         assert_eq!((renewed.preferred, renewed.valid), (40, 60));
+    }
+
+    /// Review of #39: a prefix the server keeps omitting ages until it lapses before the next
+    /// T1; then it alone is gone, at its own time, and the renewed leases stand: the binding is
+    /// never dropped for it.
+    #[test]
+    fn an_omitted_prefix_that_lapses_before_t1_goes_alone() {
+        let mut client = new_client();
+        let out = client.handle(Input::Start { binding: None }, 0);
+        let solicit = sent(&out);
+        let prefix = |net: &str| Dhcp6Option::IaPrefix {
+            prefix: net.parse().unwrap(),
+            preferred: 120,
+            valid: 200,
+            options: Vec::new(),
+        };
+        let two = Dhcp6Option::IaPd {
+            iaid: 0x11,
+            t1: 60,
+            t2: 96,
+            options: vec![prefix(PREFIX), prefix(NEW_PREFIX)],
+        };
+        let reply = answer(
+            &solicit,
+            MessageType::Reply,
+            &SERVER,
+            vec![two, ia_na(ADDRESS, 120, 200, 60, 96)],
+            [vec![Dhcp6Option::RapidCommit], resolvers()].concat(),
+        );
+        let _ = client.handle(Input::Packet(reply), 0);
+        let mut gone_at: Vec<(Timestamp, Vec<Ipv6Net>)> = Vec::new();
+        let mut now = 0;
+        while now < 260_000 {
+            now = client.next_timeout().expect("a timer");
+            let out = client.handle(Input::Timeout, now);
+            assert!(
+                sends(&out).iter().all(|m| m.kind != MessageType::Solicit),
+                "never re-solicits: {out:?}"
+            );
+            gone_at.extend(gone_output(&out).map(|g| (now, g.clone())));
+            if let Some(renew) = sends(&out)
+                .into_iter()
+                .find(|m| m.kind == MessageType::Renew)
+            {
+                let reply = answer(
+                    &renew,
+                    MessageType::Reply,
+                    &SERVER,
+                    vec![
+                        ia_pd(NEW_PREFIX, 120, 200, 60, 96),
+                        ia_na(ADDRESS, 120, 200, 60, 96),
+                    ],
+                    resolvers(),
+                );
+                let out = client.handle(Input::Packet(reply), now + 100);
+                gone_at.extend(gone_output(&out).map(|g| (now + 100, g.clone())));
+            }
+        }
+        let old: Ipv6Net = PREFIX.parse().unwrap();
+        assert_eq!(
+            gone_at.len(),
+            1,
+            "one Gone, for the omitted prefix alone: {gone_at:?}"
+        );
+        assert_eq!(gone_at[0].1, vec![old]);
+        assert!(
+            (199_000..=201_500).contains(&gone_at[0].0),
+            "at its own valid end, about 200 s: {}",
+            gone_at[0].0
+        );
+        let binding = client.binding().expect("still bound");
+        assert_eq!(
+            binding.prefixes.iter().map(|l| l.net).collect::<Vec<_>>(),
+            vec![NEW_PREFIX.parse::<Ipv6Net>().unwrap()]
+        );
+        assert_eq!(binding.addresses.len(), 1);
+    }
+
+    /// Review of #39: only a Renew or Rebind leaves an unlisted lease unchanged. A Reply to a
+    /// Request after `NoBinding`, or to a Solicit, is the server's whole word: what it does not
+    /// list is gone, so a renumbering ISP's old prefix is deprecated at once (RFC 7084 L-13).
+    #[test]
+    fn a_reply_after_no_binding_replaces_the_prefix_and_reports_the_old_one_gone() {
+        let (mut client, _) = bound();
+        let out = client.handle(Input::Timeout, 15_000);
+        let renew = sent(&out);
+        let reply = answer(
+            &renew,
+            MessageType::Reply,
+            &SERVER,
+            vec![ia_status(0x11, true, StatusCode::NoBinding)],
+            Vec::new(),
+        );
+        let _ = client.handle(Input::Packet(reply), 15_100);
+        let out = client.handle(Input::Timeout, 15_100 + REQ_TIMEOUT);
+        let request = sent(&out);
+        assert_eq!(request.kind, MessageType::Request);
+        let reply = answer(
+            &request,
+            MessageType::Reply,
+            &SERVER,
+            vec![
+                ia_pd(NEW_PREFIX, 40, 60, 10, 16),
+                ia_na(ADDRESS, 40, 60, 10, 16),
+            ],
+            resolvers(),
+        );
+        let out = client.handle(Input::Packet(reply), 16_500);
+        assert_eq!(
+            gone_output(&out),
+            Some(&vec![PREFIX.parse::<Ipv6Net>().unwrap()]),
+            "{out:?}"
+        );
+        let (binding, _) = bound_output(&out).expect("bound");
+        assert_eq!(
+            binding.prefixes.iter().map(|l| l.net).collect::<Vec<_>>(),
+            vec![NEW_PREFIX.parse::<Ipv6Net>().unwrap()]
+        );
+    }
+
+    /// Review of #39: an IA the Reply does not mention at all keeps its leases unchanged too,
+    /// their lifetimes still counting from when they were obtained, never extended.
+    #[test]
+    fn a_renewal_that_mentions_only_the_address_ages_the_prefix() {
+        let (mut client, _) = bound();
+        let out = client.handle(Input::Timeout, 15_000);
+        let renew = sent(&out);
+        let reply = answer(
+            &renew,
+            MessageType::Reply,
+            &SERVER,
+            vec![ia_na(ADDRESS, 40, 60, 10, 16)],
+            resolvers(),
+        );
+        let out = client.handle(Input::Packet(reply), 15_200);
+        assert_eq!(gone_output(&out), None);
+        let (binding, _) = bound_output(&out).expect("bound");
+        assert_eq!(
+            (binding.prefixes[0].preferred, binding.prefixes[0].valid),
+            (30, 50),
+            "10 s older than when it was obtained, not reset to 40/60"
+        );
+        assert_eq!(
+            (binding.addresses[0].preferred, binding.addresses[0].valid),
+            (40, 60)
+        );
     }
 
     #[test]

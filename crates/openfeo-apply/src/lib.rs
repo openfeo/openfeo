@@ -112,6 +112,25 @@ impl Pass {
         }
     }
 
+    /// Record an operation that keeps the kernel in step with something that changed outside
+    /// the router's state (a lifetime an advertisement refreshed): a failure counts, success is
+    /// a debug line and no op, so it neither reaches the console nor re-announces `ready`.
+    pub(crate) fn quiet_op(
+        &mut self,
+        op: &str,
+        result: Result<(), openfeo_netlink::Error>,
+        tolerated: impl Fn(&openfeo_netlink::Error) -> bool,
+    ) {
+        match result {
+            Ok(()) => tracing::debug!("{op}"),
+            Err(err) if tolerated(&err) => tracing::debug!("{op}: already so"),
+            Err(err) => {
+                tracing::warn!("{op}: {err}");
+                self.fail(ApplyError::netlink(op.to_owned(), err));
+            }
+        }
+    }
+
     /// Record a failure that was not a netlink operation (an interface that cannot be found).
     pub(crate) fn fail(&mut self, err: ApplyError) {
         if self.first_error.is_none() {

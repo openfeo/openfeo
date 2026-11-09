@@ -1,6 +1,6 @@
 # 0019 — A learned fact is acted on once the kernel shows the route it needs
 
-Status: Accepted (3 November 2026)
+Status: Accepted (3 November 2026); amended 10 November 2026 (#32)
 
 ## Context
 
@@ -19,10 +19,17 @@ routes the kernel has.
 
 ## Decision
 
-- The netlink monitor publishes the kernel's default routes (table `main`, family, output
-  interface) as a fact in the `World`, next to the link facts.
-- A reconciler that consumes a resolver a WAN learned (DHCPv4 today, RDNSS now; IPCP and
-  DHCPv6 later) uses it only while a default route of that family exists through that WAN.
+- The netlink monitor publishes the kernel's unicast routes of table `main` through an
+  interface (family, output interface, destination; a default route has none) as a fact in the
+  `World`, next to the link facts.
+- A reconciler that consumes an IPv4 resolver a WAN learned (a DHCPv4 lease's, IPCP's) uses it
+  only while a route of that family through that WAN reaches it: the default route, or any
+  route that covers the resolver. *Amended 10 November 2026 (#32):* a DHCPv4 lease carrying
+  classless static routes and no router option (RFC 3442) installs no default, so the original
+  rule, "a default route of that family", left such a lease's resolvers unused for ever; the
+  route that covers a resolver is the route that lets a send succeed, which is what the gate
+  was for. Learned IPv6 resolvers (RDNSS, DHCPv6) keep waiting for the IPv6 default route, as
+  the RA lifetime does.
   The RA reconciler advertises router lifetime 1800 only while the WAN that provides the
   prefix has carrier and an IPv6 default route in the kernel, else 0.
 - Typed configuration is never gated: `[dns] upstreams` and `[wans.static] dns` are the
