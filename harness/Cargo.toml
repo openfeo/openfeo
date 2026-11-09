@@ -101,5 +101,10 @@ name = "pppoe"
 path = "tests/pppoe.rs"
 harness = false
 
+[[test]]
+name = "m3"
+path = "tests/m3.rs"
+harness = false
+
 [lints]
 workspace = true

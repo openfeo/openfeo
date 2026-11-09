@@ -82,14 +82,17 @@ impl Ipcp {
     #[must_use]
     pub fn result(&self) -> Option<Ipv4Up> {
         let local = self.address.filter(|a| !a.is_unspecified())?;
-        self.acked.then(|| Ipv4Up {
+        let mut dns: Vec<Ipv4Addr> = [self.primary, self.secondary]
+            .into_iter()
+            .flatten()
+            .filter(|dns| !dns.is_unspecified())
+            .collect();
+        // One resolver named twice (pppd with one `ms-dns`, many concentrators) is one resolver.
+        dns.dedup();
+        self.acked.then_some(Ipv4Up {
             local,
             peer: self.peer,
-            dns: [self.primary, self.secondary]
-                .into_iter()
-                .flatten()
-                .filter(|dns| !dns.is_unspecified())
-                .collect(),
+            dns,
         })
     }
 }
@@ -229,6 +232,20 @@ mod tests {
             "an address is four bytes"
         );
         assert!(Ipcp::decode(&[129, 3, 1]).is_err());
+    }
+
+    /// pppd with one `ms-dns` (and many concentrators) names the same resolver as primary and
+    /// secondary: it is one resolver, reported once, or the forwarder asks it twice.
+    #[test]
+    fn the_same_resolver_twice_is_reported_once() {
+        let mut ipcp = Ipcp::new();
+        assert!(ipcp.naked(&[
+            Opt::Address(OURS),
+            Opt::PrimaryDns(ISP),
+            Opt::SecondaryDns(ISP),
+        ]));
+        ipcp.acked();
+        assert_eq!(ipcp.result().map(|up| up.dns), Some(vec![ISP]));
     }
 
     #[test]

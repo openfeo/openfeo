@@ -32,6 +32,8 @@ use openfeo_world::{PppIpv4, PppIpv6, PppoeFact};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use openfeo_reconcile::links::PPPOE_PORT_MTU;
+
 use crate::dhcp4::{mac_text, seed, wait_for_link};
 
 /// The PPP payload without RFC 4638.
@@ -181,13 +183,14 @@ async fn run(
     let failed =
         |err: openfeo_net::dhcp4::DriverError| TaskError::from(format!("pppoe {wan}: {err}"));
     let mut backoff = Backoff::new();
+    let mut first = true;
     loop {
         let (ifindex, _) = wait_for_link(&mut world_rx, &task.port).await?;
-        let port_mtu = world_rx
-            .borrow()
-            .links
-            .get(&task.port)
-            .map_or(1500, |link| link.mtu);
+        let mut port_mtu = port_mtu_of(&world_rx, &task.port);
+        if let Some(wait) = mtu_settle_wait(first, port_mtu) {
+            port_mtu = wait_for_port_mtu(&mut world_rx, &task.port, wait).await?;
+        }
+        first = false;
         let max_payload = offered_payload(port_mtu);
         info!(
             "{}",
@@ -207,8 +210,10 @@ async fn run(
             },
             seed(SEED_SALT ^ u64::from(ifindex)),
         );
-        let Some(found) = discover(task, &socket, &mut client, &mut world_rx).await? else {
-            // Carrier went while discovering: wait for it again.
+        let Some(found) = discover(task, &socket, &mut client, max_payload, &mut world_rx).await?
+        else {
+            // Carrier went while discovering, or the port now carries another payload: begin
+            // again with what the port offers.
             continue;
         };
         info!(
@@ -306,6 +311,7 @@ async fn discover(
     task: &WanTask,
     socket: &Discovery,
     client: &mut DiscoveryClient,
+    asked: Option<u16>,
     world_rx: &mut WorldRx,
 ) -> Result<Option<Found>, TaskError> {
     let wan = &task.wan;
@@ -352,7 +358,12 @@ async fn discover(
             () = wait_until(timer) => client.handle(discovery::Input::Timeout, millis(start)),
             changed = world_rx.changed() => {
                 changed.map_err(|_| "world publisher gone")?;
-                if port_has_carrier(world_rx, &task.port) {
+                let port_mtu = world_rx
+                    .borrow()
+                    .links
+                    .get(&task.port)
+                    .map_or(1500, |link| link.mtu);
+                if port_has_carrier(world_rx, &task.port) && !rediscover(asked, port_mtu) {
                     Vec::new()
                 } else {
                     client.handle(discovery::Input::Stop, millis(start));
@@ -361,6 +372,51 @@ async fn discover(
             }
         };
     }
+}
+
+/// How long the first discovery waits for the links applier to raise the port to 1508.
+const MTU_SETTLE: Duration = Duration::from_secs(3);
+
+/// The wait before the first discovery when the port is not at 1508 yet: an MTU change after the
+/// PPPoE socket is connected flushes the kernel's session (`NETDEV_CHANGEMTU`), and a session
+/// bound before it would run at 1492. Later attempts find the port as the applier left it (a
+/// NIC that refuses 1508 stays at 1500 and is not waited on again).
+fn mtu_settle_wait(first: bool, port_mtu: u32) -> Option<Duration> {
+    (first && port_mtu < PPPOE_PORT_MTU).then_some(MTU_SETTLE)
+}
+
+fn port_mtu_of(world_rx: &WorldRx, port: &str) -> u32 {
+    world_rx
+        .borrow()
+        .links
+        .get(port)
+        .map_or(1500, |link| link.mtu)
+}
+
+/// The port's MTU once it is 1508, or whatever it is after `wait`.
+async fn wait_for_port_mtu(
+    world_rx: &mut WorldRx,
+    port: &str,
+    wait: Duration,
+) -> Result<u32, TaskError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let mtu = port_mtu_of(world_rx, port);
+        if mtu >= PPPOE_PORT_MTU {
+            return Ok(mtu);
+        }
+        tokio::select! {
+            changed = world_rx.changed() => changed.map_err(|_| "world publisher gone")?,
+            () = tokio::time::sleep_until(deadline) => return Ok(mtu),
+        }
+    }
+}
+
+/// Whether a discovery that asked for `asked` must begin again now the port's MTU is
+/// `port_mtu`: the links applier raises the port to 1508 while discovery may be under way, and
+/// a session bound on the old offer would run at 1492 until the next reconnect.
+fn rediscover(asked: Option<u16>, port_mtu: u32) -> bool {
+    offered_payload(port_mtu) != asked
 }
 
 /// The PPP session over the kernel descriptors until it ends.
@@ -762,6 +818,34 @@ mod tests {
         assert_eq!(
             backoff.next(&Cause::Session(Reason::KeepaliveLost), secs(90)),
             secs(1)
+        );
+    }
+
+    /// The links applier raises the port to 1508 while discovery may already be under way; a
+    /// discovery that began at 1500 must start again once the port carries a larger payload,
+    /// or an RFC 4638 line runs at 1492 until the next reconnect (found by the m3 suite).
+    #[test]
+    fn discovery_restarts_when_the_port_can_offer_a_larger_payload() {
+        assert!(rediscover(None, 1508), "1500 now on offer");
+        assert!(!rediscover(None, 1500), "still nothing above 1492");
+        assert!(!rediscover(Some(1500), 1508), "already asked for it");
+        assert!(
+            rediscover(Some(1500), 1500),
+            "the port shrank: ask for less"
+        );
+    }
+
+    /// The first discovery waits for the links applier to raise the port to 1508: an MTU change
+    /// after the PPPoE socket is connected flushes the kernel's session (`NETDEV_CHANGEMTU`), and
+    /// a session bound before it runs at 1492. Later attempts find the port settled.
+    #[test]
+    fn the_first_discovery_waits_for_the_port_mtu() {
+        assert_eq!(mtu_settle_wait(true, 1500), Some(MTU_SETTLE));
+        assert_eq!(mtu_settle_wait(true, 1508), None);
+        assert_eq!(
+            mtu_settle_wait(false, 1500),
+            None,
+            "a NIC that refused 1508 is not waited on again"
         );
     }
 

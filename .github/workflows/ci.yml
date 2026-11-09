@@ -52,7 +52,7 @@ jobs:
       - name: install kernel build and harness dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 kea-dhcp4-server kea-dhcp6-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate radvd ndisc6 iproute2 iputils-ping e2fsprogs musl-tools pkg-config bc flex bison libelf-dev libssl-dev ccache zstd cpio rsync
+          sudo apt-get install -y qemu-system-x86 kea-dhcp4-server kea-dhcp6-server busybox-static dnsmasq-base bind9-dnsutils ntpsec-ntpdate radvd ndisc6 ppp pppoe iproute2 iputils-ping e2fsprogs musl-tools pkg-config bc flex bison libelf-dev libssl-dev ccache zstd cpio rsync
       - name: allow KVM and user namespaces for the runner user
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -79,6 +79,8 @@ jobs:
         run: sudo modprobe nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q
       - name: load the PPP modules and open /dev/ppp to the harness user (the runner has no reboot for a udev rule; SPEC §11)
         run: sudo modprobe ppp_generic pppox pppoe ppp_async && sudo chmod 666 /dev/ppp
+      - name: let the sandbox's mapped root run pppd (Ubuntu ships it setuid root:dip, mode 4754, so others cannot run it, and inside a user namespace root:dip is unmapped)
+        run: sudo chmod 0755 /usr/sbin/pppd
       - run: make kernel
       - run: make check-env
       - run: make test-harness
