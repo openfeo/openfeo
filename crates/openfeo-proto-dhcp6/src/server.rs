@@ -27,11 +27,16 @@ pub struct Config {
     pub refresh_secs: u32,
 }
 
-/// The Reply to `request` when it is an Information-Request for this server, else `None`:
+/// The Reply to `request` when it is an Information-Request for this server from a link-local
+/// source, else `None`:
 /// the Server Identifier, the Client Identifier echoed when the host sent one, the resolvers,
 /// the domain list and the refresh time, under the request's transaction id.
 #[must_use]
-pub fn reply(config: &Config, request: &[u8]) -> Option<Vec<u8>> {
+pub fn reply(config: &Config, from: Ipv6Addr, request: &[u8]) -> Option<Vec<u8>> {
+    // SPEC §7.3: a link-local source only; a host on the LAN asks from nothing else (#42).
+    if !from.is_unicast_link_local() {
+        return None;
+    }
     let request = Message::decode(request).ok()?;
     if request.kind != MessageType::InformationRequest {
         return None;
@@ -71,6 +76,8 @@ mod tests {
 
     const DUID: [u8; 10] = [0, 3, 0, 1, 0x52, 0x54, 0, 0xfe, 0, 2];
     const HOST: [u8; 10] = [0, 3, 0, 1, 0x52, 0x54, 0, 0xfe, 0, 0x10];
+    /// The host's link-local source.
+    const LL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x10);
 
     fn config() -> Config {
         Config {
@@ -98,6 +105,7 @@ mod tests {
     fn an_information_request_gets_dns_domain_and_refresh_time() {
         let bytes = reply(
             &config(),
+            LL,
             &information_request(0x00ab_cdef, Some(&HOST), None),
         )
         .unwrap();
@@ -117,7 +125,7 @@ mod tests {
 
     #[test]
     fn the_reply_keeps_the_xid() {
-        let bytes = reply(&config(), &information_request(0x0012_3456, None, None)).unwrap();
+        let bytes = reply(&config(), LL, &information_request(0x0012_3456, None, None)).unwrap();
         let answer = Message::decode(&bytes).unwrap();
         assert_eq!(answer.xid, 0x0012_3456);
         assert_eq!(answer.client_id(), None, "nothing to echo");
@@ -125,11 +133,31 @@ mod tests {
 
     #[test]
     fn a_request_naming_this_server_is_answered_and_another_server_is_not() {
-        assert!(reply(&config(), &information_request(1, Some(&HOST), Some(&DUID))).is_some());
+        assert!(
+            reply(
+                &config(),
+                LL,
+                &information_request(1, Some(&HOST), Some(&DUID))
+            )
+            .is_some()
+        );
         assert_eq!(
-            reply(&config(), &information_request(1, Some(&HOST), Some(&HOST))),
+            reply(
+                &config(),
+                LL,
+                &information_request(1, Some(&HOST), Some(&HOST))
+            ),
             None
         );
+    }
+
+    /// SPEC §7.3: an Information-Request is answered from a link-local source only (#42).
+    #[test]
+    fn a_request_from_a_global_source_is_ignored() {
+        let request = information_request(7, Some(&HOST), None);
+        assert!(reply(&config(), "fe80::5".parse().unwrap(), &request).is_some());
+        assert!(reply(&config(), "2001:db8::5".parse().unwrap(), &request).is_none());
+        assert!(reply(&config(), "fd12:3456:789a:1::5".parse().unwrap(), &request).is_none());
     }
 
     #[test]
@@ -146,15 +174,15 @@ mod tests {
         ] {
             let mut message = Message::new(kind, 7);
             message.options.push(Dhcp6Option::ClientId(HOST.to_vec()));
-            assert_eq!(reply(&config(), &message.encode()), None, "{kind:?}");
+            assert_eq!(reply(&config(), LL, &message.encode()), None, "{kind:?}");
         }
     }
 
     #[test]
     fn garbage_is_ignored() {
-        assert_eq!(reply(&config(), &[]), None);
-        assert_eq!(reply(&config(), &[11, 0, 0]), None);
-        assert_eq!(reply(&config(), &[11, 0, 0, 1, 0, 1, 0, 9]), None);
+        assert_eq!(reply(&config(), LL, &[]), None);
+        assert_eq!(reply(&config(), LL, &[11, 0, 0]), None);
+        assert_eq!(reply(&config(), LL, &[11, 0, 0, 1, 0, 1, 0, 9]), None);
     }
 
     #[test]
@@ -164,7 +192,7 @@ mod tests {
             domains: Vec::new(),
             ..config()
         };
-        let bytes = reply(&config, &information_request(1, None, None)).unwrap();
+        let bytes = reply(&config, LL, &information_request(1, None, None)).unwrap();
         let answer = Message::decode(&bytes).unwrap();
         assert_eq!(
             answer.options,

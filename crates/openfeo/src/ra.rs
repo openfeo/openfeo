@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use openfeo_net::ndp::{ALL_NODES, NdpSocket, Resend, Role, tentative_link_local};
+use openfeo_net::ndp::{ALL_NODES, NdpSocket, Resend, Role, transient_send_error};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_proto_ndp::server::{
     Config, Input, Lifetime, Output, PIO_PREFERRED, PIO_VALID, Pio, ROUTE_INFO_LIFETIME, Rio,
@@ -225,7 +225,7 @@ fn send_all(
         if let Output::Advertise(bytes) = output
             && let Err(err) = socket.send(ALL_NODES, &bytes)
         {
-            if tentative_link_local(&err) {
+            if transient_send_error(&err) {
                 debug!("ra {ifname}: send: {err}; again in a second");
                 pending = Some(Resend::new(ALL_NODES, bytes));
                 continue;

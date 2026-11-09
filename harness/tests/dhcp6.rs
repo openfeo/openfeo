@@ -626,7 +626,7 @@ fn respond_while<T: Send>(
                 tokio::select! {
                     received = socket.recv(&mut buf) => {
                         let (from, len) = received?;
-                        if let Some(answer) = server::reply(config, &buf[..len]) {
+                        if let Some(answer) = server::reply(config, *from.ip(), &buf[..len]) {
                             socket.send_to(from, &answer)?;
                         }
                     }

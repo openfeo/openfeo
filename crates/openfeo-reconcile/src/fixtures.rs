@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap, PortMapEntry};
 use openfeo_world::{
-    DefaultRoute, Dhcp4Fact, LeaseFact, Lifetimed, LinkFact, MacAddr, PppIpv4, PppIpv6, PppoeFact,
+    Dhcp4Fact, KernelRoute, LeaseFact, Lifetimed, LinkFact, MacAddr, PppIpv4, PppIpv6, PppoeFact,
     TimeFact, WanDhcp6Fact, WanIpv6Fact, World,
 };
 
@@ -136,9 +136,10 @@ pub fn dhcp_world() -> World {
     let mut world = dhcp_world_without_lease();
     world.dhcp4 = Arc::new(BTreeMap::from([("wan0".to_owned(), dhcp_fact())]));
     // The lease's default route is in the kernel, so its resolvers count (ADR-0019).
-    world.routes = Arc::new(std::collections::BTreeSet::from([DefaultRoute {
+    world.routes = Arc::new(std::collections::BTreeSet::from([KernelRoute {
         v6: false,
         ifname: "p0".to_owned(),
+        dst: None,
     }]));
     world
 }
@@ -242,13 +243,15 @@ pub fn ipv6_world_without_route() -> World {
 pub fn ipv6_world() -> World {
     let mut world = ipv6_world_without_route();
     world.routes = Arc::new(std::collections::BTreeSet::from([
-        DefaultRoute {
+        KernelRoute {
             v6: false,
             ifname: "p0".to_owned(),
+            dst: None,
         },
-        DefaultRoute {
+        KernelRoute {
             v6: true,
             ifname: "p0".to_owned(),
+            dst: None,
         },
     ]));
     world
@@ -273,6 +276,7 @@ pub fn dhcp6_fact_with(prefix: &str) -> WanDhcp6Fact {
         dns: vec!["2001:db8:ffff::1".parse().expect("an address")],
         search: vec!["isp.example".to_owned()],
         server: vec![0, 3, 0, 1, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        restored: false,
     }
 }
 
@@ -310,13 +314,15 @@ pub fn pd_world() -> World {
     world.dhcp6 = Arc::new(BTreeMap::from([("wan0".to_owned(), dhcp6_fact())]));
     world.ula = Some(ULA.parse().expect("a prefix"));
     world.routes = Arc::new(std::collections::BTreeSet::from([
-        DefaultRoute {
+        KernelRoute {
             v6: false,
             ifname: "p0".to_owned(),
+            dst: None,
         },
-        DefaultRoute {
+        KernelRoute {
             v6: true,
             ifname: "p0".to_owned(),
+            dst: None,
         },
     ]));
     world
@@ -365,13 +371,15 @@ pub fn pppoe_world() -> World {
     world.links = Arc::new(links);
     world.ipv6 = Arc::new(BTreeMap::from([("wan0".to_owned(), ipv6_fact())]));
     world.routes = Arc::new(std::collections::BTreeSet::from([
-        DefaultRoute {
+        KernelRoute {
             v6: false,
             ifname: "ppp-wan0".to_owned(),
+            dst: None,
         },
-        DefaultRoute {
+        KernelRoute {
             v6: true,
             ifname: "ppp-wan0".to_owned(),
+            dst: None,
         },
     ]));
     world

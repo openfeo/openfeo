@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openfeo_config::load::STATE_FILE_MODE;
-use openfeo_net::ndp::{ALL_ROUTERS, NdpSocket, RESEND_AFTER, Resend, Role, tentative_link_local};
+use openfeo_net::ndp::{ALL_ROUTERS, NdpSocket, RESEND_AFTER, Resend, Role, transient_send_error};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 use openfeo_platform::atomic;
 use openfeo_proto_dhcp4::identity::{from_hex, hex};
@@ -303,7 +303,7 @@ fn act(
                 for line in learned_lines(&task.wan, last, &learned) {
                     info!("{line}");
                 }
-                let fact = fact_from(&learned);
+                let fact = fact_from(&learned, openfeo_runtime::clock::uptime_ms());
                 publisher.update(|world| {
                     let facts = Arc::make_mut(&mut world.ipv6);
                     if learned == Learned::default() {
@@ -327,15 +327,25 @@ fn act(
 /// How long to wait before sending again, when `err` is the kernel refusing a link-local
 /// source it has not finished checking (#34); `None` for every other failure.
 pub(crate) fn send_retry(err: &openfeo_net::dhcp4::DriverError) -> Option<Duration> {
-    tentative_link_local(err).then_some(RESEND_AFTER)
+    transient_send_error(err).then_some(RESEND_AFTER)
 }
 
-/// The learned set as the reconcilers see it.
+/// The learned set as the reconcilers see it; the addresses' lifetimes count from `now_ms`,
+/// the moment the client emitted them.
 #[must_use]
-pub fn fact_from(learned: &Learned) -> WanIpv6Fact {
+pub fn fact_from(learned: &Learned, now_ms: u64) -> WanIpv6Fact {
     WanIpv6Fact {
         router: learned.router,
-        addresses: learned.addresses.clone(),
+        addresses: learned
+            .addresses
+            .iter()
+            .map(|addr| openfeo_world::Lifetimed {
+                net: addr.net,
+                obtained_ms: now_ms,
+                preferred_secs: addr.preferred,
+                valid_secs: addr.valid,
+            })
+            .collect(),
         on_link: learned.on_link.clone(),
         routes: learned
             .routes
@@ -378,12 +388,13 @@ fn learned_lines(wan: &str, before: &Learned, after: &Learned) -> Vec<String> {
             None => format!("wan {wan} ipv6 router none"),
         });
     }
+    // By address, not by lifetimes: a refresh is not news.
     for addr in after
         .addresses
         .iter()
-        .filter(|addr| !before.addresses.contains(addr))
+        .filter(|addr| !before.addresses.iter().any(|b| b.net == addr.net))
     {
-        lines.push(format!("wan {wan} ipv6 address {addr}"));
+        lines.push(format!("wan {wan} ipv6 address {}", addr.net));
     }
     if after.dns != before.dns && !after.dns.is_empty() {
         let dns: Vec<String> = after.dns.iter().map(ToString::to_string).collect();
@@ -409,18 +420,45 @@ fn note_line(wan: &str, note: &Note) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openfeo_proto_ndp::client::Route;
+    use openfeo_proto_ndp::client::{LearnedAddress, Route};
     use std::os::unix::fs::PermissionsExt as _;
 
     fn ll(n: u16) -> Ipv6Addr {
         Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, n)
     }
 
+    /// #27: an advertisement that only refreshes the lifetimes prints no address line.
+    #[test]
+    fn learned_lines_name_an_address_once_whatever_its_lifetimes() {
+        let addr = |preferred, valid| LearnedAddress {
+            net: "2001:db8:ffff:0:1234::/64".parse().unwrap(),
+            preferred,
+            valid,
+        };
+        let before = Learned {
+            addresses: vec![addr(1800, 3600)],
+            ..Learned::default()
+        };
+        let after = Learned {
+            addresses: vec![addr(1700, 3500)],
+            ..Learned::default()
+        };
+        assert_eq!(learned_lines("wan0", &before, &after), Vec::<String>::new());
+        assert_eq!(
+            learned_lines("wan0", &Learned::default(), &after),
+            vec!["wan wan0 ipv6 address 2001:db8:ffff:0:1234::/64".to_owned()]
+        );
+    }
+
     #[test]
     fn fact_from_carries_every_learned_field() {
         let learned = Learned {
             router: Some(ll(1)),
-            addresses: vec!["2001:db8:ffff:0:1234::/64".parse().unwrap()],
+            addresses: vec![LearnedAddress {
+                net: "2001:db8:ffff:0:1234::/64".parse().unwrap(),
+                preferred: 1800,
+                valid: 3600,
+            }],
             on_link: vec!["2001:db8:ffff::/64".parse().unwrap()],
             routes: vec![Route {
                 prefix: "2001:db8:2::/48".parse().unwrap(),
@@ -431,9 +469,17 @@ mod tests {
             search: vec!["isp.example".to_owned()],
             mtu: Some(1492),
         };
-        let fact = fact_from(&learned);
+        let fact = fact_from(&learned, 7_000);
         assert_eq!(fact.router, Some(ll(1)));
-        assert_eq!(fact.addresses, learned.addresses);
+        assert_eq!(
+            fact.addresses,
+            vec![openfeo_world::Lifetimed {
+                net: "2001:db8:ffff:0:1234::/64".parse().unwrap(),
+                obtained_ms: 7_000,
+                preferred_secs: 1800,
+                valid_secs: 3600,
+            }]
+        );
         assert_eq!(fact.on_link, learned.on_link);
         assert_eq!(
             fact.routes,
@@ -477,7 +523,11 @@ mod tests {
         );
         let learned = Learned {
             router: Some(ll(1)),
-            addresses: vec!["2001:db8:ffff:0:1234::/64".parse().unwrap()],
+            addresses: vec![LearnedAddress {
+                net: "2001:db8:ffff:0:1234::/64".parse().unwrap(),
+                preferred: 1800,
+                valid: 3600,
+            }],
             dns: vec!["2001:db8:ffff::1".parse().unwrap()],
             ..Learned::default()
         };

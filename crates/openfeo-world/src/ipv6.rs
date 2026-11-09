@@ -3,11 +3,14 @@
 
 //! IPv6 facts (SPEC §6.2, §7.3): what a WAN's router-advertisement client has learned, and
 //! which default routes the kernel holds (ADR-0019: a learned fact is acted on once the kernel
-//! shows the route it needs). Lifetimes stay with the client; a fact is what to apply.
+//! shows the route it needs). A fact is what to apply; an address carries the lifetimes the
+//! kernel is told (#27), everything else leaves the fact when its lifetime lapses.
 
 use std::net::Ipv6Addr;
 
-use ipnet::Ipv6Net;
+use ipnet::{IpNet, Ipv6Net};
+
+use crate::Lifetimed;
 
 /// RFC 4191 router preference, as the client reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -23,8 +26,9 @@ pub enum Preference {
 pub struct WanIpv6Fact {
     /// The default router's link-local address; `None` once its lifetime lapsed or it withdrew.
     pub router: Option<Ipv6Addr>,
-    /// Addresses from prefixes advertised with the A flag, for the WAN port.
-    pub addresses: Vec<Ipv6Net>,
+    /// Addresses from prefixes advertised with the A flag, for the WAN port, with the lifetimes
+    /// the kernel deprecates and drops them by.
+    pub addresses: Vec<Lifetimed>,
     /// Prefixes advertised with the L flag: on-link routes through the WAN port.
     pub on_link: Vec<Ipv6Net>,
     /// Route information options: (prefix, via, preference).
@@ -37,10 +41,13 @@ pub struct WanIpv6Fact {
     pub mtu: Option<u32>,
 }
 
-/// A default route the kernel holds in the main table, whatever installed it.
+/// A unicast route the kernel holds in the main table through an interface, whatever installed
+/// it (ADR-0019). `dst: None` is a default route.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct DefaultRoute {
+pub struct KernelRoute {
     pub v6: bool,
     /// The output interface's name.
     pub ifname: String,
+    /// The destination; `None` for a default route.
+    pub dst: Option<IpNet>,
 }

@@ -220,14 +220,22 @@ fn apply_link(cache: &mut Cache, msg: &LinkMessage, present: bool) -> bool {
     }
 }
 
+/// An address is its interface, its net and its peer: a message that only refreshes the
+/// lifetimes replaces the entry, and a deletion matches whatever numbers it carries (#27).
 fn apply_addr(cache: &mut Cache, msg: &AddressMessage, present: bool) -> bool {
     let Some(addr) = addr_from(msg) else {
         return false;
     };
+    let before = cache.addrs.len();
+    cache
+        .addrs
+        .retain(|a| !(a.ifindex == addr.ifindex && a.net == addr.net && a.peer == addr.peer));
+    let removed = cache.addrs.len() != before;
     if present {
-        cache.addrs.insert(addr)
+        cache.addrs.insert(addr);
+        true
     } else {
-        cache.addrs.remove(&addr)
+        removed
     }
 }
 
@@ -354,10 +362,20 @@ fn link_from(msg: &LinkMessage) -> Link {
 fn addr_from(msg: &AddressMessage) -> Option<Addr> {
     let mut address = None;
     let mut local = None;
+    let mut lifetimes = (None, None);
     for attr in &msg.attributes {
         match attr {
             AddressAttribute::Address(a) => address = Some(*a),
             AddressAttribute::Local(a) => local = Some(*a),
+            AddressAttribute::CacheInfo(info) => {
+                // The kernel reports what is left; a deadline on the process clock is what
+                // the applier compares (#27). All ones is forever.
+                let now = openfeo_runtime::clock::uptime_ms();
+                let deadline = |secs: u32| {
+                    (secs != u32::MAX).then(|| now.saturating_add(u64::from(secs) * 1000))
+                };
+                lifetimes = (deadline(info.ifa_preferred), deadline(info.ifa_valid));
+            }
             _ => {}
         }
     }
@@ -373,6 +391,8 @@ fn addr_from(msg: &AddressMessage) -> Option<Addr> {
         net,
         scope: u8::from(msg.header.scope),
         peer,
+        preferred_until_ms: lifetimes.0,
+        valid_until_ms: lifetimes.1,
     })
 }
 
@@ -424,5 +444,44 @@ fn ip_of(address: &RouteAddress) -> Option<IpAddr> {
         RouteAddress::Inet(v4) => Some(IpAddr::V4(*v4)),
         RouteAddress::Inet6(v6) => Some(IpAddr::V6(*v6)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netlink_packet_route::address::CacheInfo;
+
+    /// #27: the kernel's remaining lifetimes become deadlines on the process clock, so the
+    /// applier can compare them with what it wants; the all-ones lifetime is infinite.
+    #[test]
+    fn cacheinfo_becomes_deadlines_and_infinite_is_none() {
+        let mut msg = AddressMessage::default();
+        msg.header.family = AddressFamily::Inet6;
+        msg.header.prefix_len = 64;
+        msg.header.index = 7;
+        msg.attributes.push(AddressAttribute::Address(
+            "2001:db8:ffff::1".parse::<Ipv6Addr>().unwrap().into(),
+        ));
+        let mut info = CacheInfo::default();
+        info.ifa_preferred = 600;
+        info.ifa_valid = 0xffff_ffff;
+        msg.attributes.push(AddressAttribute::CacheInfo(info));
+        let now = openfeo_runtime::clock::uptime_ms();
+        let addr = addr_from(&msg).expect("an address");
+        let preferred = addr
+            .preferred_until_ms
+            .expect("a finite preferred lifetime");
+        assert!(
+            preferred.abs_diff(now + 600_000) < 100,
+            "{preferred} vs {now} + 600 s"
+        );
+        assert_eq!(addr.valid_until_ms, None, "all ones is forever");
+        let mut plain = msg.clone();
+        plain
+            .attributes
+            .retain(|a| !matches!(a, AddressAttribute::CacheInfo(_)));
+        let addr = addr_from(&plain).expect("an address");
+        assert_eq!((addr.preferred_until_ms, addr.valid_until_ms), (None, None));
     }
 }

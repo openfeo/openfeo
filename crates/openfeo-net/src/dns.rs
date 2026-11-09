@@ -98,6 +98,12 @@ enum Incoming {
         upstream: IpAddr,
         bytes: Vec<u8>,
     },
+    /// A TCP forward whose connection or write failed (`bytes` as forwarded): the core retries
+    /// it as it does a UDP send the kernel refused (#35).
+    UpstreamTcpFailed {
+        upstream: IpAddr,
+        bytes: Vec<u8>,
+    },
 }
 
 /// Where a client's reply goes.
@@ -298,6 +304,11 @@ impl DnsDriver {
                 transport: Transport::Tcp,
                 bytes,
             },
+            Incoming::UpstreamTcpFailed { upstream, bytes } => Input::ForwardFailed {
+                upstream,
+                transport: Transport::Tcp,
+                bytes,
+            },
         }
     }
 
@@ -351,7 +362,11 @@ impl DnsDriver {
                     bytes,
                 } => {
                     self.stats.forwarded += 1;
-                    tokio::spawn(upstream_tcp(upstream, bytes, self.inbox_tx.clone()));
+                    tokio::spawn(upstream_tcp(
+                        SocketAddr::new(upstream, DNS_PORT),
+                        bytes,
+                        self.inbox_tx.clone(),
+                    ));
                 }
                 Output::Event(event) => events.push(event),
                 Output::Drop { id } => {
@@ -635,19 +650,41 @@ async fn upstream_udp_loop(socket: Arc<UdpSocket>, inbox: mpsc::Sender<Incoming>
     }
 }
 
-/// One query to one upstream over TCP; its reply into the inbox. A failure sends nothing: the
-/// core's timer takes it from there.
-async fn upstream_tcp(upstream: IpAddr, query: Vec<u8>, inbox: mpsc::Sender<Incoming>) {
-    let exchange = async {
-        let mut stream = TcpStream::connect(SocketAddr::new(upstream, DNS_PORT)).await?;
+/// One query to one upstream over TCP; its reply into the inbox. A connection or write that
+/// fails is reported as a failed forward, so the core retries it (#35); a reply that never
+/// comes is left to the core's timer.
+async fn upstream_tcp(to: SocketAddr, query: Vec<u8>, inbox: mpsc::Sender<Incoming>) {
+    let upstream = to.ip();
+    let send = async {
+        let mut stream = TcpStream::connect(to).await?;
         stream.write_all(&frame(&query)).await?;
+        Ok::<TcpStream, std::io::Error>(stream)
+    };
+    let mut stream = match tokio::time::timeout(TCP_UPSTREAM_TIMEOUT, send).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            debug!("dns: TCP to {upstream}: {err}");
+            let _ = inbox
+                .send(Incoming::UpstreamTcpFailed {
+                    upstream,
+                    bytes: query,
+                })
+                .await;
+            return;
+        }
+        Err(_) => {
+            debug!("dns: TCP to {upstream}: no connection within {TCP_UPSTREAM_TIMEOUT:?}");
+            return;
+        }
+    };
+    let receive = async {
         let mut len = [0u8; 2];
         stream.read_exact(&mut len).await?;
         let mut reply = vec![0u8; usize::from(u16::from_be_bytes(len))];
         stream.read_exact(&mut reply).await?;
         Ok::<Vec<u8>, std::io::Error>(reply)
     };
-    match tokio::time::timeout(TCP_UPSTREAM_TIMEOUT, exchange).await {
+    match tokio::time::timeout(TCP_UPSTREAM_TIMEOUT, receive).await {
         Ok(Ok(bytes)) => {
             let _ = inbox.send(Incoming::UpstreamTcp { upstream, bytes }).await;
         }
@@ -692,6 +729,30 @@ mod tests {
         assert_eq!(unframe(&[0]), None);
         let two = [frame(&[9]), frame(&[8, 8])].concat();
         assert_eq!(unframe(&two), Some((3, &[9u8][..])));
+    }
+
+    /// #35: a TCP upstream that refuses the connection is reported to the core as a failed
+    /// forward, so the retry fires rather than the two-second timeout.
+    #[tokio::test]
+    async fn a_refused_tcp_upstream_reports_the_failure() {
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        upstream_tcp(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            vec![0, 7],
+            tx,
+        )
+        .await;
+        match rx.recv().await {
+            Some(Incoming::UpstreamTcpFailed { upstream, bytes }) => {
+                assert_eq!(upstream, IpAddr::V4(Ipv4Addr::LOCALHOST));
+                assert_eq!(bytes, vec![0, 7]);
+            }
+            other => panic!("not a failure report: {}", other.is_some()),
+        }
     }
 
     #[test]

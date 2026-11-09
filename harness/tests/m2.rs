@@ -38,6 +38,10 @@ const SCENARIOS: &[Scenario] = &[
         run: a_vlan_nobody_wants_is_dropped_by_the_untagged_bridge,
     },
     Scenario {
+        name: "a_pure_trunk_port_answers_no_untagged_arp",
+        run: a_pure_trunk_port_answers_no_untagged_arp,
+    },
+    Scenario {
         name: "dmz_host_is_reached_from_the_isp_only_through_a_rule",
         run: dmz_host_is_reached_from_the_isp_only_through_a_rule,
     },
@@ -231,6 +235,7 @@ fn main() -> ExitCode {
 /// The lab's VLAN configuration: a tagged DHCP WAN on p0.101, lan0 untagged on p2, guest tagged
 /// 223 and trusted tagged 224 on p2, trusted untagged on p3 (lan1).
 const VM_VLANS: &str = include_str!("../fixtures/vm-vlans.toml");
+const VM_TRUNK: &str = include_str!("../fixtures/vm-trunk.toml");
 const SOON: Duration = Duration::from_secs(10);
 const READY: &str = r"openfeo: ready generation=\d+";
 /// How long an HTTP fetch that is supposed to work may take.
@@ -336,6 +341,29 @@ fn boot_vlans(lab: &mut Lab) -> anyhow::Result<(Cursor, String)> {
     let lan1 = lab.lan1.as_ref().context("lan1 was added")?;
     Lab::host(lan1, "lan1", "192.168.3.2/24", "192.168.3.1")?;
     Ok((cur, address))
+}
+
+/// A port carrying only tagged LANs answers no untagged ARP for the router's addresses
+/// (`arp_ignore`): a host on its native VLAN learns nothing (#15).
+fn a_pure_trunk_port_answers_no_untagged_arp(lab: &mut Lab) -> anyhow::Result<()> {
+    vlanprobe::require_vlan_links()?;
+    lab.add_lan1()?; // lan0 lives on p3 here; p2 carries only guest's tag
+    lab.start_kea()?; // the WAN is untagged in this fixture
+    lab.with_config(VM_TRUNK)?;
+    lab.boot("")?;
+    let c = lab.console()?;
+    let mut cur = Cursor::default();
+    c.wait_for(&mut cur, &re(READY), BOOT_TIMEOUT)?;
+    // The untagged side of p2: an address in lan0's subnet, whose router address lives on
+    // br-lan0 over p3, so the ARP request arrives on an interface without it.
+    Lab::host(&lab.lan0, "lan0", "192.168.1.2/24", "192.168.1.1")?;
+    let _ = ping_once(&lab.lan0, "192.168.1.1")?; // forces the ARP request
+    let neigh = lab.lan0.ip(&["neigh", "show", "192.168.1.1"])?;
+    anyhow::ensure!(
+        !neigh.contains("lladdr"),
+        "the trunk answered the untagged ARP: {neigh}"
+    );
+    Ok(())
 }
 
 /// A guest client: a VLAN 223 sub-interface of the lan0 tap in its own namespace, leased from

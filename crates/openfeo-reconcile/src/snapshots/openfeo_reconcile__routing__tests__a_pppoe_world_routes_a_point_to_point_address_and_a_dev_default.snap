@@ -1,29 +1,37 @@
 ---
 source: crates/openfeo-reconcile/src/routing.rs
+assertion_line: 576
 expression: desired
 ---
 addrs:
   - ifname: br-lan0
     net: 192.168.1.1/24
     peer: ~
+    lifetimes: ~
   - ifname: br-lan0
     net: "2001:db8:1:222::1/64"
     peer: ~
+    lifetimes: ~
   - ifname: br-lan0
     net: "fd12:3456:789a:1::1/64"
     peer: ~
+    lifetimes: ~
   - ifname: lo
     net: "2001:db8:1::1/128"
     peer: ~
+    lifetimes: ~
   - ifname: lo
     net: "fd12:3456:789a::1/128"
     peer: ~
+    lifetimes: ~
   - ifname: ppp-wan0
     net: 203.0.113.100/32
     peer: 203.0.113.1
+    lifetimes: ~
   - ifname: ppp-wan0
     net: "fe80::1234:5678:9abc:def0/64"
     peer: ~
+    lifetimes: ~
 routes:
   - ifname: ~
     dst: "2001:db8:1::/48"

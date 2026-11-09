@@ -205,6 +205,24 @@ pub fn links(world: &World) -> DesiredLinks {
 /// is ours to set, the lease's while there is one and the default again when it is gone, so a
 /// lease that lowered it does not outlive itself; a static WAN keeps the kernel's. A tagged WAN
 /// registers its sub-interface in `vlans`.
+/// The MTU the links reconciler wants on a DHCP WAN's port: the lease's, else [`DEFAULT_MTU`].
+/// `None` for the other kinds: a static WAN keeps the kernel's, and a PPPoE WAN's IP netdev is
+/// the PPP unit, whose MTU the WAN task sets. The sysctl reconciler reads it so the IPv6 MTU it
+/// writes in the same pass never exceeds what the links applier is setting (#38).
+#[must_use]
+pub fn wan_port_mtu(world: &World, wan: &openfeo_config::Wan) -> Option<u32> {
+    match &wan.kind {
+        Some(wan::Kind::Dhcp(_)) => Some(
+            world
+                .dhcp4
+                .get(&wan.name)
+                .and_then(|fact| fact.mtu)
+                .unwrap_or(DEFAULT_MTU),
+        ),
+        Some(wan::Kind::Pppoe(_) | wan::Kind::Static(_)) | None => None,
+    }
+}
+
 fn wan_interfaces(
     world: &World,
     known: &BTreeSet<&str>,
@@ -222,13 +240,7 @@ fn wan_interfaces(
             vlans.insert(ifname.clone(), (wan.port.clone(), id));
         }
         let mtu = match &wan.kind {
-            Some(wan::Kind::Dhcp(_)) => Some(
-                world
-                    .dhcp4
-                    .get(&wan.name)
-                    .and_then(|fact| fact.mtu)
-                    .unwrap_or(DEFAULT_MTU),
-            ),
+            Some(wan::Kind::Dhcp(_)) => wan_port_mtu(world, wan),
             // The port, and a tagged WAN's parent, carry 1508-byte frames for RFC 4638.
             Some(wan::Kind::Pppoe(_)) => {
                 if ifname != wan.port {

@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use futures::TryStreamExt as _;
 use ipnet::IpNet;
 use netlink_packet_route::AddressFamily;
-use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+use netlink_packet_route::address::{AddressAttribute, AddressMessage, CacheInfo};
 use netlink_packet_route::route::{RouteMessage, RouteProtocol, RouteScope, RouteType};
 use netlink_packet_route::rule::{RuleAction as NlRuleAction, RuleAttribute, RuleMessage};
 use rtnetlink::{LinkBridge, LinkUnspec, LinkVlan, RouteMessageBuilder};
@@ -229,6 +229,44 @@ impl Netlink {
             .execute()
             .await
             .map_err(|e| request_error(format!("add addr {net} dev {index}"), e))
+    }
+
+    /// `ip addr replace <net> dev <index> preferred_lft <p> valid_lft <v>`: an address with the
+    /// lifetimes the kernel deprecates and drops it by (`IFA_CACHEINFO`), `None` for forever;
+    /// `NLM_F_REPLACE`, so the same call refreshes an address already present (#27).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the kernel refuses.
+    pub async fn addr_add_with_lifetimes(
+        &self,
+        index: u32,
+        net: IpNet,
+        preferred_secs: Option<u32>,
+        valid_secs: Option<u32>,
+    ) -> Result<(), Error> {
+        let mut request = self
+            .handle
+            .address()
+            .add(index, net.addr(), net.prefix_len())
+            .replace();
+        let mut info = CacheInfo::default();
+        info.ifa_preferred = preferred_secs.unwrap_or(u32::MAX);
+        info.ifa_valid = valid_secs.unwrap_or(u32::MAX);
+        request
+            .message_mut()
+            .attributes
+            .push(AddressAttribute::CacheInfo(info));
+        request.execute().await.map_err(|e| {
+            request_error(
+                format!(
+                    "replace addr {net} dev {index} preferred_lft {} valid_lft {}",
+                    lft(preferred_secs),
+                    lft(valid_secs)
+                ),
+                e,
+            )
+        })
     }
 
     /// `ip addr add <local> peer <peer> dev <index>`: a point-to-point address (a PPP netdev's),
@@ -549,4 +587,9 @@ impl Netlink {
             }
         }
     }
+}
+
+/// A lifetime as `ip` prints it: seconds, or `forever`.
+fn lft(secs: Option<u32>) -> String {
+    secs.map_or_else(|| "forever".to_owned(), |secs| secs.to_string())
 }
