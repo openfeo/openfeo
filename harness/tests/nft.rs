@@ -212,6 +212,18 @@ fn ula_toward_the_wan_is_rejected_with_no_route(_lab: &mut Lab) -> anyhow::Resul
         nftlist::count_verdict(&ruleset, "forward", "reject") >= 2,
         "the ULA rules reject with no-route: {ruleset}"
     );
+    // The router's own output (#45): both directions, rejected the same way.
+    for field in ["saddr", "daddr"] {
+        let ip6 = json!({"payload": {"protocol": "ip6", "field": field}});
+        ensure!(
+            nftlist::match_rights(&ruleset, "output", &ip6).contains(&&ula),
+            "no ULA {field} rule in output: {ruleset}"
+        );
+    }
+    ensure!(
+        nftlist::count_verdict(&ruleset, "output", "reject") == 2,
+        "the output ULA rules reject with no-route: {ruleset}"
+    );
     let udp_dport = json!({"payload": {"protocol": "udp", "field": "dport"}});
     let input_ports = nftlist::match_rights(&ruleset, "input", &udp_dport);
     ensure!(
