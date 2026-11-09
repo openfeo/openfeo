@@ -10,8 +10,9 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 |---|---|---|
 | M0 Harness and skeleton | done, 2026-10-30 | commits on `main`, before the repository took pull requests |
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
-| M2 IPv6 | parts 1 and 2 done, 2026-11-04; part 3 to come | #10, #22; follow-up #20 |
-| M3 to M7 | not started | |
+| M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
+| M3 PPPoE | done, 2026-11-09 | #46, #47 |
+| M4 to M7 | not started | |
 
 ## M0 Harness and skeleton
 
@@ -151,6 +152,24 @@ concentrator over a veth pair and whose session attach makes a unit netdev where
 hand (CI loads the PPP modules and opens it; a host without them skips with the udev rule to add).
 Part 2 proves the session live: `pppoe-server` in the lab, the `pppoe` suite's PPP scenarios, the `m3`
 QEMU suite, check-env and the cloud setup.
+
+**2026-11-09, [#47](https://github.com/openfeo/openfeo/pull/47), part 2: live.** The session proven end to
+end against rp-pppoe's `pppoe-server` and `pppd` in the lab. The lab's access concentrator runs in kernel
+mode through pppd's own PPPoE plugin with its secrets on a tmpfs over `/etc/ppp`, and radvd and Kea's
+DHCPv6 server start on the ISP's `ppp<N>`. The `pppoe` sandbox suite runs the session core over a real
+kernel session on a veth pair: LCP, PAP and CHAP, IPCP with the pool address and resolver and a ping over
+the unit, a wrong password reported with pppd's message, the server killed as `keepalive lost`, stopped
+as `terminated by peer`, an injected PADT ending the session, IPV6CP and a ping6, and the 1492 fallback
+(rp-pppoe cannot offer RFC 4638; the 1500 path rests on the core's tests). The `m3` QEMU suite boots
+`vm-pppoe.toml` and `vm-pppoe-pd.toml`: the console contract, HTTP through NAT over PPP, the MSS clamp
+measured at the server's socket, the server killed and the session returning, carrier loss during a
+session and during discovery, PAP, the tagged `wan0.101`, IPv6 over PPP, prefix delegation over PPP, a
+reboot keeping the prefix, the concentrator ending the session, and the password nowhere on the console.
+The live session found three router bugs, each fixed test first: a resolver named twice by IPCP, the
+first discovery running before the port's MTU was raised (the router now asks 1500 on a 1508 port), and
+ENXIO read as "no PPP" for a session the kernel refused. `make check-env` reports `pppd`, `pppoe-server`
+and `/dev/ppp`; CI and the cloud setup install and open them. SPEC §12's M3 row is met. M3 is complete;
+next is M4.
 
 ## Tooling and process
 
