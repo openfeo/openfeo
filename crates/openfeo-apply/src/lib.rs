@@ -136,7 +136,7 @@ impl Pass {
 pub fn is_managed(ifname: &str) -> bool {
     ifname.starts_with("br-")
         || is_vlan_port_name(ifname)
-        || is_port_name(ifname)
+        || openfeo_config::portname::is_port_name(ifname)
         || is_ppp_name(ifname)
 }
 
@@ -147,19 +147,12 @@ fn is_ppp_name(ifname: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty())
 }
 
-/// `p<digits>`.
-fn is_port_name(ifname: &str) -> bool {
-    ifname
-        .strip_prefix('p')
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// `p<digits>.<digits>`: a VLAN sub-interface of a port.
+/// `p<digits>.<vid>`: a VLAN sub-interface of a port, by the one grammar in
+/// `openfeo_config::portname` (so a VLAN id outside 1..=4094, or with a leading zero, is not
+/// ours).
 #[must_use]
 pub fn is_vlan_port_name(ifname: &str) -> bool {
-    ifname.split_once('.').is_some_and(|(port, vid)| {
-        is_port_name(port) && !vid.is_empty() && vid.bytes().all(|b| b.is_ascii_digit())
-    })
+    openfeo_config::portname::parse_port_ref(ifname).is_some_and(|r| r.vlan.is_some())
 }
 
 #[cfg(test)]
@@ -202,8 +195,20 @@ mod tests {
         for name in ["p0.101", "p12.4094"] {
             assert!(is_managed(name), "{name}");
         }
-        for name in ["p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6"] {
+        for name in ["p0.", "eth0.5", "p1a.5", "p1.5a", "p1.5.6", "p1.0", "p1.4095", "p1.01"] {
             assert!(!is_managed(name), "{name}");
+        }
+    }
+
+    /// One grammar for port names: what the applier owns is exactly what the config parses.
+    #[test]
+    fn the_grammar_is_openfeo_configs() {
+        for name in ["p0", "p12.101", "p1.4095", "p1.01", "px", "p1.5a", "p1.0"] {
+            assert_eq!(
+                is_vlan_port_name(name) || openfeo_config::portname::is_port_name(name),
+                openfeo_config::portname::parse_port_ref(name).is_some(),
+                "{name}"
+            );
         }
     }
 
