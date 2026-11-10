@@ -256,6 +256,9 @@ async fn run(
         .await;
         publisher.update(|world| {
             Arc::make_mut(&mut world.pppoe).remove(wan);
+            if let Ok(ended) = &ended {
+                world.set_wan_cause(wan, &cause_text(&ended.cause));
+            }
         });
         drop(kernel);
         let ended = ended?;
@@ -773,6 +776,24 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn the_cause_published_is_the_down_lines() {
+        for cause in [
+            Cause::Padt,
+            Cause::Session(Reason::KeepaliveLost),
+            Cause::Session(Reason::TerminatedByPeer),
+            Cause::Session(Reason::CarrierLost),
+        ] {
+            let published = cause_text(&cause);
+            let line = down_line("wan0", &cause, Duration::from_secs(7), None);
+            assert_eq!(line, format!("pppoe wan0 down: {published} after 7 s"));
+        }
+        assert_eq!(
+            cause_text(&Cause::Session(Reason::KeepaliveLost)),
+            "keepalive lost (3 echoes)"
+        );
     }
 
     #[test]

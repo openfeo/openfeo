@@ -30,9 +30,9 @@ use openfeo_runtime::log::{DEFAULT_RING_BYTES, Ring};
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{HealthTracker, Publisher, Supervisor};
-use openfeo_world::health::{Status, Subsystem};
+use openfeo_world::health::{HealthView, Status, Subsystem};
 use openfeo_world::portmap::{PresentPort, assign};
-use openfeo_world::{AddrFact, KernelRoute, LinkFact, MacAddr, World, rename};
+use openfeo_world::{AddrFact, EventDraft, KernelRoute, LinkFact, MacAddr, World, rename};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -104,7 +104,12 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     if ctl.is_none() {
         warn!("no control pipe (not supervised by PID 1); heartbeats go nowhere");
     }
-    tokio::spawn(heartbeat::run(ctl, health.clone(), hung));
+    // Healthy until the first beat says otherwise; the API and the health events read this.
+    let (health_view_tx, health_view_rx) = watch::channel(HealthView {
+        healthy: true,
+        unhealthy: Vec::new(),
+    });
+    tokio::spawn(heartbeat::run(ctl, health.clone(), hung, health_view_tx));
 
     match kernel_decision(kconfig::read_running(), mode) {
         KernelDecision::Proceed(n) => info!("kernel: all {n} required options present"),
@@ -133,7 +138,10 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     let config = load_config(&portmap);
     let Identity { ipv6_secret, ula } = load_identity();
 
-    let (publisher, world_rx) = Publisher::new(World::new(config, portmap));
+    let (publisher, world_rx) = Publisher::with_derive(
+        World::new(config, portmap),
+        Box::new(openfeo_reconcile::derive::derive),
+    );
     let publisher = Arc::new(publisher);
     publisher.update(|world| {
         let cache = cache_rx.borrow();
@@ -148,6 +156,13 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         let cache_rx = cache_rx.clone();
         supervisor.spawn("netlink-facts", move || {
             netlink_facts_task(publisher.clone(), cache_rx.clone())
+        });
+    }
+    {
+        let publisher = publisher.clone();
+        let view = health_view_rx.clone();
+        supervisor.spawn("health-events", move || {
+            health_events_task(publisher.clone(), view.clone())
         });
     }
     crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
@@ -552,6 +567,35 @@ async fn netlink_facts_task(
     }
 }
 
+/// The event for a change of health (SPEC §10), or none when `healthy` did not change.
+fn health_event(was_healthy: bool, view: &HealthView) -> Option<EventDraft> {
+    if view.healthy == was_healthy {
+        None
+    } else if view.healthy {
+        Some(EventDraft::new("health.ok"))
+    } else {
+        Some(EventDraft::new("health.degraded").with("unhealthy", view.unhealthy.join(", ")))
+    }
+}
+
+/// Emit `health.degraded` and `health.ok` on the edges of the heartbeat's view. The heartbeat
+/// starts before the publisher exists, so it only sends the view; this task turns it into
+/// events.
+async fn health_events_task(
+    publisher: Arc<Publisher>,
+    mut view: watch::Receiver<HealthView>,
+) -> Result<(), TaskError> {
+    let mut was_healthy = true;
+    loop {
+        let latest = view.borrow_and_update().clone();
+        if let Some(event) = health_event(was_healthy, &latest) {
+            publisher.emit(event);
+        }
+        was_healthy = latest.healthy;
+        view.changed().await.map_err(|_| "the heartbeat is gone")?;
+    }
+}
+
 /// The appliers of one child; a restarted child builds fresh ones (and a fresh libnftables
 /// context), so its first pass applies the ruleset once and adopts everything else.
 struct Appliers {
@@ -684,6 +728,24 @@ async fn apply_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_events_fire_on_the_edges_only() {
+        let bad = HealthView {
+            healthy: false,
+            unhealthy: vec!["dns".to_owned(), "nft".to_owned()],
+        };
+        let good = HealthView {
+            healthy: true,
+            unhealthy: Vec::new(),
+        };
+        let degraded = health_event(true, &bad).unwrap();
+        assert_eq!(degraded.topic, "health.degraded");
+        assert_eq!(degraded.fields["unhealthy"], "dns, nft");
+        assert_eq!(health_event(false, &bad), None);
+        assert_eq!(health_event(false, &good).unwrap().topic, "health.ok");
+        assert_eq!(health_event(true, &good), None);
+    }
 
     #[test]
     fn every_kernel_address_becomes_a_fact_with_its_interface() {

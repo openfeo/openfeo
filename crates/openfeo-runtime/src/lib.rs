@@ -16,4 +16,4 @@ pub mod world;
 
 pub use health::HealthTracker;
 pub use supervise::Supervisor;
-pub use world::{Publisher, WorldRx};
+pub use world::{Derive, Publisher, WorldRx};
