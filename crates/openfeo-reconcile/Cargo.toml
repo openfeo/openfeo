@@ -17,6 +17,10 @@ ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[features]
+# Exposes `fixtures` (World fixtures) to other crates' tests; never enabled in the binary.
+fixtures = []
+
 [dev-dependencies]
 insta.workspace = true
 

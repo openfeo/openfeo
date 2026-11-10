@@ -4,6 +4,15 @@
 //! World fixtures for the snapshot tests: the lab's three ports, first-boot defaults, and the
 //! static configuration from `harness/fixtures/vm-static.toml`.
 
+// Test support: compiled for tests only (here, or elsewhere through the `fixtures` feature), so
+// a fixture that does not parse may panic.
+#![allow(
+    clippy::expect_used,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    missing_docs
+)]
+
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
