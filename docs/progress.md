@@ -12,7 +12,8 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 to M7 | not started | |
+| M4 API and panel | part 1a, 2026-11-10 | #68 |
+| M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
 
@@ -170,6 +171,27 @@ first discovery running before the port's MTU was raised (the router now asks 15
 ENXIO read as "no PPP" for a session the kernel refused. `make check-env` reports `pppd`, `pppoe-server`
 and `/dev/ppp`; CI and the cloud setup install and open them. SPEC §12's M3 row is met. M3 is complete;
 next is M4.
+
+## M4 API and panel
+
+**2026-11-10, [#68](https://github.com/openfeo/openfeo/pull/68), part 1a: the API.** The design
+for the whole milestone (API, then a JavaScript client, then the panel on it; five parts) and the
+first half of part 1, everything in Rust. A new crate `openfeo-api` serves HTTPS on the private
+LANs with a certificate the router makes for itself (ECDSA P-256, 825 days, reissued with its
+key; ADR-0024), redirects port 80, and carries a few plain HTTP calls, a binary WebSocket
+envelope and gRPC on one listener. A first password is set once from the LAN and logs that client
+in; a wrong password makes its source wait 1 s doubling to 5 minutes; sessions are bearer tokens
+kept in memory; a request must call the router by its own name or address, and a WebSocket
+upgrade from another origin is refused. The API reports what is derived, not collected: the
+World gained addresses, link speed and a status per WAN (its phase, since when, and why it last
+went down, which the DHCP and PPPoE tasks now publish), the publisher derives that status and the
+events of every change inside each publish, and the state snapshot is a pure view of the World
+with `insta` snapshots like the reconcilers. Counters are read once a second and only while
+someone is subscribed. A refused config keeps its admin password. Proven by the `m4` QEMU suite
+(15 scenarios from the LAN side, among them SPEC §12's "a WS upgrade with a foreign `Origin` is
+refused"), a sandbox scenario for the link counters, and fuzz targets for the envelope and the
+host check. The page at `/` is a placeholder until part 1b embeds the panel; part 1b is the
+client, the component package, the panel's three screens and Playwright.
 
 ## Follow-ups
 

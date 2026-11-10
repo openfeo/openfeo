@@ -82,7 +82,11 @@ the lab's account on a tmpfs the sandbox mounts over `/etc/ppp`; `pppd` calls `s
 server by its descendants in `/proc`, not its process group. The `pppoe` sandbox suite runs the session core against
 it over a veth pair (the server's end in a namespace of its own); the `m3` QEMU suite boots `vm-pppoe*.toml` against
 it on isp0, with radvd and Kea's DHCPv6 server on the session's `ppp<N>` (`Lab::start_radvd_on`; Kea needs a plain
-`fe80::1/64` there, not pppd's point-to-point one). `make check-env` reports `/dev/ppp` and the plugin.
+`fe80::1/64` there, not pppd's point-to-point one). `make check-env` reports `/dev/ppp` and the plugin. The `m4` QEMU suite (M4 part 1a) boots
+`vm-dhcp.toml` and drives the router's API from the LAN namespace through `harness::apiclient`: plain HTTPS
+calls, the WebSocket envelope and gRPC, each on a thread that has entered the namespace, trusting whatever
+certificate is presented and handing it back for the scenario to judge; QEMU gives `p0` a link speed
+(`speed=1000`) so the API has one to report, and the lab's one password is `lab-admin-password`.
 
 ## Cloud sandbox
 `scripts/cloud-setup.sh` is the setup script for an ephemeral Ubuntu 24.04 sandbox (a Claude Code on the web

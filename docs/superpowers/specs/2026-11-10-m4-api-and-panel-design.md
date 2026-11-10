@@ -845,3 +845,34 @@ Calls 21 to 27 were made after a fresh reader checked this document against the 
     more on those screens.
 27. **No event for a reissued certificate.** Cost: the change of fingerprint is on the console
     and in `State` but not in the event list.
+
+## After part 1a (2026-11-10)
+
+What building the API changed or settled, beyond the calls above:
+
+- **The operations live in one place** (`openfeo-api::server`) and HTTP, the WebSocket and gRPC
+  each only decode, call and encode. Logout and change-password have no plain HTTP call: the
+  design's table of routes never listed one, and the panel uses the socket.
+- **The peer of a dual-stack listener is made IPv4 again at accept.** An IPv4 client arrives
+  as `::ffff:a.b.c.d`; the gate, the backoff table and the console all see `a.b.c.d`. The first
+  boot in the lab showed the mapped form on the console.
+- **A body announced as too large is refused on its announced length**, with the connection
+  closed. Refusing only once the limit had been read let a client that announced 10 MiB and
+  sent nothing hold a request open.
+- **The time a WAN entered its phase is steady across snapshots.** The wall clock and the boot
+  clock are read a moment apart; the offset between them is held and moved only when the wall
+  clock steps by more than a second.
+- **An address literal with a trailing dot is not the router's host**; a name may carry the
+  root's dot. Found by the host check's fuzz target.
+- **The canonical JSON leaves out a field that is false or empty**, as protobuf's mapping
+  says, so `needs_password` is absent when no password is needed. A client reads the typed
+  message, or treats absent as false.
+- **State is pushed ahead of queued events** on a socket, so a backlog never delays the live
+  picture; a client must not assume which arrives first.
+- **A gRPC stream that falls behind ends with `DATA_LOSS`**, and one whose session ends with
+  `UNAUTHENTICATED`; the caller subscribes again.
+- **A wrong old password on change is `INVALID_ARGUMENT`**, not `UNAUTHENTICATED`: the caller
+  is logged in, and a client that logs out on `UNAUTHENTICATED` must not.
+- **The static binary is 9.8 MB with the API** (6.4 MB before): rustls, ring, hyper, tonic.
+- **Sysctl keys are paths** in this codebase (`net/netfilter/nf_conntrack_count`); the lab
+  showed a count of zero until they were.
