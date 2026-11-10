@@ -1491,10 +1491,16 @@ name = "openfeo-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "libc",
  "nix",
+ "openfeo-api",
  "openfeo-apply",
  "openfeo-config",
  "openfeo-net",
@@ -1510,12 +1516,20 @@ dependencies = [
  "openfeo-reconcile",
  "openfeo-runtime",
  "openfeo-world",
+ "prost",
  "regex",
+ "rustls",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tonic",
+ "tower",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

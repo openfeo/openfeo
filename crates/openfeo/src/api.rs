@@ -33,6 +33,12 @@ const HTTPS: &str = "[::]:443";
 /// Redirects to HTTPS.
 const HTTP: &str = "[::]:80";
 
+/// Tracked connections now, as `openfeo_platform::sysctl` names keys (a path under
+/// `/proc/sys`).
+const CONNTRACK_COUNT: &str = "net/netfilter/nf_conntrack_count";
+/// The most the kernel will track.
+const CONNTRACK_MAX: &str = "net/netfilter/nf_conntrack_max";
+
 type StatsFuture<'a> = Pin<Box<dyn Future<Output = Option<Vec<LinkStats>>> + Send + 'a>>;
 type StatsSource = Box<dyn Fn() -> StatsFuture<'static> + Send + Sync>;
 type SysctlSource = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -97,8 +103,8 @@ impl CounterSource for RouterCounters {
                     .collect(),
                 // Absent until the first connection is tracked: the module's sysctls appear
                 // with it.
-                conntrack: self.number("net.netfilter.nf_conntrack_count"),
-                conntrack_max: self.number("net.netfilter.nf_conntrack_max"),
+                conntrack: self.number(CONNTRACK_COUNT),
+                conntrack_max: self.number(CONNTRACK_MAX),
             })
         })
     }
@@ -163,8 +169,8 @@ mod tests {
         let source = RouterCounters::with(
             || Box::pin(async { Some(vec![stats("p0", 10, 20), stats("br-lan0", 3, 4)]) }),
             |key| match key {
-                "net.netfilter.nf_conntrack_count" => Some("42\n".to_owned()),
-                "net.netfilter.nf_conntrack_max" => Some("262144\n".to_owned()),
+                CONNTRACK_COUNT => Some("42\n".to_owned()),
+                CONNTRACK_MAX => Some("262144\n".to_owned()),
                 _ => None,
             },
         );
@@ -189,6 +195,25 @@ mod tests {
         assert_eq!((counters.conntrack, counters.conntrack_max), (0, 0));
         let failing = RouterCounters::with(|| Box::pin(async { None }), |_| None);
         assert_eq!(failing.read().await, None);
+    }
+
+    #[test]
+    fn the_conntrack_keys_are_paths_the_sysctl_reader_can_open() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("net/netfilter");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nf_conntrack_count"), "7\n").unwrap();
+        std::fs::write(dir.join("nf_conntrack_max"), "65536\n").unwrap();
+        assert_eq!(
+            sysctl::read_at(root.path(), CONNTRACK_COUNT)
+                .unwrap()
+                .trim(),
+            "7"
+        );
+        assert_eq!(
+            sysctl::read_at(root.path(), CONNTRACK_MAX).unwrap().trim(),
+            "65536"
+        );
     }
 
     #[test]

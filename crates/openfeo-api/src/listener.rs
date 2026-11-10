@@ -312,6 +312,19 @@ async fn watch_certificate(shared: Arc<Shared>, tls: Arc<Tls>) -> Result<(), Tas
     }
 }
 
+/// The peer as the rest of the API should see it: an IPv4 client of the dual-stack listener
+/// arrives as `::ffff:a.b.c.d` and is the IPv4 address `a.b.c.d` to the gate, the backoff
+/// table and the console alike.
+fn canonical(peer: SocketAddr) -> SocketAddr {
+    match peer {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map_or(peer, |v4| SocketAddr::new(v4.into(), v6.port())),
+        SocketAddr::V4(_) => peer,
+    }
+}
+
 /// Take the next connection the gate admits and that fits under the limit.
 async fn accept(
     listener: &TcpListener,
@@ -329,6 +342,7 @@ async fn accept(
                 continue;
             }
         };
+        let peer = canonical(peer);
         if !admit(&shared.world.borrow(), peer) {
             debug!("api: {peer} is not on a private LAN; dropped");
             continue;
@@ -431,6 +445,25 @@ async fn accept_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ipv4_client_of_the_dual_stack_listener_is_seen_as_ipv4() {
+        let mapped: SocketAddr = "[::ffff:192.168.1.2]:50000".parse().unwrap();
+        assert_eq!(canonical(mapped), "192.168.1.2:50000".parse().unwrap());
+        assert_eq!(
+            crate::server::line_password_set(canonical(mapped).ip()),
+            "admin: password set from 192.168.1.2"
+        );
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::23".parse().unwrap(),
+            50_000,
+            0,
+            10,
+        ));
+        assert_eq!(canonical(scoped), scoped, "an IPv6 client keeps its scope");
+        let plain: SocketAddr = "192.168.1.2:50000".parse().unwrap();
+        assert_eq!(canonical(plain), plain);
+    }
 
     #[test]
     fn the_console_line_is_the_contract() {

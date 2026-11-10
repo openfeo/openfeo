@@ -126,7 +126,18 @@ pub fn build_args(spec: &VmSpec) -> Vec<OsString> {
             "-netdev",
             &format!("tap,id={},fd={}", nic.id, FIRST_NIC_FD + i),
             "-device",
-            &format!("virtio-net-pci,netdev={},mac={}", nic.id, nic.mac),
+            // virtio reports no link speed unless told one; WAN A is told, so the API's port
+            // state has a speed to show and the others show that a driver may say nothing.
+            &format!(
+                "virtio-net-pci,netdev={},mac={}{}",
+                nic.id,
+                nic.mac,
+                if i == 0 {
+                    ",speed=1000,duplex=full"
+                } else {
+                    ""
+                }
+            ),
         ]);
     }
     if let Some(disk) = &spec.state_disk {

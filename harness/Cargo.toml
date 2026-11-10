@@ -21,12 +21,27 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 ipnet.workspace = true
+# M4: the API's clients, run from inside a LAN namespace (`apiclient`)
+openfeo-api = { path = "../crates/openfeo-api", features = ["client"] }
+openfeo-config = { path = "../crates/openfeo-config" }
+rustls.workspace = true
+tokio-rustls.workspace = true
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tokio-tungstenite.workspace = true
+tonic = { workspace = true, features = ["channel"] }
+tower.workspace = true
+futures.workspace = true
+prost.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 openfeo-apply = { path = "../crates/openfeo-apply" }
-openfeo-config = { path = "../crates/openfeo-config" }
+x509-parser.workspace = true
 openfeo-netlink = { path = "../crates/openfeo-netlink" }
 openfeo-platform = { path = "../crates/openfeo-platform" }
 openfeo-proto-dhcp6 = { path = "../crates/openfeo-proto-dhcp6" }
@@ -105,6 +120,11 @@ harness = false
 [[test]]
 name = "m3"
 path = "tests/m3.rs"
+harness = false
+
+[[test]]
+name = "m4"
+path = "tests/m4.rs"
 harness = false
 
 [lints]
