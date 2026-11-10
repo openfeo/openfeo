@@ -41,6 +41,10 @@ use tokio::sync::watch;
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
+        name: "link_stats_count_what_crossed_a_veth",
+        run: link_stats_count_what_crossed_a_veth,
+    },
+    Scenario {
         name: "a_suppress_main_rule_and_a_source_rule_are_added_dumped_and_removed",
         run: a_suppress_main_rule_and_a_source_rule_are_added_dumped_and_removed,
     },
@@ -658,6 +662,56 @@ async fn wait_within(
 }
 
 /// The monitor's initial dump and its notifications for a link, an address and a route.
+/// `Netlink::link_stats` reads every link's 64-bit counters in one dump (SPEC §10): what one
+/// end of a veth pair sends (the kernel's own neighbour discovery, once both ends are up) the
+/// other end counts as received.
+fn link_stats_count_what_crossed_a_veth(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "ls0"]);
+    netns::ip(&["link", "add", "ls0", "type", "veth", "peer", "name", "ls1"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        tokio::spawn(monitor.run());
+        let of = |stats: &[openfeo_netlink::LinkStats], name: &str| {
+            stats.iter().find(|link| link.name == name).cloned()
+        };
+        let before = nl.link_stats().await?;
+        let ls0 = of(&before, "ls0").context("ls0 in the dump")?;
+        ensure!(
+            ls0.rx_packets == 0 && ls0.tx_packets == 0,
+            "a new link has counted nothing: {ls0:?}"
+        );
+        netns::ip(&["link", "set", "ls1", "up"])?;
+        netns::ip(&["link", "set", "ls0", "up"])?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let stats = nl.link_stats().await?;
+            let (ls0, ls1) = (
+                of(&stats, "ls0").context("ls0")?,
+                of(&stats, "ls1").context("ls1")?,
+            );
+            if ls0.tx_packets >= 2 && ls1.rx_packets >= 2 {
+                ensure!(
+                    ls1.rx_bytes > 0 && ls0.tx_bytes > 0,
+                    "bytes counted: {ls0:?} {ls1:?}"
+                );
+                ensure!(
+                    ls1.rx_packets <= ls0.tx_packets,
+                    "one end cannot receive more than the other sent: {ls0:?} {ls1:?}"
+                );
+                break;
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "nothing crossed the pair in 10 s: {ls0:?} {ls1:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "ls0"]);
+    result?
+}
+
 fn monitor_sees_veth_addr_and_route(_lab: &mut Lab) -> anyhow::Result<()> {
     let _ = netns::ip(&["link", "del", "nv0"]);
     netns::ip(&["link", "add", "nv0", "type", "veth", "peer", "name", "nv1"])?;

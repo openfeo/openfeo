@@ -15,6 +15,7 @@ pub mod types;
 pub use apply::{describe, describe_rule};
 pub use monitor::{Error, Monitor, Netlink};
 pub use types::{
-    Addr, Cache, Link, LinkKind, RTPROT_OPENFEO, RULE_PRIORITY_MAIN_SUPPRESS, RULE_PRIORITY_SOURCE,
-    Route, RouteKind, Rule, RuleAction, SCOPE_LINK, SCOPE_UNIVERSE, TABLE_MAIN,
+    Addr, Cache, Link, LinkKind, LinkStats, RTPROT_OPENFEO, RULE_PRIORITY_MAIN_SUPPRESS,
+    RULE_PRIORITY_SOURCE, Route, RouteKind, Rule, RuleAction, SCOPE_LINK, SCOPE_UNIVERSE,
+    TABLE_MAIN,
 };

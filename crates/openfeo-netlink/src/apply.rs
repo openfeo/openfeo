@@ -12,12 +12,13 @@ use futures::TryStreamExt as _;
 use ipnet::IpNet;
 use netlink_packet_route::AddressFamily;
 use netlink_packet_route::address::{AddressAttribute, AddressMessage, CacheInfo};
+use netlink_packet_route::link::LinkAttribute;
 use netlink_packet_route::route::{RouteMessage, RouteProtocol, RouteScope, RouteType};
 use netlink_packet_route::rule::{RuleAction as NlRuleAction, RuleAttribute, RuleMessage};
 use rtnetlink::{LinkBridge, LinkUnspec, LinkVlan, RouteMessageBuilder};
 
 use crate::monitor::{Error, Netlink, request_error};
-use crate::types::{Route, RouteKind, Rule, RuleAction, TABLE_MAIN};
+use crate::types::{LinkStats, Route, RouteKind, Rule, RuleAction, TABLE_MAIN};
 
 /// Linux errno values the appliers reason about.
 pub mod errno {
@@ -77,6 +78,44 @@ impl Error {
 }
 
 impl Netlink {
+    /// Every link's 64-bit counters, in one dump (SPEC §10). The cache does not hold them:
+    /// they change with every packet and must not wake a reconciler.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Request`] when the dump fails.
+    pub async fn link_stats(&self) -> Result<Vec<LinkStats>, Error> {
+        let mut links = self.handle.link().get().execute();
+        let mut all = Vec::new();
+        while let Some(message) = links
+            .try_next()
+            .await
+            .map_err(|e| request_error("dump link statistics".to_owned(), e))?
+        {
+            let mut stats = LinkStats::default();
+            let mut counted = false;
+            for attribute in &message.attributes {
+                match attribute {
+                    LinkAttribute::IfName(name) => stats.name.clone_from(name),
+                    LinkAttribute::Stats64(counters) => {
+                        counted = true;
+                        stats.rx_bytes = counters.rx_bytes;
+                        stats.tx_bytes = counters.tx_bytes;
+                        stats.rx_packets = counters.rx_packets;
+                        stats.tx_packets = counters.tx_packets;
+                        stats.rx_errors = counters.rx_errors;
+                        stats.tx_errors = counters.tx_errors;
+                    }
+                    _ => {}
+                }
+            }
+            if counted && !stats.name.is_empty() {
+                all.push(stats);
+            }
+        }
+        Ok(all)
+    }
+
     /// `ip link add <name> type bridge` with `vlan_filtering` as given (SPEC §7.1 wants it on).
     /// The bridge is born down: the applier sets its MAC before bringing it up, so the kernel
     /// derives the bridge's link-local from that MAC. A bridge born up takes an EUI-64 of the

@@ -14,6 +14,7 @@ pub mod envelope;
 pub mod gate;
 pub mod limits;
 pub mod pb;
+pub mod telemetry;
 
 /// Served where the panel will be when the binary was built without one (M4 part 1b embeds it).
 pub const PLACEHOLDER_PAGE: &str = "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><title>OpenFeO</title></head>\n<body>\n<h1>OpenFeO</h1>\n<p>The panel was not built into this binary. The API is up.</p>\n</body>\n</html>\n";

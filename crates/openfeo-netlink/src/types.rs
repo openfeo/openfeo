@@ -61,6 +61,25 @@ pub struct Link {
     pub mtu: u32,
 }
 
+/// One link's 64-bit counters, as a dump reads them (SPEC §10).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkStats {
+    /// Interface name.
+    pub name: String,
+    /// Bytes received.
+    pub rx_bytes: u64,
+    /// Bytes sent.
+    pub tx_bytes: u64,
+    /// Packets received.
+    pub rx_packets: u64,
+    /// Packets sent.
+    pub tx_packets: u64,
+    /// Receive errors.
+    pub rx_errors: u64,
+    /// Transmit errors.
+    pub tx_errors: u64,
+}
+
 /// One address on an interface.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Addr {
