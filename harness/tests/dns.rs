@@ -393,10 +393,14 @@ fn names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked(lab: &mut Lab) -> anyho
             .any(|e| matches!(e, Event::UpstreamDown(_))),
         "the IPv6 upstream answered: {events:?} {events2:?}"
     );
-    ensure!(
-        rig.dnsmasq.log.count(&Regex::new(&format!("from {WAN6}"))?) > 0,
-        "dnsmasq saw the query arrive over IPv6"
-    );
+    rig.dnsmasq
+        .log
+        .wait_for(
+            &mut Cursor::default(),
+            &Regex::new(&format!("from {WAN6}"))?,
+            Duration::from_secs(5),
+        )
+        .context("dnsmasq saw the query arrive over IPv6")?;
     Ok(())
 }
 
