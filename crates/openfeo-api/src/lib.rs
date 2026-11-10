@@ -10,6 +10,7 @@
 
 pub mod auth;
 pub mod cert;
+pub mod envelope;
 pub mod gate;
 pub mod limits;
 pub mod pb;
