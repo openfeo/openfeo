@@ -205,7 +205,7 @@ Rebind is answered or gives up (#44); the resolver scenarios wait for dnsmasq's 
 counting it the moment `dig` returns (#64); the `netlink` suite waits up to five seconds for a
 kernel-generated link-local, which the kernel announces only once duplicate address detection
 completes, up to two seconds after the port comes up, so the stable-privacy scenario no longer fails
-on a loaded host. The other seven minors are filed as #60 to #63, #65 and #66.
+on a loaded host. The six minors left are filed as #60 to #63, #65 and #66.
 
 ## Tooling and process
 

@@ -896,6 +896,21 @@ impl Client {
                 if na_mentioned {
                     carried(&old.addresses, &mut addresses, &mut gone);
                 }
+                // An IA the Reply refuses (NoPrefixAvail, NoAddrsAvail) is not one it left
+                // unchanged: the server has withdrawn what the IA held, so it goes.
+                let withdrawn = |held: &[Lease6], gone: &mut Vec<Ipv6Net>| {
+                    for lease in held {
+                        if !gone.contains(&lease.net) {
+                            gone.push(lease.net);
+                        }
+                    }
+                };
+                if no_prefix {
+                    withdrawn(&old.prefixes, &mut gone);
+                }
+                if no_address {
+                    withdrawn(&old.addresses, &mut gone);
+                }
             } else {
                 for net in old.nets() {
                     let kept = prefixes.iter().chain(&addresses).any(|l| l.net == net);
@@ -941,6 +956,11 @@ impl Client {
             self.no_address_noted = false;
         }
         if prefixes.is_empty() && addresses.is_empty() {
+            if old.is_some() {
+                out.push(Output::Note(Note::Restarting(
+                    "the server withdrew the binding",
+                )));
+            }
             self.binding = None;
             self.offer = None;
             // Nothing bound: keep asking, backing off from the holdoff to the pace the
@@ -2459,5 +2479,101 @@ mod tests {
             now += 100;
         }
         assert_eq!(expected, SOL_MAX_RT, "the pace reached the cap");
+    }
+
+    /// A Renew the server answers with `NoPrefixAvail` and `NoAddrsAvail` has withdrawn everything:
+    /// what was held goes through deprecation and the exchange starts over, said so.
+    #[test]
+    fn a_renew_refused_outright_lets_every_lease_go_and_restarts() {
+        let mut client = new_client();
+        let out = client.handle(Input::Start { binding: None }, 0);
+        let solicit = sent(&out);
+        let reply = answer(
+            &solicit,
+            MessageType::Reply,
+            &SERVER,
+            vec![
+                ia_pd(PREFIX, 40, 60, 10, 16),
+                ia_na(ADDRESS, 40, 60, 10, 16),
+            ],
+            vec![Dhcp6Option::RapidCommit],
+        );
+        let out = client.handle(Input::Packet(reply), 5_000);
+        assert!(bound_output(&out).is_some());
+        let out = client.handle(Input::Timeout, 15_000);
+        let renew = sent(&out);
+        assert_eq!(renew.kind, MessageType::Renew);
+        let reply = answer(
+            &renew,
+            MessageType::Reply,
+            &SERVER,
+            vec![
+                ia_status(0x11, true, StatusCode::NoPrefixAvail),
+                ia_status(0x22, false, StatusCode::NoAddrsAvail),
+            ],
+            Vec::new(),
+        );
+        let out = client.handle(Input::Packet(reply), 15_100);
+        assert!(bound_output(&out).is_none());
+        let mut gone = gone_output(&out).cloned().unwrap_or_default();
+        gone.sort();
+        let mut held = vec![
+            PREFIX.parse::<Ipv6Net>().expect("prefix"),
+            format!("{ADDRESS}/128")
+                .parse::<Ipv6Net>()
+                .expect("address"),
+        ];
+        held.sort();
+        assert_eq!(gone, held, "{out:?}");
+        assert!(
+            notes(&out)
+                .iter()
+                .any(|note| matches!(note, Note::Restarting(_))),
+            "{out:?}"
+        );
+        assert_eq!(client.state(), State::Soliciting);
+    }
+
+    /// A Renew that refuses the prefix but renews the address lets the prefix go and binds
+    /// the address: the refused IA is not left unchanged, it is withdrawn.
+    #[test]
+    fn a_renew_that_refuses_the_prefix_lets_it_go_and_keeps_the_address() {
+        let mut client = new_client();
+        let out = client.handle(Input::Start { binding: None }, 0);
+        let solicit = sent(&out);
+        let reply = answer(
+            &solicit,
+            MessageType::Reply,
+            &SERVER,
+            vec![
+                ia_pd(PREFIX, 40, 60, 10, 16),
+                ia_na(ADDRESS, 40, 60, 10, 16),
+            ],
+            vec![Dhcp6Option::RapidCommit],
+        );
+        let out = client.handle(Input::Packet(reply), 5_000);
+        assert!(bound_output(&out).is_some());
+        let out = client.handle(Input::Timeout, 15_000);
+        let renew = sent(&out);
+        let reply = answer(
+            &renew,
+            MessageType::Reply,
+            &SERVER,
+            vec![
+                ia_status(0x11, true, StatusCode::NoPrefixAvail),
+                ia_na(ADDRESS, 40, 60, 10, 16),
+            ],
+            Vec::new(),
+        );
+        let out = client.handle(Input::Packet(reply), 15_100);
+        let (binding, renewed) = bound_output(&out).expect("the address binds");
+        assert!(renewed);
+        assert_eq!(binding.prefixes, Vec::new());
+        assert_eq!(binding.addresses.len(), 1);
+        assert_eq!(
+            gone_output(&out),
+            Some(&vec![PREFIX.parse::<Ipv6Net>().expect("prefix")]),
+            "{out:?}"
+        );
     }
 }
