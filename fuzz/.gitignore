@@ -21,5 +21,11 @@ corpus/dns_forwarder/*
 !corpus/sntp_packet/
 corpus/sntp_packet/*
 !corpus/sntp_packet/seed-*.bin
+!corpus/api_envelope/
+corpus/api_envelope/*
+!corpus/api_envelope/seed-*.bin
+!corpus/api_host/
+corpus/api_host/*
+!corpus/api_host/seed-*.bin
 artifacts
 coverage

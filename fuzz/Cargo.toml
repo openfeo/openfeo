@@ -12,6 +12,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 openfeo-config = { path = "../crates/openfeo-config" }
+openfeo-api = { path = "../crates/openfeo-api" }
+openfeo-world = { path = "../crates/openfeo-world" }
 openfeo-proto-dhcp4 = { path = "../crates/openfeo-proto-dhcp4" }
 # The oracle for the differential DHCPv4 target; a fuzz dependency only, never shipped.
 dhcproto = "0.15"
@@ -187,3 +189,17 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "api_envelope"
+path = "fuzz_targets/api_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_host"
+path = "fuzz_targets/api_host.rs"
+test = false
+doc = false
+bench = false
