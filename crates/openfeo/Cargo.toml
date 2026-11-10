@@ -21,6 +21,7 @@ openfeo-netlink = { path = "../openfeo-netlink" }
 openfeo-nft = { path = "../openfeo-nft" }
 openfeo-reconcile = { path = "../openfeo-reconcile" }
 openfeo-apply = { path = "../openfeo-apply" }
+openfeo-api = { path = "../openfeo-api" }
 openfeo-net = { path = "../openfeo-net" }
 openfeo-proto-dhcp4 = { path = "../openfeo-proto-dhcp4" }
 openfeo-proto-dhcp6 = { path = "../openfeo-proto-dhcp6" }

@@ -32,6 +32,13 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Workspace-internal `path = ".."` dependencies carry no version; that is not a wildcard.
 allow-wildcard-paths = true
+# SPEC §13: rustls with ring; no OpenSSL anywhere, and no aws-lc (C, cmake, its own licence mix).
+deny = [
+    { crate = "aws-lc-sys" },
+    { crate = "aws-lc-rs" },
+    { crate = "openssl-sys" },
+    { crate = "native-tls" },
+]
 
 [sources]
 unknown-registry = "deny"
