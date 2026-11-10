@@ -396,7 +396,10 @@ mod tests {
         let (mut event, mut state) = (None, None);
         while event.is_none() || state.is_none() {
             match ws.msg().await.body {
-                Some(server_msg::Body::Event(got)) => event = Some(got),
+                // The change also withdraws the address: that event is not the one looked for.
+                Some(server_msg::Body::Event(got)) if got.topic == "wan.wan0.down" => {
+                    event = Some(got);
+                }
                 Some(server_msg::Body::Telemetry(push)) => {
                     if let Some(openfeo_config::api::telemetry::Body::State(got)) = push.body {
                         state = Some(got);
