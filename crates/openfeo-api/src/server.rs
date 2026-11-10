@@ -27,7 +27,8 @@ use crate::auth::{Backoff, Sessions, Source, Verifier};
 use crate::events::Recent;
 use crate::gate::Names;
 use crate::limits::{
-    AUTH_FRAME_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_CONNECTIONS, PING_INTERVAL, SESSION_IDLE_MS,
+    AUTH_FRAME_TIMEOUT, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS,
+    MAX_CONNECTIONS_PER_SOURCE, PING_INTERVAL, REQUEST_TIMEOUT, SESSION_IDLE_MS,
 };
 use crate::telemetry::Telemetry;
 
@@ -48,6 +49,13 @@ pub struct Limits {
     pub write: Duration,
     /// How often the server pings an open WebSocket; two unanswered close it.
     pub ping: Duration,
+    /// Connections open at once from one source (an IPv4 address or an IPv6 /64).
+    pub per_source: usize,
+    /// A connection that sends nothing for this long is closed. Long-lived ones are kept
+    /// talking by the WebSocket's pings and HTTP/2's keep-alive, both well inside it.
+    pub idle: Duration,
+    /// A plain HTTP call must be complete, body and all, within this.
+    pub request: Duration,
 }
 
 impl Default for Limits {
@@ -58,6 +66,9 @@ impl Default for Limits {
             auth_frame: AUTH_FRAME_TIMEOUT,
             write: Duration::from_secs(10),
             ping: PING_INTERVAL,
+            per_source: MAX_CONNECTIONS_PER_SOURCE,
+            idle: IDLE_TIMEOUT,
+            request: REQUEST_TIMEOUT,
         }
     }
 }
@@ -125,6 +136,28 @@ pub fn line_login_refused(from: IpAddr, wait_ms: u64) -> String {
 /// A wait in whole seconds, rounded up: what `Retry-After` carries.
 fn wait_secs(wait_ms: u64) -> u32 {
     u32::try_from(wait_ms.div_ceil(1000)).unwrap_or(u32::MAX)
+}
+
+/// A password being checked for a source. If the check is given up before it is judged (the
+/// client went away and its request was dropped), the source is freed to try again.
+struct Attempt<'a> {
+    backoff: &'a Mutex<Backoff>,
+    source: Source,
+    judged: bool,
+}
+
+impl Attempt<'_> {
+    fn judge(mut self) {
+        self.judged = true;
+    }
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if !self.judged {
+            lock(self.backoff).abandon(self.source);
+        }
+    }
 }
 
 /// The state every transport shares.
@@ -355,15 +388,23 @@ impl Shared {
             ));
         }
         let source = Source::of(from);
-        let waiting = lock(&self.backoff).wait_ms(source, boot_ms());
-        if waiting > 0 {
+        // Checking for a wait and claiming the attempt are one step: a burst sent at once is
+        // one attempt, and the rest are told to wait without a hash being computed.
+        if let Err(waiting) = lock(&self.backoff).begin(source, boot_ms()) {
             return Err(ApiError {
                 code: ErrorCode::ResourceExhausted,
                 message: format!("wait {} s before trying again", wait_secs(waiting)),
                 retry_after_secs: wait_secs(waiting),
             });
         }
-        if self.verifier.verify(password, hash).await {
+        let attempt = Attempt {
+            backoff: &self.backoff,
+            source,
+            judged: false,
+        };
+        let right = self.verifier.verify(password, hash).await;
+        attempt.judge();
+        if right {
             lock(&self.backoff).succeeded(source);
             Ok(())
         } else {
@@ -654,6 +695,15 @@ pub(crate) mod tests {
             "first-password-b"
         };
         assert!(shared.login(lan(), winner.to_owned()).await.is_ok());
+        // And the file holds the winner's hash, not the loser's and not a mixture.
+        let file = std::fs::read_to_string(&shared.config_path).unwrap();
+        let openfeo_config::admin::Salvage::Hash(hash) =
+            openfeo_config::admin::salvage_password_hash(&file)
+        else {
+            panic!("no hash in {file}");
+        };
+        assert!(crate::auth::password::verify(winner, &hash));
+        assert_eq!(file.matches("password_hash").count(), 1);
     }
 
     #[tokio::test]
@@ -683,6 +733,59 @@ pub(crate) mod tests {
             "another source is not held up"
         );
         tokio::time::sleep(Duration::from_millis(1_050)).await;
+        assert!(shared.login(lan(), PASSWORD.to_owned()).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_of_wrong_passwords_is_one_attempt_and_the_rest_wait() {
+        let (shared, _dir) = shared(ConfigState::Loaded, Limits::default());
+        shared
+            .set_initial_password(lan(), PASSWORD.to_owned())
+            .await
+            .unwrap();
+        let burst = (0..20).map(|n| {
+            let shared = shared.clone();
+            tokio::spawn(async move { shared.login(lan(), format!("wrong-password-{n:02}")).await })
+        });
+        let mut codes = Vec::new();
+        for attempt in burst.collect::<Vec<_>>() {
+            codes.push(attempt.await.unwrap().unwrap_err().code);
+        }
+        let judged = codes
+            .iter()
+            .filter(|code| **code == ErrorCode::Unauthenticated)
+            .count();
+        let held = codes
+            .iter()
+            .filter(|code| **code == ErrorCode::ResourceExhausted)
+            .count();
+        assert_eq!(
+            (judged, held),
+            (1, 19),
+            "one password was checked; the rest were told to wait"
+        );
+        // The owner, elsewhere on the LAN, is not behind a queue of them.
+        let elsewhere: IpAddr = "192.168.1.99".parse().unwrap();
+        let started = std::time::Instant::now();
+        assert!(shared.login(elsewhere, PASSWORD.to_owned()).await.is_ok());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attempt_given_up_does_not_hold_its_source() {
+        let (shared, _dir) = shared(ConfigState::Loaded, Limits::default());
+        shared
+            .set_initial_password(lan(), PASSWORD.to_owned())
+            .await
+            .unwrap();
+        // Dropped before it is judged, as when the client goes away mid-request.
+        let attempt = shared.login(lan(), "wrong-password-1".to_owned());
+        drop(tokio::time::timeout(Duration::from_millis(1), attempt).await);
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(shared.login(lan(), PASSWORD.to_owned()).await.is_ok());
     }
 

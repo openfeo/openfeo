@@ -33,8 +33,11 @@ use crate::limits::{MAX_FRAME, MAX_SOCKETS};
 use crate::server::{ApiError, Shared};
 use crate::telemetry::CountersSub;
 
+/// Close code: the token was good but every place is taken; try again later.
+pub const CLOSE_TRY_LATER: u16 = 1013;
+
 /// `GET /ws`: the upgrade, for a browser on the router's own origin or for anything that is
-/// not a browser, while fewer than [`MAX_SOCKETS`] are open.
+/// not a browser.
 pub async fn upgrade(
     State(shared): State<Arc<Shared>>,
     Extension(Peer(peer)): Extension<Peer>,
@@ -50,34 +53,61 @@ pub async fn upgrade(
     if !origin_allowed(origin, &shared.names(), &shared.world.borrow()) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(slot) = Slot::take(&shared) else {
+    // Said early when every place is already taken; the place itself is taken on `Auth`.
+    if shared.sockets.load(Ordering::SeqCst) >= MAX_SOCKETS {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    }
+    let slot = Slot::pending(&shared);
     upgrade
         .max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
         .on_upgrade(move |socket| drive(socket, slot, peer.ip()))
 }
 
-/// One of the [`MAX_SOCKETS`] places, and the session's count of sockets; both given back
-/// when the socket ends, however it ends.
-struct Slot {
-    shared: Arc<Shared>,
-    token: Option<String>,
+/// A socket's place among the [`MAX_SOCKETS`], and its session's count of sockets. A place is
+/// taken only once the socket has authenticated: sockets that never do are bounded by the
+/// connections allowed (and each source's share of them) and by the five seconds they are
+/// given, and must not be able to keep the owner's dashboard out. Both are given back when
+/// the socket ends, however it ends.
+pub(crate) struct Slot {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) token: Option<String>,
+    /// The token was good but every place is taken.
+    full: bool,
 }
 
 impl Slot {
-    fn take(shared: &Arc<Shared>) -> Option<Slot> {
-        shared
+    /// A socket that has not authenticated yet.
+    fn pending(shared: &Arc<Shared>) -> Slot {
+        Slot {
+            shared: shared.clone(),
+            token: None,
+            full: false,
+        }
+    }
+
+    fn take_place(&mut self, token: &str) -> bool {
+        let placed = self
+            .shared
             .sockets
             .try_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
                 (open < MAX_SOCKETS).then_some(open + 1)
             })
-            .ok()?;
-        Some(Slot {
-            shared: shared.clone(),
-            token: None,
-        })
+            .is_ok();
+        if placed {
+            self.shared.socket(token, 1);
+            self.token = Some(token.to_owned());
+        } else {
+            self.full = true;
+        }
+        placed
+    }
+
+    /// A place for a stream whose token has already been checked (gRPC); `None` when every
+    /// place is taken.
+    pub(crate) fn authenticated(shared: &Arc<Shared>, token: &str) -> Option<Slot> {
+        let mut slot = Slot::pending(shared);
+        slot.take_place(token).then_some(slot)
     }
 }
 
@@ -85,19 +115,17 @@ impl Drop for Slot {
     fn drop(&mut self) {
         if let Some(token) = &self.token {
             self.shared.socket(token, -1);
+            self.shared.sockets.fetch_sub(1, Ordering::SeqCst);
         }
-        self.shared.sockets.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 impl Backend for Slot {
     fn authenticate(&mut self, token: &str) -> bool {
-        let live = self.shared.authenticate(token);
-        if live && self.token.is_none() {
-            self.shared.socket(token, 1);
-            self.token = Some(token.to_owned());
+        if self.token.is_some() {
+            return self.shared.authenticate(token);
         }
-        live
+        self.shared.authenticate(token) && self.take_place(token)
     }
 
     fn backlog(&mut self, n: u32) -> Vec<openfeo_config::events::Event> {
@@ -312,6 +340,8 @@ async fn act(
                 conn.reply(id, result.map_err(|error| error.to_pb()));
             }
             Out::Close(code) => {
+                // A good token with no place left is "try again later", not "log in again".
+                let code = if slot.full { CLOSE_TRY_LATER } else { code };
                 while let Some(message) = conn.next_out() {
                     if !send_in_time(sink, frame(&message), limit).await {
                         return false;
@@ -514,17 +544,78 @@ mod tests {
         assert!((900..=1_500).contains(&apart), "{apart} ms apart");
     }
 
+    async fn roomy(limits: Limits) -> (crate::testing::TestApi, String) {
+        let api = spawn_api_with_limits(Limits {
+            per_source: 64,
+            ..limits
+        })
+        .await;
+        let token = api
+            .shared
+            .set_initial_password("127.0.0.1".parse().unwrap(), PASSWORD.to_owned())
+            .await
+            .unwrap()
+            .token;
+        (api, token)
+    }
+
     #[tokio::test]
-    async fn a_seventeenth_socket_gets_503() {
-        let (api, _) = TestApi::with_password(PASSWORD).await;
+    async fn a_seventeenth_authenticated_socket_gets_503() {
+        let (api, token) = roomy(Limits::default()).await;
         let mut open = Vec::new();
         for _ in 0..16 {
-            open.push(api.ws(None).await.unwrap());
+            open.push(api.ws_with(&token).await);
         }
+        assert_eq!(api.shared.sockets.load(Ordering::SeqCst), 16);
         assert_eq!(api.ws(None).await.err(), Some(503));
         drop(open.pop());
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(api.ws(None).await.is_ok(), "a place came free");
+        let mut again = api.ws_with(&token).await;
+        let reply = again.ask(request::Body::GetState(GetStateRequest {})).await;
+        assert!(
+            matches!(reply, server_msg::Body::Response(_)),
+            "a place came free"
+        );
+    }
+
+    #[tokio::test]
+    async fn sockets_that_never_authenticate_do_not_keep_the_owner_out() {
+        let (api, token) = roomy(Limits::default()).await;
+        let mut silent = Vec::new();
+        for _ in 0..24 {
+            silent.push(api.ws(None).await.unwrap());
+        }
+        assert_eq!(
+            api.shared.sockets.load(Ordering::SeqCst),
+            0,
+            "a socket takes a place when it authenticates, not before"
+        );
+        let mut mine = api.ws_with(&token).await;
+        let reply = mine.ask(request::Body::GetState(GetStateRequest {})).await;
+        assert!(matches!(reply, server_msg::Body::Response(_)));
+        assert_eq!(api.shared.sockets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_last_place_taken_between_upgrade_and_auth_is_try_again_later() {
+        let (api, token) = roomy(Limits::default()).await;
+        let mut late = api.ws(None).await.unwrap();
+        let mut open = Vec::new();
+        for _ in 0..16 {
+            open.push(api.ws_with(&token).await);
+        }
+        late.send(openfeo_config::api::client_msg::Body::Auth(
+            openfeo_config::api::Auth {
+                token: token.clone(),
+            },
+        ))
+        .await;
+        assert_eq!(
+            late.closed_with().await,
+            Some(1013),
+            "not 4401: the session is fine"
+        );
+        assert!(api.shared.session_is_live(&token));
     }
 
     #[tokio::test]

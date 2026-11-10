@@ -5,7 +5,7 @@
 //! plain HTTP calls, on the same listener, told apart by `content-type: application/grpc`.
 //! Every call but `Login` and `SetInitialPassword` needs `authorization: Bearer <token>`.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ use crate::limits::EVENT_BACKLOG;
 use crate::pb::auth_service_server::AuthService;
 use crate::pb::state_service_server::StateService;
 use crate::server::{ApiError, Shared};
+use crate::ws::Slot;
 
 /// Both services over the shared state.
 #[derive(Debug, Clone)]
@@ -62,12 +63,14 @@ fn status(error: &ApiError) -> Status {
     status
 }
 
-/// The address the call came from, as the listener attached it.
-fn from<T>(request: &Request<T>) -> IpAddr {
+/// The address the call came from, as the listener attached it. Without one the call is
+/// refused: the backoff would otherwise put every caller in one bucket.
+fn from<T>(request: &Request<T>) -> Result<IpAddr, Status> {
     request
         .extensions()
         .get::<Peer>()
-        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |peer| peer.0.ip())
+        .map(|peer| peer.0.ip())
+        .ok_or_else(|| Status::internal("the call carries no peer address"))
 }
 
 /// The call's token, if it names a live session.
@@ -88,7 +91,7 @@ impl AuthService for Grpc {
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<LoginResponse>, Status> {
-        let from = from(&request);
+        let from = from(&request)?;
         let session = self
             .shared
             .login(from, request.into_inner().password)
@@ -103,7 +106,7 @@ impl AuthService for Grpc {
         &self,
         request: Request<SetInitialPasswordRequest>,
     ) -> Result<Response<SetInitialPasswordResponse>, Status> {
-        let from = from(&request);
+        let from = from(&request)?;
         let session = self
             .shared
             .set_initial_password(from, request.into_inner().password)
@@ -128,7 +131,7 @@ impl AuthService for Grpc {
         request: Request<ChangePasswordRequest>,
     ) -> Result<Response<ChangePasswordResponse>, Status> {
         let token = token(&self.shared, &request)?;
-        let from = from(&request);
+        let from = from(&request)?;
         let change = request.into_inner();
         self.shared
             .change_password(from, &token, change.old_password, change.new_password)
@@ -156,15 +159,26 @@ fn stream_item(message: ServerMsg) -> Option<Result<SubscribeResponse, Status>> 
 }
 
 async fn feed(
-    shared: Arc<Shared>,
-    token: String,
+    slot: Slot,
     topics: Vec<Topic>,
     backlog: u32,
     tx: mpsc::Sender<Result<SubscribeResponse, Status>>,
 ) {
+    // The stream holds a place among the sockets and counts as its session's activity, as a
+    // WebSocket does, until this task ends.
+    let shared = slot.shared.clone();
+    let token = slot.token.clone().unwrap_or_default();
     let mut conn = Conn::subscribed(&topics);
     let mut world = shared.world.clone();
     let mut ended = shared.sessions_ended.subscribe();
+    // A logout that landed between the token check and this subscription would otherwise go
+    // unseen until the next one.
+    if !shared.session_is_live(&token) {
+        let _ = tx
+            .send(Err(Status::unauthenticated("the session ended")))
+            .await;
+        return;
+    }
     let mut events = shared.publisher.events();
     let mut counters = conn
         .wants(Topic::Counters)
@@ -246,13 +260,9 @@ impl StateService for Grpc {
         // One pending item per topic and a little slack; a slow reader holds the feed here,
         // and what it misses meanwhile is coalesced where it comes from.
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(feed(
-            self.shared.clone(),
-            token,
-            topics,
-            request.backlog,
-            tx,
-        ));
+        let slot = Slot::authenticated(&self.shared, &token)
+            .ok_or_else(|| Status::resource_exhausted("too many open streams and sockets"))?;
+        tokio::spawn(feed(slot, topics, request.backlog, tx));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
@@ -336,6 +346,11 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("1")
         );
+        // The same source as over plain HTTP: the peer's address reached the gRPC call.
+        let held = api
+            .post_json("/api/login", &serde_json::json!({ "password": PASSWORD }))
+            .await;
+        assert_eq!(held.status, 429, "one backoff source across transports");
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
         let token = auth
             .login(LoginRequest {
@@ -380,6 +395,11 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(unknown.code(), tonic::Code::NotFound);
+        assert_eq!(
+            api.shared.sockets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "an open stream holds a place, as a socket does"
+        );
         auth.logout(with_token(LogoutRequest {}, &token))
             .await
             .unwrap();
@@ -388,6 +408,12 @@ mod tests {
             ended.code(),
             tonic::Code::Unauthenticated,
             "the stream ends with the session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            api.shared.sockets.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "and gives it back"
         );
     }
 

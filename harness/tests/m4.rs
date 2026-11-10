@@ -362,7 +362,7 @@ fn a_wrong_password_waits_longer_each_time(lab: &mut Lab) -> anyhow::Result<()> 
     api.claim(PASSWORD)?;
     let wrong = json!({ "password": "not-the-password" });
     let right = json!({ "password": PASSWORD });
-    for wait in ["1", "2"] {
+    for longest in [1u64, 2] {
         let refused = api.post("/api/login", &wrong)?;
         ensure!(
             refused.status == 401,
@@ -375,12 +375,17 @@ fn a_wrong_password_waits_longer_each_time(lab: &mut Lab) -> anyhow::Result<()> 
             "the right password at once: {}",
             held.status
         );
+        // What is left of the wait, in whole seconds rounded up: the full wait if the retry
+        // was prompt, less on a slow runner, never more and never none.
+        let left: u64 = retry_after(&held)
+            .context("no retry-after")?
+            .parse()
+            .context("retry-after is not a number")?;
         ensure!(
-            retry_after(&held) == Some(wait),
-            "retry-after {:?}, expected {wait}",
-            retry_after(&held)
+            (1..=longest).contains(&left),
+            "retry-after {left}, expected 1 to {longest}"
         );
-        std::thread::sleep(Duration::from_millis(wait.parse::<u64>()? * 1_000 + 100));
+        std::thread::sleep(Duration::from_millis(left * 1_000 + 100));
     }
     let token = api.login(PASSWORD)?;
     ensure!(

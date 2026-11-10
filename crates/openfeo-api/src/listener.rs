@@ -6,6 +6,7 @@
 //! and send its request in good time, and is one of a bounded number. The certificate is held
 //! where each handshake reads it, so a reissue takes effect without a restart.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -33,10 +34,13 @@ use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+use crate::auth::Source;
 use crate::cert::{self, Action, CertError, CertMeta, Clock};
 use crate::gate::{host_allowed, https_authority};
 use crate::http::Peer;
+use crate::limits::MAX_STREAMS;
 use crate::server::Shared;
+use crate::watched::Watched;
 use crate::{Admit, ApiDeps};
 
 /// How often lapsed sessions are dropped.
@@ -241,7 +245,10 @@ impl Server {
             line_listening(self.https_addr()?.port(), self.http_addr()?.port())
         );
         let mut tasks: JoinSet<Result<(), TaskError>> = JoinSet::new();
-        let connections = Arc::new(Semaphore::new(self.shared.limits.connections));
+        let places = Places {
+            all: Arc::new(Semaphore::new(self.shared.limits.connections)),
+            per_source: Arc::new(PerSource::default()),
+        };
         tasks.spawn(remember_events(self.shared.clone()));
         tasks.spawn({
             let telemetry = self.shared.telemetry.clone();
@@ -256,13 +263,13 @@ impl Server {
             self.http,
             self.shared.clone(),
             self.admit.clone(),
-            connections.clone(),
+            places.clone(),
         ));
         tasks.spawn(accept_https(
             self.https,
             self.shared.clone(),
             self.admit,
-            connections,
+            places,
             self.acceptor,
             self.router,
         ));
@@ -325,13 +332,61 @@ fn canonical(peer: SocketAddr) -> SocketAddr {
     }
 }
 
-/// Take the next connection the gate admits and that fits under the limit.
+/// How many connections each source holds now.
+#[derive(Debug, Default)]
+struct PerSource(std::sync::Mutex<BTreeMap<Source, usize>>);
+
+/// One connection's places: one of all of them, and one of its source's. Both are given back
+/// when the connection ends, however it ends.
+struct Place {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    per_source: Arc<PerSource>,
+    source: Source,
+}
+
+impl PerSource {
+    /// Count one more for `source` unless it already holds `limit`.
+    fn take(self: &Arc<Self>, source: Source, limit: usize) -> bool {
+        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = held.entry(source).or_insert(0);
+        if *count >= limit {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let mut held = self
+            .per_source
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = held.get_mut(&self.source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                held.remove(&self.source);
+            }
+        }
+    }
+}
+
+/// The limits on connections: all of them, and each source's share.
+#[derive(Clone)]
+struct Places {
+    all: Arc<Semaphore>,
+    per_source: Arc<PerSource>,
+}
+
+/// Take the next connection the gate admits and that fits under the limits.
 async fn accept(
     listener: &TcpListener,
     shared: &Shared,
     admit: &Admit,
-    connections: &Arc<Semaphore>,
-) -> Result<(TcpStream, SocketAddr, tokio::sync::OwnedSemaphorePermit), TaskError> {
+    places: &Places,
+) -> Result<(TcpStream, SocketAddr, Place), TaskError> {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -347,11 +402,21 @@ async fn accept(
             debug!("api: {peer} is not on a private LAN; dropped");
             continue;
         }
-        let Ok(permit) = connections.clone().try_acquire_owned() else {
+        let Ok(permit) = places.all.clone().try_acquire_owned() else {
             debug!("api: too many connections; {peer} dropped");
             continue;
         };
-        return Ok((stream, peer, permit));
+        let source = Source::of(peer.ip());
+        if !places.per_source.take(source, shared.limits.per_source) {
+            debug!("api: too many connections from {peer}; dropped");
+            continue;
+        }
+        let place = Place {
+            _permit: permit,
+            per_source: places.per_source.clone(),
+            source,
+        };
+        return Ok((stream, peer, place));
     }
 }
 
@@ -359,26 +424,40 @@ async fn accept_https(
     listener: TcpListener,
     shared: Arc<Shared>,
     admit: Admit,
-    connections: Arc<Semaphore>,
+    places: Places,
     acceptor: TlsAcceptor,
     router: Router,
 ) -> Result<(), TaskError> {
     loop {
-        let (stream, peer, permit) = accept(&listener, &shared, &admit, &connections).await?;
-        let (acceptor, limit) = (acceptor.clone(), shared.limits.handshake);
+        let (stream, peer, place) = accept(&listener, &shared, &admit, &places).await?;
+        let (acceptor, limit, idle) = (
+            acceptor.clone(),
+            shared.limits.handshake,
+            shared.limits.idle,
+        );
         let service = TowerToHyperService::new(router.clone().layer(Extension(Peer(peer))));
         tokio::spawn(async move {
-            let _permit = permit;
             let Ok(Ok(tls)) = tokio::time::timeout(limit, acceptor.accept(stream)).await else {
                 debug!("api: {peer} did not finish its handshake");
                 return;
             };
+            // The handshake is not the end of it: the first bytes of a request are due as
+            // promptly, and a connection may never go quiet for long. HTTP/2's keep-alive
+            // (and the WebSocket's pings) keep a healthy long-lived one talking.
+            // The place travels with the I/O: an upgrade to a WebSocket hands the I/O to
+            // another task, and the connection must go on counting for as long as it exists.
+            let tls = Watched::new(tls, limit, idle, place);
             let mut builder = auto::Builder::new(TokioExecutor::new());
             builder
                 .http1()
                 .timer(TokioTimer::new())
                 .header_read_timeout(limit);
-            builder.http2().timer(TokioTimer::new());
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .keep_alive_interval(Some(idle / 3))
+                .keep_alive_timeout(idle / 3)
+                .max_concurrent_streams(MAX_STREAMS);
             if let Err(err) = builder
                 .serve_connection_with_upgrades(TokioIo::new(tls), service)
                 .await
@@ -418,13 +497,13 @@ async fn accept_http(
     listener: TcpListener,
     shared: Arc<Shared>,
     admit: Admit,
-    connections: Arc<Semaphore>,
+    places: Places,
 ) -> Result<(), TaskError> {
     loop {
-        let (stream, peer, permit) = accept(&listener, &shared, &admit, &connections).await?;
+        let (stream, peer, place) = accept(&listener, &shared, &admit, &places).await?;
         let (shared, limit) = (shared.clone(), shared.limits.handshake);
         tokio::spawn(async move {
-            let _permit = permit;
+            let stream = Watched::new(stream, limit, limit, place);
             let service = service_fn(move |request: Request<Incoming>| {
                 let response = redirect(&request, &shared);
                 async move { Ok::<_, std::convert::Infallible>(response) }

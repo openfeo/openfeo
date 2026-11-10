@@ -39,6 +39,15 @@ pub const PASSWORD_MAX: usize = 256;
 pub const MAX_BODY: usize = 4096;
 /// Connections open at once.
 pub const MAX_CONNECTIONS: usize = 64;
+/// Connections open at once from one source (an IPv4 address or an IPv6 /64): one host cannot
+/// take every place.
+pub const MAX_CONNECTIONS_PER_SOURCE: usize = 8;
+/// A connection that sends nothing for this long is closed.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A plain HTTP call must be complete within this.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Requests in flight at once on one HTTP/2 connection.
+pub const MAX_STREAMS: u32 = 16;
 /// A connection must finish its TLS handshake, and then send its request head, within this long.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The certificate's validity, in days (ADR-0024).

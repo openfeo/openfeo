@@ -5,7 +5,7 @@
 //! source, forgotten after 15 quiet minutes. A source is an IPv4 address or an IPv6 /64, since
 //! a LAN client chooses the rest of its IPv6 address freely.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::limits::{BACKOFF_FIRST_MS, BACKOFF_FORGET_MS, BACKOFF_MAX_MS, BACKOFF_SOURCES};
@@ -49,6 +49,8 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct Backoff {
     entries: BTreeMap<Source, Entry>,
+    /// Sources with a password being checked now.
+    attempting: BTreeSet<Source>,
 }
 
 impl Backoff {
@@ -71,9 +73,32 @@ impl Backoff {
             .map_or(0, |entry| entry.until_ms.saturating_sub(now_ms))
     }
 
+    /// Start an attempt from `source`: refused with the wait in milliseconds while it must
+    /// still wait, and while an earlier attempt of its own is still being checked (so a burst
+    /// of attempts sent at once cannot all slip in before the first one fails). An attempt
+    /// begun ends with [`failed`](Self::failed), [`succeeded`](Self::succeeded) or
+    /// [`abandon`](Self::abandon).
+    ///
+    /// # Errors
+    ///
+    /// The wait, in milliseconds.
+    pub fn begin(&mut self, source: Source, now_ms: u64) -> Result<(), u64> {
+        match self.wait_ms(source, now_ms) {
+            0 if self.attempting.insert(source) => Ok(()),
+            0 => Err(BACKOFF_FIRST_MS),
+            wait => Err(wait),
+        }
+    }
+
+    /// The attempt from `source` was given up before it was judged (the client went away).
+    pub fn abandon(&mut self, source: Source) {
+        self.attempting.remove(&source);
+    }
+
     /// Record a wrong password from `source` and return the wait that now applies: the n-th in
     /// a row waits `min(1 s << (n - 1), 5 min)`.
     pub fn failed(&mut self, source: Source, now_ms: u64) -> u64 {
+        self.attempting.remove(&source);
         let failures = self
             .live(source, now_ms)
             .map_or(0, |entry| entry.failures)
@@ -105,6 +130,7 @@ impl Backoff {
 
     /// The right password from `source`: it starts again from nothing.
     pub fn succeeded(&mut self, source: Source) {
+        self.attempting.remove(&source);
         self.entries.remove(&source);
     }
 
@@ -150,6 +176,46 @@ mod tests {
         backoff.succeeded(source);
         assert_eq!(backoff.wait_ms(source, now + 900_001), 0);
         assert!(backoff.is_empty());
+    }
+
+    #[test]
+    fn one_attempt_at_a_time_per_source_so_a_burst_cannot_outrun_the_wait() {
+        let mut backoff = Backoff::new();
+        let (here, there) = (
+            Source::of(ip("192.168.1.23")),
+            Source::of(ip("192.168.1.24")),
+        );
+        assert_eq!(backoff.begin(here, 0), Ok(()));
+        assert_eq!(
+            backoff.begin(here, 0),
+            Err(1_000),
+            "a second attempt while the first is being checked is refused at once"
+        );
+        assert_eq!(
+            backoff.begin(there, 0),
+            Ok(()),
+            "another source is not held up"
+        );
+        assert_eq!(backoff.failed(here, 10), 1_000);
+        assert_eq!(
+            backoff.begin(here, 500),
+            Err(510),
+            "now it waits out the failure"
+        );
+        assert_eq!(backoff.begin(here, 1_010), Ok(()));
+        backoff.succeeded(here);
+        assert_eq!(
+            backoff.begin(here, 1_011),
+            Ok(()),
+            "a success frees the source"
+        );
+        backoff.abandon(here);
+        backoff.abandon(there);
+        assert_eq!(
+            backoff.begin(there, 1_012),
+            Ok(()),
+            "an attempt given up frees it too"
+        );
     }
 
     #[test]

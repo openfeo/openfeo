@@ -14,7 +14,8 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Extension, RawQuery, Request, State};
 use axum::http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY,
-    CONTENT_TYPE, HOST, REFERRER_POLICY, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    CONTENT_TYPE, HOST, ORIGIN, REFERRER_POLICY, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
+    X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
@@ -29,7 +30,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::PLACEHOLDER_PAGE;
-use crate::gate::host_allowed;
+use crate::gate::{host_allowed, origin_allowed};
 use crate::limits::MAX_BODY;
 use crate::server::{ApiError, Shared};
 
@@ -223,6 +224,20 @@ async fn panel(method: Method) -> Response {
         .into_response()
 }
 
+fn is_grpc(request: &Request) -> bool {
+    request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/grpc"))
+}
+
+/// One of the plain HTTP calls under `/api`, as opposed to a gRPC call, the WebSocket or the
+/// panel's files.
+fn is_plain_call(request: &Request) -> bool {
+    request.uri().path().starts_with("/api") && !is_grpc(request)
+}
+
 /// Around every request: the host check first (SPEC §9), and the same headers on every answer.
 async fn guard(State(shared): State<Arc<Shared>>, request: Request, next: Next) -> Response {
     let host = request
@@ -244,11 +259,38 @@ async fn guard(State(shared): State<Arc<Shared>>, request: Request, next: Next) 
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|length| length > MAX_BODY as u64);
+    // A browser says where a request comes from. One from another site is refused, and a POST
+    // must be in a form no page can send without asking first (a plain form post or a
+    // `text/plain` body needs no preflight): while no password is set, a page a LAN user
+    // happens to open must not be able to set one.
+    let foreign = request.headers().get(ORIGIN).is_some_and(|origin| {
+        !origin.to_str().is_ok_and(|origin| {
+            origin_allowed(Some(origin), &shared.names(), &shared.world.borrow())
+        })
+    });
+    let untyped = is_plain_call(&request)
+        && request.method() == Method::POST
+        && !request
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(JSON) || value.starts_with(PROTOBUF));
     let mut response = if !ours {
         StatusCode::MISDIRECTED_REQUEST.into_response()
+    } else if foreign {
+        StatusCode::FORBIDDEN.into_response()
+    } else if untyped {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()
     } else if too_large {
         // The unread body cannot be skipped, so the connection ends with the answer.
         (StatusCode::PAYLOAD_TOO_LARGE, [(CONNECTION, "close")]).into_response()
+    } else if is_plain_call(&request) {
+        // A plain call is over quickly or not at all: a body that trickles in does not hold
+        // the request open. (The WebSocket and gRPC streams live as long as they are used.)
+        match tokio::time::timeout(shared.limits.request, next.run(request)).await {
+            Ok(response) => response,
+            Err(_) => (StatusCode::REQUEST_TIMEOUT, [(CONNECTION, "close")]).into_response(),
+        }
     } else {
         next.run(request).await
     };
@@ -478,7 +520,13 @@ mod tests {
             .await;
         assert_eq!(not_utf8.status, 400);
         let not_protobuf = api
-            .send(true, "POST", "/api/login", &[], vec![0xff, 0xff, 0xff])
+            .send(
+                true,
+                "POST",
+                "/api/login",
+                &[("content-type", "application/x-protobuf")],
+                vec![0xff, 0xff, 0xff],
+            )
             .await;
         assert_eq!(not_protobuf.status, 400);
     }
@@ -502,6 +550,160 @@ mod tests {
             "the two stalled connections were dropped"
         );
         drop(idle);
+    }
+
+    #[tokio::test]
+    async fn a_client_that_finishes_tls_and_says_nothing_is_dropped_and_frees_its_slot() {
+        let api = spawn_api_with_limits(Limits {
+            handshake: Duration::from_millis(200),
+            connections: 2,
+            ..Limits::default()
+        })
+        .await;
+        let mut silent = [api.tls(&[b"http/1.1"]).await, api.tls(&[b"h2"]).await];
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            api.get("/api/status").await.status,
+            200,
+            "both silent connections were dropped"
+        );
+        for tls in &mut silent {
+            let mut byte = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut byte))
+                .await
+                .expect("closed");
+            assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_http2_connection_that_goes_quiet_is_closed() {
+        let api = spawn_api_with_limits(Limits {
+            idle: Duration::from_millis(300),
+            connections: 1,
+            ..Limits::default()
+        })
+        .await;
+        let mut tls = api.tls(&[b"h2"]).await;
+        // The preface and an empty SETTINGS frame: a connection, and then nothing more.
+        tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        let mut sink = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(3), tls.read_to_end(&mut sink)).await;
+        assert!(ended.is_ok(), "still open after 3 s");
+        assert_eq!(
+            api.get("/api/status").await.status,
+            200,
+            "its one place came free"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_that_never_finishes_is_answered_408() {
+        let api = spawn_api_with_limits(Limits {
+            request: Duration::from_millis(300),
+            ..Limits::default()
+        })
+        .await;
+        let mut tls = api.tls(&[b"http/1.1"]).await;
+        tls.write_all(
+            b"POST /api/login HTTP/1.1\r\nhost: openfeo.home.arpa\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+        )
+        .await
+        .unwrap();
+        let mut head = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(3), tls.read_exact(&mut head))
+            .await
+            .expect("answered though the body never came")
+            .unwrap();
+        assert_eq!(&head, b"HTTP/1.1 408");
+    }
+
+    #[tokio::test]
+    async fn one_source_cannot_take_every_connection() {
+        let api = spawn_api_with_limits(Limits {
+            per_source: 2,
+            ..Limits::default()
+        })
+        .await;
+        // Two connections held open by sockets that are doing something.
+        let held = [api.ws(None).await.unwrap(), api.ws(None).await.unwrap()];
+        let third = TcpStream::connect(api.https).await.unwrap();
+        let mut third = third;
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), third.read(&mut byte))
+            .await
+            .expect("the third is closed at once");
+        assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(api.get("/api/status").await.status, 200, "places came free");
+    }
+
+    #[tokio::test]
+    async fn a_page_on_another_site_cannot_set_the_first_password() {
+        let api = spawn_api(ConfigState::Loaded).await;
+        let protobuf = SetInitialPasswordRequest {
+            password: "someone-elses-password".to_owned(),
+        }
+        .encode_to_vec();
+        // What a page can send with no preflight: a simple content type.
+        for content_type in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+        ] {
+            let headers: Vec<(&str, &str)> = content_type
+                .map(|value| ("content-type", value))
+                .into_iter()
+                .collect();
+            let reply = api
+                .send(true, "POST", "/api/password", &headers, protobuf.clone())
+                .await;
+            assert_eq!(reply.status, 415, "{content_type:?}");
+        }
+        // And what it sends when it does ask: its own origin.
+        let foreign = api
+            .send(
+                true,
+                "POST",
+                "/api/password",
+                &[
+                    ("content-type", "application/json"),
+                    ("origin", "https://evil.example"),
+                ],
+                br#"{"password":"someone-elses-password"}"#.to_vec(),
+            )
+            .await;
+        assert_eq!(foreign.status, 403);
+        let read = api
+            .send(
+                true,
+                "GET",
+                "/api/status",
+                &[("origin", "https://evil.example")],
+                Vec::new(),
+            )
+            .await;
+        assert_eq!(read.status, 403);
+        assert!(api.shared.status().needs_password, "nothing was set");
+        let own = api
+            .send(
+                true,
+                "POST",
+                "/api/password",
+                &[
+                    ("content-type", "application/x-protobuf"),
+                    ("origin", "https://openfeo.home.arpa"),
+                ],
+                SetInitialPasswordRequest {
+                    password: PASSWORD.to_owned(),
+                }
+                .encode_to_vec(),
+            )
+            .await;
+        assert_eq!(own.status, 200, "the panel's own origin, in protobuf");
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ pub mod server;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod watched;
 pub mod ws;
 
 use std::net::SocketAddr;

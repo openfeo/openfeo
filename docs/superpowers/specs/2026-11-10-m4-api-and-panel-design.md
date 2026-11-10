@@ -876,3 +876,32 @@ What building the API changed or settled, beyond the calls above:
 - **The static binary is 9.8 MB with the API** (6.4 MB before): rustls, ring, hyper, tonic.
 - **Sysctl keys are paths** in this codebase (`net/netfilter/nf_conntrack_count`); the lab
   showed a count of zero until they were.
+
+### After the whole-branch review
+
+A fresh review found four things a LAN client could do without a password, and two more that
+were graded up on what they would cost a person; each was fixed with a test that failed first.
+
+- **A client that finished TLS and then stalled held a place for ever** (silence, an idle
+  HTTP/2 connection, a body that trickled). Every connection is now watched: its first bytes
+  are due within 10 s, it may not go quiet for 60 s, HTTP/2 keeps itself alive and is closed
+  when unanswered, and a plain call must be complete within 30 s.
+- **A connection's place was given back when it upgraded to a WebSocket**, because hyper hands
+  the socket to another task. The place now travels with the connection's I/O, so the limit of
+  64 holds for sockets too; and one source may hold 8.
+- **A burst of logins sent at once all passed the backoff check before any of them failed.**
+  Checking for a wait and claiming the attempt are now one step per source: a burst is one
+  attempt, the rest are told to wait and no hash is computed for them.
+- **Sockets that never authenticated filled the 16 places.** A place is taken on `Auth`, not
+  on the upgrade; a good token with no place left is closed with 1013 (try again later), not
+  4401.
+- **gRPC streams were not counted, were not session activity, and could outlive a logout.**
+  A stream now holds a place like a socket, counts as its session's activity, and checks its
+  session once more after it starts listening for logouts.
+- **A page on another site could have set the first password**: a POST with a plain content
+  type was read as protobuf, and such a request needs no preflight. A POST must now be
+  `application/json` or `application/x-protobuf`, and any request with a foreign `Origin` is
+  refused.
+- gRPC refuses a call that carries no peer address instead of treating it as `0.0.0.0`.
+
+Twelve minors were deferred; they are listed in the pull request.
