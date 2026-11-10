@@ -65,6 +65,7 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.3"
 toml_edit = "0.23"
+time = "0.3"
 # M4: reads the certificate back in tests and in the harness; never shipped
 x509-parser = "0.18"
 

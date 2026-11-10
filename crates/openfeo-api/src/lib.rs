@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cert;
 pub mod limits;
 pub mod pb;
 
