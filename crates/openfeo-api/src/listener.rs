@@ -427,3 +427,13 @@ async fn accept_http(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_console_line_is_the_contract() {
+        assert_eq!(line_listening(443, 80), "api: listening on :443 and :80");
+    }
+}

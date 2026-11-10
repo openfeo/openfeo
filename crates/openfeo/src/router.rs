@@ -138,8 +138,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     }
 
     let portmap = name_ports(&nl, &cache_rx).await?;
-    // The API (M4) is told how the config came to be; nothing else needs it.
-    let (config, _config_state) = load_config(&portmap);
+    let (config, config_state) = load_config(&portmap);
     let Identity { ipv6_secret, ula } = load_identity();
 
     let (publisher, world_rx) = Publisher::with_derive(
@@ -162,13 +161,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             netlink_facts_task(publisher.clone(), cache_rx.clone())
         });
     }
-    {
-        let publisher = publisher.clone();
-        let view = health_view_rx.clone();
-        supervisor.spawn("health-events", move || {
-            health_events_task(publisher.clone(), view.clone())
-        });
-    }
+    spawn_health_events(&supervisor, &publisher, &health_view_rx);
     crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
     crate::pppoe::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
     crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
@@ -178,6 +171,15 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     crate::ra::spawn(&supervisor, &publisher, &world_rx);
     crate::dhcp6_server::spawn(&supervisor, &publisher, &world_rx);
     crate::time::spawn(&supervisor, &publisher, &world_rx);
+    crate::api::spawn(
+        &supervisor,
+        &publisher,
+        &world_rx,
+        &health_view_rx,
+        &nl,
+        &config_state,
+        version,
+    );
     {
         let health = health.clone();
         supervisor.spawn("apply", move || {
@@ -589,6 +591,17 @@ fn health_event(was_healthy: bool, view: &HealthView) -> Option<EventDraft> {
     } else {
         Some(EventDraft::new("health.degraded").with("unhealthy", view.unhealthy.join(", ")))
     }
+}
+
+fn spawn_health_events(
+    supervisor: &Supervisor,
+    publisher: &Arc<Publisher>,
+    view: &watch::Receiver<HealthView>,
+) {
+    let (publisher, view) = (publisher.clone(), view.clone());
+    supervisor.spawn("health-events", move || {
+        health_events_task(publisher.clone(), view.clone())
+    });
 }
 
 /// Emit `health.degraded` and `health.ok` on the edges of the heartbeat's view. The heartbeat
