@@ -11,7 +11,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M0 Harness and skeleton | done, 2026-10-30 | commits on `main`, before the repository took pull requests |
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
-| M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59 |
+| M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
 | M4 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -197,6 +197,15 @@ drives for a window, so the suite pins the Down reason, the PADT timing and the 
 failed`; a new `m3` scenario resolves a name through the IPCP resolver over PPP; the lab's secrets are
 written only inside the sandbox and the pppd log is rotated across a server restart; `make check-env`
 probes `/dev/ppp` after the user-namespace row and the cloud setup's facts list every module it loads.
+
+**2026-11-10, [#67](https://github.com/openfeo/openfeo/pull/67), third minors sweep.** The three
+deferred minors from #58's and #59's reviews that change what the router or the gate does: a DHCPv6
+binding restored from disk stops counting as restored when the exchange restarts, not only when its
+Rebind is answered or gives up (#44); the resolver scenarios wait for dnsmasq's log line instead of
+counting it the moment `dig` returns (#64); the `netlink` suite waits up to five seconds for a
+kernel-generated link-local, which the kernel announces only once duplicate address detection
+completes, up to two seconds after the port comes up, so the stable-privacy scenario no longer fails
+on a loaded host. The other seven minors are filed as #60 to #63, #65 and #66.
 
 ## Tooling and process
 
