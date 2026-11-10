@@ -420,10 +420,15 @@ fn ipv6_addresses_default_with_preferred_source_and_blackhole_are_applied_and_re
                 .ops)
         };
         links_pass(&mut rig, &config).await?;
-        wait_until(&mut rig.rx, "p0 up with a link-local address", |c| {
-            c.link_by_name("p0").is_some_and(|l| l.up && l.carrier)
-                && link_local_of(c, "p0").is_some()
-        })
+        wait_within(
+            &mut rig.rx,
+            "p0 up with a link-local address",
+            ADDRESS_READY,
+            |c| {
+                c.link_by_name("p0").is_some_and(|l| l.up && l.carrier)
+                    && link_local_of(c, "p0").is_some()
+            },
+        )
         .await?;
         let ops = routing_pass(&mut rig, &config).await?;
         ensure!(ops >= 4, "the first routing pass did {ops} things");
@@ -537,9 +542,12 @@ fn a_stable_privacy_link_local_is_the_same_across_two_bounces(
                 .ops)
         };
         pass(&mut rig).await?;
-        wait_until(&mut rig.rx, "p0 up with a link-local address", |c| {
-            c.link_by_name("p0").is_some_and(|l| l.up) && link_local_of(c, "p0").is_some()
-        })
+        wait_within(
+            &mut rig.rx,
+            "p0 up with a link-local address",
+            ADDRESS_READY,
+            |c| c.link_by_name("p0").is_some_and(|l| l.up) && link_local_of(c, "p0").is_some(),
+        )
         .await?;
         let first = link_local_of(&rig.rx.borrow(), "p0").context("link-local")?;
         let mac = rig
@@ -575,9 +583,12 @@ fn a_stable_privacy_link_local_is_the_same_across_two_bounces(
         })
         .await?;
         rig.nl.link_set_up(p0, true).await?;
-        wait_until(&mut rig.rx, "p0 up again with a link-local", |c| {
-            c.link_by_name("p0").is_some_and(|l| l.up) && link_local_of(c, "p0").is_some()
-        })
+        wait_within(
+            &mut rig.rx,
+            "p0 up again with a link-local",
+            ADDRESS_READY,
+            |c| c.link_by_name("p0").is_some_and(|l| l.up) && link_local_of(c, "p0").is_some(),
+        )
         .await?;
         let second = link_local_of(&rig.rx.borrow(), "p0").context("link-local")?;
         ensure!(second == first, "{second} after the bounce, {first} before");
@@ -596,6 +607,13 @@ fn main() -> ExitCode {
 /// How long a kernel notification may take to reach the cache.
 const SETTLE: Duration = Duration::from_secs(2);
 
+/// How long the kernel may take to put a link-local address on a port that came up: it is
+/// announced once duplicate address detection completes, after a random delay of up to a
+/// second and `dad_transmits` × 1 s (RFC 4862 §5.4), so up to two seconds on an idle host
+/// and more on a loaded one. [`SETTLE`] is a notification's delay, not an address's, and
+/// nothing changes in the cache between the port's up flags and the address to extend it.
+const ADDRESS_READY: Duration = Duration::from_secs(5);
+
 fn block_on<F: Future>(future: F) -> anyhow::Result<F::Output> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -604,17 +622,27 @@ fn block_on<F: Future>(future: F) -> anyhow::Result<F::Output> {
     Ok(runtime.block_on(future))
 }
 
-/// Wait until `pred` holds for the cache, or fail after [`SETTLE`].
+/// Wait until `pred` holds for the cache, or fail after [`SETTLE`] without a change.
 async fn wait_until(
     rx: &mut watch::Receiver<Arc<Cache>>,
     what: &str,
+    pred: impl Fn(&Cache) -> bool,
+) -> anyhow::Result<()> {
+    wait_within(rx, what, SETTLE, pred).await
+}
+
+/// Wait until `pred` holds for the cache, or fail after `within` without a change.
+async fn wait_within(
+    rx: &mut watch::Receiver<Arc<Cache>>,
+    what: &str,
+    within: Duration,
     pred: impl Fn(&Cache) -> bool,
 ) -> anyhow::Result<()> {
     loop {
         if pred(&rx.borrow_and_update()) {
             return Ok(());
         }
-        tokio::time::timeout(SETTLE, rx.changed())
+        tokio::time::timeout(within, rx.changed())
             .await
             .with_context(|| {
                 let cache = rx.borrow();
