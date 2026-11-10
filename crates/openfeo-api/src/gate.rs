@@ -97,6 +97,18 @@ fn host_only(text: &str) -> Option<&str> {
     }
 }
 
+/// Where port 80 sends a request for `host`: the same host over HTTPS on its default port
+/// (an IPv6 literal keeps its brackets). `None` for a host that does not parse.
+#[must_use]
+pub fn https_authority(host: &str) -> Option<String> {
+    let bare = host_only(host)?;
+    Some(if host.starts_with('[') {
+        format!("[{bare}]")
+    } else {
+        bare.to_owned()
+    })
+}
+
 fn is_port(text: &str) -> bool {
     !text.is_empty() && text.len() <= 5 && text.bytes().all(|b| b.is_ascii_digit())
 }
@@ -308,6 +320,23 @@ mod tests {
         ] {
             assert!(!origin_allowed(Some(origin), &names, &world), "{origin}");
         }
+    }
+
+    #[test]
+    fn port_80_sends_a_host_to_itself_over_https() {
+        assert_eq!(
+            https_authority("openfeo.home.arpa:80").as_deref(),
+            Some("openfeo.home.arpa")
+        );
+        assert_eq!(
+            https_authority("192.168.1.1").as_deref(),
+            Some("192.168.1.1")
+        );
+        assert_eq!(
+            https_authority("[2001:db8:1:1::1]:80").as_deref(),
+            Some("[2001:db8:1:1::1]")
+        );
+        assert_eq!(https_authority("[2001:db8:1:1::1"), None);
     }
 
     #[test]
