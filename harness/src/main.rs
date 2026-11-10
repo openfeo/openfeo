@@ -191,7 +191,6 @@ fn check() -> Result<ExitCode> {
         .open("/dev/net/tun")
         .is_ok();
     report("/dev/net/tun", tun, "");
-    report_ppp()?;
     for bin in [
         "qemu-system-x86_64",
         "ip",
@@ -243,23 +242,19 @@ fn check() -> Result<ExitCode> {
         busybox_has("udhcpc6"),
         " (the stateless DHCPv6 reference client)",
     );
+    let sandbox_ok = sandbox_works()?;
     report(
         "unprivileged user namespaces",
-        sandbox_works()?,
+        sandbox_ok,
         if sandbox::is_inside() {
             " (already inside one)"
         } else {
             ""
         },
     );
-    match nft_expressions_work()? {
-        Ok(()) => report("nft ct/fib/nat expressions", true, ""),
-        Err(detail) => report("nft ct/fib/nat expressions", false, &format!(" ({detail})")),
-    }
-    match vlan_links_work()? {
-        Ok(()) => report("802.1Q VLAN links", true, ""),
-        Err(detail) => report("802.1Q VLAN links", false, &format!(" ({detail})")),
-    }
+    // After the row that explains a "no" without user namespaces (#48).
+    report_ppp(sandbox_ok)?;
+    report_sandbox_probes(&mut report, sandbox_ok)?;
     match Lab::kernel_path() {
         Ok(path) => report("kernel image", true, &format!(" ({})", path.display())),
         Err(err) => report("kernel image", false, &format!(" ({err})")),
@@ -375,16 +370,47 @@ fn vlan_links_work() -> Result<Result<(), String>> {
     probe_in_child("probe-vlan")
 }
 
+/// The nft and VLAN probes, which run in the sandbox: without user namespaces they are missing,
+/// said plainly rather than by an error on the way in (#48).
+fn report_sandbox_probes(
+    report: &mut impl FnMut(&str, bool, &str),
+    sandbox_ok: bool,
+) -> Result<()> {
+    let needs_userns = " (needs unprivileged user namespaces; see above)";
+    if sandbox_ok {
+        match nft_expressions_work()? {
+            Ok(()) => report("nft ct/fib/nat expressions", true, ""),
+            Err(detail) => report("nft ct/fib/nat expressions", false, &format!(" ({detail})")),
+        }
+        match vlan_links_work()? {
+            Ok(()) => report("802.1Q VLAN links", true, ""),
+            Err(detail) => report("802.1Q VLAN links", false, &format!(" ({detail})")),
+        }
+    } else {
+        report("nft ct/fib/nat expressions", false, needs_userns);
+        report("802.1Q VLAN links", false, needs_userns);
+    }
+    Ok(())
+}
+
 /// `/dev/ppp` and the PPPoE plugin, reported but not fatal: the PPPoE scenarios (M3) skip without
-/// them, as the VLAN ones do without 8021q.
-fn report_ppp() -> Result<()> {
-    // Opened from the sandbox: ppp_generic wants CAP_NET_ADMIN in the opener's user namespace.
-    match probe_in_child("probe-ppp")? {
-        Ok(()) => println!("{:<30} ok", "/dev/ppp"),
-        Err(detail) => println!(
-            "{:<30} no ({detail}; the PPPoE scenarios skip: load ppp_generic and add udev: KERNEL==\"ppp\", GROUP=\"<your group>\", MODE=\"0660\")",
+/// them, as the VLAN ones do without 8021q. The device is opened from the sandbox (`ppp_generic`
+/// wants `CAP_NET_ADMIN` in the opener's user namespace), so without user namespaces the row says
+/// so instead of failing on the way in (#48).
+fn report_ppp(sandbox_ok: bool) -> Result<()> {
+    if sandbox_ok {
+        match probe_in_child("probe-ppp")? {
+            Ok(()) => println!("{:<30} ok", "/dev/ppp"),
+            Err(detail) => println!(
+                "{:<30} no ({detail}; the PPPoE scenarios skip: load ppp_generic and add udev: KERNEL==\"ppp\", GROUP=\"<your group>\", MODE=\"0660\")",
+                "/dev/ppp"
+            ),
+        }
+    } else {
+        println!(
+            "{:<30} no (needs unprivileged user namespaces; see above)",
             "/dev/ppp"
-        ),
+        );
     }
     match daemons::pppd_plugin() {
         Ok(path) => println!("{:<30} ok ({})", "pppd PPPoE plugin", path.display()),

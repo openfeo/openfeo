@@ -3,6 +3,7 @@
 
 //! A tiny scenario runner: each scenario gets a fresh [`Lab`], results print libtest-style.
 
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -108,12 +109,19 @@ fn run_one(scenario: &Scenario) -> anyhow::Result<()> {
     result
 }
 
-/// On failure: the end of the VM console, of QEMU's stderr and of every daemon's log, so the
-/// cause is in the output.
+/// On failure: the end of the VM console, of QEMU's stderr, of every daemon's log and of the
+/// pppd logs in the run dir (the rotated predecessor too, #57: the run dir is the sandbox's
+/// tmpfs and goes with it), so the cause is in the output.
 fn dump_diagnostics(lab: &Lab) {
     for daemon in &lab.daemons {
         eprintln!("--- {} (last 20 lines) ---", daemon.name);
         for line in daemon.log.tail(20) {
+            eprintln!("{line}");
+        }
+    }
+    for (name, tail) in pppd_log_tails(&lab.run_dir, 20) {
+        eprintln!("--- {name} (last 20 lines) ---");
+        for line in tail {
             eprintln!("{line}");
         }
     }
@@ -136,6 +144,41 @@ fn dump_diagnostics(lab: &Lab) {
     }
 }
 
+/// The last `lines` of every `pppd-*.log` and `pppd-*.log.1` in `run_dir`, the rotated
+/// predecessor before the current log; nothing when the directory cannot be read.
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // our own names, spelled exactly
+fn pppd_log_tails(run_dir: &Path, lines: usize) -> Vec<(String, Vec<String>)> {
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| {
+            name.starts_with("pppd-") && (name.ends_with(".log") || name.ends_with(".log.1"))
+        })
+        .collect();
+    // `.log.1` sorts after `.log`; the predecessor goes first.
+    names.sort_by_key(|name| {
+        (
+            name.trim_end_matches(".1").to_owned(),
+            !name.ends_with(".1"),
+        )
+    });
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let text = std::fs::read_to_string(run_dir.join(&name)).ok()?;
+            let all: Vec<&str> = text.lines().collect();
+            let tail = all[all.len().saturating_sub(lines)..]
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect();
+            Some((name, tail))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +186,32 @@ mod tests {
     #[allow(clippy::unnecessary_wraps)] // the signature is the Scenario fn-pointer type
     fn noop(_: &mut Lab) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// #57: the pppd logs a server wrote (the current one and the rotated predecessor) are part
+    /// of a failure's diagnostics, newest file last; nothing else in the run dir is.
+    #[test]
+    fn pppd_logs_in_the_run_dir_are_tailed_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pppd-wan0.log"), "c1\nc2\nc3\n").unwrap();
+        std::fs::write(dir.path().join("pppd-wan0.log.1"), "p1\np2\n").unwrap();
+        std::fs::write(dir.path().join("pppoe-server-wan0.pid"), "7\n").unwrap();
+        std::fs::write(dir.path().join("kea.conf"), "{}\n").unwrap();
+        let tails = pppd_log_tails(dir.path(), 2);
+        assert_eq!(
+            tails,
+            vec![
+                (
+                    "pppd-wan0.log.1".to_owned(),
+                    vec!["p1".to_owned(), "p2".to_owned()]
+                ),
+                (
+                    "pppd-wan0.log".to_owned(),
+                    vec!["c2".to_owned(), "c3".to_owned()]
+                ),
+            ]
+        );
+        assert_eq!(pppd_log_tails(Path::new("/nonexistent/run"), 2).len(), 0);
     }
 
     #[test]

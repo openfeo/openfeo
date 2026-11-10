@@ -11,7 +11,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M0 Harness and skeleton | done, 2026-10-30 | commits on `main`, before the repository took pull requests |
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
-| M3 PPPoE | done, 2026-11-09 | #46, #47; follow-up #58 |
+| M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59 |
 | M4 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -190,6 +190,13 @@ pure trunk port answers no untagged ARP, proven by a new m2 scenario (#15); the 
 exceeds the lease MTU set in the same pass (#38); the router's own ULA-sourced or ULA-bound output
 toward a WAN is refused (#45); port and VLAN spellings are canonical and `pd_hint` beside a typed
 prefix is refused (#18, #43); the applier reads port names from openfeo-config's one grammar (#16).
+
+**2026-11-10, [#59](https://github.com/openfeo/openfeo/pull/59), harness deferred minors.** The ten
+harness minors from #47's review: the `pppoe` bench fails a wait at once when the session dies and
+drives for a window, so the suite pins the Down reason, the PADT timing and the silence after `auth
+failed`; a new `m3` scenario resolves a name through the IPCP resolver over PPP; the lab's secrets are
+written only inside the sandbox and the pppd log is rotated across a server restart; `make check-env`
+probes `/dev/ppp` after the user-namespace row and the cloud setup's facts list every module it loads.
 
 ## Tooling and process
 
