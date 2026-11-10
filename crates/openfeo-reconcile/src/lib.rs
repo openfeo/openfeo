@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod derive;
 pub mod dhcp;
 pub mod dhcp6_server;
 pub mod dns;
@@ -18,6 +19,7 @@ pub mod ra;
 pub mod routing;
 pub mod sysctl;
 pub mod time;
+pub mod wan;
 
 #[cfg(test)]
 pub(crate) mod fixtures;
