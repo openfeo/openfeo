@@ -1,0 +1,73 @@
+---
+source: crates/openfeo-reconcile/src/state.rs
+expression: "state(&world, &system())"
+---
+generation: "1"
+system:
+  hostname: openfeo
+  domain: home.arpa
+  version: 0.4.0
+  uptime_secs: "3600"
+  healthy: true
+  tls_fingerprint: "AB:CD"
+ports:
+  - name: p0
+    id: "pci-0000:00:03.0"
+    mac: "52:54:00:fe:00:00"
+    carrier: true
+    uses:
+      - kind: PORT_USE_KIND_WAN
+        name: wan0
+  - name: p1
+    id: "pci-0000:00:04.0"
+    mac: "52:54:00:fe:00:01"
+  - name: p2
+    id: "pci-0000:00:05.0"
+    mac: "52:54:00:fe:00:02"
+    uses:
+      - kind: PORT_USE_KIND_LAN
+        name: lan0
+  - name: p3
+    id: "pci-0000:00:06.0"
+    mac: "52:54:00:fe:00:03"
+    uses:
+      - kind: PORT_USE_KIND_LAN
+        name: lan1
+wans:
+  - name: wan0
+    kind: WAN_KIND_DHCP
+    port: p0
+    interface: p0
+    phase: WAN_PHASE_CONNECTING
+    phase_since_unix_ms: "1794296401000"
+    mtu: 1500
+    ipv6: "2001:db8:ffff::1a4/128"
+    ipv6_prefixes:
+      - "2001:db8:100::/56"
+    default4: true
+    default6: true
+lans:
+  - name: lan0
+    interface: br-lan0
+    members:
+      - p2
+    ipv4: 192.168.1.1/24
+    dhcp: true
+    pool_size: 101
+    reaches:
+      - wan
+      - lan1
+  - name: lan1
+    interface: br-lan1
+    members:
+      - p3
+    ipv4: 192.168.2.1/24
+    dhcp: true
+    pool_size: 101
+    reaches:
+      - wan
+      - lan0
+addresses:
+  - interface: p0
+    address: 203.0.113.100/24
+    origin: ADDRESS_ORIGIN_CONFIG
