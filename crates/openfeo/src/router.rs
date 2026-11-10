@@ -18,6 +18,7 @@ use openfeo_apply::links::LinksApplier;
 use openfeo_apply::nft::NftApplier;
 use openfeo_apply::routing::RoutingApplier;
 use openfeo_apply::sysctl::SysctlApplier;
+use openfeo_config::admin::ConfigState;
 use openfeo_config::load::{self, Source};
 use openfeo_config::{Config, PortMap, file};
 use openfeo_init::cmdline::{Cmdline, Mode};
@@ -36,7 +37,9 @@ use openfeo_world::{AddrFact, EventDraft, KernelRoute, LinkFact, MacAddr, World,
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::boot::{ConfigDecision, KernelDecision, config_decision, kernel_decision};
+use crate::boot::{
+    ConfigDecision, KernelDecision, config_decision, config_to_run, kernel_decision,
+};
 use crate::chaos::{self, Chaos};
 use crate::heartbeat;
 
@@ -135,7 +138,8 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     }
 
     let portmap = name_ports(&nl, &cache_rx).await?;
-    let config = load_config(&portmap);
+    // The API (M4) is told how the config came to be; nothing else needs it.
+    let (config, _config_state) = load_config(&portmap);
     let Identity { ipv6_secret, ula } = load_identity();
 
     let (publisher, world_rx) = Publisher::with_derive(
@@ -402,27 +406,36 @@ fn persist_portmap(map: &PortMap) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load `config.toml` against the live port map, falling back to first-boot defaults.
-fn load_config(portmap: &PortMap) -> Config {
-    match config_decision(load::load(Path::new(CONFIG_PATH), portmap)) {
-        ConfigDecision::Use(loaded) => {
-            match loaded.source {
-                Source::File => {
-                    if let Some(from) = loaded.migrated_from {
-                        info!("config: migrated from version {from}");
-                    }
-                    info!(
-                        "config: loaded {CONFIG_PATH} version={}",
-                        loaded.config.config_version
-                    );
+/// Load `config.toml` against the live port map, falling back to first-boot defaults (which
+/// keep a refused file's admin password), and say on the console which it was.
+fn load_config(portmap: &PortMap) -> (Config, ConfigState) {
+    let path = Path::new(CONFIG_PATH);
+    let result = load::load(path, portmap);
+    // Only a refused file is read again, for what it still says about the admin password.
+    let text = if result.is_err() {
+        std::fs::read_to_string(path).ok()
+    } else {
+        None
+    };
+    let decision = config_decision(result, text.as_deref());
+    match &decision {
+        ConfigDecision::Use(loaded) => match loaded.source {
+            Source::File => {
+                if let Some(from) = loaded.migrated_from {
+                    info!("config: migrated from version {from}");
                 }
-                Source::FirstBootDefaults => info!(
-                    "config: none at {CONFIG_PATH}; first-boot defaults (all ports in lan0 192.168.1.1/24)"
-                ),
+                info!(
+                    "config: loaded {CONFIG_PATH} version={}",
+                    loaded.config.config_version
+                );
             }
-            loaded.config
-        }
-        ConfigDecision::Defaults { reason, violations } => {
+            Source::FirstBootDefaults => info!(
+                "config: none at {CONFIG_PATH}; first-boot defaults (all ports in lan0 192.168.1.1/24)"
+            ),
+        },
+        ConfigDecision::Defaults {
+            reason, violations, ..
+        } => {
             error!("config: {reason}; using first-boot defaults");
             for violation in violations {
                 error!(
@@ -430,9 +443,9 @@ fn load_config(portmap: &PortMap) -> Config {
                     violation.path, violation.code, violation.message
                 );
             }
-            Config::first_boot(portmap)
         }
     }
+    config_to_run(decision, portmap)
 }
 
 /// Link facts from the cache, keyed by name.

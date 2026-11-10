@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
 mod error;
 pub mod file;
 mod generated;
