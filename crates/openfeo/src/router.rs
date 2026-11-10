@@ -32,7 +32,7 @@ use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{HealthTracker, Publisher, Supervisor};
 use openfeo_world::health::{Status, Subsystem};
 use openfeo_world::portmap::{PresentPort, assign};
-use openfeo_world::{KernelRoute, LinkFact, MacAddr, World, rename};
+use openfeo_world::{AddrFact, KernelRoute, LinkFact, MacAddr, World, rename};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
@@ -137,7 +137,8 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     let publisher = Arc::new(publisher);
     publisher.update(|world| {
         let cache = cache_rx.borrow();
-        world.links = Arc::new(link_facts(&cache));
+        world.links = Arc::new(link_facts(&cache, &|name| port_speed(&world.ports, name)));
+        world.addresses = Arc::new(addr_facts(&cache, openfeo_runtime::clock::uptime_ms()));
         world.routes = Arc::new(kernel_routes(&cache));
         world.ula = ula;
     });
@@ -420,7 +421,10 @@ fn load_config(portmap: &PortMap) -> Config {
 }
 
 /// Link facts from the cache, keyed by name.
-fn link_facts(cache: &Cache) -> std::collections::BTreeMap<String, LinkFact> {
+fn link_facts(
+    cache: &Cache,
+    speed_of: &dyn Fn(&str) -> Option<u32>,
+) -> std::collections::BTreeMap<String, LinkFact> {
     cache
         .links
         .values()
@@ -443,10 +447,42 @@ fn link_facts(cache: &Cache) -> std::collections::BTreeMap<String, LinkFact> {
                         }
                         _ => None,
                     }),
+                    speed_mbps: if link.carrier {
+                        speed_of(&link.name)
+                    } else {
+                        None
+                    },
                 },
             )
         })
         .collect()
+}
+
+/// Every address the kernel holds on a link the cache knows (SPEC §6.2), deprecated when its
+/// preferred lifetime has run out at `now_ms` on the process clock.
+fn addr_facts(cache: &Cache, now_ms: u64) -> std::collections::BTreeSet<AddrFact> {
+    cache
+        .addrs
+        .iter()
+        .filter_map(|addr| {
+            let link = cache.links.get(&addr.ifindex)?;
+            Some(AddrFact {
+                ifname: link.name.clone(),
+                net: addr.net,
+                peer: addr.peer,
+                deprecated: addr.preferred_until_ms.is_some_and(|until| until <= now_ms),
+            })
+        })
+        .collect()
+}
+
+/// A physical port's negotiated speed from sysfs; nothing for any other interface.
+fn port_speed(ports: &PortMap, name: &str) -> Option<u32> {
+    if ports.names().any(|port| port == name) {
+        openfeo_platform::ports::speed_mbps_at(Path::new("/sys/class/net"), name)
+    } else {
+        None
+    }
 }
 
 /// The unicast routes the kernel holds in the main table through an interface, by family,
@@ -479,18 +515,25 @@ async fn netlink_facts_task(
 ) -> Result<(), TaskError> {
     loop {
         cache_rx.changed().await.map_err(|_| "netlink cache gone")?;
-        let (facts, routes) = {
-            let cache = cache_rx.borrow_and_update();
-            (link_facts(&cache), kernel_routes(&cache))
-        };
         let current = publisher.current();
-        if *current.links == facts && *current.routes == routes {
+        let (facts, routes, addresses) = {
+            let cache = cache_rx.borrow_and_update();
+            (
+                link_facts(&cache, &|name| port_speed(&current.ports, name)),
+                kernel_routes(&cache),
+                addr_facts(&cache, openfeo_runtime::clock::uptime_ms()),
+            )
+        };
+        if *current.links == facts && *current.routes == routes && *current.addresses == addresses {
             continue;
         }
         drop(current);
         publisher.update(|world| {
             if *world.routes != routes {
                 world.routes = Arc::new(routes);
+            }
+            if *world.addresses != addresses {
+                world.addresses = Arc::new(addresses);
             }
             if *world.links == facts {
                 return;
@@ -641,6 +684,56 @@ async fn apply_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_kernel_address_becomes_a_fact_with_its_interface() {
+        use openfeo_netlink::{Addr, Link};
+        let mut cache = Cache::default();
+        cache.links.insert(
+            2,
+            Link {
+                index: 2,
+                name: "br-lan0".to_owned(),
+                kind: None,
+                master: None,
+                parent: None,
+                vlan_id: None,
+                up: true,
+                carrier: true,
+                mac: None,
+                mtu: 1500,
+            },
+        );
+        for (ifindex, net, preferred_until_ms) in [
+            (2, "192.168.1.1/24", None),
+            (2, "2001:db8:1:1::1/64", Some(500)),
+            (9, "203.0.113.9/24", None),
+        ] {
+            cache.addrs.insert(Addr {
+                ifindex,
+                net: net.parse().unwrap(),
+                scope: 0,
+                peer: None,
+                preferred_until_ms,
+                valid_until_ms: None,
+            });
+        }
+        let facts = addr_facts(&cache, 1_000);
+        assert_eq!(
+            facts.len(),
+            2,
+            "an address on a link the cache does not know is left out"
+        );
+        assert!(facts.iter().any(|a| a.ifname == "br-lan0"
+            && a.net.to_string() == "192.168.1.1/24"
+            && !a.deprecated));
+        assert!(
+            facts
+                .iter()
+                .any(|a| a.net.to_string() == "2001:db8:1:1::1/64" && a.deprecated),
+            "preferred until 500 ms, and it is 1000 ms"
+        );
+    }
 
     #[test]
     fn kernel_routes_from_the_cache_name_their_interface_and_skip_other_tables() {

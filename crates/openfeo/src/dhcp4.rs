@@ -649,6 +649,7 @@ mod tests {
             mac: None,
             mtu: 1492,
             link_local6: None,
+            speed_mbps: None,
         };
         assert_eq!(
             link_change((7, true), Some(&link(7, true, true))),

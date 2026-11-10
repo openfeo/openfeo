@@ -50,6 +50,7 @@ pub fn link_facts() -> BTreeMap<String, LinkFact> {
                     mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, i])),
                     mtu: 1500,
                     link_local6: None,
+                    speed_mbps: None,
                 },
             )
         })
@@ -70,6 +71,8 @@ fn world(config: Config) -> World {
         dhcp6: Arc::new(BTreeMap::new()),
         pppoe: Arc::new(BTreeMap::new()),
         ula: None,
+        addresses: Arc::new(std::collections::BTreeSet::new()),
+        wan_status: Arc::new(std::collections::BTreeMap::new()),
     }
 }
 
@@ -172,6 +175,7 @@ pub fn link_facts4() -> BTreeMap<String, LinkFact> {
             mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x03])),
             mtu: 1500,
             link_local6: None,
+            speed_mbps: None,
         },
     );
     facts
@@ -230,6 +234,7 @@ pub fn ipv6_world_without_route() -> World {
                 mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x02])),
                 mtu: 1500,
                 link_local6: None,
+                speed_mbps: None,
             },
         );
     }
@@ -306,6 +311,7 @@ pub fn pd_world() -> World {
                 mac: Some(MacAddr([0x52, 0x54, 0x00, 0xfe, 0x00, 0x02])),
                 mtu: 1500,
                 link_local6: None,
+                speed_mbps: None,
             },
         );
     }
@@ -366,6 +372,7 @@ pub fn pppoe_world() -> World {
             mac: None,
             mtu: 1492,
             link_local6: Some("fe80::1234:5678:9abc:def0".parse().expect("an address")),
+            speed_mbps: None,
         },
     );
     world.links = Arc::new(links);

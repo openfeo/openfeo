@@ -979,6 +979,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
                     mac: l.mac.map(MacAddr),
                     mtu: l.mtu,
                     link_local6: None,
+                    speed_mbps: None,
                 },
             )
         })
@@ -996,6 +997,8 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         dhcp6: Arc::new(BTreeMap::new()),
         pppoe: Arc::new(BTreeMap::new()),
         ula: None,
+        addresses: Arc::new(std::collections::BTreeSet::new()),
+        wan_status: Arc::new(std::collections::BTreeMap::new()),
     }
 }
 

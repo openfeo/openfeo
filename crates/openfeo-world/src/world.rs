@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use openfeo_config::{Config, PortMap};
 
-use ipnet::Ipv6Net;
+use std::net::IpAddr;
+
+use ipnet::{IpNet, Ipv6Net};
 
 use crate::{
     Dhcp4Fact, KernelRoute, LeaseFact, MacAddr, PppoeFact, TimeFact, WanDhcp6Fact, WanIpv6Fact,
@@ -32,6 +34,45 @@ pub struct LinkFact {
     pub mtu: u32,
     /// The kernel's link-local IPv6 address on the link, once it has made one.
     pub link_local6: Option<std::net::Ipv6Addr>,
+    /// Negotiated speed in Mbit/s, for a physical port with carrier whose driver says (SPEC §10).
+    pub speed_mbps: Option<u32>,
+}
+
+/// One address the kernel holds (SPEC §6.2), whoever put it there.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AddrFact {
+    /// Kernel interface name.
+    pub ifname: String,
+    /// Address and prefix length.
+    pub net: IpNet,
+    /// The far end of a point-to-point address.
+    pub peer: Option<IpAddr>,
+    /// The kernel no longer prefers it for new connections.
+    pub deprecated: bool,
+}
+
+/// Where a WAN stands (SPEC §6.2): derived from carrier and its lease, session or address
+/// until M6's probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WanPhase {
+    /// No carrier.
+    Down,
+    /// Carrier, and no lease or session yet.
+    Connecting,
+    /// Carrier and its lease, session or address.
+    Up,
+}
+
+/// A WAN's phase, when it entered it, and why it last left `Up`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WanStatusFact {
+    /// Stamped where the World is published.
+    pub phase: WanPhase,
+    /// When it entered the phase, in milliseconds since the kernel booted.
+    pub since_boot_ms: u64,
+    /// The cause its task last gave for losing the lease or the session, in the console's words;
+    /// cleared when it comes up.
+    pub cause: Option<String>,
 }
 
 /// One immutable snapshot. Reconcilers are `fn(&World) -> Desired`.
@@ -62,6 +103,11 @@ pub struct World {
     pub pppoe: Arc<BTreeMap<String, PppoeFact>>,
     /// The router's ULA /48 (`identity/ula`), once loaded; `None` when it could not be kept.
     pub ula: Option<Ipv6Net>,
+    /// Every address the kernel holds, from the netlink monitor.
+    pub addresses: Arc<BTreeSet<AddrFact>>,
+    /// Each configured WAN's status, kept by the publisher's derive step; a WAN's task writes
+    /// only the cause.
+    pub wan_status: Arc<BTreeMap<String, WanStatusFact>>,
 }
 
 impl World {
@@ -81,7 +127,22 @@ impl World {
             dhcp6: Arc::new(BTreeMap::new()),
             pppoe: Arc::new(BTreeMap::new()),
             ula: None,
+            addresses: Arc::new(BTreeSet::new()),
+            wan_status: Arc::new(BTreeMap::new()),
         }
+    }
+
+    /// Record why `wan` lost its lease or session, for the API to report (SPEC §6.2). The phase
+    /// is the publisher's to stamp: a WAN with no status yet starts as down at boot.
+    pub fn set_wan_cause(&mut self, wan: &str, cause: &str) {
+        Arc::make_mut(&mut self.wan_status)
+            .entry(wan.to_owned())
+            .or_insert(WanStatusFact {
+                phase: WanPhase::Down,
+                since_boot_ms: 0,
+                cause: None,
+            })
+            .cause = Some(cause.to_owned());
     }
 
     /// Whether the kernel holds a default route of the family through `ifname`: the gate a
@@ -116,6 +177,23 @@ impl World {
 mod tests {
     use super::*;
     use openfeo_config::{Config, PortMap};
+
+    #[test]
+    fn a_cause_can_be_recorded_before_any_status_exists() {
+        let mut world = World::new(Config::default(), PortMap::default());
+        world.set_wan_cause("wan0", "nak");
+        let status = &world.wan_status["wan0"];
+        assert_eq!(
+            (status.phase, status.cause.as_deref()),
+            (WanPhase::Down, Some("nak"))
+        );
+        world.set_wan_cause("wan0", "lease expired");
+        assert_eq!(
+            world.wan_status["wan0"].cause.as_deref(),
+            Some("lease expired")
+        );
+        assert_eq!(world.wan_status.len(), 1);
+    }
 
     #[test]
     fn has_default_matches_family_and_interface() {

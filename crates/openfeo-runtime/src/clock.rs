@@ -18,6 +18,39 @@ pub fn uptime_ms() -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+static BOOT_OFFSET_MS: OnceLock<u64> = OnceLock::new();
+
+/// The first field of `/proc/uptime` (seconds since the kernel booted, to the hundredth) in
+/// milliseconds.
+#[must_use]
+pub fn parse_proc_uptime(text: &str) -> Option<u64> {
+    let seconds = text.split_whitespace().next()?;
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    let whole: u64 = whole.parse().ok()?;
+    let mut millis = 0;
+    let mut scale = 100;
+    for digit in fraction.chars().take(3) {
+        millis += u64::from(digit.to_digit(10)?) * scale;
+        scale /= 10;
+    }
+    whole.checked_mul(1000)?.checked_add(millis)
+}
+
+/// Milliseconds since the kernel booted (SPEC §10): the process clock plus how long the kernel
+/// had been up when it started, read once. It does not reset when PID 1 restarts the router
+/// process. Where `/proc/uptime` cannot be read it is the process clock.
+#[must_use]
+pub fn boot_ms() -> u64 {
+    let offset = *BOOT_OFFSET_MS.get_or_init(|| {
+        let now = uptime_ms();
+        std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|text| parse_proc_uptime(&text))
+            .map_or(0, |kernel| kernel.saturating_sub(now))
+    });
+    offset.saturating_add(uptime_ms())
+}
+
 /// The `Instant` at `ms` on this clock, for a timer.
 #[must_use]
 pub fn instant_at(ms: u64) -> Instant {
@@ -29,6 +62,24 @@ pub fn instant_at(ms: u64) -> Instant {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proc_uptime_parses_to_milliseconds() {
+        assert_eq!(
+            super::parse_proc_uptime("12345.67 9876.54\n"),
+            Some(12_345_670)
+        );
+        assert_eq!(super::parse_proc_uptime("0.01 0.00\n"), Some(10));
+        assert_eq!(super::parse_proc_uptime("7 3\n"), Some(7_000));
+        assert_eq!(super::parse_proc_uptime("garbage"), None);
+        assert_eq!(super::parse_proc_uptime(""), None);
+    }
+
+    #[test]
+    fn the_boot_clock_never_runs_behind_the_process_clock() {
+        let process = super::uptime_ms();
+        assert!(super::boot_ms() >= process);
+    }
+
     use super::*;
 
     #[test]
