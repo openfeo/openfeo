@@ -285,3 +285,216 @@ impl TestApi {
         .await
     }
 }
+
+/// A WebSocket client speaking the envelope.
+pub(crate) struct Ws {
+    socket: tokio_tungstenite::WebSocketStream<TlsStream<TcpStream>>,
+    next_id: u32,
+}
+
+/// What arrived on a socket.
+#[derive(Debug)]
+pub(crate) enum Got {
+    Msg(Box<openfeo_config::api::ServerMsg>),
+    Closed(Option<u16>),
+}
+
+impl TestApi {
+    /// Open `/ws`; `Err` is the HTTP status of a refused upgrade.
+    pub(crate) async fn ws(&self, origin: Option<&str>) -> Result<Ws, u16> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        let mut request = format!("wss://{HOST}/ws").into_client_request().unwrap();
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .insert("origin", origin.parse().unwrap());
+        }
+        match tokio_tungstenite::client_async(request, self.tls(&[b"http/1.1"]).await).await {
+            Ok((socket, _)) => Ok(Ws { socket, next_id: 1 }),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Err(response.status().as_u16())
+            }
+            Err(other) => panic!("{other}"),
+        }
+    }
+
+    /// A socket that has authenticated with `token`.
+    pub(crate) async fn ws_with(&self, token: &str) -> Ws {
+        let mut ws = self.ws(None).await.unwrap();
+        ws.auth(token).await;
+        ws
+    }
+
+    /// A gRPC channel to the API over TLS and HTTP/2.
+    #[cfg(feature = "client")]
+    pub(crate) async fn channel(&self) -> tonic::transport::Channel {
+        let addr = self.https;
+        tonic::transport::Endpoint::from_static("http://openfeo.home.arpa")
+            .connect_with_connector(tower::service_fn(move |_: hyper::Uri| async move {
+                let stream = TcpStream::connect(addr).await?;
+                let tls = TlsConnector::from(client_config(&[b"h2"]))
+                    .connect(ServerName::try_from(HOST).unwrap(), stream)
+                    .await?;
+                Ok::<_, std::io::Error>(TokioIo::new(tls))
+            }))
+            .await
+            .unwrap()
+    }
+}
+
+/// A gRPC request carrying `token`.
+#[cfg(feature = "client")]
+pub(crate) fn with_token<T>(message: T, token: &str) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    if !token.is_empty() {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    }
+    request
+}
+
+impl Ws {
+    pub(crate) async fn send(&mut self, body: openfeo_config::api::client_msg::Body) -> u32 {
+        use futures::SinkExt as _;
+        use prost::Message as _;
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = openfeo_config::api::ClientMsg {
+            id,
+            body: Some(body),
+        };
+        self.socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                message.encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The next envelope message or the close, within five seconds.
+    pub(crate) async fn got(&mut self) -> Got {
+        use futures::StreamExt as _;
+        use prost::Message as _;
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), self.socket.next())
+                .await
+                .expect("something within 5 s");
+            match next {
+                Some(Ok(Message::Binary(bytes))) => {
+                    return Got::Msg(Box::new(
+                        openfeo_config::api::ServerMsg::decode(bytes.as_ref()).unwrap(),
+                    ));
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    return Got::Closed(frame.map(|frame| u16::from(frame.code)));
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return Got::Closed(None),
+            }
+        }
+    }
+
+    pub(crate) async fn msg(&mut self) -> openfeo_config::api::ServerMsg {
+        match self.got().await {
+            Got::Msg(message) => *message,
+            Got::Closed(code) => panic!("closed with {code:?}"),
+        }
+    }
+
+    /// Read until the socket closes; the close code.
+    pub(crate) async fn closed_with(&mut self) -> Option<u16> {
+        loop {
+            if let Got::Closed(code) = self.got().await {
+                return code;
+            }
+        }
+    }
+
+    pub(crate) async fn auth(&mut self, token: &str) {
+        use openfeo_config::api::{Auth, client_msg::Body, server_msg};
+        let id = self
+            .send(Body::Auth(Auth {
+                token: token.to_owned(),
+            }))
+            .await;
+        let ack = self.msg().await;
+        assert_eq!(ack.id, id);
+        assert!(
+            matches!(ack.body, Some(server_msg::Body::Response(_))),
+            "{ack:?}"
+        );
+    }
+
+    pub(crate) async fn subscribe(&mut self, topic: &str, backlog: u32) {
+        use openfeo_config::api::{Subscribe, client_msg::Body};
+        let id = self
+            .send(Body::Subscribe(Subscribe {
+                topic: topic.to_owned(),
+                backlog,
+            }))
+            .await;
+        // Pushes for other topics may arrive before the acknowledgement.
+        loop {
+            if self.msg().await.id == id {
+                return;
+            }
+        }
+    }
+
+    /// The reply to `request`, skipping pushes.
+    pub(crate) async fn ask(
+        &mut self,
+        request: openfeo_config::api::request::Body,
+    ) -> openfeo_config::api::server_msg::Body {
+        use openfeo_config::api::{Request, client_msg::Body};
+        let id = self
+            .send(Body::Request(Request {
+                body: Some(request),
+            }))
+            .await;
+        loop {
+            let message = self.msg().await;
+            if message.id == id {
+                return message.body.unwrap();
+            }
+        }
+    }
+
+    pub(crate) async fn next_state(&mut self) -> openfeo_config::state::State {
+        use openfeo_config::api::{Telemetry, server_msg, telemetry};
+        loop {
+            if let Some(server_msg::Body::Telemetry(Telemetry {
+                body: Some(telemetry::Body::State(state)),
+                ..
+            })) = self.msg().await.body
+            {
+                return state;
+            }
+        }
+    }
+
+    pub(crate) async fn next_counters(&mut self) -> openfeo_config::state::Counters {
+        use openfeo_config::api::{Telemetry, server_msg, telemetry};
+        loop {
+            if let Some(server_msg::Body::Telemetry(Telemetry {
+                body: Some(telemetry::Body::Counters(counters)),
+                ..
+            })) = self.msg().await.body
+            {
+                return counters;
+            }
+        }
+    }
+
+    pub(crate) async fn next_event(&mut self) -> openfeo_config::events::Event {
+        use openfeo_config::api::server_msg;
+        loop {
+            if let Some(server_msg::Body::Event(event)) = self.msg().await.body {
+                return event;
+            }
+        }
+    }
+}

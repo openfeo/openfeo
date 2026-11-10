@@ -13,6 +13,7 @@ pub mod cert;
 pub mod envelope;
 pub mod events;
 pub mod gate;
+pub mod grpc;
 pub mod http;
 pub mod limits;
 pub mod listener;
@@ -21,6 +22,7 @@ pub mod server;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod ws;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -84,9 +86,27 @@ pub async fn run(deps: ApiDeps) -> Result<(), TaskError> {
     listener::Server::bind(deps).await?.serve().await
 }
 
-/// Every route on the HTTPS listener, before the guard closes over them.
-pub(crate) fn routes(_shared: &Arc<server::Shared>) -> axum::Router<Arc<server::Shared>> {
+/// Every route on the HTTPS listener, before the guard closes over them: the plain HTTP
+/// calls, the WebSocket, and the two gRPC services under their own paths.
+pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::Shared>> {
+    use tonic::server::NamedService;
+
+    use pb::auth_service_server::AuthServiceServer;
+    use pb::state_service_server::StateServiceServer;
+
+    let grpc = grpc::Grpc::new(shared.clone());
+    let auth = AuthServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
+    let state = StateServiceServer::new(grpc).max_decoding_message_size(limits::MAX_BODY);
     http::routes()
+        .route("/ws", axum::routing::get(ws::upgrade))
+        .route_service(
+            &format!("/{}/{{*call}}", AuthServiceServer::<grpc::Grpc>::NAME),
+            auth,
+        )
+        .route_service(
+            &format!("/{}/{{*call}}", StateServiceServer::<grpc::Grpc>::NAME),
+            state,
+        )
 }
 
 /// Served where the panel will be when the binary was built without one (M4 part 1b embeds it).

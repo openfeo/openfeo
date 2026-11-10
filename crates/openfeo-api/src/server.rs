@@ -26,7 +26,9 @@ use crate::auth::password::check_policy;
 use crate::auth::{Backoff, Sessions, Source, Verifier};
 use crate::events::Recent;
 use crate::gate::Names;
-use crate::limits::{AUTH_FRAME_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_CONNECTIONS, SESSION_IDLE_MS};
+use crate::limits::{
+    AUTH_FRAME_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_CONNECTIONS, PING_INTERVAL, SESSION_IDLE_MS,
+};
 use crate::telemetry::Telemetry;
 
 /// A change in the offset between the wall clock and the boot clock larger than this is the
@@ -44,6 +46,8 @@ pub struct Limits {
     pub auth_frame: Duration,
     /// A WebSocket that does not take a frame within this is closed.
     pub write: Duration,
+    /// How often the server pings an open WebSocket; two unanswered close it.
+    pub ping: Duration,
 }
 
 impl Default for Limits {
@@ -53,6 +57,7 @@ impl Default for Limits {
             connections: MAX_CONNECTIONS,
             auth_frame: AUTH_FRAME_TIMEOUT,
             write: Duration::from_secs(10),
+            ping: PING_INTERVAL,
         }
     }
 }

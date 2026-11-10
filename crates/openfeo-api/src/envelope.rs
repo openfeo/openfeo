@@ -125,6 +125,24 @@ impl Conn {
         Self::default()
     }
 
+    /// A connection already authenticated and subscribed to `topics`: what a gRPC stream is,
+    /// whose token travelled in its metadata.
+    #[must_use]
+    pub fn subscribed(topics: &[Topic]) -> Self {
+        Conn {
+            authenticated: true,
+            topics: topics.iter().copied().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The driver itself fell behind the event bus: say so, as when the queue overflows.
+    pub fn events_lost(&mut self) {
+        if self.wants(Topic::Events) {
+            self.lost = true;
+        }
+    }
+
     /// Whether the first frame carried a good token.
     #[must_use]
     pub fn authenticated(&self) -> bool {
@@ -610,6 +628,20 @@ mod tests {
         assert_eq!(pushed_generation(&sent[0]), None);
         conn.push_state(&State::default());
         assert_eq!(conn.next_out(), None);
+    }
+
+    #[test]
+    fn a_stream_starts_subscribed_and_a_driver_that_lagged_says_data_was_lost() {
+        let mut conn = Conn::subscribed(&[Topic::State, Topic::Events]);
+        assert!(conn.authenticated() && conn.wants(Topic::Events) && !conn.wants(Topic::Counters));
+        conn.events_lost();
+        conn.push_event(&event(5));
+        let sent = drain(&mut conn);
+        assert_eq!(error_code_of(&sent[0]), Some(ErrorCode::DataLoss));
+        assert_eq!(event_number(&sent[1]), Some(5));
+        let mut deaf = Conn::subscribed(&[Topic::State]);
+        deaf.events_lost();
+        assert_eq!(deaf.next_out(), None);
     }
 
     #[test]
