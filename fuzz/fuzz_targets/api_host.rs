@@ -7,6 +7,7 @@
 
 #![no_main]
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use libfuzzer_sys::fuzz_target;
@@ -30,18 +31,30 @@ fn world() -> World {
     world
 }
 
+/// Whether an authority without its port names the router: one of its two names, or (in any
+/// spelling) one of the addresses it holds.
+fn is_router(authority: &str, names: &Names, world: &World) -> bool {
+    let bare = authority.trim_start_matches('[').trim_end_matches(']');
+    let name = bare.strip_suffix('.').unwrap_or(bare).to_ascii_lowercase();
+    name == names.hostname
+        || name == names.fqdn
+        || bare
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| world.addresses.iter().any(|addr| addr.net.addr() == ip))
+}
+
 fuzz_target!(|data: &[u8]| {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
     let (world, names) = (world(), Names::of(None));
-    let lower = text.to_ascii_lowercase();
-    let could_be_ours = lower.contains("openfeo") || lower.contains("192.168.1.1") || lower.contains("2001:db8:1:1:");
     if host_allowed(text, &names, &world) {
-        assert!(could_be_ours, "{text:?} is not the router");
-        assert!(https_authority(text).is_some(), "an allowed host has somewhere to be sent");
+        let authority = https_authority(text).expect("an allowed host has somewhere to be sent");
+        assert!(is_router(&authority, &names, &world), "{text:?} is not the router");
     }
     if origin_allowed(Some(text), &names, &world) {
-        assert!(lower.starts_with("https://") && could_be_ours, "{text:?} is not the router's origin");
+        let authority = text.strip_prefix("https://").expect("an allowed origin is https");
+        assert!(host_allowed(authority, &names, &world), "{text:?} is not the router's origin");
+        assert!(!authority.contains('/'), "an origin has no path");
     }
 });

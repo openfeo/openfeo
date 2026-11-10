@@ -120,11 +120,12 @@ pub fn host_allowed(host: &str, names: &Names, world: &World) -> bool {
     let Some(host) = host_only(host) else {
         return false;
     };
-    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-    if host.is_empty() {
+    // A name may carry the root's trailing dot; an address literal may not.
+    let name = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if name.is_empty() {
         return false;
     }
-    if host == names.hostname || host == names.fqdn {
+    if name == names.hostname || name == names.fqdn {
         return true;
     }
     host.parse::<IpAddr>()
@@ -281,6 +282,9 @@ mod tests {
             "2001:db8:1:1::1",
             "[2001:db8:1:1::1",
             "[2001:db8:1:1::1]x",
+            "[2001:db8:1:1::1.]",
+            "[2001:db8:1:1::1.]:443",
+            "192.168.1.1.",
             "openfeo:port",
             "openfeo:",
             "",
