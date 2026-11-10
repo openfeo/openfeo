@@ -78,6 +78,7 @@ impl Config {
             firewall: None,
             dns: None,
             public_ipv4: Vec::new(),
+            admin: None,
         }
     }
 }

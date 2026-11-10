@@ -39,6 +39,14 @@ thiserror.workspace = true
 ipnet.workspace = true
 futures.workspace = true
 
+[build-dependencies]
+tonic-prost-build.workspace = true
+protox.workspace = true
+
+[features]
+# The gRPC client stubs, for the harness and this crate's own tests; the router never calls itself.
+client = []
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

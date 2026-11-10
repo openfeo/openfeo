@@ -20,6 +20,14 @@ message Config {
   Dns dns = 7;
   // Public IPv4 blocks the ISP routes to this router (SPEC §7.4, §7.5; `[[public_ipv4]]`).
   repeated PublicIpv4 public_ipv4 = 8;
+  // The admin account (SPEC §9; `[admin]`).
+  Admin admin = 9;
+}
+
+// The one admin account. The hash is a secret: the file is mode 0600 and the API never returns it.
+message Admin {
+  // Argon2id in PHC string form; empty means no password has been set.
+  string password_hash = 1;
 }
 
 // A block of public IPv4 addresses routed to this router. A LAN numbered from it is a public LAN

@@ -12,7 +12,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed={}", proto_root.display());
     let out = PathBuf::from(std::env::var("OUT_DIR")?);
 
-    let fds = protox::compile(["openfeo/v1/config.proto"], [proto_root])?;
+    let fds = protox::compile(
+        [
+            "openfeo/v1/config.proto",
+            "openfeo/v1/state.proto",
+            "openfeo/v1/events.proto",
+            "openfeo/v1/api.proto",
+        ],
+        [proto_root],
+    )?;
     let bytes = prost::Message::encode_to_vec(&fds);
     std::fs::write(out.join("descriptors.bin"), &bytes)?;
 

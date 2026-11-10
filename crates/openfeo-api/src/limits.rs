@@ -5,19 +5,19 @@
 
 use std::time::Duration;
 
-/// A WebSocket's first frame must be `Auth` within this long.
+/// A socket's first frame must be `Auth` within this long.
 pub const AUTH_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-/// The largest WebSocket frame accepted, in bytes.
+/// The largest frame accepted on a socket, in bytes.
 pub const MAX_FRAME: usize = 1 << 20;
-/// WebSockets open at once.
+/// Sockets open at once.
 pub const MAX_SOCKETS: usize = 16;
-/// Subscriptions on one WebSocket.
+/// Subscriptions on one socket.
 pub const MAX_SUBSCRIPTIONS: usize = 16;
 /// Events queued for one socket before the oldest is dropped.
 pub const EVENT_QUEUE: usize = 256;
 /// Recent events kept for a subscriber's backlog.
 pub const EVENT_BACKLOG: usize = 256;
-/// The server pings an open WebSocket this often.
+/// The server pings an open socket this often.
 pub const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// Sessions held at once.
 pub const MAX_SESSIONS: usize = 16;
