@@ -291,14 +291,17 @@ fn the_lan_resolves_a_name_through_the_ipcp_resolver_over_ppp(lab: &mut Lab) -> 
         .iter()
         .find(|d| d.name == "dnsmasq")
         .context("dnsmasq")?;
-    ensure!(
-        dnsmasq
-            .log
-            .count(&re(r"auth\[A\] www\.isp\.example from 203\.0\.113\.100"))
-            >= 1,
-        "the query reached the ISP over PPP: {:?}",
-        dnsmasq.log.tail(8)
-    );
+    dnsmasq
+        .log
+        .wait_for(
+            &mut Cursor::default(),
+            &re(&format!(
+                r"auth\[A\] www\.isp\.example from {}",
+                regex_escape(&booted.address.to_string())
+            )),
+            Duration::from_secs(5),
+        )
+        .context("the query reached the ISP over PPP")?;
     Ok(())
 }
 
