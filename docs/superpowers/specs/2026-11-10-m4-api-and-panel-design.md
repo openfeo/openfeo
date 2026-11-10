@@ -222,7 +222,10 @@ Each part is its own branch, plan and PR, and appends its entry to `docs/progres
    client; the components; the panel's three screens. Proven: the `m4` harness suite from the LAN
    side (below), which includes SPEC §12's "a WS upgrade with a foreign `Origin` is refused";
    the client's own tests against the VM; Playwright: set a password, log in, see `wan0` up, cut
-   the ISP, see it down without reloading.
+   the ISP, see it down without reloading. It lands as two branches and PRs, as M1's parts did:
+   **1a**, everything in Rust, serving a placeholder page where the panel will be
+   (`docs/superpowers/plans/2026-11-10-m4-part1a-api.md`); then **1b**, the web workspace, the
+   embedding, the notices, the lab relay and Playwright.
 2. **Changing config.** The running router takes a new config: each task family follows the
    config in the World and restarts only what changed. `Config` service (get, validate, apply
    with commit-confirm at 120 s, confirm, revert), the pending file, the events. In the panel:
@@ -340,9 +343,9 @@ For that the World gains three facts:
   interface, with prefix length, peer and the deprecated flag. The view tags each with its
   origin by matching it against the facts that explain it (the LAN's config, the DHCP lease,
   the PPP session, the WAN's IPv6 fact, a delegated prefix, the ULA).
-- **speed** on `LinkFact`, from the same task: ethtool over netlink in `openfeo-netlink`,
-  absent when the driver reports none (virtio does unless QEMU is told a speed; the harness
-  tells it one port).
+- **speed** on `LinkFact`, from the same task: read from sysfs (`/sys/class/net/<port>/speed`,
+  which SPEC §10 already names as a telemetry source) when carrier changes, absent when the
+  driver reports none (virtio does unless QEMU is told a speed; the harness tells it one port).
 - **WAN status**, one entry per WAN: its phase, when it entered it, and the cause last given
   for leaving `UP`. See the next section.
 
@@ -512,7 +515,9 @@ no topic is minted.
   runs on first-boot defaults as it does today, but that is not a first boot and the panel must
   not become claimable by whoever is on the LAN after a typo or a downgrade:
   - if the file parses as TOML, its `[admin] password_hash` is honoured: the owner logs in, and
-    the dashboard carries a banner with the reason and the violations (`config_problem`).
+    the dashboard carries a banner with the reason and the violations (`config_problem`). (A
+    file that parses and holds no hash never had a password: the first password is offered as
+    usual and written into that file.)
     Changing the password edits the key in the refused file, which stays refused for its other
     reasons and keeps the new hash;
   - if the file does not parse, there is no hash to honour: nobody can log in, the first
@@ -730,8 +735,8 @@ the dispatcher against a stub) and the host and origin parser.
 ## SPEC amendments (the plan's first task)
 
 - §8.1: the TypeScript is generated into `web/client/src/gen/`.
-- §8.2 and §9: a refused config keeps its password, and the first password is offered only when
-  there is no config file at all.
+- §8.2 and §9: a refused config keeps its password; the first password is offered when no hash
+  is set and the file, if there is one, parses.
 - §6.2: the three new facts; what `UP`, `CONNECTING` and `DOWN` mean until M6.
 - §8.3: the services carry the `Service` suffix and each call has its own request and response
   message; `GET /api/status`, `POST /api/password` and `/licences.txt`; JSON bodies; a WebSocket
@@ -822,8 +827,8 @@ the dispatcher against a stub) and the host and origin parser.
 
 Calls 21 to 27 were made after a fresh reader checked this document against the repository:
 
-21. **A refused config keeps its password, and the first password is offered only when there is
-    no config file.** Cost: an owner whose config file is corrupt beyond parsing cannot use the
+21. **A refused config keeps its password, and no first password is offered over a config file
+    that cannot be read.** Cost: an owner whose config file is corrupt beyond parsing cannot use the
     panel until M5's console menu; the alternative lets anyone on the LAN claim the router
     after a typo.
 22. **Until M6's probes, a WAN is up when it has carrier and its lease, session or address**, and
