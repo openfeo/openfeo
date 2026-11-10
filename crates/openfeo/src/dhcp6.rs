@@ -573,7 +573,7 @@ impl Run<'_> {
                     } else {
                         debug!("dhcp6 {}: {note:?}", self.task.wan);
                     }
-                    if note == Note::RebindUnanswered && self.restored {
+                    if self.restored && ends_restored(&note) {
                         self.restored = false;
                         self.publish();
                     }
@@ -853,6 +853,13 @@ fn gone_line(wan: &str, net: Ipv6Net, secs: u64) -> String {
 }
 
 /// The console line for a note, when it deserves one.
+/// After these the binding restored from disk is either kept on its own timers (the Rebind went
+/// unanswered, §18.2.12) or being replaced (the exchange restarts): it no longer counts as
+/// unconfirmed, so the LAN stops advertising it on trust (#44). A Bound clears the flag itself.
+fn ends_restored(note: &Note) -> bool {
+    matches!(note, Note::RebindUnanswered | Note::Restarting(_))
+}
+
 fn note_line(wan: &str, note: &Note) -> Option<String> {
     Some(match note {
         Note::Soliciting => format!("dhcp6 {wan} soliciting"),
@@ -1332,5 +1339,28 @@ mod tests {
             lease_path("wan0").to_str(),
             Some("/state/leases/dhcp6-wan0.toml")
         );
+    }
+
+    #[test]
+    fn a_restored_binding_stops_being_restored_when_the_exchange_restarts() {
+        assert!(ends_restored(&Note::RebindUnanswered));
+        assert!(ends_restored(&Note::Restarting(
+            "the server has no binding for us"
+        )));
+        assert!(ends_restored(&Note::Restarting(
+            "the server reported a failure"
+        )));
+        assert!(ends_restored(&Note::Restarting("no reply to the request")));
+        for note in [
+            Note::Soliciting,
+            Note::Requesting,
+            Note::Renewing,
+            Note::Rebinding,
+            Note::NoPrefixAvailable,
+            Note::NoAddressAvailable,
+            Note::Ignored("x"),
+        ] {
+            assert!(!ends_restored(&note), "{note:?}");
+        }
     }
 }
