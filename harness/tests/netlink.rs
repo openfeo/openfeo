@@ -871,12 +871,21 @@ fn an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time(
             })
         })
         .await?;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let shown = netns::ip(&["-6", "addr", "show", "dev", "lv0"])?;
-        ensure!(
-            shown.contains("deprecated"),
-            "the kernel deprecates it at 2 s: {shown}"
-        );
+        // The kernel flags it deprecated on its own timer, which it rounds and may run a
+        // second or more after the preferred lifetime ends: wait for the flag, not for a time.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let flagged_by = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let shown = netns::ip(&["-6", "addr", "show", "dev", "lv0"])?;
+            if shown.contains("deprecated") {
+                break;
+            }
+            ensure!(
+                tokio::time::Instant::now() < flagged_by,
+                "the kernel deprecates it after 2 s: {shown}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         let later = openfeo_runtime::clock::uptime_ms();
         nl.addr_add_with_lifetimes(lv0, net, Some(600), Some(1200))
             .await?;
