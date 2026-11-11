@@ -13,6 +13,10 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 openfeo-config = { path = "../crates/openfeo-config" }
 openfeo-api = { path = "../crates/openfeo-api" }
+# For the api_assets target: the request types `serve` takes, its body, and gzip to check it.
+http = "1"
+http-body-util = "0.1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 openfeo-world = { path = "../crates/openfeo-world" }
 openfeo-proto-dhcp4 = { path = "../crates/openfeo-proto-dhcp4" }
 # The oracle for the differential DHCPv4 target; a fuzz dependency only, never shipped.
@@ -200,6 +204,13 @@ bench = false
 [[bin]]
 name = "api_host"
 path = "fuzz_targets/api_host.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_assets"
+path = "fuzz_targets/api_assets.rs"
 test = false
 doc = false
 bench = false

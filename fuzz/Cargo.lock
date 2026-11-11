@@ -1160,6 +1160,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "futures",
  "getrandom 0.3.4",
  "http",
@@ -1216,7 +1217,10 @@ name = "openfeo-config-fuzz"
 version = "0.0.0"
 dependencies = [
  "dhcproto",
+ "flate2",
  "hickory-proto",
+ "http",
+ "http-body-util",
  "libfuzzer-sys",
  "openfeo-api",
  "openfeo-config",

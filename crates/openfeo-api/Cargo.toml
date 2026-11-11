@@ -19,6 +19,7 @@ hyper-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
+flate2.workspace = true
 tower.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
@@ -44,6 +45,9 @@ futures.workspace = true
 [build-dependencies]
 tonic-prost-build.workspace = true
 protox.workspace = true
+# The panel's files are compressed and hashed when they are embedded (build/assets.rs).
+flate2.workspace = true
+sha2.workspace = true
 
 [features]
 # The gRPC client stubs, for the harness and this crate's own tests; the router never calls itself.

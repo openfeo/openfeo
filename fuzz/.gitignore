@@ -27,5 +27,8 @@ corpus/api_envelope/*
 !corpus/api_host/
 corpus/api_host/*
 !corpus/api_host/seed-*.bin
+!corpus/api_assets/
+corpus/api_assets/*
+!corpus/api_assets/seed-*.bin
 artifacts
 coverage

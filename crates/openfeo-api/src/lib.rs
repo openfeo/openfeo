@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assets;
 pub mod auth;
 pub mod cert;
 pub mod envelope;
