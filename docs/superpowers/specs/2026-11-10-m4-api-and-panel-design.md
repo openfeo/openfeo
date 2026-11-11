@@ -905,3 +905,49 @@ were graded up on what they would cost a person; each was fixed with a test that
 - gRPC refuses a call that carries no peer address instead of treating it as `0.0.0.0`.
 
 Twelve minors were deferred; they are listed in the pull request.
+
+## After part 1b (2026-11-11)
+
+What building the web workspace changed or settled, beyond the calls above. The plan is
+`docs/superpowers/plans/2026-11-11-m4-part1b-web.md`; its own list of calls is there.
+
+- **The status call says when the config cannot be read.** Part 1a's answer was the same for a
+  refused file whose password still works and for a file that is not TOML. `GetStatusResponse`
+  gained `config_unreadable`, and the panel's screen for that case is chosen from it.
+- **The client watches for silence.** A browser cannot see the router's pings, so a connection
+  that dies without a close (a laptop that slept, a link that went) would sit open. After 30 s
+  with nothing received the client asks for the state; if nothing at all comes back in 10 s it
+  drops the socket and makes it again. A connection attempt gets the same 10 s: an attempt into
+  a dead network gets no answer of any kind, and the operating system would wait minutes.
+- **A lost socket is remade only while someone is subscribed.** What was waiting on it is told
+  the router is not there and is never sent twice. After a reconnect, events are subscribed
+  again with no backlog and the listener is told some may have passed (events carry no number
+  to tell a repeat by); the panel then asks for its last eight afresh.
+- **Why a session ended is the client's reading of when the router refused it:** before the
+  `Auth` was acknowledged on that socket it had lapsed (or the router restarted), after it the
+  session was ended from elsewhere. The router does not say which.
+- **A page is shown only once its address is the screen's.** The address is known before the
+  screen is, and the dashboard set up for that moment tried to subscribe with no session. Found
+  by looking at the real page; no unit test had the whole app in it until then.
+- **The page is answered `no-cache` with an `ETag`,** not `no-store`: a reload costs one small
+  request and is never stale. A path under `/assets/` that the binary does not hold is `404`,
+  so a tab left open across an update is not handed the page's HTML as a script.
+- **Chromium and Node run inside the LAN namespace as they are.** Playwright runs Chromium
+  without its own sandbox by default, which is what a process that is root in a user namespace
+  needs; no flag was added. The browser reaches the router by name through a resolver rule,
+  Node by the LAN address; both accept the router's own certificate, whose fingerprint the
+  browser test compares with the console's.
+- **The relay works.** `make run PANEL=<address>:<port>` binds before the harness enters its
+  sandbox and joins each connection to one made from inside the LAN namespace. The harness
+  build is told that host on the kernel command line; a release build has no such knob.
+- **`make panel` leaves an unchanged panel untouched,** so that building the image twice does
+  not rebuild the binary: it builds beside its place and copies over only what changed.
+- **`@bufbuild/protobuf` is published without a licence file.** The notices step stops the
+  build for such a package, as designed; its text is kept in the repository and named in the
+  gate's list.
+- **TypeScript stays on 6.0** until `typescript-eslint` accepts 7. The whole npm tree was
+  installed as of a week before, so nothing in the lockfile was days old.
+- **The design system's stylesheet was missing two things the policy made necessary** (colours
+  for a sparkline's series, a size for an icon outside a button): they are in
+  `web/ui/additions.css` and listed in `web/ui/docs/gaps.md` to go back to the design system.
+- **The static binary is 10.0 MB with the panel** (9.8 MB before it).

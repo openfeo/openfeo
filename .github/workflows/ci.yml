@@ -29,6 +29,11 @@ jobs:
           targets: x86_64-unknown-linux-musl
           components: clippy, rustfmt
       - uses: taiki-e/install-action@cargo-deny
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc # the web workspace: make web-lint, make web-test, make panel (ADR-0025)
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - uses: actions/cache@v4
         with:
           path: |
@@ -49,6 +54,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+      - uses: bufbuild/buf-action@v1 # the panel's message code is generated when the image is built
+        with:
+          setup_only: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc # the web workspace: make web-lint, make web-test, make panel (ADR-0025)
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: install kernel build and harness dependencies
         run: |
           sudo apt-get update
@@ -75,6 +88,12 @@ jobs:
           restore-keys: ccache-
       - name: fetch the pinned sources and install the kernel UAPI headers (ADR-0012)
         run: make kernel-src kernel-headers nft-src
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('web/package-lock.json') }}
+      - name: install the web workspace and the Chromium its Playwright run drives, with the libraries Chromium needs (SPEC §11)
+        run: make web-install && cd web && npx playwright install --with-deps chromium
       - name: load the nft and 802.1Q modules the sandboxed scenarios use (autoload from a user namespace is not guaranteed)
         run: sudo modprobe nf_conntrack nft_ct nft_fib_inet nft_nat nft_masq nft_chain_nat nft_limit 8021q
       - name: load the PPP modules and open /dev/ppp to the harness user (the runner has no reboot for a udev rule; SPEC §11)
@@ -86,3 +105,10 @@ jobs:
       - run: make test-harness
         env:
           OPENFEO_NO_SKIP: "1" # a kernel that cannot run a scenario fails the build here
+      - name: keep the panel's screenshots (each screen in both themes), whether or not the scenarios passed
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panel-shots
+          path: build/panel-shots
+          if-no-files-found: ignore

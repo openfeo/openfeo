@@ -95,6 +95,20 @@ if ! command -v buf >/dev/null 2>&1; then
   rm -f /tmp/buf
 fi
 
+log "Node 22 (the web workspace: make web-lint, make web-test, make panel; ADR-0025)"
+if ! node --version 2>/dev/null | grep -q '^v22\.'; then
+  # The newest 22.x from nodejs.org, checked against that release's own list of checksums. No
+  # browser is installed here: the Playwright scenario skips with its reason, the client's
+  # own tests against the VM run.
+  node_dist=https://nodejs.org/dist/latest-v22.x
+  curl -fsSL "$node_dist/SHASUMS256.txt" -o /tmp/node-sums
+  node_tar=$(awk '/linux-x64\.tar\.xz$/ {print $2}' /tmp/node-sums)
+  curl -fsSL "$node_dist/$node_tar" -o "/tmp/$node_tar"
+  (cd /tmp && grep " $node_tar\$" node-sums | sha256sum -c - >/dev/null)
+  $SUDO tar -xJ -C /usr/local --strip-components=1 -f "/tmp/$node_tar"
+  rm -f "/tmp/$node_tar" /tmp/node-sums
+fi
+
 log "superpowers plugin (the project enables it in .claude/settings.json; the VM must hold a copy)"
 # A cloud session reads the project's enabledPlugins but installs nothing itself (probed
 # 2026-11-01: the session had no superpowers skills), so install the plugin here, as the session's
@@ -182,7 +196,7 @@ version_of() {
     *) "$1" --version 2>&1 ;;
   esac | head -n 1
 }
-for tool in rustc cargo cargo-deny buf qemu-system-x86_64 kea-dhcp4 dnsmasq; do
+for tool in rustc cargo cargo-deny buf node npm qemu-system-x86_64 kea-dhcp4 dnsmasq; do
   if version=$(version_of "$tool") && [ -n "$version" ]; then
     echo "$tool: $version"
   else

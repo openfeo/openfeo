@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | part 1a, 2026-11-10 | #68 |
+| M4 API and panel | part 1 of 5, 2026-11-11 | #68, #81 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -192,6 +192,31 @@ someone is subscribed. A refused config keeps its admin password. Proven by the 
 refused"), a sandbox scenario for the link counters, and fuzz targets for the envelope and the
 host check. The page at `/` is a placeholder until part 1b embeds the panel; part 1b is the
 client, the component package, the panel's three screens and Playwright.
+
+**2026-11-11, [#81](https://github.com/openfeo/openfeo/pull/81), part 1b: the web workspace.** A
+booted router now serves its real panel. `web/` is an npm workspace of three packages with a
+checked rule between them: `@openfeo/client` (the wire: plain calls, the socket's envelope,
+subscriptions, reconnecting, typed errors; no Vue, and it runs in Node as well as a browser),
+`@openfeo/ui` (the maintainer's design system in code: its tokens, stylesheet, fonts and logos
+copied in, and seventeen Vue components over them) and the panel, which joins the two in three
+screens: set the admin password, log in, and a live read-only dashboard (the WAN and since when,
+rates with a minute of history, clients, tracked connections, a card per WAN and LAN, the port
+strip, every address and where it came from, recent events). `make panel` builds it and
+`openfeo-api`'s `build.rs` embeds the result, compressed and tagged, when `make bin` names the
+directory; cargo never runs npm, and a bare `cargo build` embeds a placeholder page (ADR-0025).
+The notices of what the page bundles are served at `/licences.txt`. The status call gained
+`config_unreadable`, so the panel can tell a refused config whose password still works from a
+file nobody can log in over. The client probes a socket that has gone silent and gives a
+connection attempt a time limit, so a laptop that slept or a link that died without a close
+shows as lost within a minute instead of freezing the numbers. `make run PANEL=<address>:<port>`
+relays the real panel out of the lab for a person to look at. Proven by 197 unit tests on the
+web side, 13 on the embedded files with a fuzz target, and three new `m4` scenarios (18 in all):
+the client's own tests run under Node from the LAN side, and Playwright's Chromium, inside the
+LAN namespace and reaching the router by name, goes from first visit (the fingerprint on the
+page is the console's) through setting the password, a reload, logging out and in, to the WAN's
+carrier lost and returned with the page left as it stood. CI gains Node and Chromium and keeps
+the run's screenshots. Parts 2 to 5 (changing config, the remaining pages, diagnostics, first
+boot) follow.
 
 ## Follow-ups
 
