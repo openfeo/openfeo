@@ -61,6 +61,11 @@ export default tseslint.config(
     },
   },
   {
+    // A page is a route's component, named for what it is, and never written as a tag.
+    files: ['panel/src/pages/**/*.vue', 'panel/src/App.vue'],
+    rules: { 'vue/multi-word-component-names': 'off' },
+  },
+  {
     // An icon's shapes are build-time constants from Lucide's files; nothing else sets markup.
     files: ['ui/src/components/OfoIcon.vue'],
     rules: { 'vue/no-v-html': 'off' },

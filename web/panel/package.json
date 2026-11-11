@@ -6,7 +6,8 @@
   "description": "The OpenFeO panel: the pages that join the client and the components",
   "type": "module",
   "scripts": {
-    "build": "vite build"
+    "build": "vite build",
+    "test": "vitest run"
   },
   "dependencies": {
     "@openfeo/client": "*",
