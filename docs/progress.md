@@ -209,7 +209,7 @@ The notices of what the page bundles are served at `/licences.txt`. The status c
 file nobody can log in over. The client probes a socket that has gone silent and gives a
 connection attempt a time limit, so a laptop that slept or a link that died without a close
 shows as lost within a minute instead of freezing the numbers. `make run PANEL=<address>:<port>`
-relays the real panel out of the lab for a person to look at. Proven by 197 unit tests on the
+relays the real panel out of the lab for a person to look at. Proven by 205 unit tests on the
 web side, 13 on the embedded files with a fuzz target, and three new `m4` scenarios (18 in all):
 the client's own tests run under Node from the LAN side, and Playwright's Chromium, inside the
 LAN namespace and reaching the router by name, goes from first visit (the fingerprint on the
