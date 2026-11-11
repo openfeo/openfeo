@@ -11,6 +11,7 @@
 
 pub mod dhcp4;
 pub mod dhcp6;
+pub mod event;
 pub mod health;
 pub mod ipv6;
 pub mod leases;
@@ -23,9 +24,10 @@ pub mod world;
 
 pub use dhcp4::Dhcp4Fact;
 pub use dhcp6::{Deprecated, Lifetimed, WanDhcp6Fact};
+pub use event::{Event, EventDraft};
 pub use ipv6::{KernelRoute, Preference, WanIpv6Fact};
 pub use leases::LeaseFact;
 pub use mac::MacAddr;
 pub use pppoe::{PppIpv4, PppIpv6, PppoeFact};
 pub use time::TimeFact;
-pub use world::{LinkFact, World};
+pub use world::{AddrFact, LinkFact, WanPhase, WanStatusFact, World};

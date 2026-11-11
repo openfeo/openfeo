@@ -508,10 +508,22 @@ async fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publishe
                 Unbound::Expired => info!("wan {wan} dhcp expired"),
                 Unbound::RebootTimedOut => info!("wan {wan} dhcp reboot timed out"),
             }
+            let cause = unbound_cause(&why);
             publisher.update(|world| {
                 Arc::make_mut(&mut world.dhcp4).remove(wan);
+                world.set_wan_cause(wan, cause);
             });
         }
+    }
+}
+
+/// Why the lease is gone, as the WAN's status fact says it (SPEC §6.2): the API's words for
+/// what the console lines above report.
+fn unbound_cause(why: &Unbound) -> &'static str {
+    match why {
+        Unbound::Nak(_) => "nak",
+        Unbound::Expired => "lease expired",
+        Unbound::RebootTimedOut => "reboot timed out",
     }
 }
 
@@ -535,6 +547,15 @@ pub(crate) fn seed(salt: u64) -> u64 {
 mod tests {
     use super::*;
     use openfeo_config::file::{parse_dhcp4_lease, render_dhcp4_lease};
+
+    #[test]
+    fn the_cause_of_an_unbound_is_the_contract() {
+        assert_eq!(unbound_cause(&Unbound::Nak(Some("no".to_owned()))), "nak");
+        assert_eq!(unbound_cause(&Unbound::Nak(None)), "nak");
+        assert_eq!(unbound_cause(&Unbound::Expired), "lease expired");
+        assert_eq!(unbound_cause(&Unbound::RebootTimedOut), "reboot timed out");
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0xfe, 0x00, 0x00];
@@ -649,6 +670,7 @@ mod tests {
             mac: None,
             mtu: 1492,
             link_local6: None,
+            speed_mbps: None,
         };
         assert_eq!(
             link_change((7, true), Some(&link(7, true, true))),

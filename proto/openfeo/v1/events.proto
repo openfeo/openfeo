@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andrew Newton
+
+syntax = "proto3";
+
+package openfeo.v1;
+
+// Something that happened (SPEC §10). Topics are stable names: `wan.<name>.up`, `.down`, `.addr`,
+// `.prefix`; `lan.<name>.lease.granted`, `.released`; `health.ok`, `health.degraded`; later
+// `config.*` and `update.*`. The fields carry the values; a UI writes the sentence.
+message Event {
+  // Wall time; the build's epoch plus uptime until SNTP has answered.
+  uint64 time_unix_ms = 1;
+  // Time since the kernel booted.
+  uint64 uptime_ms = 2;
+  string topic = 3;
+  map<string, string> fields = 4;
+}

@@ -30,6 +30,8 @@ pub enum Code {
     UnknownPort,
     /// A port given to two roles.
     PortUsedTwice,
+    /// An admin password hash that is not an Argon2id PHC string.
+    AdminHash,
     /// A VLAN id outside 1-4094 on a WAN or a tagged LAN member.
     InvalidVlan,
     /// A tagged LAN member on a port that is a WAN (a port is a WAN or carries LANs, not both).
@@ -201,6 +203,7 @@ impl Code {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Code::AdminHash => "admin_hash",
             Code::InvalidCidr => "invalid_cidr",
             Code::InvalidAddress => "invalid_address",
             Code::DuplicateName => "duplicate_name",
@@ -309,6 +312,16 @@ pub fn validate(config: &Config, ports: &PortMap) -> Vec<Violation> {
 
     if let Some(system_config) = &config.system {
         system(&mut report, system_config);
+    }
+    if let Some(admin) = &config.admin
+        && !admin.password_hash.is_empty()
+        && !admin.password_hash.starts_with("$argon2id$")
+    {
+        report.push(
+            "admin.password_hash".to_owned(),
+            Code::AdminHash,
+            "not an Argon2id hash in PHC string form (`$argon2id$...`)".to_owned(),
+        );
     }
 
     for (i, entry) in config.ports.iter().enumerate() {
@@ -3006,6 +3019,24 @@ mod dns_tests {
 
     /// Review finding: `[system]` feeds the DNS local zone, and a name that does not parse
     /// there took the forwarder down; the hostname is one label, the domain a host name.
+    #[test]
+    fn a_hash_that_is_not_argon2id_is_a_violation() {
+        let bad =
+            file::parse("config_version = 1\n[admin]\npassword_hash = \"plaintext\"\n").unwrap();
+        assert_eq!(
+            codes(&validate(&bad, &live())),
+            vec![("admin.password_hash".to_owned(), Code::AdminHash)]
+        );
+        for ok in [
+            "config_version = 1\n",
+            "config_version = 1\n[admin]\npassword_hash = \"\"\n",
+            "config_version = 1\n[admin]\npassword_hash = \"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA\"\n",
+        ] {
+            let config = file::parse(ok).unwrap();
+            assert_eq!(codes(&validate(&config, &live())), vec![], "{ok}");
+        }
+    }
+
     #[test]
     fn system_hostname_is_a_label_and_domain_a_host_name() {
         let bad = file::parse(

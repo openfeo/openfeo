@@ -118,6 +118,15 @@ pub fn enumerate(sysfs_class_net: &Path) -> io::Result<Inventory> {
     Ok(inventory)
 }
 
+/// The negotiated speed of `ifname` in Mbit/s from `<sysfs_class_net>/<ifname>/speed`
+/// (SPEC §10). `None` when the file cannot be read (no carrier, a virtual interface) or the
+/// driver reports none (`-1`, `0`).
+#[must_use]
+pub fn speed_mbps_at(sysfs_class_net: &Path, ifname: &str) -> Option<u32> {
+    let text = fs::read_to_string(sysfs_class_net.join(ifname).join("speed")).ok()?;
+    text.trim().parse::<u32>().ok().filter(|speed| *speed > 0)
+}
+
 fn port_of(dir: &Path, ifname: &str) -> Result<Port, String> {
     let device = fs::canonicalize(dir.join("device"))
         .map_err(|_| "no device link (virtual interface)".to_owned())?;
@@ -135,6 +144,19 @@ fn port_of(dir: &Path, ifname: &str) -> Result<Port, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speed_reads_sysfs_and_knows_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        for (name, text) in [("p0", "2500\n"), ("p1", "-1\n"), ("p2", "0\n")] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+            std::fs::write(root.path().join(name).join("speed"), text).unwrap();
+        }
+        assert_eq!(super::speed_mbps_at(root.path(), "p0"), Some(2500));
+        assert_eq!(super::speed_mbps_at(root.path(), "p1"), None);
+        assert_eq!(super::speed_mbps_at(root.path(), "p2"), None);
+        assert_eq!(super::speed_mbps_at(root.path(), "p9"), None);
+    }
+
     use super::*;
     use std::os::unix::fs::symlink;
 

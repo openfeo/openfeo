@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod api;
 mod boot;
 mod chaos;
 mod cli;

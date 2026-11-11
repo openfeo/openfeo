@@ -16,6 +16,12 @@ mini-gmp, used by nftables for its arbitrary-precision arithmetic (`--with-mini-
 inside the nftables tarball under the LGPL-3.0-or-later / GPL-2.0-or-later dual licence of GMP;
 OpenFeO uses it under GPL-2.0-or-later, so the GPLv2 combination stands.
 
+Since M4 the binary also carries [ring](https://github.com/briansmith/ring) 0.17 (Apache-2.0
+AND ISC), the cryptography under rustls for the API's HTTPS listener: a Rust crate whose
+primitives are C and assembly derived from BoringSSL, built by its own build script and checked
+by `cargo deny` like every other crate. No OpenSSL and no aws-lc is linked; `deny.toml` bans
+both.
+
 Not in the binary: [dhcproto](https://github.com/bluecatengineering/dhcproto) (MIT) is a
 dev-dependency of `openfeo-proto-dhcp4` and a dependency of the fuzz crate, where it serves as
 the second opinion our own DHCPv4 codec is checked against. It reaches no shipped artefact.

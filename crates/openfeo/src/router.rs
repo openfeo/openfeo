@@ -18,6 +18,7 @@ use openfeo_apply::links::LinksApplier;
 use openfeo_apply::nft::NftApplier;
 use openfeo_apply::routing::RoutingApplier;
 use openfeo_apply::sysctl::SysctlApplier;
+use openfeo_config::admin::ConfigState;
 use openfeo_config::load::{self, Source};
 use openfeo_config::{Config, PortMap, file};
 use openfeo_init::cmdline::{Cmdline, Mode};
@@ -30,13 +31,15 @@ use openfeo_runtime::log::{DEFAULT_RING_BYTES, Ring};
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{HealthTracker, Publisher, Supervisor};
-use openfeo_world::health::{Status, Subsystem};
+use openfeo_world::health::{HealthView, Status, Subsystem};
 use openfeo_world::portmap::{PresentPort, assign};
-use openfeo_world::{KernelRoute, LinkFact, MacAddr, World, rename};
+use openfeo_world::{AddrFact, EventDraft, KernelRoute, LinkFact, MacAddr, World, rename};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::boot::{ConfigDecision, KernelDecision, config_decision, kernel_decision};
+use crate::boot::{
+    ConfigDecision, KernelDecision, config_decision, config_to_run, kernel_decision,
+};
 use crate::chaos::{self, Chaos};
 use crate::heartbeat;
 
@@ -104,7 +107,12 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     if ctl.is_none() {
         warn!("no control pipe (not supervised by PID 1); heartbeats go nowhere");
     }
-    tokio::spawn(heartbeat::run(ctl, health.clone(), hung));
+    // Healthy until the first beat says otherwise; the API and the health events read this.
+    let (health_view_tx, health_view_rx) = watch::channel(HealthView {
+        healthy: true,
+        unhealthy: Vec::new(),
+    });
+    tokio::spawn(heartbeat::run(ctl, health.clone(), hung, health_view_tx));
 
     match kernel_decision(kconfig::read_running(), mode) {
         KernelDecision::Proceed(n) => info!("kernel: all {n} required options present"),
@@ -130,14 +138,18 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     }
 
     let portmap = name_ports(&nl, &cache_rx).await?;
-    let config = load_config(&portmap);
+    let (config, config_state) = load_config(&portmap);
     let Identity { ipv6_secret, ula } = load_identity();
 
-    let (publisher, world_rx) = Publisher::new(World::new(config, portmap));
+    let (publisher, world_rx) = Publisher::with_derive(
+        World::new(config, portmap),
+        Box::new(openfeo_reconcile::derive::derive),
+    );
     let publisher = Arc::new(publisher);
     publisher.update(|world| {
         let cache = cache_rx.borrow();
-        world.links = Arc::new(link_facts(&cache));
+        world.links = Arc::new(link_facts(&cache, &|name| port_speed(&world.ports, name)));
+        world.addresses = Arc::new(addr_facts(&cache, openfeo_runtime::clock::uptime_ms()));
         world.routes = Arc::new(kernel_routes(&cache));
         world.ula = ula;
     });
@@ -149,6 +161,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             netlink_facts_task(publisher.clone(), cache_rx.clone())
         });
     }
+    spawn_health_events(&supervisor, &publisher, &health_view_rx);
     crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
     crate::pppoe::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
     crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
@@ -158,6 +171,15 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     crate::ra::spawn(&supervisor, &publisher, &world_rx);
     crate::dhcp6_server::spawn(&supervisor, &publisher, &world_rx);
     crate::time::spawn(&supervisor, &publisher, &world_rx);
+    crate::api::spawn(
+        &supervisor,
+        &publisher,
+        &world_rx,
+        &health_view_rx,
+        &nl,
+        &config_state,
+        version,
+    );
     {
         let health = health.clone();
         supervisor.spawn("apply", move || {
@@ -386,27 +408,36 @@ fn persist_portmap(map: &PortMap) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load `config.toml` against the live port map, falling back to first-boot defaults.
-fn load_config(portmap: &PortMap) -> Config {
-    match config_decision(load::load(Path::new(CONFIG_PATH), portmap)) {
-        ConfigDecision::Use(loaded) => {
-            match loaded.source {
-                Source::File => {
-                    if let Some(from) = loaded.migrated_from {
-                        info!("config: migrated from version {from}");
-                    }
-                    info!(
-                        "config: loaded {CONFIG_PATH} version={}",
-                        loaded.config.config_version
-                    );
+/// Load `config.toml` against the live port map, falling back to first-boot defaults (which
+/// keep a refused file's admin password), and say on the console which it was.
+fn load_config(portmap: &PortMap) -> (Config, ConfigState) {
+    let path = Path::new(CONFIG_PATH);
+    let result = load::load(path, portmap);
+    // Only a refused file is read again, for what it still says about the admin password.
+    let text = if result.is_err() {
+        std::fs::read_to_string(path).ok()
+    } else {
+        None
+    };
+    let decision = config_decision(result, text.as_deref());
+    match &decision {
+        ConfigDecision::Use(loaded) => match loaded.source {
+            Source::File => {
+                if let Some(from) = loaded.migrated_from {
+                    info!("config: migrated from version {from}");
                 }
-                Source::FirstBootDefaults => info!(
-                    "config: none at {CONFIG_PATH}; first-boot defaults (all ports in lan0 192.168.1.1/24)"
-                ),
+                info!(
+                    "config: loaded {CONFIG_PATH} version={}",
+                    loaded.config.config_version
+                );
             }
-            loaded.config
-        }
-        ConfigDecision::Defaults { reason, violations } => {
+            Source::FirstBootDefaults => info!(
+                "config: none at {CONFIG_PATH}; first-boot defaults (all ports in lan0 192.168.1.1/24)"
+            ),
+        },
+        ConfigDecision::Defaults {
+            reason, violations, ..
+        } => {
             error!("config: {reason}; using first-boot defaults");
             for violation in violations {
                 error!(
@@ -414,13 +445,16 @@ fn load_config(portmap: &PortMap) -> Config {
                     violation.path, violation.code, violation.message
                 );
             }
-            Config::first_boot(portmap)
         }
     }
+    config_to_run(decision, portmap)
 }
 
 /// Link facts from the cache, keyed by name.
-fn link_facts(cache: &Cache) -> std::collections::BTreeMap<String, LinkFact> {
+fn link_facts(
+    cache: &Cache,
+    speed_of: &dyn Fn(&str) -> Option<u32>,
+) -> std::collections::BTreeMap<String, LinkFact> {
     cache
         .links
         .values()
@@ -443,10 +477,42 @@ fn link_facts(cache: &Cache) -> std::collections::BTreeMap<String, LinkFact> {
                         }
                         _ => None,
                     }),
+                    speed_mbps: if link.carrier {
+                        speed_of(&link.name)
+                    } else {
+                        None
+                    },
                 },
             )
         })
         .collect()
+}
+
+/// Every address the kernel holds on a link the cache knows (SPEC §6.2), deprecated when its
+/// preferred lifetime has run out at `now_ms` on the process clock.
+fn addr_facts(cache: &Cache, now_ms: u64) -> std::collections::BTreeSet<AddrFact> {
+    cache
+        .addrs
+        .iter()
+        .filter_map(|addr| {
+            let link = cache.links.get(&addr.ifindex)?;
+            Some(AddrFact {
+                ifname: link.name.clone(),
+                net: addr.net,
+                peer: addr.peer,
+                deprecated: addr.preferred_until_ms.is_some_and(|until| until <= now_ms),
+            })
+        })
+        .collect()
+}
+
+/// A physical port's negotiated speed from sysfs; nothing for any other interface.
+fn port_speed(ports: &PortMap, name: &str) -> Option<u32> {
+    if ports.names().any(|port| port == name) {
+        openfeo_platform::ports::speed_mbps_at(Path::new("/sys/class/net"), name)
+    } else {
+        None
+    }
 }
 
 /// The unicast routes the kernel holds in the main table through an interface, by family,
@@ -479,18 +545,25 @@ async fn netlink_facts_task(
 ) -> Result<(), TaskError> {
     loop {
         cache_rx.changed().await.map_err(|_| "netlink cache gone")?;
-        let (facts, routes) = {
-            let cache = cache_rx.borrow_and_update();
-            (link_facts(&cache), kernel_routes(&cache))
-        };
         let current = publisher.current();
-        if *current.links == facts && *current.routes == routes {
+        let (facts, routes, addresses) = {
+            let cache = cache_rx.borrow_and_update();
+            (
+                link_facts(&cache, &|name| port_speed(&current.ports, name)),
+                kernel_routes(&cache),
+                addr_facts(&cache, openfeo_runtime::clock::uptime_ms()),
+            )
+        };
+        if *current.links == facts && *current.routes == routes && *current.addresses == addresses {
             continue;
         }
         drop(current);
         publisher.update(|world| {
             if *world.routes != routes {
                 world.routes = Arc::new(routes);
+            }
+            if *world.addresses != addresses {
+                world.addresses = Arc::new(addresses);
             }
             if *world.links == facts {
                 return;
@@ -506,6 +579,46 @@ async fn netlink_facts_task(
             }
             world.links = Arc::new(facts);
         });
+    }
+}
+
+/// The event for a change of health (SPEC §10), or none when `healthy` did not change.
+fn health_event(was_healthy: bool, view: &HealthView) -> Option<EventDraft> {
+    if view.healthy == was_healthy {
+        None
+    } else if view.healthy {
+        Some(EventDraft::new("health.ok"))
+    } else {
+        Some(EventDraft::new("health.degraded").with("unhealthy", view.unhealthy.join(", ")))
+    }
+}
+
+fn spawn_health_events(
+    supervisor: &Supervisor,
+    publisher: &Arc<Publisher>,
+    view: &watch::Receiver<HealthView>,
+) {
+    let (publisher, view) = (publisher.clone(), view.clone());
+    supervisor.spawn("health-events", move || {
+        health_events_task(publisher.clone(), view.clone())
+    });
+}
+
+/// Emit `health.degraded` and `health.ok` on the edges of the heartbeat's view. The heartbeat
+/// starts before the publisher exists, so it only sends the view; this task turns it into
+/// events.
+async fn health_events_task(
+    publisher: Arc<Publisher>,
+    mut view: watch::Receiver<HealthView>,
+) -> Result<(), TaskError> {
+    let mut was_healthy = true;
+    loop {
+        let latest = view.borrow_and_update().clone();
+        if let Some(event) = health_event(was_healthy, &latest) {
+            publisher.emit(event);
+        }
+        was_healthy = latest.healthy;
+        view.changed().await.map_err(|_| "the heartbeat is gone")?;
     }
 }
 
@@ -641,6 +754,74 @@ async fn apply_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_events_fire_on_the_edges_only() {
+        let bad = HealthView {
+            healthy: false,
+            unhealthy: vec!["dns".to_owned(), "nft".to_owned()],
+        };
+        let good = HealthView {
+            healthy: true,
+            unhealthy: Vec::new(),
+        };
+        let degraded = health_event(true, &bad).unwrap();
+        assert_eq!(degraded.topic, "health.degraded");
+        assert_eq!(degraded.fields["unhealthy"], "dns, nft");
+        assert_eq!(health_event(false, &bad), None);
+        assert_eq!(health_event(false, &good).unwrap().topic, "health.ok");
+        assert_eq!(health_event(true, &good), None);
+    }
+
+    #[test]
+    fn every_kernel_address_becomes_a_fact_with_its_interface() {
+        use openfeo_netlink::{Addr, Link};
+        let mut cache = Cache::default();
+        cache.links.insert(
+            2,
+            Link {
+                index: 2,
+                name: "br-lan0".to_owned(),
+                kind: None,
+                master: None,
+                parent: None,
+                vlan_id: None,
+                up: true,
+                carrier: true,
+                mac: None,
+                mtu: 1500,
+            },
+        );
+        for (ifindex, net, preferred_until_ms) in [
+            (2, "192.168.1.1/24", None),
+            (2, "2001:db8:1:1::1/64", Some(500)),
+            (9, "203.0.113.9/24", None),
+        ] {
+            cache.addrs.insert(Addr {
+                ifindex,
+                net: net.parse().unwrap(),
+                scope: 0,
+                peer: None,
+                preferred_until_ms,
+                valid_until_ms: None,
+            });
+        }
+        let facts = addr_facts(&cache, 1_000);
+        assert_eq!(
+            facts.len(),
+            2,
+            "an address on a link the cache does not know is left out"
+        );
+        assert!(facts.iter().any(|a| a.ifname == "br-lan0"
+            && a.net.to_string() == "192.168.1.1/24"
+            && !a.deprecated));
+        assert!(
+            facts
+                .iter()
+                .any(|a| a.net.to_string() == "2001:db8:1:1::1/64" && a.deprecated),
+            "preferred until 500 ms, and it is 1000 ms"
+        );
+    }
 
     #[test]
     fn kernel_routes_from_the_cache_name_their_interface_and_skip_other_tables() {

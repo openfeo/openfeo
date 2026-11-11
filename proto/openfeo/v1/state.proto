@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andrew Newton
+
+syntax = "proto3";
+
+package openfeo.v1;
+
+// What the router is doing now (SPEC §8.1, §8.3): a pure view of the World (SPEC §6.2) plus a few
+// facts about the system. Addresses are strings in the forms `config.proto` uses. Field numbers
+// are never reused; removed fields become `reserved`.
+message State {
+  // The World's generation this was built from.
+  uint64 generation = 1;
+  SystemState system = 2;
+  // In port order.
+  repeated PortState ports = 3;
+  // In config order.
+  repeated WanState wans = 4;
+  // In config order.
+  repeated LanState lans = 5;
+  // Every address the kernel holds.
+  repeated AddressState addresses = 6;
+}
+
+message SystemState {
+  string hostname = 1;
+  string domain = 2;
+  string version = 3;
+  // Since the kernel booted.
+  uint64 uptime_secs = 4;
+  bool time_synced = 5;
+  // No subsystem degraded or wedged and no task dead (SPEC §10).
+  bool healthy = 6;
+  // The subsystems and tasks that are, by name.
+  repeated string unhealthy = 7;
+  // SHA-256 of the certificate the listener presents, as the console prints it.
+  string tls_fingerprint = 8;
+  // Set when `config.toml` was refused and the router runs on first-boot defaults.
+  optional ConfigProblem config_problem = 9;
+}
+
+// Why `config.toml` was refused.
+message ConfigProblem {
+  string reason = 1;
+  repeated ConfigViolation violations = 2;
+}
+
+message ConfigViolation {
+  // Where, as `lans[0].ports[1]`.
+  string path = 1;
+  // Which rule, as `invalid_cidr`.
+  string code = 2;
+  string message = 3;
+}
+
+enum PortUseKind {
+  PORT_USE_KIND_UNSPECIFIED = 0;
+  PORT_USE_KIND_WAN = 1;
+  PORT_USE_KIND_LAN = 2;
+}
+
+// One role a physical port plays: a WAN on it, or a LAN it is a member of.
+message PortUse {
+  PortUseKind kind = 1;
+  // The WAN's or LAN's name.
+  string name = 2;
+  // The 802.1Q tag, 0 when untagged.
+  uint32 vlan = 3;
+}
+
+message PortState {
+  // The kernel name, `p0`.
+  string name = 1;
+  // The bus-path identity (SPEC §7.1).
+  string id = 2;
+  string mac = 3;
+  bool carrier = 4;
+  // Absent when the driver does not say.
+  optional uint32 speed_mbps = 5;
+  repeated PortUse uses = 6;
+}
+
+enum WanKind {
+  WAN_KIND_UNSPECIFIED = 0;
+  WAN_KIND_STATIC = 1;
+  WAN_KIND_DHCP = 2;
+  WAN_KIND_PPPOE = 3;
+}
+
+// SPEC §6.2: derived from carrier and the lease, session or address until M6's probes.
+enum WanPhase {
+  WAN_PHASE_UNSPECIFIED = 0;
+  WAN_PHASE_DOWN = 1;
+  WAN_PHASE_CONNECTING = 2;
+  WAN_PHASE_UP = 3;
+}
+
+message WanState {
+  string name = 1;
+  WanKind kind = 2;
+  string port = 3;
+  uint32 vlan = 4;
+  // The kernel interface that carries its IP traffic, `ppp-wan0`.
+  string interface = 5;
+  WanPhase phase = 6;
+  // Why it is not up, in the console's words; empty when up.
+  string reason = 7;
+  // When it entered this phase.
+  optional uint64 phase_since_unix_ms = 8;
+  string ipv4 = 9;
+  string ipv4_peer = 10;
+  string gateway4 = 11;
+  uint32 mtu = 12;
+  string ipv6 = 13;
+  repeated string ipv6_prefixes = 14;
+  // Carries the IPv4 default route.
+  bool default4 = 15;
+  // Carries the IPv6 default route.
+  bool default6 = 16;
+}
+
+message LanState {
+  string name = 1;
+  // The bridge, `br-lan0`.
+  string interface = 2;
+  // `p1`, `p3.20`.
+  repeated string members = 3;
+  string ipv4 = 4;
+  repeated string ipv6 = 5;
+  // Set when every member carries the same tag.
+  optional uint32 vlan = 6;
+  bool dhcp = 7;
+  uint32 pool_size = 8;
+  // Leases in use.
+  uint32 leases = 9;
+  repeated string reaches = 10;
+}
+
+enum AddressOrigin {
+  ADDRESS_ORIGIN_UNSPECIFIED = 0;
+  ADDRESS_ORIGIN_CONFIG = 1;
+  ADDRESS_ORIGIN_PPP = 2;
+  ADDRESS_ORIGIN_DHCP = 3;
+  ADDRESS_ORIGIN_ROUTER_ADVERTISEMENT = 4;
+  ADDRESS_ORIGIN_DELEGATED_PREFIX = 5;
+  ADDRESS_ORIGIN_ULA = 6;
+  ADDRESS_ORIGIN_LINK_LOCAL = 7;
+}
+
+message AddressState {
+  string interface = 1;
+  // With its prefix length, `192.168.1.1/24`.
+  string address = 2;
+  string peer = 3;
+  AddressOrigin origin = 4;
+  bool deprecated = 5;
+}
+
+// Interface and connection counters at one moment (SPEC §10). The router computes no rates: a
+// client takes two of these and their times.
+message Counters {
+  // When they were read, on the clock that counts from the kernel's boot.
+  uint64 monotonic_ms = 1;
+  repeated LinkCounters links = 2;
+  uint32 conntrack = 3;
+  uint32 conntrack_max = 4;
+}
+
+message LinkCounters {
+  string name = 1;
+  uint64 rx_bytes = 2;
+  uint64 tx_bytes = 3;
+  uint64 rx_packets = 4;
+  uint64 tx_packets = 5;
+  uint64 rx_errors = 6;
+  uint64 tx_errors = 7;
+}

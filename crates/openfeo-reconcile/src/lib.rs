@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod derive;
 pub mod dhcp;
 pub mod dhcp6_server;
 pub mod dns;
@@ -16,11 +17,14 @@ pub mod nft;
 pub mod public;
 pub mod ra;
 pub mod routing;
+pub mod state;
 pub mod sysctl;
 pub mod time;
+pub mod wan;
 
-#[cfg(test)]
-pub(crate) mod fixtures;
+/// World fixtures for tests, this crate's and (with the `fixtures` feature) other crates'.
+#[cfg(any(test, feature = "fixtures"))]
+pub mod fixtures;
 
 /// Routes OpenFeO owns carry this protocol (SPEC §6.2). Mirrors `openfeo_netlink::RTPROT_OPENFEO`.
 pub const RTPROT_OPENFEO: u8 = 200;

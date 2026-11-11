@@ -70,7 +70,39 @@ pub struct HealthReport {
     pub wedged: Vec<Subsystem>,
 }
 
+/// Health as the API reports it (SPEC §10): stricter than what keeps the watchdog petted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HealthView {
+    /// No subsystem degraded or wedged and no task dead.
+    pub healthy: bool,
+    /// The subsystems and tasks that are, by name, sorted.
+    pub unhealthy: Vec<String>,
+}
+
 impl HealthReport {
+    /// The API's view: a degraded subsystem is unhealthy here though the heartbeat goes on.
+    #[must_use]
+    pub fn view(&self) -> HealthView {
+        let mut unhealthy: Vec<String> = self
+            .subsystems
+            .iter()
+            .filter(|(_, status)| matches!(status, Status::Degraded(_)))
+            .map(|(subsystem, _)| subsystem.as_str().to_owned())
+            .chain(
+                self.wedged
+                    .iter()
+                    .map(|subsystem| subsystem.as_str().to_owned()),
+            )
+            .chain(self.dead_tasks.iter().cloned())
+            .collect();
+        unhealthy.sort();
+        unhealthy.dedup();
+        HealthView {
+            healthy: unhealthy.is_empty(),
+            unhealthy,
+        }
+    }
+
     /// Heartbeat-worthy: no dead task and nothing wedged (SPEC §5.3).
     #[must_use]
     pub fn is_healthy(&self) -> bool {
@@ -95,6 +127,50 @@ impl HealthReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report(degraded: &[Subsystem], dead: &[&str]) -> HealthReport {
+        HealthReport {
+            subsystems: degraded
+                .iter()
+                .map(|subsystem| (*subsystem, Status::Degraded("it failed".to_owned())))
+                .chain([(Subsystem::Links, Status::Ok)])
+                .collect(),
+            dead_tasks: dead.iter().map(|name| (*name).to_owned()).collect(),
+            wedged: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_degraded_subsystem_is_unhealthy_to_the_api_though_the_watchdog_is_still_petted() {
+        let degraded = report(&[Subsystem::Nft], &[]);
+        assert!(
+            degraded.is_healthy(),
+            "the watchdog's question is unchanged"
+        );
+        assert_eq!(
+            degraded.view(),
+            HealthView {
+                healthy: false,
+                unhealthy: vec!["nft".to_owned()]
+            }
+        );
+        assert_eq!(
+            report(&[Subsystem::Nft], &["dns"]).view().unhealthy,
+            ["dns", "nft"]
+        );
+        assert_eq!(
+            report(&[], &[]).view(),
+            HealthView {
+                healthy: true,
+                unhealthy: vec![]
+            }
+        );
+        let wedged = HealthReport {
+            wedged: vec![Subsystem::Routing],
+            ..HealthReport::default()
+        };
+        assert_eq!(wedged.view().unhealthy, ["routing"]);
+    }
 
     #[test]
     fn health_is_unhealthy_only_for_dead_or_wedged() {

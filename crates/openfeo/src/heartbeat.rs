@@ -11,10 +11,17 @@ use std::time::Instant;
 
 use openfeo_init::ctl::{CtlPipe, HEARTBEAT_INTERVAL, Msg};
 use openfeo_runtime::HealthTracker;
+use openfeo_world::health::HealthView;
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 /// Run forever. A broken control pipe ends the process (PID 1 is gone or has given up on us).
-pub async fn run(mut ctl: Option<CtlPipe>, health: HealthTracker, hung: Arc<AtomicBool>) {
+pub async fn run(
+    mut ctl: Option<CtlPipe>,
+    health: HealthTracker,
+    hung: Arc<AtomicBool>,
+    view: watch::Sender<HealthView>,
+) {
     let mut ticks = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut withheld = false;
     loop {
@@ -23,6 +30,15 @@ pub async fn run(mut ctl: Option<CtlPipe>, health: HealthTracker, hung: Arc<Atom
             continue;
         }
         let now = Instant::now();
+        // The API's stricter view of the same report (SPEC §10), sent only when it changes.
+        let latest = health.report(now).view();
+        view.send_if_modified(|current| {
+            let changed = *current != latest;
+            if changed {
+                *current = latest;
+            }
+            changed
+        });
         if health.is_healthy(now) {
             if withheld {
                 info!("heartbeat resumed");

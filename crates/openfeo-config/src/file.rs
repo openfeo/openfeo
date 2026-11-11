@@ -136,6 +136,20 @@ fn to_toml<T: Serialize>(value: &T) -> Result<String, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_admin_table_round_trips() {
+        let text = "config_version = 1\n[admin]\npassword_hash = \"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA\"\n";
+        let config = super::parse(text).expect("parse");
+        assert_eq!(
+            config.admin.as_ref().expect("admin").password_hash,
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
+        );
+        assert_eq!(
+            super::parse(&super::render(&config).expect("render")).expect("reparse"),
+            config
+        );
+    }
+
     use super::*;
     use crate::{Dhcp4Lease, Dhcp4Route, DhcpWan, wan};
 
