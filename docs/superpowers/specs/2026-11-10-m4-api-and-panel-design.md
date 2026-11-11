@@ -756,11 +756,11 @@ the dispatcher against a stub) and the host and origin parser.
 
 ## ADRs
 
-- ADR-0024: the web workspace is built by `make` and embedded by cargo through an environment
+- ADR-0025: the web workspace is built by `make` and embedded by cargo through an environment
   variable; Node is a build dependency of the image and not of the Rust workspace; npm packages
-  install without their scripts and pass the licence gate; OFL fonts ship in the binary.
-- Kernel, browser and protocol quirks found on the way get their own, as before. The 825-day
-  certificate is the first candidate.
+  install without their scripts and pass the licence gate; OFL fonts ship in the binary. (This
+  document first called it ADR-0024; the 825-day certificate took that number in part 1a.)
+- Kernel, browser and protocol quirks found on the way get their own, as before.
 
 ## What is left to the builder
 

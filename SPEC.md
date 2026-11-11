@@ -341,7 +341,7 @@ SNTP client (RFC 4330) to configured servers (default `pool.ntp.org` names resol
 ### 8.1 Schema
 
 - `proto/openfeo/v1/*.proto` is the single source of truth: `config.proto` (the whole config), `state.proto` (live facts and counters), `events.proto`, `api.proto` (services). `buf lint` and `buf breaking` run in CI; field numbers are never reused, removed fields are `reserved`, `optional` is used wherever unset differs from zero.
-- Rust: `prost` + `pbjson` (canonical JSON mapping) generated in `build.rs`. TypeScript: `protobuf-es` via `buf generate` into `web/src/gen/`.
+- Rust: `prost` + `pbjson` (canonical JSON mapping) generated in `build.rs`. TypeScript: `protobuf-es` via `buf generate` into `web/client/src/gen/`, with the plugin taken from the workspace's own `node_modules`; like the Rust types, the generated code is built and not committed.
 - Semantic validation (CIDRs, overlaps, port ranges, unique names, pool inside subnet, role/port consistency) lives in `openfeo-config::validate` and is used by file load, `ApplyConfig` and the panel's preview. Errors are structured (`path`, `code`, `message`). Protobuf types alone do not validate anything.
 
 ### 8.2 Config file
@@ -487,6 +487,18 @@ The admin password is set and changed by rewriting the one key `[admin] password
 
 Vue 3 + TypeScript, built with Vite, embedded into the binary at build time. Pages: first-boot wizard; dashboard (per-WAN state, throughput, CAKE stats); ports and roles; WANs; LANs and DHCP (leases, static leases); firewall (zone matrix, port forwards, rules); DNS (upstreams, blocklists, local names); shaping; system (updates, backup/restore, password, time, reboot); logs; diagnostics. Every config change goes validate → apply with commit-confirm → confirm. The token is held in memory or `sessionStorage`, never a cookie.
 
+The web side is three npm packages in one workspace under `web/`, so that the panel is the API's first consumer and not its only description:
+
+- `@openfeo/client` is the wire: the envelope, the session, subscriptions, reconnecting. It has no Vue in it and no DOM beyond `fetch` and `WebSocket`, and runs in a browser and in Node.
+- `@openfeo/ui` is the look: the tokens, the `ofo-*` stylesheet, the fonts and Vue components that take plain props. It knows nothing of the API.
+- `web/panel` is the app: the pages that join the two. It holds no protocol code, and no CSS beyond page layout.
+
+A lint script enforces the rule between them: `web/ui` does not import the client, `web/client` does not import `vue`, and the panel reaches the generated message code only through the client.
+
+Navigation, in this order: Dashboard; **Network**: WAN, LAN & DHCP, Firewall, DNS, Routes; **Router**: Ports, Logs, Diagnostics, System. Reboot, the password and the notices live under System; shaping joins with M6. A page appears in the sidebar in the milestone part that builds it and not before.
+
+Names on screen: a WAN or LAN is titled by its name in the config (`wan0`, `lan0`, `iot`); the kernel interface is a fact beside it, in mono (`ppp-wan0 on p0.911`, `br-lan0`); physical ports are `p0…pN`. Status is always a word with a colour, and a number always has its unit.
+
 ## 9. Security requirements
 
 - No shell, no SSH, no debug listeners, no telnet, no serial login. The console menu is the only local interface and has no free-form command input.
@@ -518,7 +530,7 @@ Vue 3 + TypeScript, built with Vite, embedded into the binary at build time. Pag
 - **Unit**: sans-IO cores against synthesised and recorded packets (`tests/fixtures/*.pcap`; no credentials committed); property tests (`proptest`) on parsers; reconcilers against World fixtures with `insta` snapshots of desired state (ruleset JSON, route sets, RA contents).
 - **Fuzzing**: `cargo fuzz` targets for every parser (DHCPv4, DHCPv6, ND/RA, PPPoE, LCP/IPCP/IPV6CP/PAP/CHAP, DNS, config TOML), run in a nightly CI job with a checked-in corpus.
 - **Harness** (`harness/`): the router runs in QEMU (KVM when the runner has it, TCG otherwise; i6300esb watchdog; virtio-net ports `p0` = WAN A, `p1` = WAN B, `p2` = LAN, and `p3` = a second LAN namespace `lan1` for the scenarios that ask for two LANs) attached through tap devices to network namespaces on the CI host. ISP namespaces run **reference daemons**: Kea (DHCPv4; DHCPv6 IA_NA and IA_PD), radvd, `pppoe-server` + pppd (PAP/CHAP, IPCP, IPV6CP, RFC 4638), with radvd and Kea's DHCPv6 server started on the ISP's PPP interface once a session is up for RA and PD over PPP (the sandbox mounts a tmpfs over `/etc/ppp` for pppd's secrets, and `/dev/ppp` must be open to the user: CI grants it), plus HTTP and DNS targets. The LAN namespace runs a Rust test client (DHCPv4, SLAAC/DHCPv6, DNS, HTTP); for SLAAC the namespace's own kernel is the reference client and `rdisc6` (ndisc6) reads the advertisements' options, while radvd advertises on the ISP side; for stateless DHCPv6 busybox's `udhcpc6` is the reference client; the prefix-change scenario restarts Kea with another delegation pool, so the router's Renew meets a server with no binding. Scenarios: link flap, lease expiry, prefix change, PADT, ISP down/up, power cut during update, broken-image rollback.
-- **Panel**: Playwright end-to-end tests against the harness VM.
+- **Panel**: `@openfeo/client` has unit tests under `vitest` against a scripted socket, and integration tests that run in Node inside the harness's LAN namespace against the VM. The panel has Playwright end-to-end tests against the harness VM: Chromium inside the LAN namespace, reaching the router by its name.
 - **CI matrix**: `cargo test`, `cargo clippy -D warnings`, `cargo deny check`, `buf lint` and `buf breaking`, kernel build (cached), image build, harness scenarios for every completed milestone, nightly fuzz.
 
 ## 12. Milestones
@@ -543,7 +555,7 @@ Post-MVP order: WireGuard, download shaping (IFB), LAN VLANs in the panel, DDNS,
 ```
 openfeo/
   SPEC.md  CLAUDE.md  LICENSE (GPL-2.0-or-later)  docs/adr/
-  proto/openfeo/v1/            buf.yaml  buf.gen.yaml
+  proto/openfeo/v1/            buf.yaml
   kernel/                      required.config  x86_64.config  build.sh  openwrt/ (per-board diffconfig)
   image/                       installer, ESP layout, systemd-boot fetch/build, signing tools
   crates/
@@ -565,7 +577,10 @@ openfeo/
     openfeo-api                HTTPS, auth, WebSocket, gRPC; the panel embedded (M4 part 1b)
     openfeo-platform           slots, updates, signing, storage, backup, diagnostics, capture
     openfeo                    the binary: wiring and modes
-  web/                         Vue panel
+  web/                         one npm workspace, built by make and never by cargo (ADR-0025); buf.gen.yaml
+    client/                    @openfeo/client: the wire (src/gen/ is generated, not committed)
+    ui/                        @openfeo/ui: tokens, the ofo-* stylesheet, fonts, logos, Vue components
+    panel/                     the app; e2e/ holds its Playwright tests
   harness/                     QEMU + netns orchestration, ISP configs, scenario tests
   fuzz/
 ```
@@ -583,12 +598,13 @@ Coding rules (repeated in `CLAUDE.md`):
 - Every parser gets a fuzz target in the same PR that adds it.
 - Every change to §2 gets an ADR (`docs/adr/NNNN-title.md`: context, decision, consequences). Kernel and protocol quirks discovered in the harness are recorded as ADRs too.
 - Commits carry `Signed-off-by` (DCO). SPDX header `GPL-2.0-or-later` in every source file.
-- Third-party notices generated by `cargo about` into the image and the panel's About page.
+- Third-party notices generated by `cargo about` into the image and the panel's About page. The npm packages and the fonts the panel bundles carry theirs in `/licences.txt`, written by the panel's build and served without a login.
 
 ## 14. Licensing
 
 - Project code: GPL-2.0-or-later. No CLA; DCO sign-off.
 - Because libnftables is GPL-2.0-only, the shipped binary is a GPLv2 work: `cargo deny` MUST reject GPL-3.0*, LGPL-3.0*, AGPL-* and any licence the project has not accepted for the binary. Accepted: MIT, Apache-2.0 (accepted knowingly against the FSF's reading that it is GPLv2-incompatible; ADR-0021), BSD-2/3-Clause, ISC, MPL-2.0, Zlib, Unicode, LGPL-2.1+, GPL-2.0(-or-later), CC0, Unlicense.
+- All of `web/` is project code under the same licence. The npm packages bundled into the panel MUST pass the same accepted list, checked by a lint script over the lockfile. The panel's two fonts are SIL OFL 1.1, accepted for font files only, and ship with their licence texts.
 - The kernel's GPLv2 does not affect a userspace binary (syscall exception); uapi headers are fine. systemd-boot (LGPL-2.1+) ships as a separate EFI binary. Harness tooling may use anything.
 - Trademark, GitHub organisation and domains for "OpenFeO" to be checked (§15). Not legal advice.
 
