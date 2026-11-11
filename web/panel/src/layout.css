@@ -112,3 +112,41 @@ body {
   line-height: 20px;
   color: var(--ink-muted);
 }
+
+/* The dashboard: its blocks one under another. */
+.dash {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* The page header carries its own space beneath; the column's gap would double it. */
+.dash > .ofo-pagehead {
+  margin-bottom: 0;
+}
+
+/* A frame while its content is still on its way: the skeleton bars one under another. */
+.dash__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.dash__legend {
+  margin: var(--space-3) 0 0;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.dash__when {
+  white-space: nowrap;
+}
+
+.dash__said {
+  margin: 0;
+}
+
+.dash__violations {
+  margin: var(--space-1) 0;
+  padding-left: var(--space-5);
+}

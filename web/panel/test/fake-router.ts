@@ -112,6 +112,10 @@ export class FakeRouter implements PanelRouter {
   subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
   subscribe(topic: 'events', onPush: (event: Event) => void, options?: { backlog?: number; onLost?: () => void }): Subscription
   subscribe(topic: 'state' | 'counters' | 'events', onPush: Listener, options: { backlog?: number; onLost?: () => void } = {}): Subscription {
+    // As the client does: with no session there is nothing to subscribe on, and it says so at once.
+    if (!this.authenticated) {
+      throw new RouterError(ErrorCode.UNAUTHENTICATED, 'not logged in')
+    }
     const entry: Listening = { topic, onPush, backlog: options.backlog ?? 0, onLost: options.onLost, closed: false }
     this.listening.push(entry)
     return {
