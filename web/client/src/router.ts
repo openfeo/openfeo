@@ -12,9 +12,23 @@ import {
   type GetStatusResponse,
   type Session,
 } from './gen/openfeo/v1/api_pb.js'
+import type { Event } from './gen/openfeo/v1/events_pb.js'
+import type { Counters, State } from './gen/openfeo/v1/state_pb.js'
 import { call, type Http } from './http.js'
-import type { RouterOptions } from './options.js'
+import type { RouterOptions, Timers, WebSocketLike } from './options.js'
+import { Link, type Connection, type SessionEnd, type Subscription } from './socket.js'
 import { memoryTokenStore, type TokenStore } from './token-store.js'
+
+/** How long a socket may be silent before it is probed, and how long the probe may go unanswered. */
+const PROBE_AFTER_MS = 30_000
+const PROBE_TIMEOUT_MS = 10_000
+
+const realTimers: Timers = {
+  set: (fn, ms) => setTimeout(fn, ms),
+  clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+  now: () => Date.now(),
+  random: () => Math.random(),
+}
 
 /** The page's origin when there is a page (a browser), and nothing when there is not (Node). */
 function pageOrigin(): string | undefined {
@@ -29,6 +43,7 @@ function pageOrigin(): string | undefined {
 export class Router {
   readonly #http: Http
   readonly #store: TokenStore
+  readonly #link: Link
 
   constructor(options: RouterOptions = {}) {
     const base = options.baseUrl ?? pageOrigin()
@@ -40,6 +55,31 @@ export class Router {
       fetch: options.fetch ?? ((input, init) => globalThis.fetch(input, init)),
     }
     this.#store = options.tokenStore ?? memoryTokenStore()
+    const socket = new URL('/ws', this.#http.baseUrl)
+    socket.protocol = socket.protocol === 'http:' ? 'ws:' : 'wss:'
+    this.#link = new Link({
+      url: socket.href,
+      store: this.#store,
+      webSocket: options.webSocket ?? ((url) => new WebSocket(url) as unknown as WebSocketLike),
+      timers: options.timers ?? realTimers,
+      probeAfterMs: options.probeAfterMs ?? PROBE_AFTER_MS,
+      probeTimeoutMs: options.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
+    })
+  }
+
+  /** Where the socket stands: nothing open, on its way, open, or lost and being remade. */
+  get connection(): Connection {
+    return this.#link.connection
+  }
+
+  /** Hear each change of {@link connection}. Returns the way to stop listening. */
+  onConnection(listener: (connection: Connection) => void): () => void {
+    return this.#link.onConnection(listener)
+  }
+
+  /** Hear the session end, and why. Returns the way to stop listening. */
+  onSessionEnd(listener: (reason: SessionEnd) => void): () => void {
+    return this.#link.onSessionEnd(listener)
   }
 
   /** Whether a session's token is held. The router may still refuse it. */
@@ -68,6 +108,56 @@ export class Router {
       init: { password },
     })
     return this.#begin(answer.session)
+  }
+
+  /** One snapshot of the router's state. */
+  async state(): Promise<State> {
+    const reply = await this.#link.request({ case: 'getState', value: {} })
+    if (reply.body.case !== 'getState' || reply.body.value.state === undefined) {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered without a state')
+    }
+    return reply.body.value.state
+  }
+
+  /** End this session, here and on the router. */
+  logout(): Promise<void> {
+    return this.#link.logout()
+  }
+
+  /**
+   * Change the admin password. Every other session ends; this one stays. A wrong old password
+   * is `INVALID_ARGUMENT`, and this session stays then too.
+   */
+  async changePassword(oldPassword: string, newPassword: string): Promise<void> {
+    await this.#link.request({ case: 'changePassword', value: { oldPassword, newPassword } })
+  }
+
+  /**
+   * Listen to a topic until the subscription is closed: `state` is the whole state now and
+   * after every change, `counters` a sample each second, `events` each event as it happens
+   * (with the last `backlog` first; `onLost` when the router had to drop some).
+   */
+  subscribe(topic: 'state', onPush: (state: State) => void): Subscription
+  subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
+  subscribe(topic: 'events', onPush: (event: Event) => void, options?: { backlog?: number; onLost?: () => void }): Subscription
+  subscribe(
+    topic: 'state' | 'counters' | 'events',
+    onPush: ((state: State) => void) | ((counters: Counters) => void) | ((event: Event) => void),
+    options: { backlog?: number; onLost?: () => void } = {},
+  ): Subscription {
+    switch (topic) {
+      case 'state':
+        return this.#link.subscribeState(onPush as (state: State) => void)
+      case 'counters':
+        return this.#link.subscribeCounters(onPush as (counters: Counters) => void)
+      case 'events':
+        return this.#link.subscribeEvents(onPush as (event: Event) => void, options.backlog ?? 0, options.onLost)
+    }
+  }
+
+  /** Drop the socket and every subscription. The session and its token stay. */
+  close(): void {
+    this.#link.close()
   }
 
   #begin(session: Session | undefined): Session {
