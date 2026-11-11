@@ -7,7 +7,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs::File;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use openfeo_harness::lab::{ISP_HTTP_BODY, ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
 use openfeo_harness::lanclient::{self, DhcpClientArgs};
-use openfeo_harness::{daemons, qemu, sandbox};
+use openfeo_harness::{daemons, qemu, relay, sandbox};
 use openfeo_harness::{nftprobe, scenario, vlanprobe, web};
 
 #[derive(Parser)]
@@ -47,6 +47,10 @@ enum Cmd {
         /// Boot without a state disk: first-boot defaults (all ports in one LAN).
         #[arg(long)]
         no_config: bool,
+        /// Relay the router's panel to this address of the host (`<address>:<port>`), so that
+        /// a browser outside the lab can open it at `https://<address>:<port>/`.
+        #[arg(long)]
+        panel: Option<SocketAddr>,
     },
     /// Report whether this machine can run the harness.
     Check,
@@ -100,7 +104,8 @@ fn main() -> ExitCode {
             chaos,
             config,
             no_config,
-        } => run(kernel, chaos, config, no_config),
+            panel,
+        } => run(kernel, chaos, config, no_config, panel),
         Cmd::Check => check(),
         Cmd::CheckSandbox => sandbox::enter().map(|()| ExitCode::SUCCESS),
         Cmd::ProbeNft => probe_nft(),
@@ -128,12 +133,22 @@ fn main() -> ExitCode {
     })
 }
 
+/// The router's HTTPS listener as the LAN host reaches it.
+const ROUTER_HTTPS: SocketAddr =
+    SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 443);
+
 fn run(
     kernel: Option<PathBuf>,
     chaos: Option<String>,
     config: Option<PathBuf>,
     no_config: bool,
+    panel: Option<SocketAddr>,
 ) -> Result<ExitCode> {
+    // The relay's socket is bound while this process is still in the host's network: once
+    // inside the sandbox nothing outside can be listened on.
+    let panel = panel
+        .map(|listen| relay::bind(listen).map(|listener| (listen, listener)))
+        .transpose()?;
     sandbox::enter()?;
     let mut lab = Lab::new("run")?;
     if let Some(kernel) = kernel {
@@ -158,7 +173,18 @@ fn run(
         ISP_HTTP_BODY,
     )?;
     lab.daemons.push(http);
-    let extra = chaos.map_or_else(String::new, |c| format!("openfeo.chaos={c}"));
+    let mut extra = chaos.map_or_else(String::new, |c| format!("openfeo.chaos={c}"));
+    if let Some((listen, listener)) = panel {
+        // To the router the browser is the LAN host; the host it names is the relay's, which
+        // a harness build is told to take as its own.
+        lab.lan_side_host()?;
+        relay::start(listener, relay::into_ns(&lab.lan0, ROUTER_HTTPS))?;
+        extra = format!("{extra} openfeo.panel_host={}", listen.ip());
+        eprintln!(
+            "lab: the panel is at https://{listen}/ (the certificate is the router's own; \
+             compare its fingerprint with the console's)"
+        );
+    }
     eprintln!(
         "lab: p0 <-> isp0 wan0 {ISP0_ADDR} (kea-dhcp4 60 s leases, dnsmasq for isp.example, \
          http :8080), p1 <-> isp1 wan1 {ISP1_ADDR}, p2 <-> lan0; --config \

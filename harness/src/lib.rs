@@ -18,6 +18,7 @@ pub mod nftlist;
 pub mod nftprobe;
 pub mod qemu;
 pub mod qmp;
+pub mod relay;
 pub mod sandbox;
 pub mod scenario;
 pub mod statedisk;

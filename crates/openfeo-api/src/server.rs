@@ -191,6 +191,7 @@ pub struct Shared {
     backoff: Mutex<Backoff>,
     recent: Mutex<Recent>,
     verifier: Verifier,
+    extra_host: Option<String>,
     /// One password change at a time: the check for "no password yet" and the write are one
     /// step.
     password: tokio::sync::Mutex<()>,
@@ -226,6 +227,8 @@ pub struct SharedParts {
     pub version: String,
     /// The limits in force.
     pub limits: Limits,
+    /// One more host taken as the router's own; see [`ApiDeps::extra_host`](crate::ApiDeps).
+    pub extra_host: Option<String>,
 }
 
 impl Shared {
@@ -240,6 +243,7 @@ impl Shared {
             config_path: parts.config_path,
             config_state: parts.config_state,
             version: parts.version,
+            extra_host: parts.extra_host,
             limits: parts.limits,
             fingerprint: watch::Sender::new(String::new()),
             sessions_ended: watch::Sender::new(0),
@@ -256,7 +260,7 @@ impl Shared {
     /// The router's two names, from the running config.
     #[must_use]
     pub fn names(&self) -> Names {
-        Names::of(self.world.borrow().config.system.as_ref())
+        Names::of(self.world.borrow().config.system.as_ref()).with_extra(self.extra_host.as_deref())
     }
 
     fn hash(&self) -> String {
@@ -607,6 +611,7 @@ pub(crate) mod tests {
             config_state,
             version: "0.4.0-test".to_owned(),
             limits,
+            extra_host: None,
         });
         shared.fingerprint.send_replace("AB:CD".to_owned());
         (shared, dir)

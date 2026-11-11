@@ -40,7 +40,7 @@ kernel: bin kernel-src
 	$(KERNEL_ENV) kernel/build.sh config $(CURDIR)/$(BIN)
 	$(KERNEL_ENV) kernel/build.sh build
 run: kernel
-	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage $(if $(CONFIG),--config $(CONFIG),)
+	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage $(if $(CONFIG),--config $(CONFIG),) $(if $(PANEL),--panel $(PANEL),)
 test-harness: kernel
 	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --no-fail-fast --test netlink --test nft --test dhcp4 --test dhcp4_server --test dhcp6 --test dns --test sntp --test ndp --test pppoe --test m0 --test m1 --test m2 --test m2pd --test m3 --test m4 -- $(FILTER)
 check-env: kernel-headers nft-src
@@ -79,10 +79,14 @@ web-test: web-gen
 	cd web && npm test
 # The panel as the binary embeds it: the client built, the page and its files, and the notices
 # of what it bundles (served at /licences.txt).
+# Built beside its place and copied over only where a file's content changed, so that a panel
+# that did not change leaves the directory untouched and cargo does not rebuild the binary.
 panel: web-gen
 	cd web && npm run -s build -w @openfeo/client
-	cd web && npm run -s build -w panel -- --outDir $(PANEL_DIST) --emptyOutDir
-	node web/scripts/notices.mjs $(PANEL_DIST)/licences.txt
+	cd web && npm run -s build -w panel -- --outDir $(PANEL_DIST).new --emptyOutDir
+	node web/scripts/notices.mjs $(PANEL_DIST).new/licences.txt
+	mkdir -p $(PANEL_DIST)
+	rsync -rc --delete $(PANEL_DIST).new/ $(PANEL_DIST)/
 # The Chromium the panel's Playwright run drives (SPEC §11); kept in Playwright's own cache.
 panel-browser: web-install
 	cd web && npx playwright install chromium

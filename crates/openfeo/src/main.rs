@@ -17,6 +17,7 @@ mod dns;
 mod heartbeat;
 mod identity;
 mod ipv6;
+mod panel_host;
 mod pppoe;
 mod ra;
 mod router;

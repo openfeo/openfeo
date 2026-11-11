@@ -86,6 +86,10 @@ const SCENARIOS: &[Scenario] = &[
         run: an_unreadable_config_offers_no_first_password,
     },
     Scenario {
+        name: "a_harness_build_takes_one_extra_host_name",
+        run: a_harness_build_takes_one_extra_host_name,
+    },
+    Scenario {
         name: "the_panel_in_a_browser_on_the_lan",
         run: the_panel_in_a_browser_on_the_lan,
     },
@@ -958,4 +962,22 @@ fn the_panel_in_a_browser_on_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
         &lab.run_dir.join("playwright.log"),
         Duration::from_secs(180),
     )
+}
+
+/// The lab's relay (`make run PANEL=`) puts the panel on a host the router does not know. A
+/// harness build is told that host on the kernel command line and takes it as its own; any
+/// other host is still refused, and a release build has no such knob (a unit test of the
+/// binary says so).
+fn a_harness_build_takes_one_extra_host_name(lab: &mut Lab) -> anyhow::Result<()> {
+    boot(lab, "openfeo.panel_host=panel.test")?;
+    let api = api(lab)?;
+    // (No port here: this client sends the host as the TLS server name too. A host with a
+    // port is the gate's unit test.)
+    let relayed = api.as_host("panel.test").get("/api/status", None)?;
+    ensure!(relayed.status == 200, "the extra host: {}", relayed.status);
+    let other = api.as_host("other.test").get("/api/status", None)?;
+    ensure!(other.status == 421, "another host: {}", other.status);
+    let own = api.get("/api/status", None)?;
+    ensure!(own.status == 200, "the router's own name: {}", own.status);
+    Ok(())
 }

@@ -177,6 +177,7 @@ pub(crate) async fn spawn_api_full(
             admit,
         },
         limits,
+        extra_host: None,
     })
     .await
     .unwrap();
