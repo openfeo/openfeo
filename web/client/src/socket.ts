@@ -8,6 +8,7 @@
 
 import { create, fromBinary, toBinary, type MessageInitShape } from '@bufbuild/protobuf'
 
+import { delayMs } from './backoff.js'
 import { RouterError } from './errors.js'
 import {
   ClientMsgSchema,
@@ -107,6 +108,13 @@ export class Link {
   readonly #counters = new Set<(counters: Counters) => void>()
   readonly #events = new Set<EventListener>()
   #backlog = 0
+  /** Events were subscribed on an earlier socket: the next subscribe is a resumption. */
+  #eventsBefore = false
+  /** How many times in a row a socket has been lost without one authenticating. */
+  #attempt = 0
+  #retry: unknown = undefined
+  #silence: unknown = undefined
+  #probe: unknown = undefined
   readonly #onConnection = new Set<(connection: Connection) => void>()
   readonly #onSessionEnd = new Set<(reason: SessionEnd) => void>()
 
@@ -179,6 +187,7 @@ export class Link {
   close(): void {
     this.#forget()
     this.#drop('the socket was closed')
+    this.#rest()
     this.#set('idle')
   }
 
@@ -191,8 +200,13 @@ export class Link {
     }
     return {
       close: () => {
-        if (listeners.delete(listener) && listeners.size === 0 && this.#authenticated) {
-          this.#send(this.#nextId++, { case: 'unsubscribe', value: { topic } })
+        if (listeners.delete(listener) && listeners.size === 0) {
+          if (topic === 'events') {
+            this.#eventsBefore = false
+          }
+          if (this.#authenticated) {
+            this.#send(this.#nextId++, { case: 'unsubscribe', value: { topic } })
+          }
         }
       },
     }
@@ -213,8 +227,17 @@ export class Link {
   }
 
   #subscribe(topic: Topic): void {
-    const backlog = topic === 'events' ? this.#backlog : 0
+    // Events carry no number to tell a repeat by, so a resumed subscription asks for no
+    // backlog and says instead that some may have passed while the socket was away.
+    const resumed = topic === 'events' && this.#eventsBefore
+    const backlog = topic === 'events' && !resumed ? this.#backlog : 0
     this.#send(this.#nextId++, { case: 'subscribe', value: { topic, backlog } })
+    if (topic === 'events') {
+      this.#eventsBefore = true
+      if (resumed) {
+        this.#lost()
+      }
+    }
   }
 
   #send(id: number, body: NonNullable<MessageInitShape<typeof ClientMsgSchema>['body']>): void {
@@ -237,6 +260,9 @@ export class Link {
     if (token === null) {
       throw new RouterError(ErrorCode.UNAUTHENTICATED, 'not logged in')
     }
+    // A call made while waiting to reconnect does not wait.
+    this.#deps.timers.clear(this.#retry)
+    this.#retry = undefined
     const socket = this.#deps.webSocket(this.#deps.url)
     socket.binaryType = 'arraybuffer'
     socket.onopen = () => {
@@ -256,7 +282,9 @@ export class Link {
       }
     }
     this.#socket = socket
-    this.#set('connecting')
+    if (this.#connection === 'idle') {
+      this.#set('connecting')
+    }
   }
 
   #received(data: unknown): void {
@@ -268,8 +296,15 @@ export class Link {
       }
       message = fromBinary(ServerMsgSchema, frame)
     } catch {
+      // Whatever is at the far end is not speaking the envelope: start again.
+      this.#gone()
       return
     }
+    this.#dispatch(message)
+    this.#watch()
+  }
+
+  #dispatch(message: ServerMsg): void {
     if (message.id === 0) {
       this.#pushed(message)
     } else if (message.id === this.#authId) {
@@ -295,6 +330,7 @@ export class Link {
   /** `Auth` was acknowledged: subscribe what is wanted, then send what was held. */
   #ready(): void {
     this.#authenticated = true
+    this.#attempt = 0
     this.#set('open')
     for (const topic of this.#wanted()) {
       this.#subscribe(topic)
@@ -334,13 +370,65 @@ export class Link {
 
   /** The socket ended from the far side, or the network's. */
   #closed(code: number): void {
-    const wasAuthenticated = this.#authenticated
     if (code === CLOSE_UNAUTHENTICATED) {
-      this.#end(this.#leaving ? 'logout' : wasAuthenticated ? 'revoked' : 'lapsed')
+      // The router no longer takes the token. Before it had accepted it on this socket, the
+      // session had lapsed (or the router restarted); after, it was ended from elsewhere.
+      this.#end(this.#leaving ? 'logout' : this.#authenticated ? 'revoked' : 'lapsed')
       return
     }
+    // Anything else, 1013 (no place free) included, is a socket lost and a session kept.
+    this.#gone()
+  }
+
+  /** The socket is lost. If anyone is listening it is made again, later each time it fails. */
+  #gone(): void {
     this.#drop('the connection to the router was lost')
-    this.#set('idle')
+    if (this.#wanted().length === 0) {
+      this.#set('idle')
+      return
+    }
+    this.#set('reconnecting')
+    const { timers } = this.#deps
+    this.#retry = timers.set(() => {
+      this.#retry = undefined
+      try {
+        this.#open()
+      } catch {
+        // The token went while the socket was away.
+        this.#end('lapsed')
+      }
+    }, delayMs(this.#attempt, timers.random()))
+    this.#attempt += 1
+  }
+
+  /**
+   * A browser cannot see the router's pings, so a connection that died without a close (a
+   * laptop that slept, a link that went) would sit open for ever. After a silence the router
+   * is asked for its state, and if nothing at all comes back the socket is not believed.
+   */
+  #watch(): void {
+    const { timers, probeAfterMs, probeTimeoutMs } = this.#deps
+    timers.clear(this.#silence)
+    timers.clear(this.#probe)
+    this.#probe = undefined
+    this.#silence = !this.#authenticated
+      ? undefined
+      : timers.set(() => {
+          this.#silence = undefined
+          this.request({ case: 'getState', value: {} }).catch(() => undefined)
+          this.#probe = timers.set(() => {
+            this.#probe = undefined
+            this.#gone()
+          }, probeTimeoutMs)
+        }, probeAfterMs)
+  }
+
+  /** Stop every timer and start counting failures afresh. */
+  #rest(): void {
+    const { timers } = this.#deps
+    timers.clear(this.#retry)
+    this.#retry = undefined
+    this.#attempt = 0
   }
 
   /** Let go of the socket; whatever was waiting on it is told the router is not there. */
@@ -349,6 +437,10 @@ export class Link {
     this.#socket = null
     this.#authenticated = false
     this.#held = []
+    this.#deps.timers.clear(this.#silence)
+    this.#deps.timers.clear(this.#probe)
+    this.#silence = undefined
+    this.#probe = undefined
     if (socket !== null) {
       socket.onopen = null
       socket.onmessage = null
@@ -367,6 +459,7 @@ export class Link {
     this.#state.clear()
     this.#counters.clear()
     this.#events.clear()
+    this.#eventsBefore = false
   }
 
   /** The session is over: nothing is kept, nothing reconnects, and whoever listens is told why. */
@@ -375,6 +468,7 @@ export class Link {
     this.#deps.store.clear()
     this.#forget()
     this.#drop('the session ended')
+    this.#rest()
     this.#set('idle')
     deliver(this.#onSessionEnd, reason)
   }
