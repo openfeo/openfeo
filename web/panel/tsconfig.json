@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "customConditions": ["openfeo-source"],
+    "types": ["vite/client", "node"],
+    "jsx": "preserve",
+    "noEmit": true
+  },
+  "include": ["src", "test", "e2e", "scripts", "*.config.ts"]
+}

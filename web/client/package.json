@@ -1,0 +1,24 @@
+{
+  "name": "@openfeo/client",
+  "version": "0.0.0",
+  "private": true,
+  "license": "GPL-2.0-or-later",
+  "description": "The OpenFeO API from JavaScript: the envelope, the session and subscriptions, with no UI in it",
+  "type": "module",
+  "exports": {
+    ".": {
+      "openfeo-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.0.0"
+  }
+}

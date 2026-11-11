@@ -23,6 +23,7 @@ BIN := target/$(TARGET)/$(PROFILE)/openfeo
 KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
 .PHONY: bin kernel-src kernel-headers nft-src kernel run test-harness check-env ci lint test fuzz
+.PHONY: web-install web-gen web-lint web-test
 bin: kernel-headers nft-src
 	OPENFEO_BUILD_ID=$(BUILD_ID) OPENFEO_BUILD_EPOCH=$(BUILD_EPOCH) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 kernel-src:
@@ -41,7 +42,7 @@ test-harness: kernel
 check-env: kernel-headers nft-src
 	OPENFEO_KERNEL=$(BUILD)/bzImage cargo run -q -p openfeo-harness -- check
 ci: lint test kernel test-harness
-lint: kernel-headers nft-src
+lint: kernel-headers nft-src web-lint
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo clippy -p openfeo --all-targets -- -D warnings
@@ -52,8 +53,23 @@ lint: kernel-headers nft-src
 	scripts/check-spdx.sh
 	scripts/check-deps.sh
 	scripts/check-proto.sh
-test: kernel-headers nft-src
+test: kernel-headers nft-src web-test
 	cargo test --workspace --lib --bins --all-features
 	cargo test -p openfeo
 fuzz:
 	cd fuzz && cargo +nightly fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_SECS)
+
+# The web workspace (SPEC §8.4, ADR-0025): Node builds and checks it, cargo never does. npm
+# installs from the lockfile and runs no package's install script.
+WEB_STAMP := web/node_modules/.package-lock.json
+$(WEB_STAMP): web/package-lock.json web/package.json web/client/package.json web/ui/package.json web/panel/package.json
+	cd web && npm ci --ignore-scripts
+	@touch $@
+web-install: $(WEB_STAMP)
+# The TypeScript for proto/openfeo/v1, written into web/client/src/gen (built, not committed).
+web-gen: web-install
+	cd web && npm run -s gen
+web-lint: web-gen
+	cd web && npm run -s lint
+web-test: web-gen
+	cd web && npm test
