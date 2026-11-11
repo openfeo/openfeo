@@ -16,7 +16,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.0.0"
