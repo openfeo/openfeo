@@ -3,10 +3,23 @@
   "compilerOptions": {
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "customConditions": ["openfeo-source"],
-    "types": ["vite/client", "node"],
+    "customConditions": [
+      "openfeo-source"
+    ],
+    "types": [
+      "vite/client",
+      "node"
+    ],
     "jsx": "preserve",
-    "noEmit": true
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true
   },
-  "include": ["src", "test", "e2e", "scripts", "*.config.ts"]
+  "include": [
+    "src",
+    "test",
+    "e2e",
+    "scripts",
+    "*.config.ts"
+  ]
 }

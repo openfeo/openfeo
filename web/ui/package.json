@@ -14,5 +14,9 @@
   },
   "peerDependencies": {
     "vue": "^3.5.0"
+  },
+  "scripts": {
+    "tokens": "node scripts/tokens.mjs",
+    "test": "vitest run"
   }
 }

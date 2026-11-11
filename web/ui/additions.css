@@ -1,0 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (C) 2026 Andrew Newton */
+
+/* What building the panel showed the design system's stylesheet (ofo.css) lacked. Each rule
+   says why it is here, and docs/gaps.md lists them so they can go back to the design system,
+   which stays the source: once a rule is there and copied across, it leaves this file. */
