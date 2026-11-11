@@ -152,7 +152,7 @@ fn password_never_logged(lab: &Lab) -> anyhow::Result<()> {
 }
 
 /// HTTPS answers on the LAN address, by the router's name and by its address; port 80 sends a
-/// browser to HTTPS; the page is the placeholder until part 1b embeds the panel.
+/// browser to HTTPS; the page is the real panel with its files and its notices.
 fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
     lab: &mut Lab,
 ) -> anyhow::Result<()> {
@@ -184,16 +184,61 @@ fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
         "by address: {}",
         by_address.status
     );
+    // The panel itself (M4 part 1b): an image always carries the real one, never the
+    // placeholder a bare `cargo build` embeds (ADR-0025).
     let page = api.get("/", None)?;
     ensure!(
-        page.status == 200
-            && page
-                .text()
-                .contains("The panel was not built into this binary"),
+        page.status == 200 && page.text().contains("<div id=\"app\">"),
         "the page: {} {}",
         page.status,
         page.text()
     );
+    ensure!(
+        !page.text().contains("The panel was not built"),
+        "the VM serves the placeholder"
+    );
+    let script = re(r#"src="(/assets/[^"]+\.js)""#)
+        .captures(&page.text())
+        .and_then(|found| found.get(1).map(|path| path.as_str().to_owned()))
+        .context("the page names no script")?;
+    let js = api.request(true, "GET", &script, &[("accept-encoding", "gzip")], &[])?;
+    ensure!(
+        js.status == 200 && js.header("content-encoding") == Some("gzip"),
+        "{script}: {} {:?}",
+        js.status,
+        js.header("content-encoding")
+    );
+    ensure!(
+        js.header("cache-control")
+            .is_some_and(|value| value.contains("immutable")),
+        "{script} is not cached for good"
+    );
+    ensure!(
+        api.get("/assets/nothing-00000000.js", None)?.status == 404,
+        "a missing asset is not 404"
+    );
+    ensure!(
+        api.get("/wan/wan0", None)?
+            .text()
+            .contains("<div id=\"app\">"),
+        "a route of the panel is not the page"
+    );
+    let notices = api.get("/licences.txt", None)?;
+    ensure!(
+        notices.status == 200
+            && notices
+                .header("content-type")
+                .is_some_and(|value| value.starts_with("text/plain")),
+        "the notices: {} {:?}",
+        notices.status,
+        notices.header("content-type")
+    );
+    for needed in ["SIL OPEN FONT LICENSE", "@bufbuild/protobuf", "vue "] {
+        ensure!(
+            notices.text().contains(needed),
+            "the notices do not mention {needed}"
+        );
+    }
     let redirect = api.request(false, "GET", "/somewhere?x=1", &[], &[])?;
     ensure!(redirect.status == 308, "port 80: {}", redirect.status);
     ensure!(

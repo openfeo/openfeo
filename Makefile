@@ -19,13 +19,17 @@ export OPENFEO_NFT_SRC      := $(BUILD)/nft/src
 export OPENFEO_UAPI_INCLUDE := $(BUILD)/kernel/headers/include
 
 BIN := target/$(TARGET)/$(PROFILE)/openfeo
+# Where `make panel` leaves the built panel for the binary to embed.
+PANEL_DIST := $(BUILD)/panel
 
 KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
 .PHONY: bin kernel-src kernel-headers nft-src kernel run test-harness check-env ci lint test fuzz
-.PHONY: web-install web-gen web-lint web-test panel-browser
-bin: kernel-headers nft-src
-	OPENFEO_BUILD_ID=$(BUILD_ID) OPENFEO_BUILD_EPOCH=$(BUILD_EPOCH) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
+.PHONY: web-install web-gen web-lint web-test panel-browser panel
+# The binary carries the panel (ADR-0025): OPENFEO_PANEL_DIST is set for this cargo call and no
+# other, so `make lint` and `make test` build no panel and embed the placeholder.
+bin: kernel-headers nft-src panel
+	OPENFEO_PANEL_DIST=$(PANEL_DIST) OPENFEO_BUILD_ID=$(BUILD_ID) OPENFEO_BUILD_EPOCH=$(BUILD_EPOCH) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 kernel-src:
 	$(KERNEL_ENV) kernel/build.sh fetch
 kernel-headers: kernel-src
@@ -73,6 +77,12 @@ web-lint: web-gen
 	cd web && npm run -s lint
 web-test: web-gen
 	cd web && npm test
+# The panel as the binary embeds it: the client built, the page and its files, and the notices
+# of what it bundles (served at /licences.txt).
+panel: web-gen
+	cd web && npm run -s build -w @openfeo/client
+	cd web && npm run -s build -w panel -- --outDir $(PANEL_DIST) --emptyOutDir
+	node web/scripts/notices.mjs $(PANEL_DIST)/licences.txt
 # The Chromium the panel's Playwright run drives (SPEC §11); kept in Playwright's own cache.
 panel-browser: web-install
 	cd web && npx playwright install chromium

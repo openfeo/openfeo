@@ -16,5 +16,8 @@
     "Unlicense",
     "0BSD"
   ],
-  "overrides": {}
+  "overrides": {},
+  "texts": {
+    "@bufbuild/protobuf": "licence-texts/bufbuild-protobuf.txt"
+  }
 }
