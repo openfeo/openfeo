@@ -180,4 +180,7 @@ message GetStatusResponse {
   // `config.toml` was refused; the router runs on first-boot defaults.
   bool config_refused = 4;
   string tls_fingerprint = 5;
+  // The refused file is not even TOML: no password can be read from it, none may be set
+  // over it, and nobody can log in until it is fixed or removed from the console.
+  bool config_unreadable = 6;
 }

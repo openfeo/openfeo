@@ -836,7 +836,7 @@ fn a_refused_config_keeps_its_password(lab: &mut Lab) -> anyhow::Result<()> {
     let api = api(lab)?;
     let status = status(&api)?;
     ensure!(
-        !status.needs_password && status.config_refused,
+        !status.needs_password && status.config_refused && !status.config_unreadable,
         "{status:?}"
     );
     let first = api.post(
@@ -871,7 +871,7 @@ fn an_unreadable_config_offers_no_first_password(lab: &mut Lab) -> anyhow::Resul
     let api = api(lab)?;
     let status = status(&api)?;
     ensure!(
-        !status.needs_password && status.config_refused,
+        !status.needs_password && status.config_refused && status.config_unreadable,
         "{status:?}"
     );
     let first = api.post("/api/password", &json!({ "password": PASSWORD }))?;

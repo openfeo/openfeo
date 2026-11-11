@@ -295,6 +295,7 @@ impl Shared {
             needs_password: self.hash().is_empty() && !self.config_unreadable(),
             config_refused: matches!(self.config_state, ConfigState::Refused { .. }),
             tls_fingerprint: self.fingerprint.borrow().clone(),
+            config_unreadable: self.config_unreadable(),
         }
     }
 
@@ -882,6 +883,33 @@ pub(crate) mod tests {
                 .reason,
             "not TOML"
         );
+    }
+
+    #[test]
+    fn status_says_when_the_config_cannot_be_read() {
+        // The panel shows a screen of its own for a file nobody can log in over, and must tell
+        // it from a refused file whose password still works before anyone types one.
+        let (unreadable, _dir) = shared(
+            ConfigState::Refused {
+                problem: problem("not TOML"),
+                readable: false,
+            },
+            Limits::default(),
+        );
+        let status = unreadable.status();
+        assert!(status.config_unreadable && status.config_refused && !status.needs_password);
+        let (refused, _dir) = shared(
+            ConfigState::Refused {
+                problem: problem("invalid (1 errors)"),
+                readable: true,
+            },
+            Limits::default(),
+        );
+        assert!(!refused.status().config_unreadable && refused.status().config_refused);
+        let (loaded, _dir) = shared(ConfigState::Loaded, Limits::default());
+        assert!(!loaded.status().config_unreadable);
+        let (first_boot, _dir) = shared(ConfigState::FirstBoot, Limits::default());
+        assert!(!first_boot.status().config_unreadable);
     }
 
     #[tokio::test]
