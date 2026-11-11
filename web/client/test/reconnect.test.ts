@@ -350,3 +350,38 @@ test('after the session ends, a new login and a new subscribe work on the same r
   // The listener from before the session ended is gone with it.
   expect(before).toEqual([])
 })
+
+test('a socket that does not open and authenticate in time is dropped and tried again', async () => {
+  // The network swallows the attempt: no open and no close ever comes. Without a limit of its
+  // own the client would wait as long as the operating system does, which is minutes.
+  const { router, sockets, socket, timers } = setup()
+  router.subscribe('state', () => undefined)
+  timers.advance(9_999)
+  expect(sockets).toHaveLength(1)
+  expect(router.connection).toBe('connecting')
+  timers.advance(1)
+  expect(socket().closedWith).toBeDefined()
+  expect(router.connection).toBe('reconnecting')
+  timers.advance(500)
+  expect(sockets).toHaveLength(2)
+  // Opened but never acknowledged is no better.
+  socket().open()
+  timers.advance(10_000)
+  expect(socket().closedWith).toBeDefined()
+  timers.advance(1_000)
+  expect(sockets).toHaveLength(3)
+  // One that authenticates in time is left alone.
+  timers.advance(9_000)
+  socket().accept()
+  timers.advance(5_000)
+  expect(router.connection).toBe('open')
+  expect(socket().closedWith).toBeUndefined()
+
+  // With nothing subscribed, what was waiting is told and nothing is retried.
+  const alone = setup()
+  const pending = alone.router.state()
+  alone.timers.advance(10_000)
+  expect((await refusal(pending)).code).toBe(ErrorCode.UNAVAILABLE)
+  expect(alone.router.connection).toBe('idle')
+  expect(alone.timers.pending).toBe(0)
+})

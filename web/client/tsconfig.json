@@ -3,8 +3,17 @@
   "compilerOptions": {
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "types": ["node"],
-    "noEmit": true
+    "types": [
+      "node"
+    ],
+    "noEmit": true,
+    "allowJs": true,
+    "checkJs": true
   },
-  "include": ["src", "test", "itest", "vitest.config.ts"]
+  "include": [
+    "src",
+    "test",
+    "itest",
+    "vitest.config.ts"
+  ]
 }

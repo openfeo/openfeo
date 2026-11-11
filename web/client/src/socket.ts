@@ -115,6 +115,8 @@ export class Link {
   #retry: unknown = undefined
   #silence: unknown = undefined
   #probe: unknown = undefined
+  /** Running while a socket has yet to open and have its `Auth` acknowledged. */
+  #opening: unknown = undefined
   readonly #onConnection = new Set<(connection: Connection) => void>()
   readonly #onSessionEnd = new Set<(reason: SessionEnd) => void>()
 
@@ -282,6 +284,12 @@ export class Link {
       }
     }
     this.#socket = socket
+    // An attempt into a dead network gets no answer of any kind; the operating system would
+    // wait minutes. It is given as long as a probe is and then tried again.
+    this.#opening = this.#deps.timers.set(() => {
+      this.#opening = undefined
+      this.#gone()
+    }, this.#deps.probeTimeoutMs)
     if (this.#connection === 'idle') {
       this.#set('connecting')
     }
@@ -331,6 +339,8 @@ export class Link {
   #ready(): void {
     this.#authenticated = true
     this.#attempt = 0
+    this.#deps.timers.clear(this.#opening)
+    this.#opening = undefined
     this.#set('open')
     for (const topic of this.#wanted()) {
       this.#subscribe(topic)
@@ -439,8 +449,10 @@ export class Link {
     this.#held = []
     this.#deps.timers.clear(this.#silence)
     this.#deps.timers.clear(this.#probe)
+    this.#deps.timers.clear(this.#opening)
     this.#silence = undefined
     this.#probe = undefined
+    this.#opening = undefined
     if (socket !== null) {
       socket.onopen = null
       socket.onmessage = null

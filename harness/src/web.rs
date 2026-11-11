@@ -126,12 +126,7 @@ pub fn chromium() -> Result<PathBuf, String> {
 ///
 /// A [`Skip`] that says what is missing and how to get it.
 pub fn ready() -> Result<(), Skip> {
-    node_version().map_err(Skip)?;
-    if !installed() {
-        return Err(Skip(
-            "web/node_modules is not installed (make web-install)".to_owned(),
-        ));
-    }
+    node_ready()?;
     chromium()
         .map(|_| ())
         .map_err(|why| Skip(format!("Playwright's Chromium: {why} (make panel-browser)")))
@@ -219,6 +214,90 @@ pub fn run_logged(cmd: Command, log: &Path, timeout: Duration) -> Result<()> {
     run_with(cmd, log, timeout, || Ok(()))
 }
 
+/// Whether this machine can run the scenarios that need Node alone.
+///
+/// # Errors
+///
+/// A [`Skip`] that says what is missing and how to get it.
+pub fn node_ready() -> Result<(), Skip> {
+    node_version().map_err(Skip)?;
+    if installed() {
+        Ok(())
+    } else {
+        Err(Skip(
+            "web/node_modules is not installed (make web-install)".to_owned(),
+        ))
+    }
+}
+
+/// How a test running in a lab namespace asks the lab for something only the harness can do
+/// (take a port's carrier away, give it back). The test writes `<n>.req` holding a verb into
+/// this directory, numbering from 1, and waits for `<n>.ack`: `ok`, or `error: <why>`.
+/// `web/scripts/labctl.mjs` is the other end.
+#[derive(Debug)]
+pub struct LabCtl {
+    dir: PathBuf,
+}
+
+impl LabCtl {
+    /// A fresh control directory under `run_dir`.
+    ///
+    /// # Errors
+    ///
+    /// When the directory cannot be made.
+    pub fn new(run_dir: &Path) -> Result<Self> {
+        let dir = run_dir.join("labctl");
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).with_context(|| format!("clear {}", dir.display()))?;
+        }
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(Self { dir })
+    }
+
+    /// The directory, for the test's `OPENFEO_LAB_CTL`.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Run `cmd` to its end as [`run_logged`] does, answering its requests in order while it
+    /// runs: `act` is given each verb, and what it returns is the acknowledgement. A verb
+    /// `act` refuses is the test's to hear about, not the end of the run.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_logged`], and when the control directory cannot be read or written.
+    pub fn serve_while(
+        &self,
+        cmd: Command,
+        log: &Path,
+        timeout: Duration,
+        mut act: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        let mut next = 1u32;
+        run_with(cmd, log, timeout, || {
+            let request = self.dir.join(format!("{next}.req"));
+            let verb = match std::fs::read_to_string(&request) {
+                Ok(verb) => verb,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(err).with_context(|| format!("read {}", request.display())),
+            };
+            let answer = match act(verb.trim()) {
+                Ok(()) => "ok".to_owned(),
+                Err(err) => format!("error: {err:#}"),
+            };
+            // Written beside and moved into place, so the test never reads half an answer.
+            let ack = self.dir.join(format!("{next}.ack"));
+            let beside = self.dir.join(format!("{next}.ack.tmp"));
+            std::fs::write(&beside, answer)
+                .with_context(|| format!("write {}", beside.display()))?;
+            std::fs::rename(&beside, &ack).with_context(|| format!("write {}", ack.display()))?;
+            next += 1;
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +356,57 @@ mod tests {
             .to_string();
         assert!(err.contains("broken failed"), "{err}");
         assert!(err.contains("the reason"), "{err}");
+    }
+
+    #[test]
+    fn requests_are_answered_in_order_and_a_refused_verb_is_an_error_ack() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = LabCtl::new(dir.path()).unwrap();
+        let log = dir.path().join("asker.log");
+        // What a test does through web/scripts/labctl.mjs: write a request, wait for its ack.
+        let script = r#"
+            ask() {
+                printf '%s' "$2" > "$CTL/$1.req.tmp" && mv "$CTL/$1.req.tmp" "$CTL/$1.req"
+                while [ ! -f "$CTL/$1.ack" ]; do sleep 0.02; done
+                echo "$2 -> $(cat "$CTL/$1.ack")"
+            }
+            ask 1 wan-down; ask 2 no-such-verb; ask 3 wan-up
+        "#;
+        let mut cmd = sh(script);
+        cmd.env("CTL", ctl.dir());
+        let mut seen = Vec::new();
+        ctl.serve_while(cmd, &log, Duration::from_secs(20), |verb| {
+            seen.push(verb.to_owned());
+            if verb == "no-such-verb" {
+                anyhow::bail!("no such verb: {verb}");
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, ["wan-down", "no-such-verb", "wan-up"]);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("wan-down -> ok"), "{text}");
+        assert!(
+            text.contains("no-such-verb -> error: no such verb: no-such-verb"),
+            "{text}"
+        );
+        assert!(text.contains("wan-up -> ok"), "{text}");
+    }
+
+    #[test]
+    fn a_command_that_fails_under_the_lab_is_an_error_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctl = LabCtl::new(dir.path()).unwrap();
+        let err = ctl
+            .serve_while(
+                sh("echo it broke; exit 1"),
+                &dir.path().join("broken.log"),
+                Duration::from_secs(10),
+                |_| Ok(()),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("it broke"), "{err}");
     }
 
     #[test]

@@ -19,6 +19,7 @@ use openfeo_harness::daemons;
 use openfeo_harness::lab::{BOOT_TIMEOUT, ISP_HTTP_BODY, Lab};
 use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Regex};
+use openfeo_harness::qmp::Qmp;
 use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
 use openfeo_harness::web;
@@ -88,6 +89,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "a_harness_build_takes_one_extra_host_name",
         run: a_harness_build_takes_one_extra_host_name,
+    },
+    Scenario {
+        name: "the_javascript_client_works_from_the_lan",
+        run: the_javascript_client_works_from_the_lan,
     },
     Scenario {
         name: "the_panel_in_a_browser_on_the_lan",
@@ -979,5 +984,48 @@ fn a_harness_build_takes_one_extra_host_name(lab: &mut Lab) -> anyhow::Result<()
     ensure!(other.status == 421, "another host: {}", other.status);
     let own = api.get("/api/status", None)?;
     ensure!(own.status == 200, "the router's own name: {}", own.status);
+    Ok(())
+}
+
+/// What a test inside the lab may ask of it (`web/scripts/labctl.mjs`): the WAN port's carrier
+/// and the LAN port's, taken away and given back as the link-flap scenarios do.
+fn lab_verb(qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
+    match verb {
+        "wan-down" => qmp.set_link("p0", false),
+        "wan-up" => qmp.set_link("p0", true),
+        "lan-down" => qmp.set_link("p2", false),
+        "lan-up" => qmp.set_link("p2", true),
+        other => anyhow::bail!("no such verb: {other}"),
+    }
+}
+
+/// `@openfeo/client`'s own tests (SPEC §11), run by Node inside the LAN namespace against the
+/// booted router: the first password, login, state, counters and rates, a WAN that goes and
+/// comes, a LAN link that goes silent and returns, and a session ended from elsewhere.
+/// Skipped, with the reason, on a machine without Node or the workspace's packages.
+fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
+    web::node_ready()?;
+    boot(lab, "")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut vitest = web::tool(&lab.lan0, "vitest")?;
+    vitest
+        .args(["run", "--config", "client/itest/vitest.config.ts"])
+        .env("OPENFEO_ROUTER", "https://192.168.1.1")
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir())
+        // The certificate is the router's own; another scenario compares its fingerprint.
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    ctl.serve_while(
+        vitest,
+        &lab.run_dir.join("client-itest.log"),
+        Duration::from_secs(300),
+        |verb| lab_verb(&mut qmp, verb),
+    )?;
+    password_never_logged(lab)?;
+    ensure!(
+        lab.console()?.count(&re("lab-other-password")) == 0,
+        "the changed password is on the console"
+    );
     Ok(())
 }
