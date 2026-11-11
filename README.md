@@ -26,6 +26,7 @@ decision in SPEC §2 is recorded in [`docs/adr/`](docs/adr/).
 | `kernel/` | Linux 6.18 LTS built from `allnoconfig` plus checked-in fragments, with the binary as its initramfs |
 | `crates/openfeo` | The binary: argument parsing, port enumeration, the router process |
 | `crates/openfeo-init` | PID 1: mounts, sysctls, watchdog, supervisor, console log |
+| `web/` | The web side, an npm workspace: `client` (the API from JavaScript, with no UI in it), `ui` (the design system in code) and `panel` (the router's own panel, built into the binary) |
 | `harness/` | Rootless QEMU lab: network namespaces for two fake ISPs and one or two LANs (plus VLAN clients), reference daemons, scenario tests |
 | `docs/` | ADRs (`adr/`), the design and plan documents each part was built from (`superpowers/`), third-party notes, and `progress.md`, the log of what has landed against SPEC §12 |
 
@@ -39,6 +40,11 @@ package `musl` on Arch, `musl-tools` on Debian and Ubuntu), `pkg-config`, `cargo
 `bind9-dnsutils` on Debian and Ubuntu; the lab's DNS client), `ntpdate` (`ntp` on Arch,
 `ntpsec-ntpdate` on Debian and Ubuntu; the lab's reference time client), `mkfs.ext4`
 (e2fsprogs), `ccache`, and the usual kernel build dependencies (`bc`, `flex`, `bison`, `libelf`, `libssl`, `zstd`, `cpio`).
+The panel is built by Node: `make bin`, `make kernel`, `make lint` and `make test` need Node 22.12
+or later with npm (`make` installs the workspace's packages from its lockfile, running none of
+their scripts). A bare `cargo build` needs no Node and embeds a placeholder page instead
+(ADR-0025). The two lab scenarios that drive the panel in a browser and the client from Node skip
+with their reason until `make panel-browser` has fetched Playwright's Chromium.
 `make` fetches the pinned sources of nftables, libnftnl, libmnl and jansson (`nft/sources.txt`),
 verifies them and builds them statically for the firewall backend, against the UAPI headers of
 the pinned kernel (ADR-0012). The lab runs without

@@ -2,11 +2,12 @@
 // Copyright (C) 2026 Andrew Newton
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import { productionPackages } from './lock.mjs'
 import { gather, licenceFile, notices } from './notices.mjs'
 
 test('each bundled package appears once, by name, with its version, licence and text', () => {
@@ -79,10 +80,23 @@ test('a bundled package with no licence file is named, and the others are read',
 })
 
 test('every text kept here is for a package that needs it', () => {
-  // (so a kept text does not outlive the package, or the day its publisher adds the file)
+  // A kept text must not outlive the package it is for, nor the day its publisher starts
+  // shipping the file: then the package's own text is the one to carry.
   const scripts = new URL('.', import.meta.url)
+  const web = new URL('..', scripts)
   const { texts } = JSON.parse(readFileSync(new URL('licences.json', scripts), 'utf8'))
+  const bundled = productionPackages(JSON.parse(readFileSync(new URL('package-lock.json', web), 'utf8')))
+  assert.ok(Object.keys(texts).length > 0, 'the list of kept texts was read')
   for (const [name, file] of Object.entries(texts)) {
-    assert.ok(readFileSync(new URL(file, scripts), 'utf8').length > 200, `${name}: ${file}`)
+    const installed = bundled.filter((each) => each.name === name)
+    assert.ok(installed.length > 0, `${name} is not among the packages that can reach the panel: its kept text can go`)
+    for (const { path, version } of installed) {
+      assert.equal(
+        licenceFile(readdirSync(new URL(`${path}/`, web))),
+        undefined,
+        `${name}@${version} ships its own licence file now: its kept text can go`,
+      )
+    }
+    assert.ok(readFileSync(new URL(file, scripts), 'utf8').length > 200, `${name}: ${file} is not a licence text`)
   }
 })

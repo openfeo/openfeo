@@ -27,7 +27,7 @@ import { useLive } from '../live'
 import { addresses, cards, defaultWan, headline, ports, tiles } from '../model/dashboard'
 import { sentence, when } from '../model/events'
 import { clock, duration } from '../model/format'
-import { ROUTER, SESSION } from '../session'
+import { ROUTER, SESSION, storageOr } from '../session'
 
 // The dashboard (SPEC §8.4): read-only and live. What it says and how it says it is
 // model/; this arranges it. A page appears in the sidebar in the part that builds it, so for
@@ -62,20 +62,26 @@ const host = computed(() => {
   const status = session.status.value
   return status === null ? '' : [status.hostname, status.domain].filter((part) => part !== '').join('.')
 })
+/** How long the router has been up by now: what it last said, and the time since it said it. */
+const sinceBootMs = computed(() => {
+  const system = state.value?.system
+  return system === undefined ? undefined : Number(system.uptimeSecs) * 1000 + Math.max(0, now.value.getTime() - stateAt)
+})
 const meta = computed(() => {
   const system = state.value?.system
-  if (system === undefined) {
+  if (system === undefined || sinceBootMs.value === undefined) {
     return ''
   }
-  const uptime = Number(system.uptimeSecs) + Math.max(0, (now.value.getTime() - stateAt) / 1000)
-  return `${system.version} · up ${duration(uptime)}`
+  return `${system.version} · up ${duration(sinceBootMs.value / 1000)}`
 })
 
 const nav: NavEntry[] = [{ kind: 'item', label: 'Dashboard', icon: 'layout-dashboard', to: '/', current: true }]
 
-const theme = ref<Theme>(storedTheme(window.localStorage) ?? systemTheme(window.matchMedia?.('(prefers-color-scheme: light)').matches ?? false))
+// The theme is the one thing kept in local storage; where that is blocked, a choice lasts the page.
+const themeStorage = storageOr(() => window.localStorage)
+const theme = ref<Theme>(storedTheme(themeStorage) ?? systemTheme(window.matchMedia?.('(prefers-color-scheme: light)').matches ?? false))
 function setTheme(chosen: Theme): void {
-  chooseTheme(document.documentElement, window.localStorage, chosen)
+  chooseTheme(document.documentElement, themeStorage, chosen)
   theme.value = chosen
 }
 
@@ -111,7 +117,7 @@ const ADDRESS_COLUMNS = [
 ]
 const happened = computed(() =>
   live.events.value.map((event) => ({
-    at: when(event, state.value?.system?.timeSynced === true, now.value),
+    at: when(event, state.value?.system?.timeSynced === true, now.value, sinceBootMs.value),
     parts: sentence(event),
   })),
 )

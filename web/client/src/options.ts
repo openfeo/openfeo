@@ -35,6 +35,10 @@ export interface RouterOptions {
   timers?: Timers
   /** How long a socket may be silent before it is probed, in milliseconds. Default: 30000. */
   probeAfterMs?: number
-  /** How long the probe may go unanswered before the socket is dropped. Default: 10000. */
+  /**
+   * How long the router may go unanswered before it is taken not to be there, in
+   * milliseconds: a probe on a silent socket, a socket that is opening, and each plain call
+   * (status, login, the first password). Default: 10000.
+   */
   probeTimeoutMs?: number
 }

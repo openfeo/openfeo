@@ -54,9 +54,17 @@ Copied on 11 November 2026, file for file:
 | `docs/components/Toast.md` | `components/Toast/README.md` | `5270d540bb6e03966c6c0baa5bc7fd329f83dc61284d61070239e0aa0f85dcd4` |
 | `docs/components/Toggle.md` | `components/Toggle/README.md` | `2f983e00bf89f1d7025acc487a93a3d6ca14ccbde65c98de85879f6d70d475a0` |
 
-The one change to a copied file: `ofo.css` begins with the two licence lines every source
-file in this repository carries; from its third line on it is the design system's
-`components/bundle.css`, and the checksum above is of that file without them.
+Two changes to copied files, and no others:
+
+- `ofo.css` begins with the two licence lines every source file in this repository carries;
+  from its third line on it is the design system's `components/bundle.css`, and the checksum
+  above is of that file without them.
+- `tokens.json`: the sample text of the `data` type style showed a hardware address with a
+  maker's assigned prefix. Every word in this repository is public and its examples use
+  documentation addresses, so the sample here is `02:00:00:0a:11:3e` (a locally administered
+  address). The checksum above is of the design system's file as it was copied; a test
+  (`test/policy.test.ts`) keeps such an address out of the package. The same change is waiting
+  to be made in the design system (`gaps.md`).
 
 Not copied: `components/bundle.js` (the mark's animation, which the panel's first part does
 not use), each component's `preview.html`, and the document's own scaffolding.

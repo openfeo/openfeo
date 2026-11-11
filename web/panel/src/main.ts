@@ -14,11 +14,11 @@ import { createApp } from 'vue'
 
 import App from './App.vue'
 import { panelRoutes } from './routes'
-import { ROUTER, SESSION, sessionStore, useSession } from './session'
+import { ROUTER, SESSION, sessionStore, storageOr, useSession } from './session'
 
 // The router is the one that served this page. The session's token is kept in the tab's own
 // storage: it lasts a reload and ends with the tab, and it is never a cookie.
-const router = new Router({ tokenStore: sessionStore(window.sessionStorage) })
+const router = new Router({ tokenStore: sessionStore(storageOr(() => window.sessionStorage)) })
 const session = useSession(router)
 
 createApp(App).provide(ROUTER, router).provide(SESSION, session).use(panelRoutes(session)).mount('#app')

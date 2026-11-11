@@ -34,8 +34,8 @@ async function loaded() {
   router.push('state', state())
   router.push('counters', counters(1_000n, [['ppp-wan0', 0n, 0n], ['br-lan0', 0n, 0n]]))
   router.push('counters', counters(2_000n, [['ppp-wan0', 51_575_000n, 4_775_000n], ['br-lan0', 4_737_500n, 51_137_500n]]))
-  router.push('events', event('wan.wan0.down', { reason: 'keepalive lost' }, new Date(2026, 10, 7, 9, 14, 19)))
-  router.push('events', event('wan.wan0.up', {}, new Date(2026, 10, 7, 9, 14, 22)))
+  router.push('events', event('wan.wan0.down', { reason: 'keepalive lost' }, new Date(2026, 10, 7, 21, 3, 19)))
+  router.push('events', event('wan.wan0.up', {}, new Date(2026, 10, 7, 21, 3, 22)))
   router.push('events', event('lan.lan0.lease.granted', { address: '192.168.1.23', host: 'pixel-8' }, new Date(2026, 10, 10, 19, 42, 7)))
   await flushPromises()
   return made
@@ -115,8 +115,8 @@ test('with the fixture state it shows the headline, four tiles, three cards, fou
   const events = wrapper.findAll('.dash__events tbody tr')
   expect(events.map((row) => row.findAll('td').map((cell) => cell.text()))).toEqual([
     ['19:42:07', 'lan0 leased 192.168.1.23 to pixel-8.'],
-    ['7 Nov 09:14', 'wan0 up.'],
-    ['7 Nov 09:14', 'wan0 down: keepalive lost.'],
+    ['7 Nov 21:03', 'wan0 up.'],
+    ['7 Nov 21:03', 'wan0 down: keepalive lost.'],
   ])
   expect(events[0]?.findAll('code').map((code) => code.text())).toEqual(['lan0', '192.168.1.23', 'pixel-8'])
   // Nothing leads onward until the Logs page exists.
@@ -143,6 +143,15 @@ test('the uptime keeps counting between the router’s words', async () => {
   expect(wrapper.find('.ofo-topbar__meta').text()).toBe('0.4.0 · up 3d 4h')
   await vi.advanceTimersByTimeAsync(3_600_000)
   expect(wrapper.find('.ofo-topbar__meta').text()).toBe('0.4.0 · up 3d 5h')
+})
+
+test('an event stamped before the clock was set is shown when it happened, not on the day the image was built', async () => {
+  const { wrapper, router } = await dashboard()
+  router.push('state', state())
+  // Four seconds after boot, by a clock that was still the build's.
+  router.push('events', event('wan.wan0.up', {}, new Date(2026, 9, 1, 12, 0, 0), 4_000n))
+  await flushPromises()
+  expect(wrapper.find('.dash__events td').text()).toBe('7 Nov 15:42')
 })
 
 test('before the clock is synced the events show the uptime', async () => {
@@ -245,6 +254,27 @@ test('with no theme chosen the switch starts from what the system prefers, and s
   expect(wrapper.find('.ofo-topbar__end button[aria-label]').attributes('aria-label')).toBe('Use dark theme')
   expect(window.localStorage.getItem(THEME_KEY)).toBeNull()
   expect(document.documentElement.hasAttribute('data-theme')).toBe(false)
+})
+
+test('with storage blocked the dashboard still comes up, and a theme can be chosen for this page', async () => {
+  const real = Object.getOwnPropertyDescriptor(window, 'localStorage')
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    get: () => {
+      throw new DOMException('The operation is insecure.', 'SecurityError')
+    },
+  })
+  try {
+    const { wrapper } = await loaded()
+    expect(wrapper.find('h1').text()).toBe('Dashboard')
+    await wrapper.find('.ofo-topbar__end button[aria-label]').trigger('click')
+    expect(document.documentElement.getAttribute('data-theme')).toBe('light')
+    expect(wrapper.find('.ofo-topbar__end button[aria-label]').attributes('aria-label')).toBe('Use dark theme')
+  } finally {
+    if (real !== undefined) {
+      Object.defineProperty(window, 'localStorage', real)
+    }
+  }
 })
 
 test('leaving the page lets go of the router', async () => {

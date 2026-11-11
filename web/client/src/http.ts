@@ -9,12 +9,16 @@ import { create, fromBinary, toBinary, type DescMessage, type MessageInitShape, 
 
 import { RouterError } from './errors.js'
 import { ErrorCode, ErrorSchema } from './gen/openfeo/v1/api_pb.js'
+import type { Timers } from './options.js'
 
 const PROTOBUF = 'application/x-protobuf'
 
 export interface Http {
   baseUrl: string
   fetch: typeof fetch
+  timers: Timers
+  /** How long a call may take, answer and all, before the router is taken not to be there. */
+  timeoutMs: number
 }
 
 /** The wait a refusal carries: in its `Error`, or in `Retry-After` as whole seconds. */
@@ -65,20 +69,48 @@ export async function call<I extends DescMessage, O extends DescMessage>(
     headers['content-type'] = PROTOBUF
     init.body = toBinary(request.schema, create(request.schema, request.init))
   }
-  let response: Response
-  try {
-    response = await http.fetch(`${http.baseUrl}${path}`, init)
-  } catch {
-    throw new RouterError(ErrorCode.UNAVAILABLE, 'the router did not answer')
+  // A router that lost power a moment ago takes the request down a connection that still looks
+  // open and never answers; a browser would wait minutes. The call is given a limit of its
+  // own, body and all, and the request is told to stop when it runs out.
+  const stop = new AbortController()
+  init.signal = stop.signal
+  const exchange = async (): Promise<MessageShape<O>> => {
+    let response: Response
+    try {
+      response = await http.fetch(`${http.baseUrl}${path}`, init)
+    } catch {
+      throw new RouterError(ErrorCode.UNAVAILABLE, 'the router did not answer')
+    }
+    if (!response.ok) {
+      throw await refused(response)
+    }
+    let body: Uint8Array
+    try {
+      body = new Uint8Array(await response.arrayBuffer())
+    } catch {
+      throw new RouterError(ErrorCode.UNAVAILABLE, 'the router stopped answering')
+    }
+    try {
+      return fromBinary(answer, body)
+    } catch {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered with something that could not be read', {
+        httpStatus: response.status,
+      })
+    }
   }
-  if (!response.ok) {
-    throw await refused(response)
-  }
+  let limit: unknown
+  const tooLong = new Promise<never>((_resolve, reject) => {
+    limit = http.timers.set(() => {
+      stop.abort()
+      reject(new RouterError(ErrorCode.UNAVAILABLE, 'the router did not answer in time'))
+    }, http.timeoutMs)
+  })
+  const answered = exchange()
+  // Whichever loses the race is still settled later; its outcome is nobody's to hear.
+  answered.catch(() => undefined)
   try {
-    return fromBinary(answer, new Uint8Array(await response.arrayBuffer()))
-  } catch {
-    throw new RouterError(ErrorCode.INTERNAL, 'the router answered with something that could not be read', {
-      httpStatus: response.status,
-    })
+    return await Promise.race([answered, tooLong])
+  } finally {
+    http.timers.clear(limit)
   }
 }

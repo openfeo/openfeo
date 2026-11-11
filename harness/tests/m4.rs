@@ -160,41 +160,11 @@ fn password_never_logged(lab: &Lab) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// HTTPS answers on the LAN address, by the router's name and by its address; port 80 sends a
-/// browser to HTTPS; the page is the real panel with its files and its notices.
-fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
-    lab: &mut Lab,
-) -> anyhow::Result<()> {
-    boot(lab, "")?;
-    let api = api(lab)?;
-    let status = api.get("/api/status?format=json", None)?;
-    ensure!(
-        status.status == 200,
-        "status: {} {}",
-        status.status,
-        status.text()
-    );
-    let json: serde_json::Value = status.json()?;
-    ensure!(
-        json["hostname"] == "openfeo" && json["domain"] == "home.arpa",
-        "{json}"
-    );
-    ensure!(json["needs_password"] == true, "{json}");
-    for header in [
-        "content-security-policy",
-        "x-frame-options",
-        "x-content-type-options",
-    ] {
-        ensure!(status.header(header).is_some(), "no {header} header");
-    }
-    let by_address = api.as_host("192.168.1.1").get("/api/status", None)?;
-    ensure!(
-        by_address.status == 200,
-        "by address: {}",
-        by_address.status
-    );
-    // The panel itself (M4 part 1b): an image always carries the real one, never the
-    // placeholder a bare `cargo build` embeds (ADR-0025).
+/// The panel itself (M4 part 1b): an image always carries the real one, never the placeholder
+/// a bare `cargo build` embeds (ADR-0025). The page, revalidated and never stale; its hashed
+/// files, compressed and cached for good; a file the binary does not hold; a route of the
+/// panel; and the notices of what the page bundles.
+fn the_panel_and_its_files_are_served(api: &Api) -> anyhow::Result<()> {
     let page = api.get("/", None)?;
     ensure!(
         page.status == 200 && page.text().contains("<div id=\"app\">"),
@@ -205,6 +175,23 @@ fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
     ensure!(
         !page.text().contains("The panel was not built"),
         "the VM serves the placeholder"
+    );
+    // The page itself is never used stale (a tab left open across an update): it is kept
+    // only to be checked against its tag, and a browser that holds the tag is told so.
+    ensure!(
+        page.header("cache-control") == Some("no-cache"),
+        "the page's cache-control: {:?}",
+        page.header("cache-control")
+    );
+    let tag = page
+        .header("etag")
+        .context("the page has no ETag")?
+        .to_owned();
+    let again = api.request(true, "GET", "/", &[("if-none-match", &tag)], &[])?;
+    ensure!(
+        again.status == 304 && again.text().is_empty(),
+        "the page asked for again with its tag: {}",
+        again.status
     );
     let script = re(r#"src="(/assets/[^"]+\.js)""#)
         .captures(&page.text())
@@ -248,6 +235,43 @@ fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
             "the notices do not mention {needed}"
         );
     }
+    Ok(())
+}
+
+/// HTTPS answers on the LAN address, by the router's name and by its address; port 80 sends a
+/// browser to HTTPS; the page is the real panel with its files and its notices.
+fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    boot(lab, "")?;
+    let api = api(lab)?;
+    let status = api.get("/api/status?format=json", None)?;
+    ensure!(
+        status.status == 200,
+        "status: {} {}",
+        status.status,
+        status.text()
+    );
+    let json: serde_json::Value = status.json()?;
+    ensure!(
+        json["hostname"] == "openfeo" && json["domain"] == "home.arpa",
+        "{json}"
+    );
+    ensure!(json["needs_password"] == true, "{json}");
+    for header in [
+        "content-security-policy",
+        "x-frame-options",
+        "x-content-type-options",
+    ] {
+        ensure!(status.header(header).is_some(), "no {header} header");
+    }
+    let by_address = api.as_host("192.168.1.1").get("/api/status", None)?;
+    ensure!(
+        by_address.status == 200,
+        "by address: {}",
+        by_address.status
+    );
+    the_panel_and_its_files_are_served(&api)?;
     let redirect = api.request(false, "GET", "/somewhere?x=1", &[], &[])?;
     ensure!(redirect.status == 308, "port 80: {}", redirect.status);
     ensure!(

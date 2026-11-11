@@ -18,3 +18,7 @@ across, the working answer lives in `additions.css` or in a component, as noted.
   `span` that holds the pair; the stylesheet's rules work on either.
 - The guidelines do not say what separates a number from its unit in an interface card's
   rates. Here it is a non-breaking space, so the two never part at a line's end.
+- `tokens.json`: the `data` type style's sample holds a hardware address with a maker's
+  assigned prefix. The router's repository is public and uses documentation
+  addresses in every example, so its copy has `02:00:00:0a:11:3e`; the design system's sample
+  should change to match.

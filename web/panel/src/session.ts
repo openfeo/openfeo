@@ -52,6 +52,26 @@ export function passwordProblem(password: string, repeat: string): string | null
   return lengthProblem(password) ?? (password === repeat ? null : 'The two passwords differ.')
 }
 
+/** What stands in for storage the browser will not hand over: nothing is kept, nothing fails. */
+const NO_STORAGE: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> = {
+  getItem: () => null,
+  setItem: () => undefined,
+  removeItem: () => undefined,
+}
+
+/**
+ * The browser's storage, or a stand-in that keeps nothing. With site data blocked, reading
+ * `window.sessionStorage` or `window.localStorage` itself throws; the panel must still come
+ * up, with a session and a theme that last for this page.
+ */
+export function storageOr(get: () => Storage): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
+  try {
+    return get()
+  } catch {
+    return NO_STORAGE
+  }
+}
+
 /** The key the session's token is kept under. The theme aside, it is all the panel stores. */
 export const TOKEN_KEY = 'openfeo.token'
 

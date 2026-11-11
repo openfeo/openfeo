@@ -19,7 +19,10 @@ import type { RouterOptions, Timers, WebSocketLike } from './options.js'
 import { Link, type Connection, type SessionEnd, type Subscription } from './socket.js'
 import { memoryTokenStore, type TokenStore } from './token-store.js'
 
-/** How long a socket may be silent before it is probed, and how long the probe may go unanswered. */
+/**
+ * How long a socket may be silent before it is probed, and how long the router may then go
+ * unanswered: by a probe, by a socket that is opening, or by a plain call.
+ */
 const PROBE_AFTER_MS = 30_000
 const PROBE_TIMEOUT_MS = 10_000
 
@@ -50,9 +53,13 @@ export class Router {
     if (base === undefined) {
       throw new TypeError('Router needs a baseUrl when there is no page to take it from')
     }
+    const timers = options.timers ?? realTimers
+    const probeTimeoutMs = options.probeTimeoutMs ?? PROBE_TIMEOUT_MS
     this.#http = {
       baseUrl: new URL(base).origin,
       fetch: options.fetch ?? ((input, init) => globalThis.fetch(input, init)),
+      timers,
+      timeoutMs: probeTimeoutMs,
     }
     this.#store = options.tokenStore ?? memoryTokenStore()
     const socket = new URL('/ws', this.#http.baseUrl)
@@ -61,9 +68,9 @@ export class Router {
       url: socket.href,
       store: this.#store,
       webSocket: options.webSocket ?? ((url) => new WebSocket(url) as unknown as WebSocketLike),
-      timers: options.timers ?? realTimers,
+      timers,
       probeAfterMs: options.probeAfterMs ?? PROBE_AFTER_MS,
-      probeTimeoutMs: options.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
+      probeTimeoutMs,
     })
   }
 

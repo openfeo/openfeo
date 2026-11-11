@@ -4,7 +4,7 @@
 import { expect, test } from 'vitest'
 
 import { sentence, when, type Part } from '../src/model/events'
-import { event, NOW } from './fixtures'
+import { event, NOW, UPTIME_SECS } from './fixtures'
 
 const text = (parts: Part[]) => parts.map((part) => part.text).join('')
 const mono = (parts: Part[]) => parts.filter((part) => part.mono === true).map((part) => part.text)
@@ -66,4 +66,24 @@ test('before the clock is synced an event shows the uptime', () => {
   // Until SNTP answers the wall clock is the build's; the time since boot is what is true.
   expect(when(event('wan.wan0.up', {}, NOW, 192_000n), false, NOW)).toBe('up 3m 12s')
   expect(when(event('wan.wan0.up', {}, NOW, 999n), false, NOW)).toBe('up 0s')
+})
+
+test('an event from before the clock was set is timed by how long ago it happened, not by its stamp', () => {
+  // The router stamps an event when it happens, and until SNTP answers its clock is only the
+  // build's. Everything at boot (the WAN coming up, the first leases) carries the build's date
+  // for good. How long ago it happened is known from the boot clock, which never jumps.
+  const built = new Date(2026, 9, 1, 12, 0, 0)
+  const atBoot = event('wan.wan0.up', {}, built, 4_000n)
+  // The router has been up a minute, so this was 56 seconds ago.
+  expect(when(atBoot, true, NOW, 60_000)).toBe('19:41:34')
+  // Three days into its uptime the same event is three days old.
+  expect(when(atBoot, true, NOW, UPTIME_SECS * 1000)).toBe('7 Nov 15:42')
+  // With no state at hand there is only the stamp to go by.
+  expect(when(atBoot, true, NOW)).toBe('1 Oct 12:00')
+  // An event the router stamped correctly reads the same either way.
+  const later = event('wan.wan0.down', { reason: 'no carrier' }, new Date(2026, 10, 10, 19, 42, 7))
+  expect(when(later, true, NOW, UPTIME_SECS * 1000)).toBe('19:42:07')
+  expect(when(later, true, NOW)).toBe('19:42:07')
+  // An uptime ahead of the router's own (a state that is a moment stale) is "now", not the future.
+  expect(when(event('wan.wan0.up', {}, built, 61_000n), true, NOW, 60_000)).toBe('19:42:30')
 })

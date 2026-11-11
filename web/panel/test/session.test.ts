@@ -3,7 +3,7 @@
 
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import { passwordProblem, screenFor, sessionStore, TOKEN_KEY, useSession } from '../src/session'
+import { passwordProblem, screenFor, sessionStore, storageOr, TOKEN_KEY, useSession } from '../src/session'
 import { FakeRouter } from './fake-router'
 
 const settled = async () => {
@@ -179,4 +179,21 @@ test('storage that refuses is a session kept for this page only', () => {
   expect(store.get()).toBe('a-token')
   store.clear()
   expect(store.get()).toBeNull()
+})
+
+test('storage the browser will not hand over at all is no storage, not an error', () => {
+  // With site data blocked, reading `window.sessionStorage` itself throws. The panel must
+  // still come up: the session is then kept for this page only.
+  const denied = storageOr(() => {
+    throw new DOMException('The operation is insecure.', 'SecurityError')
+  })
+  expect(denied.getItem('anything')).toBeNull()
+  const store = sessionStore(denied)
+  expect(store.get()).toBeNull()
+  store.set('a-token')
+  expect(store.get()).toBe('a-token')
+  store.clear()
+  expect(store.get()).toBeNull()
+  // Storage that is there is used as it is.
+  expect(storageOr(() => window.sessionStorage)).toBe(window.sessionStorage)
 })

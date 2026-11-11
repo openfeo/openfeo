@@ -22,6 +22,10 @@ import {
 export const WAN_UP_AT = new Date(2026, 10, 7, 9, 14, 22)
 /** Three days and some hours later. */
 export const NOW = new Date(2026, 10, 10, 19, 42, 30)
+/** How long the fixture's router has been up at NOW: `3d 4h`. */
+export const UPTIME_SECS = 273_600
+/** When it booted, by NOW's clock. */
+export const BOOTED = new Date(NOW.getTime() - UPTIME_SECS * 1000)
 
 export function state(): State {
   return create(StateSchema, {
@@ -30,7 +34,7 @@ export function state(): State {
       hostname: 'openfeo',
       domain: 'home.arpa',
       version: '0.4.0',
-      uptimeSecs: 273_600n,
+      uptimeSecs: BigInt(UPTIME_SECS),
       timeSynced: true,
       healthy: true,
       tlsFingerprint: '3F:9A',
@@ -129,6 +133,11 @@ export function counters(monotonicMs: bigint, links: [name: string, rx: bigint, 
   })
 }
 
-export function event(topic: string, fields: Record<string, string> = {}, at: Date = NOW, uptimeMs = 192_000n): Event {
-  return create(EventSchema, { topic, fields, timeUnixMs: BigInt(at.getTime()), uptimeMs })
+/**
+ * An event that happened at `at`. Its uptime is what the fixture's router would have stamped
+ * (the time since BOOTED) unless given: the router's two stamps agree when its clock is right.
+ */
+export function event(topic: string, fields: Record<string, string> = {}, at: Date = NOW, uptimeMs?: bigint): Event {
+  const sinceBoot = BigInt(Math.max(0, at.getTime() - BOOTED.getTime()))
+  return create(EventSchema, { topic, fields, timeUnixMs: BigInt(at.getTime()), uptimeMs: uptimeMs ?? sinceBoot })
 }

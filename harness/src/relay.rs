@@ -182,9 +182,24 @@ mod tests {
         .unwrap();
         let mut stream = client(&relay);
         let mut rest = Vec::new();
-        // The end of the stream, or a reset: either way the client is not left waiting.
+        let asked = std::time::Instant::now();
         let ended = stream.read_to_end(&mut rest);
-        assert!(matches!(ended, Ok(0)) || ended.is_err(), "{ended:?}");
+        // The end of the stream, or a reset: the relay closed it. Not the client's own read
+        // timeout running out, which is what a relay that left it open would look like.
+        let closed = match &ended {
+            Ok(0) => true,
+            Err(err) => matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            ),
+            Ok(_) => false,
+        };
+        assert!(closed, "{ended:?}");
+        assert!(
+            asked.elapsed() < SOON / 2,
+            "closed only after {:?}",
+            asked.elapsed()
+        );
         assert_eq!(rest, b"");
     }
 }

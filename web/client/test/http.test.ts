@@ -14,6 +14,7 @@ import {
   SetInitialPasswordResponseSchema,
 } from '../src/gen/openfeo/v1/api_pb.js'
 import { memoryTokenStore, Router, RouterError } from '../src/index.js'
+import { ManualTimers, settle } from './scripted.js'
 
 const BASE = 'https://openfeo.home.arpa'
 const PROTOBUF = 'application/x-protobuf'
@@ -248,4 +249,54 @@ test('two routers share nothing', async () => {
   await own.login(PASSWORD)
   expect(own.authenticated).toBe(true)
   expect(second.router.authenticated).toBe(false)
+})
+
+test('a call the router never answers is given up after ten seconds, as UNAVAILABLE', async () => {
+  // A router that has just lost power: the request goes down a connection that is still open
+  // and nothing comes back. Without a limit of its own the client waits as long as the
+  // browser does, with a login button that says "Logging in…" for minutes.
+  const timers = new ManualTimers()
+  let signal: AbortSignal | undefined
+  const fetch: typeof globalThis.fetch = (_input, init) =>
+    new Promise<Response>((_resolve, reject) => {
+      signal = init?.signal ?? undefined
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    })
+  const r = new Router({ baseUrl: BASE, fetch, timers })
+  const pending = refusal(r.login(PASSWORD))
+  await settle()
+  timers.advance(9_999)
+  await settle()
+  expect(signal?.aborted).toBe(false)
+  timers.advance(1)
+  const error = await pending
+  expect(error.code).toBe(ErrorCode.UNAVAILABLE)
+  expect(error.message).not.toContain(PASSWORD)
+  // The request itself is told to stop, so nothing is left running behind the error.
+  expect(signal?.aborted).toBe(true)
+  expect(timers.pending).toBe(0)
+  expect(r.authenticated).toBe(false)
+})
+
+test('an answer whose body never arrives is given up too', async () => {
+  const timers = new ManualTimers()
+  const never = new ReadableStream<Uint8Array>({ start: () => undefined })
+  const fetch: typeof globalThis.fetch = () => Promise.resolve(new Response(never, { status: 200, headers: { 'content-type': PROTOBUF } }))
+  const pending = refusal(new Router({ baseUrl: BASE, fetch, timers }).status())
+  await settle()
+  timers.advance(10_000)
+  expect((await pending).code).toBe(ErrorCode.UNAVAILABLE)
+})
+
+test('a call that is answered leaves no timer behind, and the limit is the one given', async () => {
+  const timers = new ManualTimers()
+  const answered = scripted(answer(200, GetStatusResponseSchema, { hostname: 'openfeo' }))
+  await new Router({ baseUrl: BASE, fetch: answered.fetch, timers }).status()
+  expect(timers.pending).toBe(0)
+
+  const hung: typeof globalThis.fetch = () => new Promise<Response>(() => undefined)
+  const pending = refusal(new Router({ baseUrl: BASE, fetch: hung, timers, probeTimeoutMs: 2_000 }).status())
+  await settle()
+  timers.advance(2_000)
+  expect((await pending).code).toBe(ErrorCode.UNAVAILABLE)
 })

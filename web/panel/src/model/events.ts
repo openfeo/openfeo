@@ -87,7 +87,20 @@ export function sentence(event: { topic: string; fields: Record<string, string> 
  * When an event happened, as the panel shows it: by the clock once the router's clock is
  * synced, and by the time since boot before that (until SNTP answers, the wall clock is only
  * the build's).
+ *
+ * The router stamps an event when it happens and never restamps it, so one from before the
+ * clock was set (the WAN coming up at boot, the first leases) carries the build's date for
+ * good. Both of an event's times travel for this: given how long the router has been up
+ * (`sinceBootMs`, from its state), the event's own uptime says how long ago it was, and that
+ * is counted back from now. With no state at hand there is only the stamp.
  */
-export function when(event: Pick<Event, 'timeUnixMs' | 'uptimeMs'>, timeSynced: boolean, now: Date): string {
-  return timeSynced ? clock(event.timeUnixMs, now) : `up ${duration(Number(event.uptimeMs / 1000n))}`
+export function when(event: Pick<Event, 'timeUnixMs' | 'uptimeMs'>, timeSynced: boolean, now: Date, sinceBootMs?: number): string {
+  if (!timeSynced) {
+    return `up ${duration(Number(event.uptimeMs / 1000n))}`
+  }
+  if (sinceBootMs === undefined) {
+    return clock(event.timeUnixMs, now)
+  }
+  const ago = Math.max(0, sinceBootMs - Number(event.uptimeMs))
+  return clock(BigInt(Math.round(now.getTime() - ago)), now)
 }
