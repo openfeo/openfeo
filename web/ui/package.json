@@ -18,5 +18,8 @@
   "scripts": {
     "tokens": "node scripts/tokens.mjs",
     "test": "vitest run"
+  },
+  "dependencies": {
+    "lucide-static": "^1.67.0"
   }
 }

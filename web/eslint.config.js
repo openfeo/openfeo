@@ -48,6 +48,8 @@ export default tseslint.config(
     rules: {
       // The router's content security policy refuses a style attribute.
       'vue/no-static-inline-styles': ['error', { allowBinding: false }],
+      // An optional prop is typed as one; `undefined` is its default.
+      'vue/require-default-prop': 'off',
       // Formatting is not this linter's business.
       'vue/max-attributes-per-line': 'off',
       'vue/singleline-html-element-content-newline': 'off',
@@ -57,5 +59,10 @@ export default tseslint.config(
       'vue/multiline-html-element-content-newline': 'off',
       'vue/first-attribute-linebreak': 'off',
     },
+  },
+  {
+    // An icon's shapes are build-time constants from Lucide's files; nothing else sets markup.
+    files: ['ui/src/components/OfoIcon.vue'],
+    rules: { 'vue/no-v-html': 'off' },
   },
 )

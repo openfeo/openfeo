@@ -16,7 +16,7 @@
   "scripts": {
     "gen": "buf generate ../proto --template buf.gen.yaml",
     "typecheck": "tsc -p client --noEmit && vue-tsc -p ui --noEmit && vue-tsc -p panel --noEmit",
-    "lint": "npm run -s typecheck && eslint . && node scripts/check-layering.mjs && node scripts/check-licences.mjs && npm run -s tokens -w @openfeo/ui -- --check",
+    "lint": "npm run -s typecheck && eslint . --max-warnings 0 && node scripts/check-layering.mjs && node scripts/check-licences.mjs && npm run -s tokens -w @openfeo/ui -- --check",
     "test": "node --test \"scripts/*.test.mjs\" && npm test --workspaces --if-present"
   },
   "devDependencies": {
