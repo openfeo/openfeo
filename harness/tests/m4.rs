@@ -978,6 +978,9 @@ fn the_panel_in_a_browser_on_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
         .context("no fingerprint on the console")?;
     let shots = std::env::var_os("OPENFEO_SHOTS")
         .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    // The LAN host's interface came up a moment ago. Chromium gives up what it has in flight
+    // when the host's addresses change, so it is started once they have settled.
+    web::settle(&lab.lan0, "lan0")?;
     let ctl = web::LabCtl::new(&lab.run_dir)?;
     let mut qmp = lab.qmp()?;
     let mut playwright = web::tool(&lab.lan0, "playwright")?;

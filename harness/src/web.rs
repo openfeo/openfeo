@@ -21,6 +21,8 @@ const NODE_FLOOR: (u32, u32) = (22, 12);
 /// How much of a failed command's log an error carries.
 const LOG_TAIL: usize = 40;
 const POLL: Duration = Duration::from_millis(50);
+/// How long a host's addresses may take to settle before a browser is started on it.
+const SETTLE: Duration = Duration::from_secs(10);
 
 /// The web workspace.
 #[must_use]
@@ -154,6 +156,46 @@ pub fn node(ns: &NetNs) -> Result<Command> {
     let mut cmd = ns.command("node")?;
     cmd.current_dir(web_dir());
     Ok(cmd)
+}
+
+/// Whether `ip -6 -o addr show dev <ifname>` lists addresses that will not change by
+/// themselves: at least one, and none still being checked for a duplicate.
+fn settled(addrs: &str) -> bool {
+    let mut lines = addrs
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .peekable();
+    lines.peek().is_some()
+        && lines.all(|line| line.split_whitespace().all(|word| word != "tentative"))
+}
+
+/// Wait until the IPv6 addresses of `ifname` in `ns` have settled, before a browser is
+/// started there.
+///
+/// An interface just brought up checks its link-local address for a duplicate for a second
+/// or two, and the kernel announces the address only when that ends. Chromium watches those
+/// announcements and gives up everything it has in flight when one comes
+/// (`net::ERR_NETWORK_CHANGED`), so a page asked for in that instant fails to load. Node has
+/// no such watch; only the browser needs this.
+///
+/// # Errors
+///
+/// When `ip` fails, or the addresses have not settled in ten seconds.
+pub fn settle(ns: &NetNs, ifname: &str) -> Result<()> {
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let addrs = ns.ip(&["-6", "-o", "addr", "show", "dev", ifname])?;
+        if settled(&addrs) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "{ifname}'s addresses did not settle within {SETTLE:?}: {}",
+                addrs.trim()
+            );
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 /// Run `cmd` to its end with both its outputs kept in `log`, calling `tick` while it runs.
@@ -312,6 +354,33 @@ mod tests {
         assert!(new_enough((24, 0, 0)));
         assert!(!new_enough((22, 11, 9)));
         assert!(!new_enough((20, 19, 0)));
+    }
+
+    #[test]
+    fn addresses_have_settled_once_there_is_one_and_none_is_tentative() {
+        // As `ip -6 -o addr show dev lan0` prints them in the lab.
+        let checking = "2: lan0    inet6 fe80::3ca1:caff:fe4d:e569/64 scope link tentative proto kernel_ll \\       valid_lft forever preferred_lft forever\n";
+        let usable = "2: lan0    inet6 fe80::3ca1:caff:fe4d:e569/64 scope link proto kernel_ll \\       valid_lft forever preferred_lft forever\n";
+        let second = "2: lan0    inet6 fd12:3456:789a:1::2/64 scope global tentative \\       valid_lft forever preferred_lft forever\n";
+        let refused = "2: lan0    inet6 fe80::1/64 scope link dadfailed tentative \\       valid_lft forever preferred_lft forever\n";
+        assert!(settled(usable));
+        assert!(
+            !settled(checking),
+            "duplicate address detection has not finished"
+        );
+        assert!(
+            !settled(""),
+            "an interface just brought up may not have its address yet"
+        );
+        assert!(!settled("\n"));
+        assert!(
+            !settled(&format!("{usable}{second}")),
+            "one of two is still checked"
+        );
+        assert!(!settled(refused));
+        // The word, not the letters: an interface may be called anything.
+        let named = usable.replace("lan0", "tentative0");
+        assert!(settled(&named));
     }
 
     #[test]

@@ -104,7 +104,10 @@ certificate is presented and handing it back for the scenario to judge; QEMU giv
 (`speed=1000`) so the API has one to report, and the lab's one password is `lab-admin-password`. Two `m4`
 scenarios run the web side inside the LAN namespace against the VM (`harness::web`; M4 part 1b):
 `@openfeo/client`'s own tests under Node (`web/client/itest`, by the LAN address) and the panel in Playwright's
-Chromium (`web/panel/e2e`, by the router's name through a resolver rule), from first visit to a cut WAN. Each
+Chromium (`web/panel/e2e`, by the router's name through a resolver rule), from first visit to a cut WAN; the
+browser is started once the LAN host's IPv6 addresses have settled (`harness::web::settle`), because the kernel
+announces a link-local address only when its duplicate check ends, a second or so after the interface comes up,
+and Chromium fails a first connection made in that instant with `ERR_NETWORK_CHANGED`. Each
 asks the lab to take a port's carrier away and give it back through a control directory (`harness::web::LabCtl`,
 `web/scripts/labctl.mjs`). They need Node 22.12 or later with `web/node_modules` installed, and the browser run
 needs `make panel-browser`; without them they skip with the reason and `make check-env` says which. The browser
