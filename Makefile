@@ -19,12 +19,17 @@ export OPENFEO_NFT_SRC      := $(BUILD)/nft/src
 export OPENFEO_UAPI_INCLUDE := $(BUILD)/kernel/headers/include
 
 BIN := target/$(TARGET)/$(PROFILE)/openfeo
+# Where `make panel` leaves the built panel for the binary to embed.
+PANEL_DIST := $(BUILD)/panel
 
 KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
 .PHONY: bin kernel-src kernel-headers nft-src kernel run test-harness check-env ci lint test fuzz
-bin: kernel-headers nft-src
-	OPENFEO_BUILD_ID=$(BUILD_ID) OPENFEO_BUILD_EPOCH=$(BUILD_EPOCH) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
+.PHONY: web-install web-gen web-lint web-test panel-browser panel
+# The binary carries the panel (ADR-0025): OPENFEO_PANEL_DIST is set for this cargo call and no
+# other, so `make lint` and `make test` build no panel and embed the placeholder.
+bin: kernel-headers nft-src panel
+	OPENFEO_PANEL_DIST=$(PANEL_DIST) OPENFEO_BUILD_ID=$(BUILD_ID) OPENFEO_BUILD_EPOCH=$(BUILD_EPOCH) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 kernel-src:
 	$(KERNEL_ENV) kernel/build.sh fetch
 kernel-headers: kernel-src
@@ -35,13 +40,13 @@ kernel: bin kernel-src
 	$(KERNEL_ENV) kernel/build.sh config $(CURDIR)/$(BIN)
 	$(KERNEL_ENV) kernel/build.sh build
 run: kernel
-	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage $(if $(CONFIG),--config $(CONFIG),)
+	cargo run -q -p openfeo-harness -- run --kernel $(BUILD)/bzImage $(if $(CONFIG),--config $(CONFIG),) $(if $(PANEL),--panel $(PANEL),)
 test-harness: kernel
-	OPENFEO_KERNEL=$(BUILD)/bzImage cargo test -p openfeo-harness --no-fail-fast --test netlink --test nft --test dhcp4 --test dhcp4_server --test dhcp6 --test dns --test sntp --test ndp --test pppoe --test m0 --test m1 --test m2 --test m2pd --test m3 --test m4 -- $(FILTER)
+	OPENFEO_KERNEL=$(BUILD)/bzImage OPENFEO_SHOTS=$(BUILD)/panel-shots cargo test -p openfeo-harness --no-fail-fast --test netlink --test nft --test dhcp4 --test dhcp4_server --test dhcp6 --test dns --test sntp --test ndp --test pppoe --test m0 --test m1 --test m2 --test m2pd --test m3 --test m4 -- $(FILTER)
 check-env: kernel-headers nft-src
 	OPENFEO_KERNEL=$(BUILD)/bzImage cargo run -q -p openfeo-harness -- check
 ci: lint test kernel test-harness
-lint: kernel-headers nft-src
+lint: kernel-headers nft-src web-lint
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 	cargo clippy -p openfeo --all-targets -- -D warnings
@@ -52,8 +57,36 @@ lint: kernel-headers nft-src
 	scripts/check-spdx.sh
 	scripts/check-deps.sh
 	scripts/check-proto.sh
-test: kernel-headers nft-src
+test: kernel-headers nft-src web-test
 	cargo test --workspace --lib --bins --all-features
 	cargo test -p openfeo
 fuzz:
 	cd fuzz && cargo +nightly fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_SECS)
+
+# The web workspace (SPEC §8.4, ADR-0025): Node builds and checks it, cargo never does. npm
+# installs from the lockfile and runs no package's install script.
+WEB_STAMP := web/node_modules/.package-lock.json
+$(WEB_STAMP): web/package-lock.json web/package.json web/client/package.json web/ui/package.json web/panel/package.json
+	cd web && npm ci --ignore-scripts
+	@touch $@
+web-install: $(WEB_STAMP)
+# The TypeScript for proto/openfeo/v1, written into web/client/src/gen (built, not committed).
+web-gen: web-install
+	cd web && npm run -s gen
+web-lint: web-gen
+	cd web && npm run -s lint
+web-test: web-gen
+	cd web && npm test
+# The panel as the binary embeds it: the client built, the page and its files, and the notices
+# of what it bundles (served at /licences.txt).
+# Built beside its place and copied over only where a file's content changed, so that a panel
+# that did not change leaves the directory untouched and cargo does not rebuild the binary.
+panel: web-gen
+	cd web && npm run -s build -w @openfeo/client
+	cd web && npm run -s build -w panel -- --outDir $(PANEL_DIST).new --emptyOutDir
+	node web/scripts/notices.mjs $(PANEL_DIST).new/licences.txt
+	mkdir -p $(PANEL_DIST)
+	rsync -rc --delete $(PANEL_DIST).new/ $(PANEL_DIST)/
+# The Chromium the panel's Playwright run drives (SPEC §11); kept in Playwright's own cache.
+panel-browser: web-install
+	cd web && npx playwright install chromium

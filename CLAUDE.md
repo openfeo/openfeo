@@ -5,10 +5,17 @@ Any deviation from §2 needs an ADR in `docs/adr/` before code; kernel and proto
 the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequences).
 
 ## Commands
-- `make bin`           static musl binary (`--features harness` by default; `FEATURES=` for a release build)
+- `make bin`           static musl binary (`--features harness` by default; `FEATURES=` for a release build);
+                       builds the panel first and embeds it (a bare `cargo build` embeds a placeholder page: ADR-0025)
+- `make panel`         the web panel into `$(BUILD)/panel` with its notices (Node 22; `web/` is an npm workspace)
+- `make web-lint`, `make web-test`  the web workspace's own checks (type-check, ESLint, the layering and licence
+                       gates, generated files up to date; vitest); `make lint` and `make test` run them
 - `make kernel`        fetch/verify/build Linux (see `kernel/`) with the binary embedded → `build/bzImage`
 - `make run`           boot the VM in the rootless lab with the serial console on your terminal (Ctrl-A x quits);
-                       `CONFIG=harness/fixtures/vm-dhcp.toml` boots with a DHCP WAN served by the lab's Kea
+                       `CONFIG=harness/fixtures/vm-dhcp.toml` boots with a DHCP WAN served by the lab's Kea;
+                       `PANEL=<address>:<port>` relays the router's panel to that address of this machine, so a
+                       browser outside the lab can open it (the certificate is the router's own)
+- `make panel-browser` install the Chromium the panel's Playwright run drives (into Playwright's own cache)
 - `make test`          unit tests; `make test-harness` runs the QEMU scenarios (`FILTER=name` to pick one)
 - `make lint`          fmt, clippy (-D warnings), cargo-deny, SPDX headers
 - `make ci`            everything CI runs, in CI's order
@@ -26,6 +33,14 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
   `openfeo-proto-*`, `openfeo-reconcile` and `openfeo-world` are pure: no tokio, libc, nix or socket2 anywhere in
   their dependency trees. `scripts/check-deps.sh` (part of `make lint`) enforces both rules.
 - Every parser gets a fuzz target in the PR that adds it.
+- `web/` is three npm packages with a rule between them (SPEC §8.4), checked by `web/scripts/check-layering.mjs`:
+  `web/client` (`@openfeo/client`, the wire) imports no Vue and uses no DOM beyond `fetch` and `WebSocket`;
+  `web/ui` (`@openfeo/ui`, the design system in code) knows nothing of the API; `web/panel` reaches the wire only
+  through the client and holds no CSS beyond page layout. npm installs from the lockfile without running any
+  package's scripts (`npm ci --ignore-scripts`); a package that can reach the page must pass
+  `web/scripts/check-licences.mjs` (the list is `deny.toml`'s). The page's content security policy allows no inline
+  script, no `style` attribute and no `data:` URL. The design system's own files under `web/ui` (`tokens.json`,
+  `ofo.css`, fonts, logos, `docs/`) are copies: a change is made in the design system first (`web/ui/docs/SOURCE.md`).
 - Every source file starts with `SPDX-License-Identifier: GPL-2.0-or-later` and `Copyright (C) 2026 Andrew Newton`.
 - Commits: `git commit -s` (DCO, identity `Andrew Newton <andy@vitri.ltd>`, set repo-locally), subject `<area>: <summary>`.
 - Test hooks (`openfeo.chaos=`) exist only under the `harness` cargo feature; release builds carry none.
@@ -86,7 +101,17 @@ it on isp0, with radvd and Kea's DHCPv6 server on the session's `ppp<N>` (`Lab::
 `vm-dhcp.toml` and drives the router's API from the LAN namespace through `harness::apiclient`: plain HTTPS
 calls, the WebSocket envelope and gRPC, each on a thread that has entered the namespace, trusting whatever
 certificate is presented and handing it back for the scenario to judge; QEMU gives `p0` a link speed
-(`speed=1000`) so the API has one to report, and the lab's one password is `lab-admin-password`.
+(`speed=1000`) so the API has one to report, and the lab's one password is `lab-admin-password`. Two `m4`
+scenarios run the web side inside the LAN namespace against the VM (`harness::web`; M4 part 1b):
+`@openfeo/client`'s own tests under Node (`web/client/itest`, by the LAN address) and the panel in Playwright's
+Chromium (`web/panel/e2e`, by the router's name through a resolver rule), from first visit to a cut WAN; the
+browser is started once the LAN host's IPv6 addresses have settled (`harness::web::settle`), because the kernel
+announces a link-local address only when its duplicate check ends, a second or so after the interface comes up,
+and Chromium fails a first connection made in that instant with `ERR_NETWORK_CHANGED`. Each
+asks the lab to take a port's carrier away and give it back through a control directory (`harness::web::LabCtl`,
+`web/scripts/labctl.mjs`). They need Node 22.12 or later with `web/node_modules` installed, and the browser run
+needs `make panel-browser`; without them they skip with the reason and `make check-env` says which. The browser
+run leaves a screenshot of each screen in both themes in `$(BUILD)/panel-shots`.
 
 ## Cloud sandbox
 `scripts/cloud-setup.sh` is the setup script for an ephemeral Ubuntu 24.04 sandbox (a Claude Code on the web
@@ -97,6 +122,8 @@ five-minute budget that gets the filesystem snapshotted for later sessions; sour
 `BUILD=/opt/openfeo/build`, outside the clone, and the environment sets the same `BUILD` so every `make` reuses
 them. In such a session run `make check-env` before trusting the harness: without `/dev/kvm` QEMU runs under TCG
 (about 1.2x the KVM wall time, not broken), without the nft and `8021q` modules those scenarios skip with a reason,
-and `OPENFEO_NO_SKIP` stays unset (it is CI's assertion). `make kernel` and `make test-harness` outlast a
+and `OPENFEO_NO_SKIP` stays unset (it is CI's assertion); the script installs Node 22 from nodejs.org and no
+browser, so the Playwright scenario skips there and the client's own tests run, and the environment's network
+list has to allow nodejs.org and the npm registry. `make kernel` and `make test-harness` outlast a
 foreground command there, so run them in the background; build the kernel once per session and only when a QEMU
 scenario is needed, since `make lint` and `make test` do not need it.

@@ -177,8 +177,11 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         &world_rx,
         &health_view_rx,
         &nl,
-        &config_state,
-        version,
+        crate::api::Boot {
+            config_state: config_state.clone(),
+            version: version.to_owned(),
+            extra_host: crate::panel_host::from_cmdline(cmdline),
+        },
     );
     {
         let health = health.clone();

@@ -19,8 +19,10 @@ use openfeo_harness::daemons;
 use openfeo_harness::lab::{BOOT_TIMEOUT, ISP_HTTP_BODY, Lab};
 use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Regex};
+use openfeo_harness::qmp::Qmp;
 use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
+use openfeo_harness::web;
 use serde_json::json;
 
 const SCENARIOS: &[Scenario] = &[
@@ -84,6 +86,18 @@ const SCENARIOS: &[Scenario] = &[
         name: "an_unreadable_config_offers_no_first_password",
         run: an_unreadable_config_offers_no_first_password,
     },
+    Scenario {
+        name: "a_harness_build_takes_one_extra_host_name",
+        run: a_harness_build_takes_one_extra_host_name,
+    },
+    Scenario {
+        name: "the_javascript_client_works_from_the_lan",
+        run: the_javascript_client_works_from_the_lan,
+    },
+    Scenario {
+        name: "the_panel_in_a_browser_on_the_lan",
+        run: the_panel_in_a_browser_on_the_lan,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -146,8 +160,86 @@ fn password_never_logged(lab: &Lab) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The panel itself (M4 part 1b): an image always carries the real one, never the placeholder
+/// a bare `cargo build` embeds (ADR-0025). The page, revalidated and never stale; its hashed
+/// files, compressed and cached for good; a file the binary does not hold; a route of the
+/// panel; and the notices of what the page bundles.
+fn the_panel_and_its_files_are_served(api: &Api) -> anyhow::Result<()> {
+    let page = api.get("/", None)?;
+    ensure!(
+        page.status == 200 && page.text().contains("<div id=\"app\">"),
+        "the page: {} {}",
+        page.status,
+        page.text()
+    );
+    ensure!(
+        !page.text().contains("The panel was not built"),
+        "the VM serves the placeholder"
+    );
+    // The page itself is never used stale (a tab left open across an update): it is kept
+    // only to be checked against its tag, and a browser that holds the tag is told so.
+    ensure!(
+        page.header("cache-control") == Some("no-cache"),
+        "the page's cache-control: {:?}",
+        page.header("cache-control")
+    );
+    let tag = page
+        .header("etag")
+        .context("the page has no ETag")?
+        .to_owned();
+    let again = api.request(true, "GET", "/", &[("if-none-match", &tag)], &[])?;
+    ensure!(
+        again.status == 304 && again.text().is_empty(),
+        "the page asked for again with its tag: {}",
+        again.status
+    );
+    let script = re(r#"src="(/assets/[^"]+\.js)""#)
+        .captures(&page.text())
+        .and_then(|found| found.get(1).map(|path| path.as_str().to_owned()))
+        .context("the page names no script")?;
+    let js = api.request(true, "GET", &script, &[("accept-encoding", "gzip")], &[])?;
+    ensure!(
+        js.status == 200 && js.header("content-encoding") == Some("gzip"),
+        "{script}: {} {:?}",
+        js.status,
+        js.header("content-encoding")
+    );
+    ensure!(
+        js.header("cache-control")
+            .is_some_and(|value| value.contains("immutable")),
+        "{script} is not cached for good"
+    );
+    ensure!(
+        api.get("/assets/nothing-00000000.js", None)?.status == 404,
+        "a missing asset is not 404"
+    );
+    ensure!(
+        api.get("/wan/wan0", None)?
+            .text()
+            .contains("<div id=\"app\">"),
+        "a route of the panel is not the page"
+    );
+    let notices = api.get("/licences.txt", None)?;
+    ensure!(
+        notices.status == 200
+            && notices
+                .header("content-type")
+                .is_some_and(|value| value.starts_with("text/plain")),
+        "the notices: {} {:?}",
+        notices.status,
+        notices.header("content-type")
+    );
+    for needed in ["SIL OPEN FONT LICENSE", "@bufbuild/protobuf", "vue "] {
+        ensure!(
+            notices.text().contains(needed),
+            "the notices do not mention {needed}"
+        );
+    }
+    Ok(())
+}
+
 /// HTTPS answers on the LAN address, by the router's name and by its address; port 80 sends a
-/// browser to HTTPS; the page is the placeholder until part 1b embeds the panel.
+/// browser to HTTPS; the page is the real panel with its files and its notices.
 fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
     lab: &mut Lab,
 ) -> anyhow::Result<()> {
@@ -179,16 +271,7 @@ fn the_api_answers_on_the_lan_over_https_and_port_80_redirects(
         "by address: {}",
         by_address.status
     );
-    let page = api.get("/", None)?;
-    ensure!(
-        page.status == 200
-            && page
-                .text()
-                .contains("The panel was not built into this binary"),
-        "the page: {} {}",
-        page.status,
-        page.text()
-    );
+    the_panel_and_its_files_are_served(&api)?;
     let redirect = api.request(false, "GET", "/somewhere?x=1", &[], &[])?;
     ensure!(redirect.status == 308, "port 80: {}", redirect.status);
     ensure!(
@@ -831,7 +914,7 @@ fn a_refused_config_keeps_its_password(lab: &mut Lab) -> anyhow::Result<()> {
     let api = api(lab)?;
     let status = status(&api)?;
     ensure!(
-        !status.needs_password && status.config_refused,
+        !status.needs_password && status.config_refused && !status.config_unreadable,
         "{status:?}"
     );
     let first = api.post(
@@ -866,12 +949,116 @@ fn an_unreadable_config_offers_no_first_password(lab: &mut Lab) -> anyhow::Resul
     let api = api(lab)?;
     let status = status(&api)?;
     ensure!(
-        !status.needs_password && status.config_refused,
+        !status.needs_password && status.config_refused && status.config_unreadable,
         "{status:?}"
     );
     let first = api.post("/api/password", &json!({ "password": PASSWORD }))?;
     ensure!(first.status == 409, "a first password: {}", first.status);
     let login = api.post("/api/login", &json!({ "password": PASSWORD }))?;
     ensure!(login.status == 401, "a login: {}", login.status);
+    Ok(())
+}
+
+/// The panel in a real browser (SPEC §11, §12): Chromium inside the LAN namespace opens the
+/// router by its name and goes from the first visit (the fingerprint on the page is the
+/// console's) through setting the password, a reload, logging out and in, to the WAN's carrier
+/// lost and returned with the page left as it stood. Screenshots of each screen in both themes
+/// go to `OPENFEO_SHOTS` (the Makefile points it at `$(BUILD)/panel-shots`). Skipped, with the
+/// reason, on a machine without Node or Playwright's Chromium.
+fn the_panel_in_a_browser_on_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
+    web::ready()?;
+    boot(lab, "")?;
+    let fingerprint = lab
+        .console()?
+        .wait_for(&mut Cursor::default(), &re(FINGERPRINT), SOON)?
+        .groups
+        .first()
+        .cloned()
+        .flatten()
+        .context("no fingerprint on the console")?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    // The LAN host's interface came up a moment ago. Chromium gives up what it has in flight
+    // when the host's addresses change, so it is started once they have settled.
+    web::settle(&lab.lan0, "lan0")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args(["test", "--config", "panel/playwright.config.ts"])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_FINGERPRINT", fingerprint)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright.log"),
+        Duration::from_secs(360),
+        |verb| lab_verb(&mut qmp, verb),
+    )?;
+    password_never_logged(lab)
+}
+
+/// The lab's relay (`make run PANEL=`) puts the panel on a host the router does not know. A
+/// harness build is told that host on the kernel command line and takes it as its own; any
+/// other host is still refused, and a release build has no such knob (a unit test of the
+/// binary says so).
+fn a_harness_build_takes_one_extra_host_name(lab: &mut Lab) -> anyhow::Result<()> {
+    boot(lab, "openfeo.panel_host=panel.test")?;
+    let api = api(lab)?;
+    // (No port here: this client sends the host as the TLS server name too. A host with a
+    // port is the gate's unit test.)
+    let relayed = api.as_host("panel.test").get("/api/status", None)?;
+    ensure!(relayed.status == 200, "the extra host: {}", relayed.status);
+    let other = api.as_host("other.test").get("/api/status", None)?;
+    ensure!(other.status == 421, "another host: {}", other.status);
+    let own = api.get("/api/status", None)?;
+    ensure!(own.status == 200, "the router's own name: {}", own.status);
+    Ok(())
+}
+
+/// What a test inside the lab may ask of it (`web/scripts/labctl.mjs`): the WAN port's carrier
+/// and the LAN port's, taken away and given back as the link-flap scenarios do.
+fn lab_verb(qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
+    match verb {
+        "wan-down" => qmp.set_link("p0", false),
+        "wan-up" => qmp.set_link("p0", true),
+        "lan-down" => qmp.set_link("p2", false),
+        "lan-up" => qmp.set_link("p2", true),
+        other => anyhow::bail!("no such verb: {other}"),
+    }
+}
+
+/// `@openfeo/client`'s own tests (SPEC §11), run by Node inside the LAN namespace against the
+/// booted router: the first password, login, state, counters and rates, a WAN that goes and
+/// comes, a LAN link that goes silent and returns, and a session ended from elsewhere.
+/// Skipped, with the reason, on a machine without Node or the workspace's packages.
+fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
+    web::node_ready()?;
+    boot(lab, "")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut vitest = web::tool(&lab.lan0, "vitest")?;
+    vitest
+        .args(["run", "--config", "client/itest/vitest.config.ts"])
+        .env("OPENFEO_ROUTER", "https://192.168.1.1")
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir())
+        // The certificate is the router's own; another scenario compares its fingerprint.
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    ctl.serve_while(
+        vitest,
+        &lab.run_dir.join("client-itest.log"),
+        Duration::from_secs(300),
+        |verb| lab_verb(&mut qmp, verb),
+    )?;
+    password_never_logged(lab)?;
+    ensure!(
+        lab.console()?.count(&re("lab-other-password")) == 0,
+        "the changed password is on the console"
+    );
     Ok(())
 }

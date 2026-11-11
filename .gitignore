@@ -3,3 +3,11 @@
 /.superpowers
 # insta writes a pending snapshot beside the real one when an assertion fails; it is reviewed, never committed
 *.snap.new
+# The web workspace: installed packages, generated message code and build output (ADR-0025)
+/web/node_modules
+# (each package's own, where its tools keep their caches)
+/web/*/node_modules
+/web/client/src/gen
+/web/client/dist
+/web/panel/dist
+/web/panel/e2e-out

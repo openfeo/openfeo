@@ -1,0 +1,21 @@
+{
+  "name": "panel",
+  "version": "0.0.0",
+  "private": true,
+  "license": "GPL-2.0-or-later",
+  "description": "The OpenFeO panel: the pages that join the client and the components",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@openfeo/client": "*",
+    "@openfeo/ui": "*",
+    "vue": "^3.5.0",
+    "vue-router": "^5.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
+  }
+}

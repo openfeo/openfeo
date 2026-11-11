@@ -29,7 +29,6 @@ use prost::Message;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::PLACEHOLDER_PAGE;
 use crate::gate::{host_allowed, origin_allowed};
 use crate::limits::MAX_BODY;
 use crate::server::{ApiError, Shared};
@@ -211,17 +210,9 @@ async fn no_such_call(headers: HeaderMap, RawQuery(query): RawQuery) -> Response
     )
 }
 
-/// Where the panel will be (M4 part 1b embeds it): every path that is not the API's serves the
-/// page, so the panel's own routes survive a reload.
-async fn panel(method: Method) -> Response {
-    if method != Method::GET && method != Method::HEAD {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
-    }
-    (
-        [(CONTENT_TYPE, "text/html; charset=utf-8")],
-        PLACEHOLDER_PAGE,
-    )
-        .into_response()
+/// The panel (SPEC §8.4): every path that is not the API's is one of its files or its page.
+async fn panel(method: Method, uri: axum::http::Uri, headers: HeaderMap) -> Response {
+    crate::assets::serve(crate::assets::PANEL, &method, uri.path(), &headers)
 }
 
 fn is_grpc(request: &Request) -> bool {
@@ -342,6 +333,25 @@ mod tests {
     use crate::server::Limits;
     use crate::server::tests::{PASSWORD, problem};
     use crate::testing::{TestApi, spawn_api, spawn_api_full, spawn_api_with_limits};
+
+    #[tokio::test]
+    async fn the_security_headers_are_on_a_panel_file_too() {
+        let api = spawn_api(ConfigState::Loaded).await;
+        for path in ["/", "/some/route/of/the/panel"] {
+            let page = api.get(path).await;
+            assert_eq!(page.status, 200, "{path}");
+            for header in [
+                "content-security-policy",
+                "x-frame-options",
+                "x-content-type-options",
+                "referrer-policy",
+            ] {
+                assert!(page.header(header).is_some(), "{path}: no {header}");
+            }
+        }
+        // A file under assets/ that the binary does not hold is not the page.
+        assert_eq!(api.get("/assets/nothing.js").await.status, 404);
+    }
 
     #[tokio::test]
     async fn a_router_with_no_password_answers_only_status_and_the_first_password() {

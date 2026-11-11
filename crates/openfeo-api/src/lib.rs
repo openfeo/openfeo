@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod assets;
 pub mod auth;
 pub mod cert;
 pub mod envelope;
@@ -76,6 +77,10 @@ pub struct ApiDeps {
     pub listen: Listen,
     /// The limits in force.
     pub limits: Limits,
+    /// One more `Host` taken as the router's own, beside its two names and its addresses.
+    /// Always `None` in a release build: only a harness build reads the knob that sets it
+    /// (`openfeo.panel_host=`, for the lab's relay).
+    pub extra_host: Option<String>,
 }
 
 /// Bind and serve the API until a listener fails.

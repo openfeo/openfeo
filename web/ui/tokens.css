@@ -1,0 +1,141 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (C) 2026 Andrew Newton */
+/* Generated from tokens.json by scripts/tokens.mjs: change the tokens and run `npm run tokens`. */
+
+@font-face {
+  font-family:"Instrument Sans";
+  src:url("./fonts/InstrumentSans-Variable.woff2") format("woff2");
+  font-weight:400 700;
+  font-style:normal;
+  font-display:swap;
+}
+
+@font-face {
+  font-family:"JetBrains Mono";
+  src:url("./fonts/JetBrainsMono-Variable.woff2") format("woff2");
+  font-weight:100 800;
+  font-style:normal;
+  font-display:swap;
+}
+
+:root, :root[data-theme="dark"] {
+  --font-sans:"Instrument Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --font-mono:"JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --space-1:4px;
+  --space-2:8px;
+  --space-3:12px;
+  --space-4:16px;
+  --space-5:24px;
+  --space-6:32px;
+  --space-7:48px;
+  --space-8:64px;
+  --space-9:96px;
+  --radius-sm:3px;
+  --radius-md:6px;
+  --radius-lg:10px;
+  --radius-full:999px;
+  --control-sm:28px;
+  --control-md:36px;
+  --control-lg:44px;
+  --ground:#0e1114;
+  --surface:#15191e;
+  --surface-raised:#1c2127;
+  --surface-sunken:#0a0c0f;
+  --line:#272d35;
+  --line-strong:#68737f;
+  --ink:#e7ebee;
+  --ink-muted:#9ba6b1;
+  --oxide:#f0773f;
+  --oxide-hover:#f58c5a;
+  --on-oxide:#1a0b04;
+  --oxide-soft:#3a1c10;
+  --oxide-deep:#7c2b0c;
+  --on-oxide-deep:#fde9de;
+  --oxide-bright:#f0773f;
+  --steel:#3a4652;
+  --ok:#3cc2b0;
+  --ok-soft:#0f2c29;
+  --warn:#e9b949;
+  --warn-soft:#33280c;
+  --danger:#ff6b84;
+  --danger-soft:#3a131c;
+  --on-danger:#1f0409;
+  --info:#6cb2ff;
+  --info-soft:#13243a;
+  --focus:#8cc6ff;
+  --link:var(--info);
+  --series-1:var(--oxide);
+  --series-2:var(--info);
+  --series-3:#b99cf5;
+  --shadow-pop:0 8px 24px rgba(0,0,0,0.5), 0 0 0 1px #272d35;
+}
+
+:root[data-theme="light"] {
+  --ground:#f3f4f5;
+  --surface:#ffffff;
+  --surface-raised:#f8f9fa;
+  --surface-sunken:#eceef0;
+  --line:#dde1e5;
+  --line-strong:#7f8a95;
+  --ink:#14181c;
+  --ink-muted:#56616c;
+  --oxide:#b13f0d;
+  --oxide-hover:#953409;
+  --on-oxide:#ffffff;
+  --oxide-soft:#fbe7dd;
+  --oxide-deep:#7c2b0c;
+  --on-oxide-deep:#fde9de;
+  --oxide-bright:#f0773f;
+  --steel:#c9d1d8;
+  --ok:#0b7468;
+  --ok-soft:#ddf3f0;
+  --warn:#855800;
+  --warn-soft:#fbefd2;
+  --danger:#c01a3c;
+  --danger-soft:#fbe1e6;
+  --on-danger:#ffffff;
+  --info:#1d5fb8;
+  --info-soft:#e0ecfb;
+  --focus:#1d5fb8;
+  --link:var(--info);
+  --series-1:var(--oxide);
+  --series-2:var(--info);
+  --series-3:#6a44c2;
+  --shadow-pop:0 8px 24px rgba(20,24,28,0.12), 0 0 0 1px #dde1e5;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --ground:#f3f4f5;
+    --surface:#ffffff;
+    --surface-raised:#f8f9fa;
+    --surface-sunken:#eceef0;
+    --line:#dde1e5;
+    --line-strong:#7f8a95;
+    --ink:#14181c;
+    --ink-muted:#56616c;
+    --oxide:#b13f0d;
+    --oxide-hover:#953409;
+    --on-oxide:#ffffff;
+    --oxide-soft:#fbe7dd;
+    --oxide-deep:#7c2b0c;
+    --on-oxide-deep:#fde9de;
+    --oxide-bright:#f0773f;
+    --steel:#c9d1d8;
+    --ok:#0b7468;
+    --ok-soft:#ddf3f0;
+    --warn:#855800;
+    --warn-soft:#fbefd2;
+    --danger:#c01a3c;
+    --danger-soft:#fbe1e6;
+    --on-danger:#ffffff;
+    --info:#1d5fb8;
+    --info-soft:#e0ecfb;
+    --focus:#1d5fb8;
+    --link:var(--info);
+    --series-1:var(--oxide);
+    --series-2:var(--info);
+    --series-3:#6a44c2;
+    --shadow-pop:0 8px 24px rgba(20,24,28,0.12), 0 0 0 1px #dde1e5;
+  }
+}

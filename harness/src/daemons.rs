@@ -116,6 +116,11 @@ impl Daemon {
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// How the process ended, once it has: for a command that is run to its end, not a daemon.
+    pub fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
 }
 
 /// Every process below `pid`, children before their own children, from each thread's

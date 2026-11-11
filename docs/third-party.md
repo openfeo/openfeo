@@ -22,6 +22,20 @@ primitives are C and assembly derived from BoringSSL, built by its own build scr
 by `cargo deny` like every other crate. No OpenSSL and no aws-lc is linked; `deny.toml` bans
 both.
 
+Since M4 part 1b the binary also carries the web panel: JavaScript, a stylesheet, two fonts and
+five logo files, embedded when the image is built (ADR-0025). The page is built from
+[Vue](https://vuejs.org) and [Vue Router](https://router.vuejs.org) (MIT),
+[@bufbuild/protobuf](https://github.com/bufbuild/protobuf-es) (Apache-2.0 AND BSD-3-Clause) and a
+handful of [Lucide](https://lucide.dev) icons (ISC). The fonts are
+[Instrument Sans](https://github.com/Instrument/instrument-sans) and
+[JetBrains Mono](https://github.com/JetBrains/JetBrainsMono), both SIL OFL 1.1, accepted for font
+files only (SPEC §14). `web/scripts/check-licences.mjs`, part of `make lint`, holds every npm
+package that can reach the page to the list `cargo deny` applies; the panel's build writes each
+one's licence text and the fonts' into one file, which the router serves at `/licences.txt` without
+a login. That file names more packages than the page contains (a package's build-time helpers are
+counted with it), which errs on the side of saying too much. @bufbuild/protobuf is published
+without its licence file; its text is kept in `web/scripts/licence-texts/`.
+
 Not in the binary: [dhcproto](https://github.com/bluecatengineering/dhcproto) (MIT) is a
 dev-dependency of `openfeo-proto-dhcp4` and a dependency of the fuzz crate, where it serves as
 the second opinion our own DHCPv4 codec is checked against. It reaches no shipped artefact.

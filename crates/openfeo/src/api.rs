@@ -110,6 +110,18 @@ impl CounterSource for RouterCounters {
     }
 }
 
+/// What the API is told once, at boot.
+#[derive(Debug, Clone)]
+pub struct Boot {
+    /// How the running config came to be.
+    pub config_state: ConfigState,
+    /// The binary's version.
+    pub version: String,
+    /// One more host the API takes as its own: the lab's relay, in a harness build
+    /// ([`crate::panel_host`]); always `None` in a release build.
+    pub extra_host: Option<String>,
+}
+
 /// Run the API as a supervised task: restarted if it dies, named by health if it will not
 /// stay up, like any other.
 pub fn spawn(
@@ -118,16 +130,18 @@ pub fn spawn(
     world: &WorldRx,
     health: &watch::Receiver<HealthView>,
     nl: &Netlink,
-    config_state: &ConfigState,
-    version: &str,
+    boot: Boot,
 ) {
     let (publisher, world, health) = (publisher.clone(), world.clone(), health.clone());
     let counters: Arc<dyn CounterSource> = Arc::new(RouterCounters::new(nl.clone()));
-    let (config_state, version) = (config_state.clone(), version.to_owned());
     supervisor.spawn("api", move || {
         let (publisher, world, health) = (publisher.clone(), world.clone(), health.clone());
-        let (counters, config_state, version) =
-            (counters.clone(), config_state.clone(), version.clone());
+        let counters = counters.clone();
+        let Boot {
+            config_state,
+            version,
+            extra_host,
+        } = boot.clone();
         async move {
             openfeo_api::run(ApiDeps {
                 world,
@@ -145,6 +159,7 @@ pub fn spawn(
                     admit: Arc::new(openfeo_api::gate::client_admitted),
                 },
                 limits: Limits::default(),
+                extra_host,
             })
             .await
         }

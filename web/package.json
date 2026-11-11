@@ -1,0 +1,38 @@
+{
+  "name": "openfeo-web",
+  "version": "0.0.0",
+  "private": true,
+  "license": "GPL-2.0-or-later",
+  "description": "OpenFeO's web workspace: the API client, the component package and the panel (SPEC \u00a78.4)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "workspaces": [
+    "client",
+    "ui",
+    "panel"
+  ],
+  "scripts": {
+    "gen": "buf generate ../proto --template buf.gen.yaml",
+    "typecheck": "tsc -p client --noEmit && vue-tsc -p ui --noEmit && vue-tsc -p panel --noEmit",
+    "lint": "npm run -s typecheck && eslint . --max-warnings 0 && node scripts/check-layering.mjs && node scripts/check-licences.mjs && npm run -s tokens -w @openfeo/ui -- --check",
+    "test": "node --test \"scripts/*.test.mjs\" && npm test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "^2.0.0",
+    "@eslint/js": "^10.0.0",
+    "@types/node": "^22.0.0",
+    "@vitejs/plugin-vue": "^6.0.0",
+    "@vue/test-utils": "^2.5.0",
+    "eslint": "^10.0.0",
+    "eslint-plugin-vue": "^10.0.0",
+    "globals": "^17.0.0",
+    "happy-dom": "^21.0.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.0.0",
+    "vite": "^8.0.0",
+    "vitest": "^5.0.0",
+    "vue-tsc": "^3.3.0"
+  }
+}

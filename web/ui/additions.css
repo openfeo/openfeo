@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* Copyright (C) 2026 Andrew Newton */
+
+/* What building the panel showed the design system's stylesheet (ofo.css) lacked. Each rule
+   says why it is here, and docs/gaps.md lists them so they can go back to the design system,
+   which stays the source: once a rule is there and copied across, it leaves this file. */
+
+/* A stat tile's sparkline has no colour of its own in ofo.css: the design system's preview
+   sets the stroke with a style attribute, which the router's content security policy
+   refuses. Download is series 1, upload series 2. */
+.ofo-spark--s1 path { stroke: var(--series-1); }
+.ofo-spark--s2 path { stroke: var(--series-2); }
+
+/* ofo.css sizes an icon inside a button, a nav item and a banner, and nowhere else. */
+.ofo-icon { width: 16px; height: 16px; flex: none; }

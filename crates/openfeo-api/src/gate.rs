@@ -21,6 +21,9 @@ pub struct Names {
     pub hostname: String,
     /// `openfeo.home.arpa`.
     pub fqdn: String,
+    /// One more host taken as the router's own, lower-case: a name or an address literal.
+    /// Only a harness build is ever given one (the lab's relay, `make run PANEL=`).
+    pub extra: Option<String>,
 }
 
 impl Names {
@@ -31,7 +34,18 @@ impl Names {
         Names {
             hostname: names.next().unwrap_or_default(),
             fqdn: names.next().unwrap_or_default(),
+            extra: None,
         }
+    }
+
+    /// The same names with one more host taken as the router's own; `None` or an empty host
+    /// adds nothing.
+    #[must_use]
+    pub fn with_extra(mut self, extra: Option<&str>) -> Self {
+        self.extra = extra
+            .filter(|host| !host.is_empty())
+            .map(str::to_ascii_lowercase);
+        self
     }
 }
 
@@ -114,7 +128,8 @@ fn is_port(text: &str) -> bool {
 }
 
 /// Whether a request's `Host` (or `:authority`) is the router: one of its two names, or an
-/// address literal the kernel holds on any interface; any port.
+/// address literal the kernel holds on any interface; any port. A harness build may be told
+/// one more host ([`Names::with_extra`]).
 #[must_use]
 pub fn host_allowed(host: &str, names: &Names, world: &World) -> bool {
     let Some(host) = host_only(host) else {
@@ -125,7 +140,7 @@ pub fn host_allowed(host: &str, names: &Names, world: &World) -> bool {
     if name.is_empty() {
         return false;
     }
-    if name == names.hostname || name == names.fqdn {
+    if name == names.hostname || name == names.fqdn || names.extra.as_deref() == Some(&name) {
         return true;
     }
     host.parse::<IpAddr>()
@@ -349,8 +364,44 @@ mod tests {
             names(),
             Names {
                 hostname: "openfeo".into(),
-                fqdn: "openfeo.home.arpa".into()
+                fqdn: "openfeo.home.arpa".into(),
+                extra: None,
             }
         );
+    }
+
+    #[test]
+    fn one_extra_host_is_the_routers_own_when_given() {
+        // The lab relay (`make run PANEL=`) puts the panel on an address of the developer's
+        // machine; a harness build is told that host and takes it as its own.
+        let world = world();
+        let relayed = names().with_extra(Some("192.0.2.10"));
+        assert!(host_allowed("192.0.2.10:8443", &relayed, &world));
+        assert!(host_allowed("192.0.2.10", &relayed, &world));
+        assert!(origin_allowed(
+            Some("https://192.0.2.10:8443"),
+            &relayed,
+            &world
+        ));
+        assert!(!host_allowed("192.0.2.11:8443", &relayed, &world));
+        assert!(!origin_allowed(
+            Some("http://192.0.2.10:8443"),
+            &relayed,
+            &world
+        ));
+        assert!(
+            host_allowed("openfeo.home.arpa", &relayed, &world),
+            "its own names still pass"
+        );
+        // Without it the same host is foreign.
+        assert!(!host_allowed("192.0.2.10:8443", &names(), &world));
+        assert_eq!(names().with_extra(None), names());
+        // A name is compared without regard to case, and may carry the root's dot.
+        let named = names().with_extra(Some("Panel.Test"));
+        assert!(host_allowed("panel.test:8443", &named, &world));
+        assert!(host_allowed("PANEL.test.", &named, &world));
+        assert!(!host_allowed("other.test", &named, &world));
+        // An empty extra host is no extra host.
+        assert!(!host_allowed("", &names().with_extra(Some("")), &world));
     }
 }
