@@ -20,6 +20,8 @@ export default defineConfig({
     baseURL: process.env.OPENFEO_PANEL_URL,
     // The certificate is the router's own (SPEC §9); the harness compares its fingerprint.
     ignoreHTTPSErrors: true,
+    // The panel follows the system's theme until the person chooses; dark is its first.
+    colorScheme: 'dark',
     launchOptions: {
       args: resolve === undefined ? [] : [`--host-resolver-rules=MAP ${resolve}`],
     },

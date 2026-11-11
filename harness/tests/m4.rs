@@ -935,38 +935,44 @@ fn an_unreadable_config_offers_no_first_password(lab: &mut Lab) -> anyhow::Resul
     Ok(())
 }
 
-/// Node and Chromium run inside the LAN namespace and reach the router as a LAN host does:
-/// Node by the LAN address, the browser by the router's name, each trusting the router's own
-/// certificate. Skipped, with the reason, on a machine without Node or Playwright's Chromium.
+/// The panel in a real browser (SPEC §11, §12): Chromium inside the LAN namespace opens the
+/// router by its name and goes from the first visit (the fingerprint on the page is the
+/// console's) through setting the password, a reload, logging out and in, to the WAN's carrier
+/// lost and returned with the page left as it stood. Screenshots of each screen in both themes
+/// go to `OPENFEO_SHOTS` (the Makefile points it at `$(BUILD)/panel-shots`). Skipped, with the
+/// reason, on a machine without Node or Playwright's Chromium.
 fn the_panel_in_a_browser_on_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
     web::ready()?;
     boot(lab, "")?;
-    let mut node = web::node(&lab.lan0)?;
-    node.args([
-        "--input-type=module",
-        "-e",
-        "const r = await fetch('https://192.168.1.1/api/status?format=json'); \
-         console.log('hostname', (await r.json()).hostname)",
-    ])
-    .env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
-    let log = lab.run_dir.join("node.log");
-    web::run_logged(node, &log, Duration::from_secs(30))?;
-    let said = std::fs::read_to_string(&log)?;
-    ensure!(
-        said.contains("hostname openfeo"),
-        "node did not read the status: {said}"
-    );
+    let fingerprint = lab
+        .console()?
+        .wait_for(&mut Cursor::default(), &re(FINGERPRINT), SOON)?
+        .groups
+        .first()
+        .cloned()
+        .flatten()
+        .context("no fingerprint on the console")?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
     let mut playwright = web::tool(&lab.lan0, "playwright")?;
     playwright
         .args(["test", "--config", "panel/playwright.config.ts"])
         .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
         .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
-        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e"));
-    web::run_logged(
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_FINGERPRINT", fingerprint)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
         playwright,
         &lab.run_dir.join("playwright.log"),
-        Duration::from_secs(180),
-    )
+        Duration::from_secs(360),
+        |verb| lab_verb(&mut qmp, verb),
+    )?;
+    password_never_logged(lab)
 }
 
 /// The lab's relay (`make run PANEL=`) puts the panel on a host the router does not know. A
