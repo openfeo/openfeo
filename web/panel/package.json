@@ -13,5 +13,8 @@
     "@openfeo/ui": "*",
     "vue": "^3.5.0",
     "vue-router": "^5.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0"
   }
 }

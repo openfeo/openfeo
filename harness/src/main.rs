@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use openfeo_harness::lab::{ISP_HTTP_BODY, ISP0_ADDR, ISP1_ADDR, Lab, workspace_root};
 use openfeo_harness::lanclient::{self, DhcpClientArgs};
 use openfeo_harness::{daemons, qemu, sandbox};
-use openfeo_harness::{nftprobe, scenario, vlanprobe};
+use openfeo_harness::{nftprobe, scenario, vlanprobe, web};
 
 #[derive(Parser)]
 #[command(
@@ -214,6 +214,7 @@ fn check() -> Result<ExitCode> {
     ] {
         report(bin, on_path(bin), "");
     }
+    report_web(&mut report);
     for (daemon, rendered) in [
         ("kea-dhcp4", daemons::render_kea_dhcp4("lo")),
         (
@@ -326,6 +327,25 @@ fn busybox_has(applet: &str) -> bool {
                 .lines()
                 .any(|line| line.trim() == applet)
         })
+}
+
+/// What the web workspace needs: Node and npm for its own checks (`make web-lint`,
+/// `make web-test`) and the panel's build, and Playwright's Chromium for the browser scenarios,
+/// which skip without it.
+fn report_web(report: &mut impl FnMut(&str, bool, &str)) {
+    match web::node_version() {
+        Ok(version) => report("node >= 22.12", true, &format!(" ({version})")),
+        Err(why) => report("node >= 22.12", false, &format!(" ({why})")),
+    }
+    report("npm", on_path("npm"), "");
+    report("web/node_modules", web::installed(), " (make web-install)");
+    match web::chromium() {
+        Ok(_) => println!("{:<30} ok", "Playwright's Chromium"),
+        Err(why) => println!(
+            "{:<30} no ({why}; the browser and client scenarios skip: make panel-browser)",
+            "Playwright's Chromium"
+        ),
+    }
 }
 
 fn on_path(bin: &str) -> bool {

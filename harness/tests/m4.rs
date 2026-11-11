@@ -21,6 +21,7 @@ use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Regex};
 use openfeo_harness::sandbox;
 use openfeo_harness::scenario::{Scenario, run_all};
+use openfeo_harness::web;
 use serde_json::json;
 
 const SCENARIOS: &[Scenario] = &[
@@ -83,6 +84,10 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "an_unreadable_config_offers_no_first_password",
         run: an_unreadable_config_offers_no_first_password,
+    },
+    Scenario {
+        name: "the_panel_in_a_browser_on_the_lan",
+        run: the_panel_in_a_browser_on_the_lan,
     },
 ];
 
@@ -874,4 +879,38 @@ fn an_unreadable_config_offers_no_first_password(lab: &mut Lab) -> anyhow::Resul
     let login = api.post("/api/login", &json!({ "password": PASSWORD }))?;
     ensure!(login.status == 401, "a login: {}", login.status);
     Ok(())
+}
+
+/// Node and Chromium run inside the LAN namespace and reach the router as a LAN host does:
+/// Node by the LAN address, the browser by the router's name, each trusting the router's own
+/// certificate. Skipped, with the reason, on a machine without Node or Playwright's Chromium.
+fn the_panel_in_a_browser_on_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
+    web::ready()?;
+    boot(lab, "")?;
+    let mut node = web::node(&lab.lan0)?;
+    node.args([
+        "--input-type=module",
+        "-e",
+        "const r = await fetch('https://192.168.1.1/api/status?format=json'); \
+         console.log('hostname', (await r.json()).hostname)",
+    ])
+    .env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    let log = lab.run_dir.join("node.log");
+    web::run_logged(node, &log, Duration::from_secs(30))?;
+    let said = std::fs::read_to_string(&log)?;
+    ensure!(
+        said.contains("hostname openfeo"),
+        "node did not read the status: {said}"
+    );
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args(["test", "--config", "panel/playwright.config.ts"])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e"));
+    web::run_logged(
+        playwright,
+        &lab.run_dir.join("playwright.log"),
+        Duration::from_secs(180),
+    )
 }

@@ -23,7 +23,7 @@ BIN := target/$(TARGET)/$(PROFILE)/openfeo
 KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
 .PHONY: bin kernel-src kernel-headers nft-src kernel run test-harness check-env ci lint test fuzz
-.PHONY: web-install web-gen web-lint web-test
+.PHONY: web-install web-gen web-lint web-test panel-browser
 bin: kernel-headers nft-src
 	OPENFEO_BUILD_ID=$(BUILD_ID) OPENFEO_BUILD_EPOCH=$(BUILD_EPOCH) cargo build -p openfeo --$(PROFILE) --target $(TARGET) $(if $(FEATURES),--features $(FEATURES))
 kernel-src:
@@ -73,3 +73,6 @@ web-lint: web-gen
 	cd web && npm run -s lint
 web-test: web-gen
 	cd web && npm test
+# The Chromium the panel's Playwright run drives (SPEC §11); kept in Playwright's own cache.
+panel-browser: web-install
+	cd web && npx playwright install chromium
