@@ -53,11 +53,21 @@ pub enum Why {
 }
 
 /// An apply the keeper will take: see [`Keeper::accept`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Accepted {
     config: Arc<Config>,
     pending: Option<PendingFact>,
     effects: Vec<Effect>,
+}
+
+/// By hand: the config holds the admin's hash and the PPPoE passwords, and is not printed.
+impl std::fmt::Debug for Accepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Accepted")
+            .field("pending", &self.pending)
+            .field("effects", &self.effects)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Accepted {
@@ -81,7 +91,6 @@ impl Accepted {
 }
 
 /// Which config is confirmed, which is running, and what is pending.
-#[derive(Debug)]
 pub struct Keeper {
     /// What `config.toml` says, or the defaults the router started on.
     confirmed: Arc<Config>,
@@ -89,6 +98,17 @@ pub struct Keeper {
     pending: Option<(Arc<Config>, PendingFact)>,
     default_window_secs: u32,
     file_refused: bool,
+}
+
+/// By hand: neither config is printed, for the secrets they hold.
+impl std::fmt::Debug for Keeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keeper")
+            .field("pending", &self.pending.as_ref().map(|(_, fact)| fact))
+            .field("default_window_secs", &self.default_window_secs)
+            .field("file_refused", &self.file_refused)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Keeper {
@@ -288,6 +308,31 @@ mod tests {
 
     fn keeper(config: Config) -> Keeper {
         Keeper::new(Arc::new(config), &ConfigState::Loaded, DEFAULT_WINDOW_SECS)
+    }
+
+    /// The keeper, what it accepts and the fact it publishes all hold whole configs, the
+    /// admin's hash and a PPPoE password in them: none says any of it when printed for a log.
+    #[test]
+    fn nothing_the_keeper_holds_is_printed_with_its_config() {
+        let mut keeper = keeper(pppoe());
+        let tag = secrets::tag(keeper.running());
+        let accepted = keeper
+            .accept(with_reservation(pppoe()), &tag, false, 0, &ports(), NOW)
+            .unwrap();
+        let fact = accepted.pending().unwrap().clone();
+        let mut printed = vec![format!("{accepted:?}"), format!("{fact:?}")];
+        keeper.commit(accepted);
+        printed.push(format!("{keeper:?}"));
+        for text in printed {
+            assert!(
+                !text.contains(HASH)
+                    && !text.contains("example-secret")
+                    && !text.contains("password"),
+                "{text}"
+            );
+            // It still says what is going on.
+            assert!(text.contains("120"), "{text}");
+        }
     }
 
     /// `config` with a reservation more on `lan0`.

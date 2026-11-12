@@ -62,7 +62,7 @@ pub struct Effect {
 }
 
 /// A change that is running and will revert by itself unless it is confirmed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PendingFact {
     /// The config it goes back to. The keeper of the config holds it too; it is here for
     /// whoever finds the change pending with nobody keeping its window (the API task was
@@ -78,6 +78,19 @@ pub struct PendingFact {
     pub effects: Vec<Effect>,
     /// The LANs it touches: their DHCPv4 servers grant no lease longer than the window.
     pub lans: BTreeSet<String>,
+}
+
+/// By hand: the config it goes back to holds secrets and is not printed.
+impl std::fmt::Debug for PendingFact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingFact")
+            .field("applied_boot_ms", &self.applied_boot_ms)
+            .field("reverts_boot_ms", &self.reverts_boot_ms)
+            .field("window_secs", &self.window_secs)
+            .field("effects", &self.effects)
+            .field("lans", &self.lans)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]
