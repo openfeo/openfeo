@@ -576,9 +576,19 @@ from the design above.
 - A changed domain restarts the LAN's DHCP server as well as renaming the router: the server
   hands the domain out.
 - What stopping means, family by family: the DHCPv4 client releases a lease it holds (not one
-  it is still confirming after a reboot); PPPoE sends Terminate-Request and PADT, cut short at
-  three seconds against a concentrator that says nothing; the router-advertisement and DHCPv6
-  clients say nothing and their facts go.
+  it is still confirming after a reboot) and forgets the stored lease, so that its successor
+  begins with a DISCOVER and does not ask a server for a lease it was just given back; PPPoE
+  sends Terminate-Request and PADT, cut short at three seconds against a concentrator that
+  says nothing; the router-advertisement and DHCPv6 clients say nothing and their facts go.
+- A DHCPv4 server that is restarted keeps its LAN's leases in the World (no lease is
+  reported released and granted again), writes its file as it stops, and holds the records it
+  cannot use on its own clock, so that neither a restart nor a revert loses leases to a wall
+  clock that SNTP has just stepped.
+- Each of apply, confirm and revert runs to its end once begun, whoever is still waiting for
+  it, and a confirm writes `config.toml` whole from what the keeper holds, so it can be asked
+  again. An API task restarted by the supervisor while a change is pending goes back to the
+  confirmed config at once (`config: reverted (the API restarted before it was confirmed)`):
+  its timer and every session that could have confirmed went with the old task.
 - DNS and time bind their sockets again in place when the LANs change, which is no failure of
   theirs, and serve the LANs that exist whether or not a cable is in. The DHCPv4 server keeps
   the lease records it cannot use under the config of the moment, which is what lets a revert
@@ -599,9 +609,12 @@ from the design above.
   gone before the answer is out; the lab met it within three runs. A refusal is always
   answered, since nothing moved. The client must not wait on the answer of an apply
   whose validation said `connection_drops`: no answer means taken. It finds the router at
-  `router_after`, and reads the pending change, the countdown and the new tag there.
-  Answering before publishing would make the answer likely and not certain, and needs the
-  keeper's lock released between the two; it is left as a follow-up.
+  `router_after`, and reads the pending change, the countdown and the new tag there. The same
+  holds for a revert asked at an address the pending change gave the router: the address goes
+  with the change. Answering before publishing is possible on the WebSocket (the reply
+  written, then the publish, with the keeper held across both) and would make the answer
+  likely, not certain; gRPC cannot tell when its reply has left. It changes call 3 above and
+  is left to the maintainer.
 - The browser run cannot name a window in the apply, because the panel always uses the
   router's default (call 14): a harness build takes `openfeo.confirm_secs=<10..600>` on the
   kernel command line.
@@ -610,17 +623,22 @@ from the design above.
 
 **Known limits, found by the scenarios**
 
-- **A change that moves a WAN's own link can cut the old task's goodbye short.** The appliers
-  and the task managers both follow the World, and nothing makes an applier wait for the stop
-  of the task that is using a link. Fixed for the commonest case: a WAN changed from PPPoE to
-  another type keeps its port's MTU until the session has been ended in order (the kernel
-  drops every PPPoE session on a port whose MTU changes). Still open: a PPPoE WAN moved to
-  another port or tag loses its Terminate-Request (the concentrator still gets a PADT), and a
-  DHCP WAN whose tag changes loses its release (the lease runs out by itself). Ordering the
-  appliers after the stops is a change to the shape above: the keeper would announce a change,
-  the managers stop what it touches, and only then is the config published.
+- **A change that takes a WAN's own link away can cut the old task's goodbye short.** The
+  appliers and the task managers both follow the World, and nothing makes an applier wait for
+  the stop of the task that is using a link. Fixed for a WAN that changes type on the same
+  port: the port keeps its MTU until a PPPoE session has been ended in order (the kernel
+  drops every PPPoE session on a port whose MTU changes), and keeps the leased address until
+  a DHCPv4 lease has been given back (its routes go at once, so a release to a server that is
+  not on the link may be lost). Still open: a WAN that is removed, or moved to another port
+  or tag. Its port is set down, or its sub-interface deleted, at once: a PPPoE session gets
+  neither its Terminate-Request nor, reliably, its PADT, and the concentrator learns from its
+  own echoes; a DHCPv4 lease is not given back and runs out by itself. Where an ISP allows
+  one session per account, a WAN removed and put back (or the revert of a removal) may wait
+  for the concentrator to give the old session up. Ordering the appliers after the stops is a
+  change to the shape above: the keeper would announce a change, the managers stop what it
+  touches, and only then is the config published.
 - For as long as a stop takes, the World holds the new config beside the stopping task's
   facts. On a tag change the old lease's address and routes sit on the new interface for some
-  milliseconds, and the new client first asks for the lease the old network gave.
+  milliseconds.
 - A WAN changed from PPPoE to static keeps the port's MTU at 1508 until a reboot: a static
   WAN's MTU is left as the kernel has it, which used to mean 1500.

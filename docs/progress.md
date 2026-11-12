@@ -241,8 +241,8 @@ advertised deprecated before it goes. While a change is pending the DHCP server 
 leases no longer than the window, and after a revert it has the leases it had: the lease file
 keeps the records it cannot use. The state says what is pending and when it reverts; the events
 are `config.applied`, `config.confirmed`, `config.reverted` and `config.discarded`. SPEC §1.2 now
-lets LANs be added and removed in the panel. Proven by fourteen new `m4` scenarios from the LAN
-side (32 in all), among them SPEC §12's "a subnet change not confirmed is reverted", a subnet
+lets LANs be added and removed in the panel. Proven by fifteen new `m4` scenarios from the LAN
+side (33 in all), among them SPEC §12's "a subnet change not confirmed is reverted", a subnet
 change confirmed from the address it moved the router to, a WAN changed from DHCP to PPPoE and
 back with Kea seeing the release and `pppd` the Terminate-Request, a tag moved, a LAN added and
 removed, and leases across a change that is taken back; by a `dhcp4` and a `dns` sandbox
@@ -250,9 +250,14 @@ scenario; and by the keeper's, the managers' and the slices' unit tests. The sce
 what the unit tests could not: a pending file whose removal was not synced and came back after a
 power cut, the forwarder binding again before its old listener had closed, the port's MTU
 changing under a PPPoE session that was saying goodbye, and the console telling a change's
-consequences before the change. Left open and written into the design: an apply that takes away
-the address it arrived at may not be answered, and a change that moves a WAN's own link (another
-port, another tag) can cut the old task's goodbye short. Part 2b is the client's calls, the
+consequences before the change. The whole-branch review found more at the edges, fixed in the
+same pull request: an API task restarted inside the window lost the revert; an apply or confirm
+whose caller went away mid-write could leave the file and the running config apart; a restarted
+DHCP server reported every lease released and granted again, and lost its leases to a clock
+that SNTP had stepped; and a DHCP client asked again for the lease it had just given back. Left
+open and written into the design: an apply that takes away the address it arrived at may not be
+answered, and a WAN that is removed, or moved to another port or tag, loses its link before its
+old task has said goodbye. Part 2b is the client's calls, the
 draft, and the WAN and LAN & DHCP pages.
 
 ## Follow-ups
