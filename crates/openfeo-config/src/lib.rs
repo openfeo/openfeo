@@ -16,6 +16,7 @@ pub mod migrate;
 mod portmap;
 pub mod portname;
 pub mod rules;
+pub mod secrets;
 pub mod validate;
 
 pub use error::ConfigError;
