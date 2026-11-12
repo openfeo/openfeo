@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 use crate::auth::Source;
 use crate::cert::{self, Action, CertError, CertMeta, Clock};
 use crate::gate::{host_allowed, https_authority};
-use crate::http::Peer;
+use crate::http::{Local, Peer};
 use crate::limits::MAX_STREAMS;
 use crate::server::Shared;
 use crate::watched::Watched;
@@ -444,7 +444,15 @@ async fn accept_https(
             shared.limits.handshake,
             shared.limits.idle,
         );
-        let service = TowerToHyperService::new(router.clone().layer(Extension(Peer(peer))));
+        // Where the connection arrived, as canonical as where it came from. A socket that
+        // cannot say is gone already; the peer's own address then stands in and names no LAN.
+        let local = stream.local_addr().map_or(peer, canonical);
+        let service = TowerToHyperService::new(
+            router
+                .clone()
+                .layer(Extension(Peer(peer)))
+                .layer(Extension(Local(local))),
+        );
         tokio::spawn(async move {
             let Ok(Ok(tls)) = tokio::time::timeout(limit, acceptor.accept(stream)).await else {
                 debug!("api: {peer} did not finish its handshake");

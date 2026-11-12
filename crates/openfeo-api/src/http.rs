@@ -37,6 +37,11 @@ use crate::server::{ApiError, Shared};
 #[derive(Debug, Clone, Copy)]
 pub struct Peer(pub SocketAddr);
 
+/// The router address a connection arrived at, attached to each of its requests beside
+/// [`Peer`]: what a change of config would take from under the caller (SPEC §8.3).
+#[derive(Debug, Clone, Copy)]
+pub struct Local(pub SocketAddr);
+
 const PROTOBUF: &str = "application/x-protobuf";
 const JSON: &str = "application/json";
 /// Own origin only: no inline script, no `eval`, nothing framed or fetched from elsewhere.
