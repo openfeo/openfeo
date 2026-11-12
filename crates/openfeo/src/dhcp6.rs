@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ipnet::Ipv6Net;
-use openfeo_config::{Dhcp6Binding, Dhcp6Deprecated, Dhcp6Lease, file, rules};
+use openfeo_config::{Dhcp6Binding, Dhcp6Deprecated, Dhcp6Lease, file};
 use openfeo_net::dhcp6::ClientSocket;
 use openfeo_net::ndp::{RESEND_AFTER, RESEND_TRIES, transient_send_error};
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
@@ -25,11 +25,12 @@ use openfeo_proto_dhcp4::identity::{duid_ll, from_hex, hex};
 use openfeo_proto_dhcp6::client::{Binding, Client, Config, Input, Lease6, Note, Output};
 use openfeo_proto_dhcp6::iaid;
 use openfeo_reconcile::lan6;
+use openfeo_reconcile::slices::{Dhcp6ClientSlice, dhcp6_clients};
+use openfeo_runtime::Publisher;
 use openfeo_runtime::clock;
-use openfeo_runtime::supervise::TaskError;
+use openfeo_runtime::supervise::{BoxedTask, Stop, TaskError};
 use openfeo_runtime::world::WorldRx;
-use openfeo_runtime::{Publisher, Supervisor};
-use openfeo_world::{Deprecated, Lifetimed, WanDhcp6Fact};
+use openfeo_world::{Deprecated, Lifetimed, WanDhcp6Fact, World};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -37,6 +38,7 @@ use crate::dhcp4::{
     DUID_PATH, LEASES_DIR, LinkChange, link_change, load_or_create_duid, lowest_port_mac, mac_text,
     seed, wait_for_link, wait_for_netdev,
 };
+use crate::family::Family;
 use crate::state;
 
 /// The salt of the clock fallback of [`seed`].
@@ -55,31 +57,53 @@ pub fn lease_path(wan: &str) -> PathBuf {
     Path::new(LEASES_DIR).join(format!("dhcp6-{wan}.toml"))
 }
 
-/// One task per WAN with `[wans.ipv6]` in mode `auto` and no typed prefix.
-pub fn spawn_all(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    let config = publisher.current().config.clone();
-    for wan in &config.wans {
-        let Some(ipv6) = &wan.ipv6 else {
-            continue;
-        };
-        if ipv6.mode == "disabled" || !ipv6.prefix.is_empty() {
-            continue;
-        }
-        let task = WanTask {
-            wan: wan.name.clone(),
-            port: openfeo_reconcile::wan_ifname(wan),
-            netdev: openfeo_reconcile::wan_netdev(wan),
-            pd_hint: rules::pd_hint(ipv6),
-        };
-        let publisher = publisher.clone();
-        let world_rx = world_rx.clone();
-        supervisor.spawn(format!("dhcp6-{}", wan.name), move || {
-            let task = task.clone();
-            let publisher = publisher.clone();
-            let world_rx = world_rx.clone();
-            async move { run(&task, &publisher, world_rx).await }
-        });
+/// The DHCPv6 client of every WAN with `[wans.ipv6]` in mode `auto` and no typed prefix
+/// (SPEC §7.3), kept in step with the config by its manager ([`crate::family`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Dhcp6Clients;
+
+impl Family for Dhcp6Clients {
+    type Slice = Dhcp6ClientSlice;
+    const PREFIX: &'static str = "dhcp6";
+
+    fn wanted(&self, world: &World) -> BTreeMap<String, Dhcp6ClientSlice> {
+        dhcp6_clients(&world.config)
     }
+
+    fn run(
+        &self,
+        key: &str,
+        slice: &Dhcp6ClientSlice,
+        publisher: Arc<Publisher>,
+        world_rx: WorldRx,
+        mut stop: Stop,
+    ) -> BoxedTask {
+        let task = WanTask {
+            wan: key.to_owned(),
+            port: slice.port.clone(),
+            netdev: slice.netdev.clone(),
+            pd_hint: slice.pd_hint,
+        };
+        Box::pin(async move {
+            // No Release is sent: the binding is the ISP's to time out, and its file stays for
+            // a WAN that asks again. A stop ends the client wherever it waits.
+            tokio::select! {
+                ended = run(&task, &publisher, world_rx) => ended,
+                () = stop.requested() => {
+                    info!("{}", stopped_line(&task.wan));
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    fn withdraw(&self, key: &str, world: &mut World) {
+        Arc::make_mut(&mut world.dhcp6).remove(key);
+    }
+}
+
+fn stopped_line(wan: &str) -> String {
+    format!("dhcp6 {wan} stopped")
 }
 
 #[derive(Debug, Clone)]
@@ -885,6 +909,93 @@ mod tests {
 
     fn net(text: &str) -> Ipv6Net {
         text.parse().unwrap()
+    }
+
+    fn ipv6_wan(
+        name: &str,
+        port: &str,
+        ipv6: Option<openfeo_config::Ipv6Wan>,
+    ) -> openfeo_config::Wan {
+        openfeo_config::Wan {
+            name: name.to_owned(),
+            port: port.to_owned(),
+            kind: Some(openfeo_config::wan::Kind::Dhcp(
+                openfeo_config::DhcpWan::default(),
+            )),
+            ipv6,
+            ..openfeo_config::Wan::default()
+        }
+    }
+
+    fn world_with(wans: Vec<openfeo_config::Wan>) -> openfeo_world::World {
+        openfeo_world::World::new(
+            openfeo_config::Config {
+                wans,
+                ..openfeo_config::Config::default()
+            },
+            openfeo_config::PortMap::default(),
+        )
+    }
+
+    #[test]
+    fn the_stopped_line_is_the_contract() {
+        assert_eq!(stopped_line("wan0"), "dhcp6 wan0 stopped");
+    }
+
+    #[test]
+    fn the_family_wants_one_client_per_wan_asking_for_a_prefix() {
+        let typed = openfeo_config::Ipv6Wan {
+            prefix: "2001:db8:1::/48".to_owned(),
+            ..openfeo_config::Ipv6Wan::default()
+        };
+        let asking = openfeo_config::Ipv6Wan {
+            pd_hint: 60,
+            ..openfeo_config::Ipv6Wan::default()
+        };
+        let world = world_with(vec![
+            ipv6_wan("wan0", "p0", Some(asking)),
+            ipv6_wan("wan1", "p1", Some(typed)),
+            ipv6_wan("wan2", "p4", None),
+        ]);
+        let wanted = Dhcp6Clients.wanted(&world);
+        assert_eq!(wanted.keys().collect::<Vec<_>>(), ["wan0"]);
+        assert_eq!(wanted["wan0"].pd_hint, 60);
+    }
+
+    #[test]
+    fn withdrawing_takes_the_binding() {
+        let mut world = world_with(Vec::new());
+        for wan in ["wan0", "wan1"] {
+            Arc::make_mut(&mut world.dhcp6).insert(wan.to_owned(), WanDhcp6Fact::default());
+        }
+        Dhcp6Clients.withdraw("wan0", &mut world);
+        assert_eq!(world.dhcp6.keys().collect::<Vec<_>>(), ["wan1"]);
+        Dhcp6Clients.withdraw("wan9", &mut world);
+    }
+
+    /// The client sends no Release (the binding is the ISP's to time out), so a stop ends it
+    /// wherever it is waiting: here for a port with no link.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_stops_at_once_wherever_it_waits() {
+        let (publisher, world_rx) = Publisher::new(world_with(vec![ipv6_wan(
+            "wan0",
+            "p0",
+            Some(openfeo_config::Ipv6Wan::default()),
+        )]));
+        let publisher = Arc::new(publisher);
+        let slice = Dhcp6Clients.wanted(&publisher.current())["wan0"].clone();
+        let supervisor = openfeo_runtime::Supervisor::new(openfeo_runtime::HealthTracker::new());
+        let task = supervisor.spawn_stoppable("dhcp6-wan0", move |stop| {
+            Dhcp6Clients.run("wan0", &slice, publisher.clone(), world_rx.clone(), stop)
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let asked = tokio::time::Instant::now();
+        task.stop().await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(1),
+            "took {:?}: the task did not hear the stop",
+            asked.elapsed()
+        );
     }
 
     fn binding(bound_at: u64) -> Binding {

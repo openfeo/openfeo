@@ -211,8 +211,13 @@ fn spawn_families(
         publisher,
         world_rx,
     );
-    crate::ipv6::spawn_all(supervisor, publisher, world_rx, ipv6_secret);
-    crate::dhcp6::spawn_all(supervisor, publisher, world_rx);
+    crate::family::spawn(
+        crate::ipv6::RaClients { secret },
+        supervisor,
+        publisher,
+        world_rx,
+    );
+    crate::family::spawn(crate::dhcp6::Dhcp6Clients, supervisor, publisher, world_rx);
     crate::dhcp4_server::spawn_all(supervisor, publisher, world_rx);
 }
 
