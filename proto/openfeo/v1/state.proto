@@ -37,6 +37,47 @@ message SystemState {
   string tls_fingerprint = 8;
   // Set when `config.toml` was refused and the router runs on first-boot defaults.
   optional ConfigProblem config_problem = 9;
+  // Set while a change of config is applied and not yet confirmed (SPEC §5.5).
+  optional PendingConfig pending_config = 10;
+}
+
+// What happens to one thing when a config is applied (SPEC §8.3).
+enum ConfigEffectKind {
+  CONFIG_EFFECT_KIND_UNSPECIFIED = 0;
+  CONFIG_EFFECT_KIND_WAN_ADDED = 1;
+  CONFIG_EFFECT_KIND_WAN_REMOVED = 2;
+  // Its clients are restarted: it drops and comes back.
+  CONFIG_EFFECT_KIND_WAN_RECONNECTS = 3;
+  CONFIG_EFFECT_KIND_LAN_ADDED = 4;
+  CONFIG_EFFECT_KIND_LAN_REMOVED = 5;
+  // Its IPv4 address or subnet changes: its devices need new addresses.
+  CONFIG_EFFECT_KIND_LAN_ADDRESS_MOVES = 6;
+  CONFIG_EFFECT_KIND_LAN_DHCP_STARTS = 7;
+  CONFIG_EFFECT_KIND_LAN_DHCP_STOPS = 8;
+  // Its DHCPv4 server is restarted with other settings; leases are kept.
+  CONFIG_EFFECT_KIND_LAN_DHCP_RESTARTS = 9;
+  // The hostname or domain changes: the certificate is reissued.
+  CONFIG_EFFECT_KIND_ROUTER_RENAMED = 10;
+}
+
+// One thing a change of config does. A UI writes the sentence.
+message ConfigEffect {
+  // The WAN or LAN by name, or the router's new `<hostname>.<domain>`.
+  string subject = 1;
+  ConfigEffectKind kind = 2;
+}
+
+// A change that is running and reverts by itself unless it is confirmed.
+message PendingConfig {
+  // When it was applied, since the kernel booted (the clock of `SystemState.uptime_secs`
+  // and of an event's `uptime_ms`).
+  uint64 applied_uptime_ms = 1;
+  // When it reverts, on the same clock.
+  uint64 reverts_uptime_ms = 2;
+  // The window it was given.
+  uint32 window_secs = 3;
+  // What applying it did.
+  repeated ConfigEffect effects = 4;
 }
 
 // Why `config.toml` was refused.

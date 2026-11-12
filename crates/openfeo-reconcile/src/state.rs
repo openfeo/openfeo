@@ -85,6 +85,8 @@ fn system_state(world: &World, system: &SystemFacts) -> SystemState {
         unhealthy: system.health.unhealthy.clone(),
         tls_fingerprint: system.tls_fingerprint.clone(),
         config_problem: system.config_problem.clone(),
+        // Filled from the World's pending change where the state is completed (Task 16).
+        pending_config: None,
     }
 }
 

@@ -154,6 +154,19 @@ pub(crate) async fn perform(
                 .await?;
             response::Body::ChangePassword(ChangePasswordResponse {})
         }
+        // The config calls are answered by the keeper, which arrives with its own commits.
+        Some(
+            request::Body::GetConfig(_)
+            | request::Body::ValidateConfig(_)
+            | request::Body::ApplyConfig(_)
+            | request::Body::ConfirmConfig(_)
+            | request::Body::RevertConfig(_),
+        ) => {
+            return Err(ApiError::new(
+                ErrorCode::Internal,
+                "the config service is not built yet",
+            ));
+        }
         None => {
             return Err(ApiError::new(
                 ErrorCode::InvalidArgument,

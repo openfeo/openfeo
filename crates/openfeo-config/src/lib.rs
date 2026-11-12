@@ -39,9 +39,9 @@ pub mod pb {
 /// its counters.
 pub mod state {
     pub use crate::generated::{
-        AddressOrigin, AddressState, ConfigProblem, ConfigViolation, Counters, LanState,
-        LinkCounters, PortState, PortUse, PortUseKind, State, SystemState, WanKind, WanPhase,
-        WanState,
+        AddressOrigin, AddressState, ConfigEffect, ConfigEffectKind, ConfigProblem,
+        ConfigViolation, Counters, LanState, LinkCounters, PendingConfig, PortState, PortUse,
+        PortUseKind, State, SystemState, WanKind, WanPhase, WanState,
     };
 }
 
@@ -54,18 +54,117 @@ pub mod events {
 /// `openfeo-api`, which generates it against these types.
 pub mod api {
     pub use crate::generated::{
-        Auth, ChangePasswordRequest, ChangePasswordResponse, ClientMsg, Error, ErrorCode,
-        GetStateRequest, GetStateResponse, GetStatusResponse, LoginRequest, LoginResponse,
-        LogoutRequest, LogoutResponse, Request, Response, ServerMsg, Session,
+        ApplyConfigRequest, ApplyConfigResponse, Auth, Caller, ChangePasswordRequest,
+        ChangePasswordResponse, ClientMsg, ConfirmConfigRequest, ConfirmConfigResponse, Error,
+        ErrorCode, GetConfigRequest, GetConfigResponse, GetStateRequest, GetStateResponse,
+        GetStatusResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Request,
+        Response, RevertConfigRequest, RevertConfigResponse, ServerMsg, Session,
         SetInitialPasswordRequest, SetInitialPasswordResponse, Subscribe, SubscribeRequest,
-        SubscribeResponse, Telemetry, Unsubscribe, client_msg, request, response, server_msg,
-        subscribe_response, telemetry,
+        SubscribeResponse, Telemetry, Unsubscribe, ValidateConfigRequest, ValidateConfigResponse,
+        client_msg, request, response, server_msg, subscribe_response, telemetry,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A protobuf `bool` left out is `false`, so the field is the one that asks for the path
+    /// with no way back: a request that says nothing gets the countdown (SPEC §5.5, §8.3).
+    #[test]
+    fn a_request_that_says_nothing_asks_for_the_countdown() {
+        let request = api::ApplyConfigRequest::default();
+        assert!(!request.immediate);
+        assert_eq!(request.timeout_secs, 0, "0 is the router's default window");
+        assert_eq!(request.tag, "");
+        // Decoded from no bytes at all it is the same.
+        let decoded = <api::ApplyConfigRequest as prost::Message>::decode(&[][..]).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn a_pending_change_travels_in_the_state_under_its_json_name() {
+        let system = state::SystemState {
+            pending_config: Some(state::PendingConfig {
+                applied_uptime_ms: 1_000,
+                reverts_uptime_ms: 121_000,
+                window_secs: 120,
+                effects: vec![state::ConfigEffect {
+                    subject: "lan0".to_owned(),
+                    kind: state::ConfigEffectKind::LanAddressMoves.into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&system).unwrap();
+        // snake_case, as every state field is; 64-bit integers are strings.
+        let pending = &json["pending_config"];
+        assert_eq!(pending["window_secs"], 120);
+        assert_eq!(pending["reverts_uptime_ms"], "121000");
+        assert_eq!(pending["effects"][0]["subject"], "lan0");
+        assert_eq!(
+            pending["effects"][0]["kind"],
+            "CONFIG_EFFECT_KIND_LAN_ADDRESS_MOVES"
+        );
+        assert_eq!(
+            serde_json::from_value::<state::SystemState>(json).unwrap(),
+            system
+        );
+        // With nothing pending the key is not there at all.
+        let quiet = serde_json::to_value(state::SystemState::default()).unwrap();
+        assert!(quiet.get("pending_config").is_none(), "{quiet}");
+    }
+
+    #[test]
+    fn the_config_service_has_a_message_each_way_for_every_call() {
+        // Each exists and is its own type; the envelope carries all five.
+        let _ = (
+            api::GetConfigRequest::default(),
+            api::ValidateConfigRequest::default(),
+            api::ConfirmConfigRequest::default(),
+            api::RevertConfigRequest::default(),
+            api::ConfirmConfigResponse::default(),
+            api::RevertConfigResponse::default(),
+        );
+        let got = api::GetConfigResponse {
+            config: Some(Config::default()),
+            tag: "0".repeat(32),
+            confirm_secs: 120,
+        };
+        assert_eq!(got.confirm_secs, 120);
+        let said = api::ValidateConfigResponse {
+            violations: Vec::new(),
+            effects: Vec::new(),
+            caller: Some(api::Caller {
+                connection_drops: true,
+                lan_changes: true,
+                lan: "lan0".to_owned(),
+                router_after: "192.168.2.1".to_owned(),
+            }),
+        };
+        assert!(said.caller.is_some());
+        let applied = api::ApplyConfigResponse {
+            tag: "1".repeat(32),
+        };
+        assert_eq!(applied.tag.len(), 32);
+        let asked = api::Request {
+            body: Some(api::request::Body::ApplyConfig(
+                api::ApplyConfigRequest::default(),
+            )),
+        };
+        let answered = api::Response {
+            body: Some(api::response::Body::ApplyConfig(applied)),
+        };
+        assert!(asked.body.is_some() && answered.body.is_some());
+        for body in [
+            api::request::Body::GetConfig(api::GetConfigRequest {}),
+            api::request::Body::ValidateConfig(api::ValidateConfigRequest::default()),
+            api::request::Body::ConfirmConfig(api::ConfirmConfigRequest {}),
+            api::request::Body::RevertConfig(api::RevertConfigRequest {}),
+        ] {
+            let _ = api::Request { body: Some(body) };
+        }
+    }
 
     #[test]
     fn json_uses_proto_field_names_and_round_trips() {
