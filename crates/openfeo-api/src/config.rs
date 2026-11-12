@@ -57,12 +57,23 @@ pub fn line_confirmed() -> String {
     "config: confirmed".to_owned()
 }
 
-/// `config: reverted (asked)`, or `config: reverted (not confirmed in 120 s)`.
+/// `config: reverted (asked)`, `config: reverted (not confirmed in 120 s)`, or
+/// `config: reverted (the API restarted before it was confirmed)`.
 #[must_use]
 pub fn line_reverted(why: Why, window_secs: u32) -> String {
     match why {
         Why::Asked => "config: reverted (asked)".to_owned(),
         Why::TimedOut => format!("config: reverted (not confirmed in {window_secs} s)"),
+        Why::Restarted => "config: reverted (the API restarted before it was confirmed)".to_owned(),
+    }
+}
+
+/// The `why` of a `config.reverted` event.
+fn why_field(why: Why) -> &'static str {
+    match why {
+        Why::Asked => "asked",
+        Why::TimedOut => "timeout",
+        Why::Restarted => "restart",
     }
 }
 
@@ -388,13 +399,8 @@ impl Shared {
             remove_pending(&config_path).map(|_| ())
         })
         .await;
-        self.publisher.emit(EventDraft::new("config.reverted").with(
-            "why",
-            match why {
-                Why::Asked => "asked",
-                Why::TimedOut => "timeout",
-            },
-        ));
+        self.publisher
+            .emit(EventDraft::new("config.reverted").with("why", why_field(why)));
         Ok(())
     }
 
@@ -418,6 +424,29 @@ impl Shared {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => warn!("config: cannot remove {}: {err}", pending_path.display()),
         }
+    }
+
+    /// At the start of the API task (SPEC §5.5): nobody is keeping a window. A change the
+    /// World still calls pending was applied by an API task that has since been restarted,
+    /// with its timer and every session that could have confirmed it: the router goes back
+    /// to the confirmed config now. With nothing pending in the World, a pending file is what
+    /// an earlier run of the router left ([`Shared::discard_pending`]).
+    pub fn settle_at_start(&self) {
+        let orphan = self.world.borrow().pending.clone();
+        let Some(fact) = orphan else {
+            self.discard_pending();
+            return;
+        };
+        info!("{}", line_reverted(Why::Restarted, fact.window_secs));
+        self.publish(fact.confirmed.clone(), None);
+        if let Err(err) = remove_pending(&self.config_path) {
+            warn!(
+                "config: cannot remove {}: {err}",
+                file::pending_path(&self.config_path).display()
+            );
+        }
+        self.publisher
+            .emit(EventDraft::new("config.reverted").with("why", why_field(Why::Restarted)));
     }
 
     /// One swap of the World's config, and of what is pending with it.
@@ -535,6 +564,27 @@ mod tests {
             Rig::over(fixtures::dhcp_world(), ConfigState::Loaded, window_secs)
         }
 
+        /// The shared state a restarted API task builds: new, over the same World and the
+        /// same files.
+        fn restarted(&self) -> Arc<Shared> {
+            let (_health_tx, health) = watch::channel(HealthView {
+                healthy: true,
+                unhealthy: Vec::new(),
+            });
+            Shared::new(SharedParts {
+                world: self.shared.world.clone(),
+                publisher: self.shared.publisher.clone(),
+                health,
+                telemetry: Telemetry::new(Arc::new(NoCounters)),
+                config_path: self.config_path(),
+                config_state: ConfigState::Loaded,
+                version: "0.4.0-test".to_owned(),
+                limits: Limits::default(),
+                extra_host: None,
+                default_window_secs: 120,
+            })
+        }
+
         fn config_path(&self) -> std::path::PathBuf {
             self.dir.path().join("config.toml")
         }
@@ -591,6 +641,54 @@ mod tests {
 
     fn dhcp() -> Config {
         (*fixtures::dhcp_world().config).clone()
+    }
+
+    /// The supervisor restarts the API task while a change is pending. The task that kept
+    /// the window is gone, and every session with it: the new one goes back to the confirmed
+    /// config at once and says that, not that it found something to discard.
+    #[tokio::test]
+    async fn an_api_restarted_inside_the_window_goes_back_to_the_confirmed_config() {
+        let mut rig = Rig::new(120);
+        let before = rig.shared.config_view().await.tag;
+        rig.apply(&moved(dhcp()), false, 0).await.unwrap();
+        assert!(rig.shared.world.borrow().pending.is_some());
+        assert_eq!(rig.running().lans[0].ipv4, "192.168.2.1/24");
+        rig.topics();
+        let second = rig.restarted();
+        second.settle_at_start();
+        assert_eq!(rig.running().lans[0].ipv4, "192.168.1.1/24");
+        assert_eq!(rig.on_disk().lans[0].ipv4, "192.168.1.1/24");
+        assert!(rig.shared.world.borrow().pending.is_none());
+        assert!(!rig.pending_path().exists());
+        assert_eq!(rig.topics(), ["config.reverted why=restart"]);
+        // It keeps the confirmed config: the tag is the one from before the change, and an
+        // apply over it is taken.
+        assert_eq!(second.config_view().await.tag, before);
+        second
+            .apply_config(ApplyConfigRequest {
+                config: Some(secrets::redact(&with_reservation(dhcp()))),
+                tag: before,
+                immediate: true,
+                timeout_secs: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.on_disk().lans[0].dhcp.as_ref().unwrap().r#static.len(),
+            2
+        );
+    }
+
+    /// With nothing pending in the World a start is what it was: a pending file is a change
+    /// some earlier run of the router never confirmed.
+    #[tokio::test]
+    async fn a_start_with_nothing_pending_discards_a_pending_file() {
+        let mut rig = Rig::new(120);
+        std::fs::write(rig.pending_path(), file::render(&moved(dhcp())).unwrap()).unwrap();
+        rig.shared.settle_at_start();
+        assert!(!rig.pending_path().exists());
+        assert_eq!(rig.running().lans[0].ipv4, "192.168.1.1/24");
+        assert_eq!(rig.topics(), ["config.discarded"]);
     }
 
     /// `config` with a reservation more on `lan0`.

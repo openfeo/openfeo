@@ -48,6 +48,8 @@ pub enum Why {
     Asked,
     /// Nobody confirmed it within its window.
     TimedOut,
+    /// The API task that kept its window was restarted: nobody is counting any more.
+    Restarted,
 }
 
 /// An apply the keeper will take: see [`Keeper::accept`].
@@ -182,6 +184,7 @@ impl Keeper {
         let lans = touched_lans(self.running(), &proposed);
         let (config, effects) = self.check(proposed, ports)?;
         let pending = (!immediate).then(|| PendingFact {
+            confirmed: self.confirmed.clone(),
             applied_boot_ms: now_boot_ms,
             reverts_boot_ms: now_boot_ms.saturating_add(u64::from(window_secs) * 1000),
             window_secs,
@@ -242,8 +245,9 @@ impl Keeper {
             password_hash: hash.to_owned(),
         });
         Arc::make_mut(&mut self.confirmed).admin.clone_from(&admin);
-        if let Some((config, _)) = &mut self.pending {
+        if let Some((config, fact)) = &mut self.pending {
             Arc::make_mut(config).admin = admin;
+            fact.confirmed = self.confirmed.clone();
         }
     }
 }

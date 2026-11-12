@@ -826,6 +826,7 @@ mod tests {
         // A pending change that touches the LAN changes its slice: the server is restarted
         // capped, and once more when the change is settled.
         world.pending = Some(Arc::new(openfeo_world::PendingFact {
+            confirmed: world.config.clone(),
             applied_boot_ms: 0,
             reverts_boot_ms: 120_000,
             window_secs: 120,

@@ -6,6 +6,9 @@
 //! server reads it for the cap on its leases.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use openfeo_config::Config;
 
 /// What happens to one thing when a config is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -59,8 +62,12 @@ pub struct Effect {
 }
 
 /// A change that is running and will revert by itself unless it is confirmed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PendingFact {
+    /// The config it goes back to. The keeper of the config holds it too; it is here for
+    /// whoever finds the change pending with nobody keeping its window (the API task was
+    /// restarted), who publishes it again.
+    pub confirmed: Arc<Config>,
     /// When it was applied, in milliseconds since the kernel booted.
     pub applied_boot_ms: u64,
     /// When it reverts, on the same clock.

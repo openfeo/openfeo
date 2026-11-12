@@ -412,6 +412,7 @@ mod tests {
             None
         );
         world.pending = Some(Arc::new(PendingFact {
+            confirmed: world.config.clone(),
             applied_boot_ms: 3_590_000,
             reverts_boot_ms: 3_710_000,
             window_secs: 120,

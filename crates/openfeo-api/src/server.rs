@@ -254,11 +254,16 @@ impl Shared {
     /// The shared state, with no sessions and nobody waiting.
     #[must_use]
     pub fn new(parts: SharedParts) -> Arc<Self> {
-        let keeper = Keeper::new(
-            parts.world.borrow().config.clone(),
-            &parts.config_state,
-            parts.default_window_secs,
-        );
+        // A change still pending in the World is one an earlier API task applied: what this
+        // one keeps is the config that change goes back to (`Shared::settle_at_start`).
+        let confirmed = {
+            let world = parts.world.borrow();
+            world
+                .pending
+                .as_ref()
+                .map_or_else(|| world.config.clone(), |fact| fact.confirmed.clone())
+        };
+        let keeper = Keeper::new(confirmed, &parts.config_state, parts.default_window_secs);
         Arc::new(Shared {
             world: parts.world,
             publisher: parts.publisher,

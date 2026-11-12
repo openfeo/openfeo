@@ -299,6 +299,7 @@ mod tests {
 
     fn pending(window_secs: u32, lans: &[&str]) -> Arc<openfeo_world::PendingFact> {
         Arc::new(openfeo_world::PendingFact {
+            confirmed: Arc::default(),
             applied_boot_ms: 1_000,
             reverts_boot_ms: 1_000 + u64::from(window_secs) * 1_000,
             window_secs,

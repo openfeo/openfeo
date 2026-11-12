@@ -255,7 +255,7 @@ impl Server {
         // API's own start is in the backlog.
         let events = self.shared.publisher.events();
         tasks.spawn(remember_events(self.shared.clone(), events));
-        self.shared.discard_pending();
+        self.shared.settle_at_start();
         tasks.spawn(crate::config::keep_window(self.shared.clone()));
         tasks.spawn({
             let telemetry = self.shared.telemetry.clone();
