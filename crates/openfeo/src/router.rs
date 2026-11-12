@@ -162,11 +162,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         });
     }
     spawn_health_events(&supervisor, &publisher, &health_view_rx);
-    crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
-    crate::pppoe::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
-    crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
-    crate::dhcp6::spawn_all(&supervisor, &publisher, &world_rx);
-    crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
+    spawn_families(&supervisor, &publisher, &world_rx, ipv6_secret);
     crate::dns::spawn(&supervisor, &publisher, &world_rx);
     crate::ra::spawn(&supervisor, &publisher, &world_rx);
     crate::dhcp6_server::spawn(&supervisor, &publisher, &world_rx);
@@ -197,6 +193,21 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     }
 
     std::future::pending().await
+}
+
+/// The tasks that exist once per WAN or LAN (SPEC §6.3): the DHCPv4 client, PPPoE, the two
+/// IPv6 clients of a WAN, and the DHCPv4 server of a LAN.
+fn spawn_families(
+    supervisor: &Supervisor,
+    publisher: &Arc<Publisher>,
+    world_rx: &openfeo_runtime::world::WorldRx,
+    ipv6_secret: Option<[u8; 16]>,
+) {
+    crate::family::spawn(crate::dhcp4::Dhcp4Clients, supervisor, publisher, world_rx);
+    crate::pppoe::spawn_all(supervisor, publisher, world_rx, ipv6_secret);
+    crate::ipv6::spawn_all(supervisor, publisher, world_rx, ipv6_secret);
+    crate::dhcp6::spawn_all(supervisor, publisher, world_rx);
+    crate::dhcp4_server::spawn_all(supervisor, publisher, world_rx);
 }
 
 /// What `/state/identity/` holds for IPv6, loaded before the World exists.

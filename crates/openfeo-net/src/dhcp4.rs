@@ -8,7 +8,7 @@
 //! the core's decision; this module only moves bytes and keeps time.
 
 use std::ffi::OsString;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -212,6 +212,18 @@ impl Driver {
         self.perform(outputs)
     }
 
+    /// Give a lease in force back to its server (RFC 2131 §4.4.4): the client is being stopped
+    /// and the driver is of no further use. Without a lease nothing is sent.
+    ///
+    /// # Errors
+    ///
+    /// None today; the signature is [`link`](Self::link)'s.
+    pub fn release(&mut self) -> Result<Vec<Event>, DriverError> {
+        let now = self.now();
+        let outputs = self.client.handle(Input::Release, now);
+        self.perform(outputs)
+    }
+
     #[must_use]
     pub fn state(&self) -> State {
         self.client.state()
@@ -270,10 +282,18 @@ impl Driver {
                     None => Err("no packet-socket address".to_owned()),
                 }
             }
-            Transport::Udp(socket) => socket
-                .try_send_to(payload, SocketAddr::V4(SocketAddrV4::new(dst, SERVER_PORT)))
-                .map(|_| ())
-                .map_err(|err| err.to_string()),
+            // Straight to the kernel, not through tokio's `try_send_to`: that answers
+            // `WouldBlock` for a socket the reactor has not yet reported writable, which a
+            // socket opened a moment ago has not been, and the packet would be lost. The
+            // socket does not block.
+            Transport::Udp(socket) => sendto(
+                socket.as_raw_fd(),
+                payload,
+                &SockaddrIn::from(SocketAddrV4::new(dst, SERVER_PORT)),
+                MsgFlags::empty(),
+            )
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
         };
         match result {
             Ok(()) => debug!(

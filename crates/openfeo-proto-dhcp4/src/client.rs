@@ -266,6 +266,8 @@ pub enum Input {
     LinkUp,
     /// Carrier went away.
     LinkDown,
+    /// Give the lease back (RFC 2131 §4.4.4): the client is being stopped.
+    Release,
 }
 
 /// What the client wants done or known.
@@ -382,6 +384,7 @@ impl Client {
                 self.carrier = true;
                 self.link_up(now, &mut out);
             }
+            Input::Release => self.release(&mut out),
         }
         out
     }
@@ -710,6 +713,18 @@ impl Client {
         options.push(DhcpOption::MaxMessageSize(self.config.max_message_size));
         options.push(DhcpOption::ParameterRequestList(PARAMETERS.to_vec()));
         options.extend(extra);
+        let secs = u16::try_from(now.saturating_sub(self.started) / MS).unwrap_or(u16::MAX);
+        self.request(secs, ciaddr, broadcast, options)
+    }
+
+    /// A BOOTREQUEST from this client with exactly `options`.
+    fn request(
+        &self,
+        secs: u16,
+        ciaddr: Ipv4Addr,
+        broadcast: bool,
+        options: Vec<DhcpOption>,
+    ) -> Message {
         let mut hardware = [0u8; 16];
         hardware[..6].copy_from_slice(&self.config.mac);
         Message {
@@ -718,7 +733,7 @@ impl Client {
             hlen: 6,
             hops: 0,
             xid: self.xid,
-            secs: u16::try_from(now.saturating_sub(self.started) / MS).unwrap_or(u16::MAX),
+            secs,
             flags: if broadcast { FLAG_BROADCAST } else { 0 },
             ciaddr,
             yiaddr: UNSPEC,
@@ -729,6 +744,37 @@ impl Client {
             file: [0; 128],
             options,
         }
+    }
+
+    /// Give a lease in force back to its server and forget it (RFC 2131 §4.4.4): one
+    /// DHCPRELEASE, unicast, with the options table 5 allows and no others. Without a lease in
+    /// force (still acquiring, or confirming one after a reboot) there is nothing to give back.
+    fn release(&mut self, out: &mut Vec<Output>) {
+        if !matches!(
+            self.state,
+            State::Bound | State::Renewing | State::Rebinding
+        ) {
+            return;
+        }
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        self.xid = self.random_xid();
+        let message = self.request(
+            0,
+            lease.address,
+            false,
+            vec![
+                DhcpOption::MessageType(MessageType::Release),
+                DhcpOption::ClientIdentifier(self.config.client_id.clone()),
+                DhcpOption::ServerIdentifier(lease.server),
+            ],
+        );
+        out.push(send(lease.address, lease.server, &message));
+        self.state = State::Init;
+        self.timeout = None;
+        self.offer = None;
+        self.addressed = false;
     }
 
     /// xorshift64: good enough for transaction ids and jitter.
@@ -857,6 +903,95 @@ mod tests {
 
     fn bound() -> (Client, Lease) {
         bound_with(lease_options())
+    }
+
+    #[test]
+    fn a_bound_client_releases_its_lease_to_its_server() {
+        let config = ClientConfig {
+            hostname: Some("openfeo-lab".to_owned()),
+            vendor_class: Some(b"isp-box".to_vec()),
+            ..ClientConfig::new(MAC, CLIENT_ID.to_vec())
+        };
+        let mut c = Client::new(config, 42);
+        let out = c.handle(Input::Start { lease: None }, 0);
+        let (_, _, discover) = sent(&out);
+        let out = c.handle(
+            Input::Packet(reply(&discover, MessageType::Offer, lease_options())),
+            500,
+        );
+        let (_, _, request) = sent(&out);
+        c.handle(
+            Input::Packet(reply(&request, MessageType::Ack, lease_options())),
+            SEC,
+        );
+        assert_eq!(c.state(), State::Bound);
+        let out = c.handle(Input::Release, 5 * SEC);
+        // RFC 2131 §4.4.4 and table 5: unicast from the leased address to the server that
+        // granted it, naming both, and carrying nothing a RELEASE must not.
+        let (src, dst, m) = sent(&out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!((src, dst), (OFFERED, SERVER));
+        assert_eq!(m.op, Op::BootRequest);
+        assert_eq!(m.message_type(), Some(MessageType::Release));
+        assert_eq!(m.ciaddr, OFFERED);
+        assert_eq!(m.flags & FLAG_BROADCAST, 0);
+        assert_eq!(&m.chaddr[..6], &MAC);
+        assert_ne!(m.xid, request.xid, "a release is its own exchange");
+        assert_eq!(m.option(54), Some(&DhcpOption::ServerIdentifier(SERVER)));
+        assert_eq!(
+            m.option(61),
+            Some(&DhcpOption::ClientIdentifier(CLIENT_ID.to_vec()))
+        );
+        for forbidden in [50, 51, 55, 57, 60, 12] {
+            assert_eq!(m.option(forbidden), None, "option {forbidden}");
+        }
+        // The lease is gone and nothing more is owed.
+        assert_eq!(c.state(), State::Init);
+        assert_eq!(c.lease(), None);
+        assert_eq!(c.next_timeout(), None);
+        assert_eq!(c.handle(Input::Release, 6 * SEC), Vec::new(), "only once");
+    }
+
+    #[test]
+    fn a_client_renewing_or_rebinding_releases_too() {
+        for wait in [20, 40] {
+            let (mut c, _) = bound();
+            // Run the timers up to the state.
+            while let Some(at) = c.next_timeout().filter(|at| *at <= wait * SEC + SEC) {
+                c.handle(Input::Timeout, at);
+            }
+            assert!(
+                matches!(c.state(), State::Renewing | State::Rebinding),
+                "{:?} after {wait} s",
+                c.state()
+            );
+            let out = c.handle(Input::Release, wait * SEC + 2 * SEC);
+            let (_, dst, m) = sent(&out);
+            assert_eq!(m.message_type(), Some(MessageType::Release));
+            assert_eq!(dst, SERVER);
+            assert_eq!(c.state(), State::Init);
+        }
+    }
+
+    #[test]
+    fn a_client_with_no_lease_releases_nothing() {
+        // INIT, before it was started.
+        let mut c = client();
+        assert_eq!(c.handle(Input::Release, 0), Vec::new());
+        // SELECTING.
+        let mut c = client();
+        c.handle(Input::Start { lease: None }, 0);
+        assert_eq!(c.state(), State::Selecting);
+        let waiting = c.next_timeout();
+        assert_eq!(c.handle(Input::Release, SEC), Vec::new());
+        assert_eq!(c.state(), State::Selecting);
+        assert_eq!(c.next_timeout(), waiting);
+        // REBOOTING: the lease being confirmed is not ours to give back.
+        let (_, lease) = bound();
+        let mut c = client();
+        c.handle(Input::Start { lease: Some(lease) }, 0);
+        assert_eq!(c.state(), State::Rebooting);
+        assert_eq!(c.handle(Input::Release, SEC), Vec::new());
     }
 
     #[test]
