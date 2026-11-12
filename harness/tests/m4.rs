@@ -159,6 +159,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "leases_survive_a_change_that_is_taken_back",
         run: leases_survive_a_change_that_is_taken_back,
     },
+    Scenario {
+        name: "leases_survive_a_restart_after_the_clock_stepped",
+        run: leases_survive_a_restart_after_the_clock_stepped,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -1152,8 +1156,13 @@ fn boot_claimed(lab: &mut Lab) -> anyhow::Result<(Api, String, String)> {
 /// `config` with `lan0` at `192.168.2.1/24`, and every address of the old subnet moved with
 /// it: the pool, the reservations and the port forwards' targets, as the panel's draft does.
 fn moved(config: &Config) -> Config {
+    moved_to(config, "192.168.2.")
+}
+
+/// As [`moved`], to the /24 that begins `subnet` (`192.168.5.`).
+fn moved_to(config: &Config, subnet: &str) -> Config {
     let mut config = config.clone();
-    let renumber = |address: &mut String| *address = address.replace("192.168.1.", "192.168.2.");
+    let renumber = |address: &mut String| *address = address.replace("192.168.1.", subnet);
     if let Some(lan) = config.lans.first_mut() {
         renumber(&mut lan.ipv4);
         if let Some(dhcp) = &mut lan.dhcp {
@@ -1355,13 +1364,14 @@ fn a_subnet_change_not_confirmed_is_reverted(lab: &mut Lab) -> anyhow::Result<()
     no_task_failed(lab)?;
     // Nothing of it is on disk: a reset finds no pending file and the old config.
     reset_and_wait(lab)?;
+    let token = api.login(PASSWORD)?;
+    let (ipv4, _) = lan0_of(&mut api.ws_with(&token)?)?;
+    ensure!(ipv4 == "192.168.1.1/24", "after the reset: {ipv4}");
+    // Looked for once the API has answered: the line, if any, follows the listening one.
     ensure!(
         lab.console()?.count(&re(DISCARDED)) == 0,
         "a pending file was left behind"
     );
-    let token = api.login(PASSWORD)?;
-    let (ipv4, _) = lan0_of(&mut api.ws_with(&token)?)?;
-    ensure!(ipv4 == "192.168.1.1/24", "after the reset: {ipv4}");
     password_never_logged(lab)
 }
 
@@ -1401,13 +1411,13 @@ fn a_subnet_change_is_confirmed_from_the_new_address(lab: &mut Lab) -> anyhow::R
     refused(ws.revert()?, ErrorCode::FailedPrecondition)?;
     no_task_failed(lab)?;
     reset_and_wait(lab)?;
+    let token = there.login(PASSWORD)?;
+    let (ipv4, _) = lan0_of(&mut there.ws_with(&token)?)?;
+    ensure!(ipv4 == "192.168.2.1/24", "after the reset: {ipv4}");
     ensure!(
         lab.console()?.count(&re(DISCARDED)) == 0,
         "a confirmed change left a pending file"
     );
-    let token = there.login(PASSWORD)?;
-    let (ipv4, _) = lan0_of(&mut there.ws_with(&token)?)?;
-    ensure!(ipv4 == "192.168.2.1/24", "after the reset: {ipv4}");
     password_never_logged(lab)
 }
 
@@ -1434,12 +1444,12 @@ fn an_immediate_apply_stands_at_once(lab: &mut Lab) -> anyhow::Result<()> {
     refused(ws.confirm()?, ErrorCode::FailedPrecondition)?;
     no_task_failed(lab)?;
     reset_and_wait(lab)?;
+    let token = api.login(PASSWORD)?;
+    let config = api.ws_with(&token)?.config()?.config.context("no config")?;
     ensure!(
         lab.console()?.count(&re(DISCARDED)) == 0,
         "an immediate apply left a pending file"
     );
-    let token = api.login(PASSWORD)?;
-    let config = api.ws_with(&token)?.config()?.config.context("no config")?;
     let kept = config
         .lans
         .first()
@@ -1723,6 +1733,7 @@ const UDHCPC_TIMEOUT: Duration = Duration::from_secs(20);
 const LAN0_DHCP_STOPPED: &str = r"openfeo: lan lan0 dhcp stopped";
 const WAN0_DHCP_STOPPED: &str = r"openfeo: wan wan0 dhcp stopped";
 const PPPOE_STOPPED: &str = r"openfeo: pppoe wan0 stopped";
+const INIT_REBOOT: &str = r"openfeo: wan wan0 dhcp init-reboot";
 /// How long a scenario watches for something that must not happen.
 const QUIET: Duration = Duration::from_secs(5);
 
@@ -1828,6 +1839,9 @@ fn a_lan_change_leaves_a_dhcp_wan_alone(lab: &mut Lab) -> anyhow::Result<()> {
     let before = wan0_of(&before)?.clone();
     ensure!(before.phase() == WanPhase::Up, "{before:?}");
     let bound = lab.console()?.count(&re(BOUND));
+    // A client holds a lease on the LAN whose server is about to be restarted.
+    let leased = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    udhcpc_env(&leased, "ip")?;
     // A socket of its own for the events: a request discards the pushes that arrive before
     // its answer.
     let mut watch = api.ws_with(&token)?;
@@ -1849,6 +1863,18 @@ fn a_lan_change_leaves_a_dhcp_wan_alone(lab: &mut Lab) -> anyhow::Result<()> {
     ensure!(
         !events.iter().any(|event| event.topic.starts_with("wan.")),
         "a LAN change made news of a WAN: {events:?}"
+    );
+    // Nor of a lease: the server that comes back has the leases the one that went had.
+    ensure!(
+        !events.iter().any(|event| event.topic.contains(".lease.")),
+        "a restarted server's leases were released and granted again: {events:?}"
+    );
+    ensure!(
+        state_json(&api, &token)?
+            .lans
+            .first()
+            .is_some_and(|lan| lan.leases == 1),
+        "the lease is not in the state after the restart"
     );
     let after = state_json(&api, &token)?;
     let after = wan0_of(&after)?;
@@ -1975,6 +2001,12 @@ fn a_wan_changes_type_while_running(lab: &mut Lab) -> anyhow::Result<()> {
         state.addresses
     );
     ensure!(wan0_of(&state)?.interface == "p0", "{:?}", state.wans);
+    // The lease was given back when the WAN became PPPoE: the client that came after began
+    // with a DISCOVER, not by asking for a lease it no longer holds.
+    ensure!(
+        console.count(&re(INIT_REBOOT)) == 0,
+        "a DHCP client started from a lease its predecessor had given back"
+    );
     ensure!(
         console.count(&re(daemons::PPP_PASSWORD)) == 0,
         "the PPPoE password is on the console"
@@ -2038,7 +2070,48 @@ fn a_vlan_tag_moves_the_wan(lab: &mut Lab) -> anyhow::Result<()> {
         !serde_json::to_string(&state)?.contains("p0.101"),
         "the state still names p0.101: {state:?}"
     );
+    // The client on the untagged port starts from nothing: the lease it would otherwise ask
+    // for again was given on another network.
+    console.wait_for(&mut cur, &re(r"openfeo: wan wan0 dhcp discover"), SOON)?;
+    ensure!(
+        console.count(&re(INIT_REBOOT)) == 0,
+        "a DHCP client started from the lease of the network it left"
+    );
     no_task_failed(lab)
+}
+
+/// With `two` running (`lan0` and `lan1`): asked from `lan1`, a change that moves `lan0`
+/// moves neither the caller's connection nor the caller's LAN; asked from `lan0` (`ws`) it
+/// moves both.
+fn a_change_moves_only_those_on_the_lan_it_moves(
+    lan1: &openfeo_harness::netns::NetNs,
+    ws: &mut Ws,
+    token: &str,
+    two: &Config,
+) -> anyhow::Result<()> {
+    let elsewhere = moved_to(two, "192.168.5.");
+    let from_lan1 = Api::on(lan1, "192.168.2.1:443".parse::<SocketAddr>()?, HOST);
+    let caller = from_lan1
+        .ws_with(token)?
+        .validate(&elsewhere)?
+        .caller
+        .context("no caller")?;
+    ensure!(
+        !caller.connection_drops
+            && !caller.lan_changes
+            && caller.lan == "lan1"
+            && caller.router_after == "192.168.2.1",
+        "asked from lan1: {caller:?}"
+    );
+    let caller = ws.validate(&elsewhere)?.caller.context("no caller")?;
+    ensure!(
+        caller.connection_drops
+            && caller.lan_changes
+            && caller.lan == "lan0"
+            && caller.router_after == "192.168.5.1",
+        "asked from lan0: {caller:?}"
+    );
+    Ok(())
 }
 
 /// A second LAN added while the router runs serves its clients at once, DHCP and the
@@ -2103,6 +2176,7 @@ fn a_lan_is_added_and_removed_while_running(lab: &mut Lab) -> anyhow::Result<()>
         console.count(&re(LAN0_DHCP_STOPPED)) == 0,
         "adding lan1 restarted lan0's DHCP server"
     );
+    a_change_moves_only_those_on_the_lan_it_moves(lan1, &mut ws, &token, &two)?;
     // And away again.
     applied(&mut ws, &one, &tag, true, 0)?;
     console.wait_for(
@@ -2202,6 +2276,60 @@ fn leases_survive_a_change_that_is_taken_back(lab: &mut Lab) -> anyhow::Result<(
     ensure!(
         udhcpc_env(&again, "ip")? == ip,
         "after the revert the first client was given {:?}, not {ip}",
+        udhcpc_env(&again, "ip")
+    );
+    no_task_failed(lab)
+}
+
+/// A router whose clock SNTP sets a year forward after a client took its lease, as a box with
+/// no clock of its own does at every boot: a change of config that restarts the LAN's DHCP
+/// server still finds the lease. The file carries wall-clock times, and the server writes it
+/// as it stops, on the clock of that moment.
+fn leases_survive_a_restart_after_the_clock_stepped(lab: &mut Lab) -> anyhow::Result<()> {
+    const YEAR: i64 = 31_536_000;
+    let (api, _, _) = boot_claimed(lab)?;
+    let first = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&first, "ip")?.to_owned();
+    // The first write of the database follows the lease at once; give the disk a moment.
+    std::thread::sleep(Duration::from_secs(2));
+    // The ISP's time server comes to life a year ahead; the router steps at its next poll.
+    lab.start_sntp(YEAR)?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: time step \+3153\d{4}\.\d{3}s from 203\.0\.113\.1"),
+        Duration::from_secs(90),
+    )?;
+    // A session need not outlive a year.
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let mut cur = Cursor::default();
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    console.wait_for(&mut cur, &re(APPLIED_IMMEDIATELY), SOON)?;
+    console.wait_for(&mut cur, &re(LAN0_DHCP_STOPPED), SOON)?;
+    console
+        .wait_for(
+            &mut cur,
+            &re(r"openfeo: lan lan0 dhcp restored 1 leases"),
+            SOON,
+        )
+        .context("the restarted server did not restore the lease")?;
+    ensure!(
+        console.count(&re(r"openfeo: lan lan0 dhcp ignoring lease")) == 0,
+        "the restarted server read a lease as expired"
+    );
+    let again = lanclient::udhcpc(
+        &lab.lan0,
+        "lan0",
+        &lab.run_dir,
+        &["-r", &ip],
+        UDHCPC_TIMEOUT,
+    )?;
+    ensure!(
+        udhcpc_env(&again, "ip")? == ip,
+        "after the restart the client was given {:?}, not {ip}",
         udhcpc_env(&again, "ip")
     );
     no_task_failed(lab)
