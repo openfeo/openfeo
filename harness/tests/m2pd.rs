@@ -72,9 +72,10 @@ const KERNEL_BANNER: &str = r"Linux version 6\.18\.59-openfeo";
 const WAN_LINK_LOCAL: &str = r"openfeo: wan wan0 ipv6 link-local (fe80:[0-9a-f:]+)";
 const ROUTER_LEARNED: &str = r"openfeo: wan wan0 ipv6 router fe80::1 \(learned\)";
 /// The routing applier installing the WAN's IPv6 default in the main table (the one in the
-/// WAN's own table ends with `table 100`).
+/// WAN's own table ends with `table 100`). With a delegation it is installed twice: at the
+/// router's advertisement, with no source, and again with one once the prefix has arrived.
 const DEFAULT6_INSTALLED: &str =
-    r"openfeo: add route default via fe80::1 dev p0 src [0-9a-f:]+ proto 200 metric 10$";
+    r"openfeo: add route default via fe80::1 dev p0 (?:src [0-9a-f:]+ )?proto 200 metric 10$";
 /// The delegation and the WAN's address as the console reports them, from either pool.
 const BOUND: &str = r"openfeo: dhcp6 wan0 bound prefix (2001:db8:[0-9a-f:]+/56) \(preferred \d+ s, valid \d+ s\) address (2001:db8:ffff:[0-9a-f:]+) t1=10s t2=16s from [0-9a-f]+";
 /// The same, from pool B only.
@@ -725,7 +726,10 @@ fn isp_resolvers_learned_over_dhcpv6_join_after_the_route(lab: &mut Lab) -> anyh
     c.wait_for(&mut cur, &re(ROUTER_LEARNED), SOON)?;
     // The anchor is the default route's own op in the main table: the reconcilers act on the
     // kernel's route the moment the monitor reports it, which can be before the routing pass
-    // logs its summary.
+    // logs its summary. It is the first such op, at the router's advertisement: the gate is a
+    // default route in the kernel (ADR-0019), and the forwarder, which binds again in place
+    // when the delegation numbers the LANs, may say the resolver before that route has been
+    // given its source, leave it out while the route is replaced, and say it again.
     c.wait_for(&mut cur, &re(DEFAULT6_INSTALLED), SOON)?;
     let routed = cur;
     let announced =
@@ -740,6 +744,17 @@ fn isp_resolvers_learned_over_dhcpv6_join_after_the_route(lab: &mut Lab) -> anyh
         Ok(lan_ready(&lab.lan0, "lan0", lan_net)?
             && host_ula(&lab.lan0, "lan0")?.is_some_and(|host| !host.tentative))
     })?;
+    // Whatever the forwarder said while the route was replaced, it ends with the resolver.
+    let last = c
+        .tail(400)
+        .into_iter()
+        .rev()
+        .find(|line| line.contains("openfeo: dns upstreams "))
+        .context("no upstreams line on the console")?;
+    ensure!(
+        announced.is_match(&last),
+        "the forwarder ended without the DHCPv6 upstream: {last}"
+    );
     let ula = host_ula(&lab.lan0, "lan0")?.context("the ULA address")?;
     let router_ula = router_in(net_of(ula.addr));
     let answer = lanclient::dig(
