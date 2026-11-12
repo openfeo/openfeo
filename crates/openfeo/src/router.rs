@@ -204,7 +204,13 @@ fn spawn_families(
     ipv6_secret: Option<[u8; 16]>,
 ) {
     crate::family::spawn(crate::dhcp4::Dhcp4Clients, supervisor, publisher, world_rx);
-    crate::pppoe::spawn_all(supervisor, publisher, world_rx, ipv6_secret);
+    let secret = ipv6_secret.unwrap_or([0; 16]);
+    crate::family::spawn(
+        crate::pppoe::PppoeClients { secret },
+        supervisor,
+        publisher,
+        world_rx,
+    );
     crate::ipv6::spawn_all(supervisor, publisher, world_rx, ipv6_secret);
     crate::dhcp6::spawn_all(supervisor, publisher, world_rx);
     crate::dhcp4_server::spawn_all(supervisor, publisher, world_rx);
