@@ -15,5 +15,5 @@ pub mod supervise;
 pub mod world;
 
 pub use health::HealthTracker;
-pub use supervise::Supervisor;
+pub use supervise::{STOP_GRACE, Stop, Stoppable, Supervisor};
 pub use world::{Derive, Publisher, WorldRx};
