@@ -51,17 +51,10 @@ impl Drop for Lan {
 }
 
 async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
-    let duid = {
-        let world = world_rx.borrow_and_update();
-        let lowest = lowest_port_mac(&world).unwrap_or([0; 6]);
-        match load_or_create_duid(Path::new(DUID_PATH), lowest) {
-            Ok((duid, _)) => duid,
-            Err(err) => {
-                warn!("dhcp6-server: cannot keep {DUID_PATH}: {err}; using an unsaved DUID");
-                duid_ll(lowest)
-            }
-        }
-    };
+    // The router's DUID is read, or made, when the first responder needs it and not before: on
+    // a router with no IPv6 this task is idle, and the DUID is the DHCPv4 client's to make and
+    // to announce.
+    let mut duid: Option<Vec<u8>> = None;
     let mut lans: BTreeMap<String, Lan> = BTreeMap::new();
     loop {
         let wanted = desired(&world_rx.borrow_and_update());
@@ -78,8 +71,11 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
                     });
                 }
                 _ => {
+                    let duid = duid
+                        .get_or_insert_with(|| server_duid(&world_rx.borrow()))
+                        .clone();
                     let (tx, rx) = watch::channel(Some(responder.clone()));
-                    let handle = tokio::spawn(lan_task(rx, world_rx.clone(), duid.clone()));
+                    let handle = tokio::spawn(lan_task(rx, world_rx.clone(), duid));
                     lans.insert(responder.ifname.clone(), Lan { tx, handle });
                 }
             }
@@ -94,6 +90,18 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
             .changed()
             .await
             .map_err(|_| "world publisher gone")?;
+    }
+}
+
+/// The DUID the responders answer with: the router's own, kept under `identity/`.
+fn server_duid(world: &openfeo_world::World) -> Vec<u8> {
+    let lowest = lowest_port_mac(world).unwrap_or([0; 6]);
+    match load_or_create_duid(Path::new(DUID_PATH), lowest) {
+        Ok((duid, _)) => duid,
+        Err(err) => {
+            warn!("dhcp6-server: cannot keep {DUID_PATH}: {err}; using an unsaved DUID");
+            duid_ll(lowest)
+        }
     }
 }
 
