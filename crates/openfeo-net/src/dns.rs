@@ -443,6 +443,20 @@ impl DnsDriver {
     }
 }
 
+impl DnsDriver {
+    /// Stop serving, and return once every socket is closed: a driver made straight afterwards
+    /// binds the same ports. Dropping the driver stops it too, but only asks its tasks to end;
+    /// the listening sockets they own stay open until the runtime next reaches them, which is
+    /// after a bind that follows the drop at once.
+    pub async fn close(mut self) {
+        for task in std::mem::take(&mut self.tasks) {
+            task.abort();
+            // Cancelled is the answer wanted: the task's sockets went with it.
+            let _ = task.await;
+        }
+    }
+}
+
 impl Drop for DnsDriver {
     fn drop(&mut self) {
         for task in &self.tasks {

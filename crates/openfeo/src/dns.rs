@@ -181,7 +181,11 @@ async fn serve(world_rx: &mut WorldRx) -> Result<(), TaskError> {
                 };
                 match change(&current, &next) {
                     Change::Nothing => continue,
-                    Change::Rebind => return Ok(()),
+                    Change::Rebind => {
+                        // The next bind follows at once: the ports must be free by then.
+                        driver.close().await;
+                        return Ok(());
+                    }
                     Change::Configure => {}
                 }
                 for event in driver.configure(forwarder_config(&next)) {

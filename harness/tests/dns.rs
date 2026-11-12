@@ -70,6 +70,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked",
         run: names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked,
     },
+    Scenario {
+        name: "a_closed_forwarder_has_given_its_ports_back",
+        run: a_closed_forwarder_has_given_its_ports_back,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -401,6 +405,25 @@ fn names_resolve_over_ipv6_and_an_ipv6_upstream_is_asked(lab: &mut Lab) -> anyho
             Duration::from_secs(5),
         )
         .context("dnsmasq saw the query arrive over IPv6")?;
+    Ok(())
+}
+
+/// A forwarder that is closed has given its ports back by the time `close` returns: the one
+/// started straight afterwards binds them, TCP's among them, and serves. This is a LAN
+/// changing while the router runs (SPEC §5.5): the forwarder binds again at once, on a
+/// runtime that has had no turn to clear the old one's tasks away.
+fn a_closed_forwarder_has_given_its_ports_back(lab: &mut Lab) -> anyhow::Result<()> {
+    let rig = Rig::create(lab)?;
+    let rt = runtime()?;
+    let mut first = Rig::driver(&rt, Rig::config()?)?;
+    let (_, nas) = lookup(&rt, &mut first, &rig, "nas.home.arpa", "A", &[])?;
+    expect_a(&nas, "nas.home.arpa", "192.168.1.10")?;
+    rt.block_on(first.close());
+    let mut second = Rig::driver(&rt, Rig::config()?)?;
+    for extra in [&[][..], &["+tcp"][..]] {
+        let (_, nas) = lookup(&rt, &mut second, &rig, "nas.home.arpa", "A", extra)?;
+        expect_a(&nas, "nas.home.arpa", "192.168.1.10")?;
+    }
     Ok(())
 }
 
