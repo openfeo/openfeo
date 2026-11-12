@@ -154,15 +154,32 @@ fn keep_original(config_path: &Path) -> io::Result<()> {
     file::write_whole(&original, &text).map_err(io::Error::other)
 }
 
-/// The pending file becomes `config.toml`: renamed over it, the directory synced.
-fn promote(config_path: &Path) -> io::Result<()> {
-    keep_original(config_path)?;
-    std::fs::rename(file::pending_path(config_path), config_path)?;
-    let dir = match config_path.parent() {
+/// Sync the directory `path` is in: a rename or a removal there is on the disk when this
+/// returns, not at the filesystem's next commit some seconds later.
+fn sync_dir_of(path: &Path) -> io::Result<()> {
+    let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
     };
     std::fs::File::open(dir)?.sync_all()
+}
+
+/// The pending file becomes `config.toml`: renamed over it, the directory synced.
+fn promote(config_path: &Path) -> io::Result<()> {
+    keep_original(config_path)?;
+    std::fs::rename(file::pending_path(config_path), config_path)?;
+    sync_dir_of(config_path)
+}
+
+/// Remove the pending file for good: the directory is synced, so a power cut straight
+/// afterwards does not bring the file back to be discarded at the next start. `false` when
+/// there was none.
+fn remove_pending(config_path: &Path) -> io::Result<bool> {
+    match std::fs::remove_file(file::pending_path(config_path)) {
+        Ok(()) => sync_dir_of(config_path).map(|()| true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Run file work off the async threads and say what went wrong.
@@ -356,16 +373,12 @@ impl Shared {
         let config = keeper.revert().map_err(|refusal| refused(&refusal))?;
         self.publish(config, None);
         self.window.send_replace(None);
-        let pending_path = file::pending_path(&self.config_path);
+        let config_path = self.config_path.clone();
         // The config is already back; a pending file that will not go is discarded at the
         // next start, as any other.
-        let _ = off_thread(
-            "config.pending.toml (removing it)",
-            move || match std::fs::remove_file(&pending_path) {
-                Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
-                _ => Ok(()),
-            },
-        )
+        let _ = off_thread("config.pending.toml (removing it)", move || {
+            remove_pending(&config_path).map(|_| ())
+        })
         .await;
         info!("{}", line_reverted(why, window_secs));
         self.publisher.emit(EventDraft::new("config.reverted").with(
@@ -384,6 +397,14 @@ impl Shared {
         let pending_path = file::pending_path(&self.config_path);
         match std::fs::remove_file(&pending_path) {
             Ok(()) => {
+                // Gone for this run whatever the sync says; unsynced, a power cut in the next
+                // seconds has it discarded once more.
+                if let Err(err) = sync_dir_of(&pending_path) {
+                    warn!(
+                        "config: cannot sync the removal of {}: {err}",
+                        pending_path.display()
+                    );
+                }
                 info!("{}", line_discarded());
                 self.publisher.emit(EventDraft::new("config.discarded"));
             }
