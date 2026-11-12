@@ -14,6 +14,9 @@ mod dhcp4_server;
 mod dhcp6;
 mod dhcp6_server;
 mod dns;
+// No family is on a manager yet: the first follows in the next commit.
+#[cfg_attr(not(test), allow(dead_code))]
+mod family;
 mod heartbeat;
 mod identity;
 mod ipv6;
