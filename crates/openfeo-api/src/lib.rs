@@ -83,6 +83,10 @@ pub struct ApiDeps {
     /// Always `None` in a release build: only a harness build reads the knob that sets it
     /// (`openfeo.panel_host=`, for the lab's relay).
     pub extra_host: Option<String>,
+    /// The window a change of config is given when its apply names none (SPEC §5.5):
+    /// [`keeper::DEFAULT_WINDOW_SECS`], unless a harness build was told a shorter one
+    /// (`openfeo.confirm_secs=`).
+    pub confirm_secs: u32,
 }
 
 /// Bind and serve the API until a listener fails.

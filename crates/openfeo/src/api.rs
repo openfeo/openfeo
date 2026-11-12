@@ -120,6 +120,9 @@ pub struct Boot {
     /// One more host the API takes as its own: the lab's relay, in a harness build
     /// ([`crate::panel_host`]); always `None` in a release build.
     pub extra_host: Option<String>,
+    /// A shorter window for a change of config, in a harness build ([`crate::confirm_secs`]);
+    /// always `None` in a release build, which waits the 120 s of SPEC §5.5.
+    pub confirm_secs: Option<u32>,
 }
 
 /// Run the API as a supervised task: restarted if it dies, named by health if it will not
@@ -141,6 +144,7 @@ pub fn spawn(
             config_state,
             version,
             extra_host,
+            confirm_secs,
         } = boot.clone();
         async move {
             openfeo_api::run(ApiDeps {
@@ -160,6 +164,7 @@ pub fn spawn(
                 },
                 limits: Limits::default(),
                 extra_host,
+                confirm_secs: confirm_secs.unwrap_or(openfeo_api::keeper::DEFAULT_WINDOW_SECS),
             })
             .await
         }

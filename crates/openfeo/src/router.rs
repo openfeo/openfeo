@@ -177,6 +177,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             config_state: config_state.clone(),
             version: version.to_owned(),
             extra_host: crate::panel_host::from_cmdline(cmdline),
+            confirm_secs: crate::confirm_secs::from_cmdline(cmdline),
         },
     );
     {

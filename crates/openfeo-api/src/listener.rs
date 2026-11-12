@@ -173,7 +173,7 @@ impl Server {
             version: deps.version,
             limits: deps.limits,
             extra_host: deps.extra_host,
-            default_window_secs: crate::keeper::DEFAULT_WINDOW_SECS,
+            default_window_secs: deps.confirm_secs,
         });
         let loaded = cert::load(&deps.tls_dir).unwrap_or_else(|err| {
             warn!("tls: {err}; issuing a new certificate");

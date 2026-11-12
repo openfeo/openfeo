@@ -9,6 +9,7 @@ mod api;
 mod boot;
 mod chaos;
 mod cli;
+mod confirm_secs;
 mod dhcp4;
 mod dhcp4_server;
 mod dhcp6;
