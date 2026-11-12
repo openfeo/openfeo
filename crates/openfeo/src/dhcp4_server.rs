@@ -88,7 +88,12 @@ impl Family for Dhcp4Servers {
     }
 
     fn withdraw(&self, key: &str, world: &mut World) {
-        Arc::make_mut(&mut world.leases).remove(key);
+        // A server stopped to be started again leaves its LAN's leases in the World, where
+        // the one that follows puts its own. Taken out and put back, every lease would read
+        // as released and granted again, and every name a lease gives would be gone between.
+        if !self.wanted(world).contains_key(key) {
+            Arc::make_mut(&mut world.leases).remove(key);
+        }
     }
 }
 
@@ -132,7 +137,7 @@ async fn run(
     }
     // What the file holds and this server cannot use (another subnet, outside the pool) stays
     // in the file until it expires: a change of config that is taken back finds it there.
-    let aside = set_aside(&file, &restored, unix_now());
+    let aside = set_aside(&file, &restored, driver.now(), unix_now());
     if !aside.is_empty() {
         info!(
             "lan {lan} dhcp keeping {} leases it cannot use",
@@ -198,10 +203,11 @@ async fn run(
                 save_at = None;
             }
             () = stop.requested() => {
-                // A save still owed is written first: whatever serves this LAN next reads it.
-                if save_at.is_some() {
-                    save_leases(&path, lan, &driver, &aside).await;
-                }
+                // Written on the way out, owed or not: whatever serves this LAN next reads the
+                // file, and the file tells time by the wall clock. One written before the
+                // clock was stepped (SNTP's first answer) would have every lease read as long
+                // expired; written now, the times in it are a moment old.
+                save_leases(&path, lan, &driver, &aside).await;
                 info!("{}", stopped_line(lan));
                 return Ok(());
             }
@@ -325,15 +331,28 @@ pub fn facts_from(records: &[LeaseRecord], now: Timestamp, unix_now: u64) -> Vec
     facts
 }
 
+/// A file entry the server cannot use under the config of the moment, held until its time is
+/// up on the server's own clock, as the server's own records are. The wall clock may be
+/// stepped while it is held (SNTP's first answer on a box whose clock began at the build's),
+/// and a record is not lost to that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aside {
+    /// The entry as the file had it.
+    pub lease: Dhcp4ServerLease,
+    /// When it expires, on the driver's clock.
+    pub expires_at: Timestamp,
+}
+
 /// The file's entries the server did not take: those that parse, have not expired, and whose
 /// address is not among `kept`, the leases the server holds after reading the file. They are
-/// another subnet's, or fell outside the pool.
+/// another subnet's, or fell outside the pool. `now` and `unix_now` are the same instant.
 #[must_use]
 pub fn set_aside(
     file: &Dhcp4ServerLeases,
     kept: &[LeaseRecord],
+    now: Timestamp,
     unix_now: u64,
-) -> Vec<Dhcp4ServerLease> {
+) -> Vec<Aside> {
     file.leases
         .iter()
         .filter(|lease| record_from(lease, 0, unix_now).is_ok())
@@ -343,23 +362,45 @@ pub fn set_aside(
                 .parse()
                 .is_ok_and(|address: Ipv4Addr| kept.iter().all(|record| record.address != address))
         })
-        .cloned()
+        .map(|lease| Aside {
+            lease: lease.clone(),
+            expires_at: now + lease.expires_unix.saturating_sub(unix_now),
+        })
         .collect()
 }
 
-/// `own`, the server's leases as a file, followed by what was set aside: each entry as it was,
-/// unless it has expired or the server has since leased its address to someone.
+/// `own`, the server's leases as a file, followed by what was set aside, unless it has expired
+/// or the server has since leased its address to someone. An entry set aside is written with
+/// the time it has left, counted from `unix_now`: as it was, while the wall clock has kept
+/// step with the driver's. `now` and `unix_now` are the same instant.
 #[must_use]
 pub fn file_with(
     mut own: Dhcp4ServerLeases,
-    aside: &[Dhcp4ServerLease],
+    aside: &[Aside],
+    now: Timestamp,
     unix_now: u64,
 ) -> Dhcp4ServerLeases {
     let kept: Vec<Dhcp4ServerLease> = aside
         .iter()
-        .filter(|lease| lease.expires_unix > unix_now)
-        .filter(|lease| own.leases.iter().all(|live| live.address != lease.address))
-        .cloned()
+        .filter(|entry| entry.expires_at > now)
+        .filter(|entry| {
+            own.leases
+                .iter()
+                .all(|live| live.address != entry.lease.address)
+        })
+        .map(|entry| {
+            let expires_unix = unix_now + (entry.expires_at - now);
+            // The lease is as long as it was: its start moves with its end.
+            let length = entry
+                .lease
+                .expires_unix
+                .saturating_sub(entry.lease.granted_unix);
+            Dhcp4ServerLease {
+                granted_unix: expires_unix.saturating_sub(length),
+                expires_unix,
+                ..entry.lease.clone()
+            }
+        })
         .collect();
     own.leases.extend(kept);
     own
@@ -409,10 +450,10 @@ fn read_leases(
     }
 }
 
-async fn save_leases(path: &Path, lan: &str, driver: &ServerDriver, aside: &[Dhcp4ServerLease]) {
-    let now_unix = unix_now();
-    let own = file_from_records(lan, &driver.leases(), driver.now(), now_unix);
-    let leases = file_with(own, aside, now_unix);
+async fn save_leases(path: &Path, lan: &str, driver: &ServerDriver, aside: &[Aside]) {
+    let (now, now_unix) = (driver.now(), unix_now());
+    let own = file_from_records(lan, &driver.leases(), now, now_unix);
+    let leases = file_with(own, aside, now, now_unix);
     let result = match file::render_dhcp4_server_leases(&leases) {
         Ok(text) => state::write(path, text).await,
         Err(err) => Err(io::Error::other(err.to_string())),
@@ -713,8 +754,8 @@ mod tests {
             Vec::new(),
             "the server of another subnet takes neither"
         );
-        let aside = set_aside(&file, &kept, NOW_UNIX);
-        assert_eq!(aside, file.leases);
+        let aside = set_aside(&file, &kept, 50, NOW_UNIX);
+        assert_eq!(leases_of(&aside), file.leases);
         // A grant in the new subnet, and a save ten seconds on.
         let granted = LeaseRecord {
             address: ip("192.168.2.100"),
@@ -725,7 +766,7 @@ mod tests {
             expires_at: 175,
         };
         let own = file_from_records("lan0", &[granted], 60, NOW_UNIX + 10);
-        let saved = file_with(own, &aside, NOW_UNIX + 10);
+        let saved = file_with(own, &aside, 60, NOW_UNIX + 10);
         assert_eq!(
             addresses(&saved),
             ["192.168.2.100", "192.168.1.100", "192.168.1.101"]
@@ -737,15 +778,52 @@ mod tests {
         );
     }
 
+    /// The wall clock steps forward a year while records are set aside: SNTP's first answer
+    /// on a box whose clock started at the build's. They are still in the next file, with the
+    /// time they had left, and they still go when that time is up.
+    #[test]
+    fn what_is_set_aside_outlives_a_step_of_the_wall_clock() {
+        const YEAR: u64 = 31_536_000;
+        let file = old_file();
+        let aside = set_aside(&file, &[], 0, NOW_UNIX);
+        assert_eq!(aside.len(), 2);
+        // Ten seconds on by the server's clock, a year and ten seconds by the wall's.
+        let stepped = NOW_UNIX + 10 + YEAR;
+        let empty = file_from_records("lan0", &[], 10, stepped);
+        let saved = file_with(empty, &aside, 10, stepped);
+        assert_eq!(addresses(&saved), ["192.168.1.100", "192.168.1.101"]);
+        for (written, was) in saved.leases.iter().zip(&file.leases) {
+            assert_eq!(written.expires_unix, stepped + 9_000 - 10);
+            assert_eq!(
+                written.expires_unix - written.granted_unix,
+                was.expires_unix - was.granted_unix,
+                "as long a lease as it was"
+            );
+        }
+        // Read back at the stepped time, they are leases with 8 990 s to run.
+        let (records, dropped) = records_from_file(&saved, "lan0", 0, stepped);
+        assert_eq!((records.len(), dropped.len()), (2, 0));
+        assert_eq!(records[0].expires_at, 8_990);
+        // And 9 000 s on by the server's clock they are gone, whatever the wall says.
+        let empty = file_from_records("lan0", &[], 9_000, NOW_UNIX);
+        assert_eq!(file_with(empty, &aside, 9_000, NOW_UNIX).leases, Vec::new());
+    }
+
     #[test]
     fn a_foreign_record_past_its_time_is_dropped_at_the_next_save() {
         let aside = vec![
-            entry("02:00:00:00:00:0a", "192.168.1.100", NOW_UNIX + 100),
-            entry("02:00:00:00:00:0b", "192.168.1.101", NOW_UNIX + 9_000),
+            Aside {
+                lease: entry("02:00:00:00:00:0a", "192.168.1.100", NOW_UNIX + 100),
+                expires_at: 100,
+            },
+            Aside {
+                lease: entry("02:00:00:00:00:0b", "192.168.1.101", NOW_UNIX + 9_000),
+                expires_at: 9_000,
+            },
         ];
-        let empty = file_from_records("lan0", &[], 0, NOW_UNIX + 100);
+        let empty = file_from_records("lan0", &[], 100, NOW_UNIX + 100);
         assert_eq!(
-            addresses(&file_with(empty, &aside, NOW_UNIX + 100)),
+            addresses(&file_with(empty, &aside, 100, NOW_UNIX + 100)),
             ["192.168.1.101"]
         );
     }
@@ -766,17 +844,16 @@ mod tests {
         );
         // Their time is what it was: 9 000 s from the first writing, 20 s of it gone.
         assert_eq!(kept[0].expires_at, 50 + 9_000 - 20);
-        let aside = set_aside(&file, &kept, NOW_UNIX + 20);
-        assert_eq!(aside, [file.leases[0].clone()]);
+        let aside = set_aside(&file, &kept, 50, NOW_UNIX + 20);
+        assert_eq!(leases_of(&aside), [file.leases[0].clone()]);
     }
 
     #[test]
     fn a_record_set_aside_gives_way_to_a_live_lease_of_its_address() {
-        let aside = vec![entry(
-            "02:00:00:00:00:0a",
-            "192.168.1.100",
-            NOW_UNIX + 9_000,
-        )];
+        let aside = vec![Aside {
+            lease: entry("02:00:00:00:00:0a", "192.168.1.100", NOW_UNIX + 9_000),
+            expires_at: 9_000,
+        }];
         let live = LeaseRecord {
             address: ip("192.168.1.100"),
             mac: MAC_B,
@@ -786,7 +863,7 @@ mod tests {
             expires_at: 43_200,
         };
         let own = file_from_records("lan0", &[live], 0, NOW_UNIX);
-        let saved = file_with(own, &aside, NOW_UNIX);
+        let saved = file_with(own, &aside, 0, NOW_UNIX);
         assert_eq!(addresses(&saved), ["192.168.1.100"]);
         assert_eq!(saved.leases[0].mac, "02:00:00:00:00:0b");
     }
@@ -803,9 +880,14 @@ mod tests {
             ],
         };
         assert_eq!(
-            addresses_of(&set_aside(&file, &[], NOW_UNIX)),
+            addresses_of(&leases_of(&set_aside(&file, &[], 0, NOW_UNIX))),
             ["192.168.9.7"]
         );
+    }
+
+    /// The entries set aside, as the file had them.
+    fn leases_of(aside: &[Aside]) -> Vec<Dhcp4ServerLease> {
+        aside.iter().map(|entry| entry.lease.clone()).collect()
     }
 
     fn addresses_of(leases: &[Dhcp4ServerLease]) -> Vec<&str> {
@@ -838,14 +920,27 @@ mod tests {
         assert_ne!(capped["lan0"], wanted["lan0"]);
     }
 
+    /// A server stopped to be started again leaves its LAN's leases in the World, where the
+    /// one that follows puts its own: taken out and put back, every lease would read as
+    /// released and granted again. A LAN that has no server any more loses them.
     #[test]
-    fn withdrawing_takes_the_lans_leases() {
+    fn withdrawing_takes_the_leases_of_a_lan_that_has_no_server_any_more() {
         let mut world = static_world();
         for lan in ["lan0", "guest"] {
             Arc::make_mut(&mut world.leases).insert(lan.to_owned(), Vec::new());
         }
+        // `lan0` still has its server in the config: this is a restart.
+        Dhcp4Servers.withdraw("lan0", &mut world);
+        assert_eq!(world.leases.keys().collect::<Vec<_>>(), ["guest", "lan0"]);
+        // Its DHCP table taken away, the server is gone for good.
+        let mut config = (*world.config).clone();
+        config.lans[0].dhcp = None;
+        world.config = Arc::new(config);
         Dhcp4Servers.withdraw("lan0", &mut world);
         assert_eq!(world.leases.keys().collect::<Vec<_>>(), ["guest"]);
+        // As is the server of a LAN that is not in the config at all.
+        Dhcp4Servers.withdraw("guest", &mut world);
+        assert!(world.leases.is_empty());
         Dhcp4Servers.withdraw("lan9", &mut world);
     }
 
