@@ -16,6 +16,7 @@ pub mod events;
 pub mod gate;
 pub mod grpc;
 pub mod http;
+pub mod keeper;
 pub mod limits;
 pub mod listener;
 pub mod pb;
