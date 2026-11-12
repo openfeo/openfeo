@@ -353,10 +353,16 @@ async fn run(
             }
             () = stop.requested() => {
                 // The lease goes back while its address is still on the port: the manager
-                // takes the fact out, and the appliers the address, once this returns.
+                // takes the fact out, and with it the appliers the address, once this returns.
+                // (A WAN moved to another port or tag is the exception: SPEC §6.3.)
                 if let Err(err) = driver.release() {
                     warn!("wan {wan} dhcp release: {err}");
                 }
+                // A client stopped on purpose leaves nothing to start from: the lease was
+                // given back, or belongs to a port, a tag or a network the WAN is leaving. A
+                // successor that asked for it again would wait out a server with no record of
+                // it (RFC 2131 §4.3.2) before it began again with a DISCOVER.
+                forget_lease(&path, wan);
                 info!("{}", stopped_line(wan));
                 return Ok(());
             }
@@ -364,6 +370,16 @@ async fn run(
         for event in events {
             publish(wan, mac, &path, publisher, event).await;
         }
+    }
+}
+
+/// Remove the stored lease, so that whatever runs this WAN next starts with a DISCOVER. A
+/// file that is not there is no trouble.
+fn forget_lease(path: &Path, wan: &str) {
+    if let Err(err) = fs::remove_file(path)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        warn!("wan {wan} dhcp cannot remove {}: {err}", path.display());
     }
 }
 
@@ -533,11 +549,7 @@ async fn publish(wan: &str, mac: [u8; 6], path: &Path, publisher: &Publisher, ev
             match &why {
                 Unbound::Nak(text) => {
                     info!("wan {wan} dhcp nak {}", text.as_deref().unwrap_or("-"));
-                    if let Err(err) = fs::remove_file(path)
-                        && err.kind() != io::ErrorKind::NotFound
-                    {
-                        warn!("wan {wan} dhcp cannot remove {}: {err}", path.display());
-                    }
+                    forget_lease(path, wan);
                 }
                 Unbound::Expired => info!("wan {wan} dhcp expired"),
                 Unbound::RebootTimedOut => info!("wan {wan} dhcp reboot timed out"),
@@ -813,6 +825,17 @@ mod tests {
         let wanted = Dhcp4Clients.wanted(&world_with(config));
         assert_eq!(wanted.keys().collect::<Vec<_>>(), ["wan0", "wan2"]);
         assert_eq!(wanted["wan2"].port, "p4");
+    }
+
+    /// What a client stopped on purpose does to its stored lease, and a NAK before it.
+    #[test]
+    fn a_forgotten_lease_is_gone_and_a_missing_one_is_no_trouble() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dhcp4-wan0.toml");
+        std::fs::write(&path, "lease").unwrap();
+        forget_lease(&path, "wan0");
+        assert!(!path.exists());
+        forget_lease(&path, "wan0");
     }
 
     #[test]
