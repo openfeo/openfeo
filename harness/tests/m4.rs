@@ -12,7 +12,10 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
-use openfeo_config::api::{ErrorCode, GetStateResponse, GetStatusResponse};
+use openfeo_config::api::{
+    ApplyConfigRequest, ErrorCode, GetStateResponse, GetStatusResponse, Request, client_msg,
+    request,
+};
 use openfeo_config::state::{ConfigEffectKind, State, WanPhase};
 use openfeo_config::{Config, StaticLease, wan};
 use openfeo_harness::apiclient::{Api, Ws};
@@ -1177,6 +1180,55 @@ fn applied(
         .map_err(|error| anyhow::anyhow!("the apply was refused: {error:?}"))
 }
 
+/// Apply a change that takes away the address this socket arrived at, and do not wait for
+/// the answer: the router answers once the config is published, and its old address may be
+/// gone before the answer is out. A validation says beforehand that the connection will drop
+/// (SPEC §8.3); that the change was taken is read on the console, and `cur` is left after
+/// the line.
+fn applied_moving(
+    lab: &Lab,
+    ws: &mut Ws,
+    config: &Config,
+    tag: &str,
+    timeout_secs: u32,
+    cur: &mut Cursor,
+) -> anyhow::Result<()> {
+    ws.send(client_msg::Body::Request(Request {
+        body: Some(request::Body::ApplyConfig(ApplyConfigRequest {
+            config: Some(config.clone()),
+            tag: tag.to_owned(),
+            immediate: false,
+            timeout_secs,
+        })),
+    }))?;
+    let taken = re(&format!(
+        "openfeo: config: applied; confirm within {timeout_secs} s"
+    ));
+    lab.console()?
+        .wait_for(cur, &taken, SOON)
+        .with_context(|| {
+            format!(
+                "the apply was not taken; the socket said {:?}",
+                ws.msg(Duration::from_secs(1))
+            )
+        })?;
+    Ok(())
+}
+
+/// A change of config is the config changing and a failure of nothing (SPEC §5.5): no task
+/// may have died anywhere on the console.
+fn no_task_failed(lab: &Lab) -> anyhow::Result<()> {
+    let failed = lab.console()?.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: task \S+ failed"),
+        Duration::from_millis(1),
+    );
+    match failed {
+        Ok(found) => anyhow::bail!("a task failed across the change: {}", found.line),
+        Err(_) => Ok(()),
+    }
+}
+
 /// The router refused, with `code`.
 fn refused<T: std::fmt::Debug>(
     answer: Result<T, openfeo_config::api::Error>,
@@ -1206,15 +1258,15 @@ fn a_subnet_change_not_confirmed_is_reverted(lab: &mut Lab) -> anyhow::Result<()
     ensure!(view.confirm_secs == 120, "the default window: {view:?}");
     let config = view.config.context("no config")?;
     let mut cur = Cursor::default();
-    applied(&mut ws, &moved(&config), &view.tag, false, SHORT_WINDOW)?;
-    let console = lab.console()?;
-    console.wait_for(
+    applied_moving(
+        lab,
+        &mut ws,
+        &moved(&config),
+        &view.tag,
+        SHORT_WINDOW,
         &mut cur,
-        &re(&format!(
-            "openfeo: config: applied; confirm within {SHORT_WINDOW} s"
-        )),
-        SOON,
     )?;
+    let console = lab.console()?;
     console.wait_for(
         &mut Cursor::default(),
         &re(r"openfeo: config: effect lan0 address moves"),
@@ -1275,6 +1327,7 @@ fn a_subnet_change_not_confirmed_is_reverted(lab: &mut Lab) -> anyhow::Result<()
         reverted.fields.get("why").map(String::as_str) == Some("timeout"),
         "{reverted:?}"
     );
+    no_task_failed(lab)?;
     // Nothing of it is on disk: a reset finds no pending file and the old config.
     reset_and_wait(lab)?;
     ensure!(
@@ -1294,10 +1347,23 @@ fn a_subnet_change_is_confirmed_from_the_new_address(lab: &mut Lab) -> anyhow::R
     let mut ws = api.ws_with(&token)?;
     let view = ws.config()?;
     let config = view.config.context("no config")?;
-    let tag = applied(&mut ws, &moved(&config), &view.tag, false, 60)?;
+    applied_moving(
+        lab,
+        &mut ws,
+        &moved(&config),
+        &view.tag,
+        60,
+        &mut Cursor::default(),
+    )?;
     rehome(lab, "192.168.2.2/24", "192.168.2.1")?;
     let there = Api::on(&lab.lan0, MOVED_ROUTER.parse::<SocketAddr>()?, HOST);
     let mut ws = there.ws_with(&token)?;
+    // The answer to the apply may never have come: the tag is read where the router now is.
+    let (ipv4, tag) = lan0_of(&mut ws)?;
+    ensure!(
+        ipv4 == "192.168.2.1/24" && tag != view.tag,
+        "while pending: {ipv4} {tag}"
+    );
     ws.confirm()?
         .map_err(|error| anyhow::anyhow!("the confirm was refused: {error:?}"))?;
     lab.console()?.wait_for(
@@ -1308,6 +1374,7 @@ fn a_subnet_change_is_confirmed_from_the_new_address(lab: &mut Lab) -> anyhow::R
     let (ipv4, now) = lan0_of(&mut ws)?;
     ensure!(ipv4 == "192.168.2.1/24" && now == tag, "{ipv4} {now}");
     refused(ws.revert()?, ErrorCode::FailedPrecondition)?;
+    no_task_failed(lab)?;
     reset_and_wait(lab)?;
     ensure!(
         lab.console()?.count(&re(DISCARDED)) == 0,
@@ -1340,6 +1407,7 @@ fn an_immediate_apply_stands_at_once(lab: &mut Lab) -> anyhow::Result<()> {
         "an immediate apply is pending"
     );
     refused(ws.confirm()?, ErrorCode::FailedPrecondition)?;
+    no_task_failed(lab)?;
     reset_and_wait(lab)?;
     ensure!(
         lab.console()?.count(&re(DISCARDED)) == 0,
@@ -1366,12 +1434,15 @@ fn a_restart_during_the_window_discards_the_change(lab: &mut Lab) -> anyhow::Res
     let mut ws = api.ws_with(&token)?;
     let view = ws.config()?;
     let config = view.config.context("no config")?;
-    applied(&mut ws, &moved(&config), &view.tag, false, 600)?;
-    lab.console()?.wait_for(
+    applied_moving(
+        lab,
+        &mut ws,
+        &moved(&config),
+        &view.tag,
+        600,
         &mut Cursor::default(),
-        &re(r"openfeo: config: applied; confirm within 600 s"),
-        SOON,
     )?;
+    no_task_failed(lab)?;
     reset_and_wait(lab)?;
     lab.console()?
         .wait_for(&mut Cursor::default(), &re(DISCARDED), SOON)?;
@@ -1444,6 +1515,7 @@ fn what_the_router_refuses_changes_nothing(lab: &mut Lab) -> anyhow::Result<()> 
     ensure!(lan0_of(&mut ws)?.1 == newer, "after the revert");
     // The password is the one it was.
     api.login(PASSWORD)?;
+    no_task_failed(lab)?;
     password_never_logged(lab)
 }
 
@@ -1615,5 +1687,6 @@ fn no_secret_comes_back(lab: &mut Lab) -> anyhow::Result<()> {
         console.count(&re(daemons::PPP_PASSWORD)) == 0,
         "the PPPoE password is on the console"
     );
+    no_task_failed(lab)?;
     password_never_logged(lab)
 }
