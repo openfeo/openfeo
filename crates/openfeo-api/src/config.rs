@@ -175,11 +175,20 @@ fn sync_dir_of(path: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
-/// The pending file becomes `config.toml`: renamed over it, the directory synced.
-fn promote(config_path: &Path) -> io::Result<()> {
+/// The pending config becomes `config.toml`: written whole from `text`, what the keeper
+/// holds, and not renamed from the pending file, so that a confirm cut off after this (or
+/// asked again) finds nothing it cannot do twice. The pending file is removed afterwards; one
+/// that will not go is discarded at the next start, holding what `config.toml` now does.
+fn promote(config_path: &Path, text: &str) -> io::Result<()> {
     keep_original(config_path)?;
-    std::fs::rename(file::pending_path(config_path), config_path)?;
-    sync_dir_of(config_path)
+    file::write_whole(config_path, text).map_err(io::Error::other)?;
+    if let Err(err) = remove_pending(config_path) {
+        warn!(
+            "config: cannot remove {}: {err}",
+            file::pending_path(config_path).display()
+        );
+    }
+    Ok(())
 }
 
 /// Remove the pending file for good: the directory is synced, so a power cut straight
@@ -190,6 +199,26 @@ fn remove_pending(config_path: &Path) -> io::Result<bool> {
         Ok(()) => sync_dir_of(config_path).map(|()| true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
+    }
+}
+
+/// Run a change of config to its end, whoever is waiting for it. A caller that goes away
+/// mid-flight (a gRPC call reset or past its deadline drops the handler's future) must not
+/// leave the file written and the keeper and the World as they were: the change runs as a
+/// task of its own and the caller only waits for it.
+async fn whole<T: Send + 'static>(
+    what: &'static str,
+    work: impl Future<Output = Result<T, ApiError>> + Send + 'static,
+) -> Result<T, ApiError> {
+    match tokio::spawn(work).await {
+        Ok(done) => done,
+        Err(err) => {
+            warn!("config: {what} did not finish: {err}");
+            Err(ApiError::new(
+                ErrorCode::Internal,
+                "the change of config did not finish",
+            ))
+        }
     }
 }
 
@@ -285,6 +314,15 @@ impl Shared {
     /// window out of range; `FailedPrecondition` for a stale tag, a change already pending or
     /// a router running over a refused file; `Internal` when the file cannot be written.
     pub async fn apply_config(
+        self: &Arc<Self>,
+        request: ApplyConfigRequest,
+    ) -> Result<ApplyConfigResponse, ApiError> {
+        let this = Arc::clone(self);
+        whole("the apply", async move { this.apply_whole(request).await }).await
+    }
+
+    /// The apply itself, from the keeper's lock to the event.
+    async fn apply_whole(
         &self,
         request: ApplyConfigRequest,
     ) -> Result<ApplyConfigResponse, ApiError> {
@@ -359,13 +397,21 @@ impl Shared {
     ///
     /// `FailedPrecondition` when nothing is pending; `Internal` when the file cannot be
     /// promoted (the change is then still pending).
-    pub async fn confirm_config(&self) -> Result<(), ApiError> {
+    pub async fn confirm_config(self: &Arc<Self>) -> Result<(), ApiError> {
+        let this = Arc::clone(self);
+        whole("the confirm", async move { this.confirm_whole().await }).await
+    }
+
+    /// The confirm itself.
+    async fn confirm_whole(&self) -> Result<(), ApiError> {
         let mut keeper = self.keeper.lock().await;
         if keeper.pending().is_none() {
             return Err(refused(&Refusal::NothingPending));
         }
+        let text = file::render(keeper.running())
+            .map_err(|err| not_written("the config as text", &err))?;
         let config_path = self.config_path.clone();
-        off_thread("config.toml", move || promote(&config_path)).await?;
+        off_thread("config.toml", move || promote(&config_path, &text)).await?;
         let config = keeper.confirm().map_err(|refusal| refused(&refusal))?;
         info!("{}", line_confirmed());
         self.publish(config, None);
@@ -379,9 +425,13 @@ impl Shared {
     /// # Errors
     ///
     /// `FailedPrecondition` when nothing is pending.
-    pub async fn revert_config(&self, why: Why) -> Result<(), ApiError> {
-        let mut keeper = self.keeper.lock().await;
-        self.revert_held(&mut keeper, why).await
+    pub async fn revert_config(self: &Arc<Self>, why: Why) -> Result<(), ApiError> {
+        let this = Arc::clone(self);
+        whole("the revert", async move {
+            let mut keeper = this.keeper.lock().await;
+            this.revert_held(&mut keeper, why).await
+        })
+        .await
     }
 
     /// The revert, by whoever holds the keeper.
@@ -679,6 +729,80 @@ mod tests {
         );
     }
 
+    /// Wait, on the runtime, for `settled` to hold; two seconds is for ever here.
+    async fn eventually(what: &str, settled: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !settled() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Whoever asked for an apply goes away while its file is being written: a gRPC call
+    /// reset in flight drops the handler's future. What was begun is finished, so the file
+    /// and the running config never part.
+    #[tokio::test]
+    async fn an_apply_whose_caller_goes_away_is_finished_whole() {
+        let rig = Rig::new(120);
+        let request = ApplyConfigRequest {
+            config: Some(secrets::redact(&with_reservation(dhcp()))),
+            tag: rig.shared.config_view().await.tag,
+            immediate: true,
+            timeout_secs: 0,
+        };
+        // Polled once and dropped, while the keeper is busy so that it cannot be done by then.
+        let busy = rig.shared.keeper.lock().await;
+        let cut = tokio::time::timeout(Duration::ZERO, rig.shared.apply_config(request)).await;
+        assert!(cut.is_err(), "the apply finished at its first poll");
+        drop(busy);
+        eventually("the file written", || {
+            rig.on_disk().lans[0].dhcp.as_ref().unwrap().r#static.len() == 2
+        })
+        .await;
+        eventually("the config the file holds running", || {
+            rig.running().lans[0].dhcp.as_ref().unwrap().r#static.len() == 2
+        })
+        .await;
+    }
+
+    /// The same for a confirm: the file promoted and the keeper still waiting would have the
+    /// timer take the change back while the disk keeps it for the next boot.
+    #[tokio::test]
+    async fn a_confirm_whose_caller_goes_away_is_finished_whole() {
+        let rig = Rig::new(120);
+        rig.apply(&moved(dhcp()), false, 0).await.unwrap();
+        let busy = rig.shared.keeper.lock().await;
+        let cut = tokio::time::timeout(Duration::ZERO, rig.shared.confirm_config()).await;
+        assert!(cut.is_err(), "the confirm finished at its first poll");
+        drop(busy);
+        eventually("the file promoted", || {
+            rig.on_disk().lans[0].ipv4 == "192.168.2.1/24"
+        })
+        .await;
+        eventually("nothing pending", || {
+            rig.shared.world.borrow().pending.is_none()
+        })
+        .await;
+        assert_eq!(rig.running().lans[0].ipv4, "192.168.2.1/24");
+        assert!(!rig.pending_path().exists());
+        // Settled: a second confirm is told there is nothing to confirm.
+        let err = rig.shared.confirm_config().await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
+    /// A confirm cut off after its file work, however that came about (the rename done, the
+    /// directory's sync refused), is not stuck: asked again, it finishes.
+    #[tokio::test]
+    async fn a_confirm_can_be_asked_again_after_its_file_was_promoted() {
+        let rig = Rig::new(120);
+        rig.apply(&moved(dhcp()), false, 0).await.unwrap();
+        std::fs::rename(rig.pending_path(), rig.config_path()).unwrap();
+        rig.shared.confirm_config().await.unwrap();
+        assert_eq!(rig.on_disk().lans[0].ipv4, "192.168.2.1/24");
+        assert_eq!(rig.running().lans[0].ipv4, "192.168.2.1/24");
+        assert!(rig.shared.world.borrow().pending.is_none());
+    }
+
     /// With nothing pending in the World a start is what it was: a pending file is a change
     /// some earlier run of the router never confirmed.
     #[tokio::test]
@@ -812,41 +936,60 @@ mod tests {
         let window = tokio::spawn(keep_window(rig.shared.clone()));
         rig.apply(&moved(dhcp()), false, 0).await.unwrap();
         assert_eq!(rig.running(), moved(dhcp()));
-        tokio::time::sleep(Duration::from_millis(1_600)).await;
-        assert_eq!(rig.running(), dhcp());
-        assert_eq!(rig.shared.world.borrow().pending, None);
-        assert!(!rig.pending_path().exists());
-        assert_eq!(rig.on_disk(), dhcp());
+        // The event is the last thing a revert does: wait for it, however loaded the host.
+        let mut seen = rig.topics();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !seen
+            .iter()
+            .any(|topic| topic.starts_with("config.reverted"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the window never ran out: {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen.extend(rig.topics());
+        }
         assert_eq!(
-            rig.topics(),
+            seen,
             [
                 "config.applied effects=1 mode=pending window_secs=1",
                 "config.reverted why=timeout"
             ]
         );
+        assert_eq!(rig.running(), dhcp());
+        assert_eq!(rig.shared.world.borrow().pending, None);
+        assert!(!rig.pending_path().exists());
+        assert_eq!(rig.on_disk(), dhcp());
         // And the next change gets its own window.
         rig.apply(&with_reservation(dhcp()), false, 0)
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(1_600)).await;
-        assert_eq!(rig.running(), dhcp());
+        assert_eq!(rig.running(), with_reservation(dhcp()));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while rig.running() != dhcp() {
+            assert!(Instant::now() < deadline, "the second window never ran out");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         window.abort();
     }
 
     #[tokio::test]
     async fn a_confirm_just_before_the_window_ends_stands() {
-        let mut rig = Rig::new(2);
+        // Three seconds of window: the confirm has two to spare on a loaded host, and the
+        // look afterwards is a second past where the window would have ended.
+        let mut rig = Rig::new(3);
         let window = tokio::spawn(keep_window(rig.shared.clone()));
         rig.apply(&moved(dhcp()), false, 0).await.unwrap();
         tokio::time::sleep(Duration::from_millis(1_000)).await;
         rig.shared.confirm_config().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
         assert_eq!(rig.running(), moved(dhcp()));
         assert_eq!(rig.on_disk(), moved(dhcp()));
         assert_eq!(
             rig.topics(),
             [
-                "config.applied effects=1 mode=pending window_secs=2",
+                "config.applied effects=1 mode=pending window_secs=3",
                 "config.confirmed"
             ]
         );

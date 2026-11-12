@@ -137,7 +137,7 @@ impl Backend for Slot {
 
 /// Perform what a connection asked: the same operations HTTP and gRPC call.
 pub(crate) async fn perform(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     at: Arrival,
     token: &str,
     request: Request,
