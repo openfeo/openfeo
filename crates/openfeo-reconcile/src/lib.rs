@@ -17,6 +17,7 @@ pub mod nft;
 pub mod public;
 pub mod ra;
 pub mod routing;
+pub mod slices;
 pub mod state;
 pub mod sysctl;
 pub mod time;
