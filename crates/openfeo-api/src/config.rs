@@ -315,18 +315,24 @@ impl Shared {
         let (config, pending) = (accepted.config().clone(), accepted.pending().cloned());
         let effects = accepted.effects().to_vec();
         keeper.commit(accepted);
-        self.publish(config, pending.clone());
-        let (mode, window_secs) = if let Some(fact) = &pending {
-            self.start_window(fact.window_secs);
-            info!("{}", line_applied(fact.window_secs));
-            ("pending", fact.window_secs)
-        } else {
-            info!("{}", line_applied_immediately());
-            ("immediate", 0)
-        };
+        // Said before it is published, so that on the console the change comes first and
+        // what it sets off (a task stopped, an address moved) follows it.
+        let applied = pending
+            .as_ref()
+            .map_or_else(line_applied_immediately, |fact| {
+                line_applied(fact.window_secs)
+            });
+        info!("{applied}");
         for effect in &effects {
             info!("{}", line_effect(effect));
         }
+        self.publish(config, pending.clone());
+        let (mode, window_secs) = if let Some(fact) = &pending {
+            self.start_window(fact.window_secs);
+            ("pending", fact.window_secs)
+        } else {
+            ("immediate", 0)
+        };
         self.publisher.emit(
             EventDraft::new("config.applied")
                 .with("mode", mode)
@@ -350,9 +356,9 @@ impl Shared {
         let config_path = self.config_path.clone();
         off_thread("config.toml", move || promote(&config_path)).await?;
         let config = keeper.confirm().map_err(|refusal| refused(&refusal))?;
+        info!("{}", line_confirmed());
         self.publish(config, None);
         self.window.send_replace(None);
-        info!("{}", line_confirmed());
         self.publisher.emit(EventDraft::new("config.confirmed"));
         Ok(())
     }
@@ -371,6 +377,8 @@ impl Shared {
     async fn revert_held(&self, keeper: &mut Keeper, why: Why) -> Result<(), ApiError> {
         let window_secs = keeper.pending().map_or(0, |fact| fact.window_secs);
         let config = keeper.revert().map_err(|refusal| refused(&refusal))?;
+        // As an apply: the line first, then what going back sets off.
+        info!("{}", line_reverted(why, window_secs));
         self.publish(config, None);
         self.window.send_replace(None);
         let config_path = self.config_path.clone();
@@ -380,7 +388,6 @@ impl Shared {
             remove_pending(&config_path).map(|_| ())
         })
         .await;
-        info!("{}", line_reverted(why, window_secs));
         self.publisher.emit(EventDraft::new("config.reverted").with(
             "why",
             match why {
