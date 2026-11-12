@@ -356,11 +356,9 @@ mod tests {
             1,
             "a stopped task stays stopped"
         );
-        assert!(
-            health
-                .report(std::time::Instant::now())
-                .dead_tasks
-                .is_empty()
+        assert_eq!(
+            health.report(std::time::Instant::now()).dead_tasks,
+            Vec::<String>::new()
         );
     }
 
@@ -406,11 +404,9 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert_eq!(starts.load(Ordering::SeqCst), 1);
-        assert!(
-            health
-                .report(std::time::Instant::now())
-                .dead_tasks
-                .is_empty()
+        assert_eq!(
+            health.report(std::time::Instant::now()).dead_tasks,
+            Vec::<String>::new()
         );
     }
 
