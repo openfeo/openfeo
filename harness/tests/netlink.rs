@@ -1062,6 +1062,7 @@ fn world_from(cache: &Cache, config: &Config) -> World {
         ula: None,
         addresses: Arc::new(std::collections::BTreeSet::new()),
         wan_status: Arc::new(std::collections::BTreeMap::new()),
+        pending: None,
     }
 }
 

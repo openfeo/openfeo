@@ -14,7 +14,8 @@ use std::net::IpAddr;
 use ipnet::{IpNet, Ipv6Net};
 
 use crate::{
-    Dhcp4Fact, KernelRoute, LeaseFact, MacAddr, PppoeFact, TimeFact, WanDhcp6Fact, WanIpv6Fact,
+    Dhcp4Fact, KernelRoute, LeaseFact, MacAddr, PendingFact, PppoeFact, TimeFact, WanDhcp6Fact,
+    WanIpv6Fact,
 };
 
 /// What the netlink monitor knows about one interface (SPEC §7.1: link state is a fact).
@@ -108,6 +109,9 @@ pub struct World {
     /// Each configured WAN's status, kept by the publisher's derive step; a WAN's task writes
     /// only the cause.
     pub wan_status: Arc<BTreeMap<String, WanStatusFact>>,
+    /// A change of config that is applied and not yet confirmed (SPEC §5.5); the keeper of the
+    /// config sets it.
+    pub pending: Option<Arc<PendingFact>>,
 }
 
 impl World {
@@ -129,6 +133,7 @@ impl World {
             ula: None,
             addresses: Arc::new(BTreeSet::new()),
             wan_status: Arc::new(BTreeMap::new()),
+            pending: None,
         }
     }
 

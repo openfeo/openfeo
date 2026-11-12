@@ -11,6 +11,7 @@ pub mod derive;
 pub mod dhcp;
 pub mod dhcp6_server;
 pub mod dns;
+pub mod effects;
 pub mod lan6;
 pub mod links;
 pub mod nft;
