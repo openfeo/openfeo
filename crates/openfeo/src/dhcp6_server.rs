@@ -15,7 +15,6 @@ use openfeo_net::dhcp6::ServerSocket;
 use openfeo_proto_dhcp4::identity::duid_ll;
 use openfeo_proto_dhcp6::server::{Config, INFORMATION_REFRESH_TIME, reply};
 use openfeo_reconcile::dhcp6_server::{DesiredResponder, desired};
-use openfeo_reconcile::ra::wanted;
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{Publisher, Supervisor};
@@ -28,12 +27,9 @@ use crate::dhcp4::{DUID_PATH, load_or_create_duid, lowest_port_mac, wait_for_lin
 /// The DHCPv6 message buffer.
 const RECEIVE_BUFFER: usize = 1500;
 
-/// The one responder task, when a LAN advertises.
-pub fn spawn(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    if !wanted(&publisher.current()) {
-        info!("dhcp6-server not started: no LAN advertises");
-        return;
-    }
+/// The one responder task. It is started whatever the config: it follows the World, and a LAN
+/// that comes to advertise later gets its responder then.
+pub fn spawn(supervisor: &Supervisor, _publisher: &Arc<Publisher>, world_rx: &WorldRx) {
     let world_rx = world_rx.clone();
     supervisor.spawn("dhcp6-server", move || {
         let world_rx = world_rx.clone();
@@ -212,6 +208,37 @@ mod tests {
             ],
             domain: "home.arpa".to_owned(),
         }
+    }
+
+    const VM_IPV6: &str = include_str!("../../../harness/fixtures/vm-ipv6.toml");
+
+    /// The lab's IPv6 configuration (a routed /48, `lan0` with its /64 in it).
+    fn ipv6_world() -> openfeo_world::World {
+        let ports = openfeo_config::PortMap {
+            ports: (0..4)
+                .map(|i| openfeo_config::PortMapEntry {
+                    id: format!("pci-0000:00:0{}.0", i + 3),
+                    name: format!("p{i}"),
+                })
+                .collect(),
+        };
+        openfeo_world::World::new(openfeo_config::file::parse(VM_IPV6).unwrap(), ports)
+    }
+
+    #[test]
+    fn the_task_s_desired_state_follows_a_changed_config() {
+        let mut world = ipv6_world();
+        let before = desired(&world);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].lan, "lan0");
+        let mut config = (*world.config).clone();
+        config.system.get_or_insert_with(Default::default).domain = "lan.example".to_owned();
+        world.config = std::sync::Arc::new(config);
+        assert_eq!(desired(&world)[0].domain, "lan.example");
+        let mut config = (*world.config).clone();
+        config.lans[0].ra = Some(false);
+        world.config = std::sync::Arc::new(config);
+        assert_eq!(desired(&world), Vec::new());
     }
 
     #[test]

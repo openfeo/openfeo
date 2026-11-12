@@ -20,9 +20,7 @@ use openfeo_proto_ndp::server::{
 };
 use openfeo_proto_ndp::wire::Preference;
 use openfeo_reconcile::lan6::Source;
-use openfeo_reconcile::ra::{
-    DEPRECATION_SECS, DesiredPio, DesiredRa, PioLifetimes, desired, wanted,
-};
+use openfeo_reconcile::ra::{DEPRECATION_SECS, DesiredPio, DesiredRa, PioLifetimes, desired};
 use openfeo_runtime::clock;
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::world::WorldRx;
@@ -41,17 +39,53 @@ const RECEIVE_BUFFER: usize = 1500;
 /// Milliseconds per second, for deadlines.
 const MS: u64 = 1000;
 
-/// The one advertisement task, when a LAN advertises.
-pub fn spawn(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    if !wanted(&publisher.current()) {
-        info!("ra not started: no LAN advertises");
-        return;
-    }
+/// The one advertisement task. It is started whatever the config: it follows the World, and a
+/// LAN that comes to advertise later gets its server then.
+pub fn spawn(supervisor: &Supervisor, _publisher: &Arc<Publisher>, world_rx: &WorldRx) {
     let world_rx = world_rx.clone();
     supervisor.spawn("ra", move || {
         let world_rx = world_rx.clone();
         async move { run(world_rx).await }
     });
+}
+
+/// What to advertise now, given what was being advertised: `next`, and after its prefixes every
+/// prefix `advertised` named that `next` does not, each with no preferred lifetime and a valid
+/// one that runs out two hours from `now_ms` ([`DEPRECATION_SECS`], RFC 4862 §5.5.3), or at
+/// the deadline it already had. A prefix the config or its WAN takes off a LAN is told to the
+/// hosts as going, not dropped in silence. One whose time is up is no longer named.
+fn with_farewells(advertised: &DesiredRa, mut next: DesiredRa, now_ms: u64) -> DesiredRa {
+    for pio in &advertised.prefixes {
+        if next.prefixes.iter().any(|kept| kept.prefix == pio.prefix) {
+            continue;
+        }
+        let until_ms = match pio.lifetimes {
+            PioLifetimes::Deprecated { until_ms } => until_ms,
+            _ => now_ms.saturating_add(u64::from(DEPRECATION_SECS) * MS),
+        };
+        if until_ms > now_ms {
+            next.prefixes.push(DesiredPio {
+                prefix: pio.prefix,
+                source: pio.source.clone(),
+                lifetimes: PioLifetimes::Deprecated { until_ms },
+            });
+        }
+    }
+    next
+}
+
+/// When the first of the farewells in `advertised` runs out: the prefixes it names that
+/// `asked`, what the World asks for, does not.
+fn next_farewell(advertised: &DesiredRa, asked: &DesiredRa) -> Option<u64> {
+    advertised
+        .prefixes
+        .iter()
+        .filter(|pio| asked.prefixes.iter().all(|kept| kept.prefix != pio.prefix))
+        .filter_map(|pio| match pio.lifetimes {
+            PioLifetimes::Deprecated { until_ms } => Some(until_ms),
+            _ => None,
+        })
+        .min()
 }
 
 /// One LAN's server, driven on its own task and told what to advertise through a watch; `None`
@@ -134,7 +168,10 @@ async fn serve(
     };
     let socket = NdpSocket::open(index, &ra.ifname, Role::Server)
         .map_err(|err| TaskError::from(format!("ra {}: {err}", ra.ifname)))?;
-    let mut current = rx.borrow_and_update().clone().unwrap_or_else(|| ra.clone());
+    // `asked` is what the World asks for; `current` what is advertised: that, and the
+    // farewells of prefixes taken away since.
+    let mut asked = rx.borrow_and_update().clone().unwrap_or_else(|| ra.clone());
+    let mut current = asked.clone();
     let mut server = Server::new(server_config(&current, mac), seed(SEED_SALT));
     let mut sends = Throttle::new(NOISY_WINDOW);
     let mut buf = vec![0u8; RECEIVE_BUFFER];
@@ -149,7 +186,17 @@ async fn serve(
         let timer = server
             .next_timeout()
             .map(|at| Instant::from_std(clock::instant_at(at)));
+        let farewell =
+            next_farewell(&current, &asked).map(|at| Instant::from_std(clock::instant_at(at)));
         tokio::select! {
+            () = wait_until(farewell) => {
+                // A farewell has had its two hours: the prefix is no longer named.
+                let now = clock::uptime_ms();
+                let next = with_farewells(&current, asked.clone(), now);
+                let outputs = server.handle(Input::Configure(server_config(&next, mac)), now);
+                pending = send_all(&socket, outputs, &mut sends, &current.ifname).or(pending);
+                current = next;
+            }
             () = wait_until(pending.as_ref().map(|resend| resend.at)) => {
                 // The bridge's link-local address was tentative a second ago (#34).
                 if let Some(resend) = pending.take() {
@@ -192,10 +239,13 @@ async fn serve(
                     }
                     continue;
                 };
+                let now = clock::uptime_ms();
+                asked = next;
+                let next = with_farewells(&current, asked.clone(), now);
                 for line in change_lines(&current, &next) {
                     info!("{line}");
                 }
-                let outputs = server.handle(Input::Configure(server_config(&next, mac)), clock::uptime_ms());
+                let outputs = server.handle(Input::Configure(server_config(&next, mac)), now);
                 pending = send_all(&socket, outputs, &mut sends, &current.ifname).or(pending);
                 current = next;
             }
@@ -440,6 +490,138 @@ mod tests {
             other: true,
             routes: vec![net("fd12:3456:789a::/48"), net("2001:db8:100::/56")],
         }
+    }
+
+    const VM_IPV6: &str = include_str!("../../../harness/fixtures/vm-ipv6.toml");
+
+    /// The lab's IPv6 configuration (a routed /48, `lan0` with its /64 in it).
+    fn ipv6_world() -> openfeo_world::World {
+        let ports = openfeo_config::PortMap {
+            ports: (0..4)
+                .map(|i| openfeo_config::PortMapEntry {
+                    id: format!("pci-0000:00:0{}.0", i + 3),
+                    name: format!("p{i}"),
+                })
+                .collect(),
+        };
+        openfeo_world::World::new(openfeo_config::file::parse(VM_IPV6).unwrap(), ports)
+    }
+
+    #[test]
+    fn the_task_s_desired_state_follows_a_changed_config() {
+        let mut world = ipv6_world();
+        let before = desired(&world);
+        assert_eq!(
+            before.iter().map(|ra| ra.lan.as_str()).collect::<Vec<_>>(),
+            ["lan0"]
+        );
+        // A LAN told not to advertise drops out; the task then says goodbye for it.
+        let mut config = (*world.config).clone();
+        config.lans[0].ra = Some(false);
+        world.config = Arc::new(config);
+        assert_eq!(desired(&world), Vec::new());
+        // Another domain is another search list.
+        let mut world = ipv6_world();
+        let mut config = (*world.config).clone();
+        config.system.get_or_insert_with(Default::default).domain = "lan.example".to_owned();
+        world.config = Arc::new(config);
+        assert_eq!(desired(&world)[0].domain, "lan.example");
+        assert_ne!(desired(&world), before);
+    }
+
+    const TWO_HOURS_MS: u64 = 7_200_000;
+
+    /// A prefix that leaves what the World asks for (its WAN's DHCPv6 client was removed, the
+    /// LAN's typed /64 was changed) is not dropped in silence: it is advertised with no
+    /// preferred lifetime for two hours, so that hosts stop using it for new connections.
+    #[test]
+    fn a_prefix_the_config_takes_off_a_lan_is_deprecated_to_its_hosts() {
+        let current = ra(1800);
+        let mut next = current.clone();
+        let gone = next.prefixes.remove(0);
+        next.rdnss.truncate(1);
+        let advertised = with_farewells(&current, next.clone(), 50_000);
+        assert_eq!(advertised.prefixes.len(), 2);
+        assert_eq!(
+            advertised.prefixes[0], next.prefixes[0],
+            "what is asked for comes first"
+        );
+        assert_eq!(
+            advertised.prefixes[1],
+            DesiredPio {
+                prefix: gone.prefix,
+                source: gone.source,
+                lifetimes: PioLifetimes::Deprecated {
+                    until_ms: 50_000 + TWO_HOURS_MS
+                },
+            }
+        );
+        // Everything else is what was asked for.
+        assert_eq!(advertised.rdnss, next.rdnss);
+        assert_eq!(advertised.routes, next.routes);
+        // The core is told: no preferred lifetime, the valid one counting down.
+        let config = server_config(&advertised, [0; 6]);
+        assert_eq!(config.prefixes[1].preferred, Lifetime::Fixed(0));
+        assert_eq!(
+            config.prefixes[1].valid,
+            Lifetime::Until {
+                at: 50_000 + TWO_HOURS_MS,
+                cap: DEPRECATION_SECS
+            }
+        );
+        // A typed /64 changed for another: the old one beside the new.
+        let mut changed = current.clone();
+        changed.prefixes[1].prefix = net("fd12:3456:789a:2::/64");
+        let advertised = with_farewells(&current, changed.clone(), 50_000);
+        assert_eq!(
+            advertised
+                .prefixes
+                .iter()
+                .map(|pio| pio.prefix)
+                .collect::<Vec<_>>(),
+            [
+                net("2001:db8:100:1::/64"),
+                net("fd12:3456:789a:2::/64"),
+                net("fd12:3456:789a:1::/64")
+            ]
+        );
+        // Nothing taken away, nothing added.
+        assert_eq!(with_farewells(&current, current.clone(), 50_000), current);
+    }
+
+    #[test]
+    fn a_farewell_keeps_its_deadline_and_ends_at_it() {
+        let current = ra(1800);
+        let mut next = current.clone();
+        next.prefixes.remove(0);
+        let advertised = with_farewells(&current, next.clone(), 50_000);
+        assert_eq!(
+            next_farewell(&advertised, &next),
+            Some(50_000 + TWO_HOURS_MS)
+        );
+        // A later change that still lacks the prefix does not start its two hours again.
+        let mut later_ask = next.clone();
+        later_ask.router_lifetime = 0;
+        let later = with_farewells(&advertised, later_ask.clone(), 60_000);
+        assert_eq!(
+            later.prefixes[1].lifetimes,
+            PioLifetimes::Deprecated {
+                until_ms: 50_000 + TWO_HOURS_MS
+            }
+        );
+        // At its deadline it is no longer named.
+        let after = with_farewells(&later, later_ask.clone(), 50_000 + TWO_HOURS_MS);
+        assert_eq!(after, later_ask);
+        assert_eq!(next_farewell(&after, &later_ask), None);
+        // A prefix that comes back is live again, with what the World says of it.
+        let back = with_farewells(&advertised, current.clone(), 70_000);
+        assert_eq!(back, current);
+        // One the World itself was deprecating keeps the World's deadline when it goes.
+        let mut with_dep = next.clone();
+        with_dep.prefixes.push(deprecated(90_000));
+        let carried = with_farewells(&with_dep, next.clone(), 60_000);
+        assert_eq!(carried.prefixes[1], deprecated(90_000));
+        assert_eq!(with_farewells(&with_dep, next.clone(), 90_000), next);
     }
 
     fn deprecated(until_ms: u64) -> DesiredPio {

@@ -20,17 +20,14 @@ use openfeo_runtime::{Publisher, Supervisor};
 use tokio::time::Instant;
 use tracing::{debug, info};
 
-use crate::dhcp4::{seed, wait_for_link};
+use crate::dhcp4::seed;
 
 /// The salt of the clock fallback of [`seed`].
 const SEED_SALT: u64 = 0x0044_4e53;
 
-/// The one DNS task, when there is a LAN to listen on.
-pub fn spawn(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    if desired(&publisher.current()).listeners.is_empty() {
-        info!("dns not started: no LAN to listen on");
-        return;
-    }
+/// The one DNS task. It is started whatever the config: with no LAN to listen on it waits for
+/// a config that has one.
+pub fn spawn(supervisor: &Supervisor, _publisher: &Arc<Publisher>, world_rx: &WorldRx) {
     let world_rx = world_rx.clone();
     supervisor.spawn("dns", move || {
         let world_rx = world_rx.clone();
@@ -38,16 +35,91 @@ pub fn spawn(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &Wor
     });
 }
 
-/// The task: wait for every LAN bridge, run the driver, log what it says, and follow the World:
-/// new upstreams or local names reconfigure the core live; a bridge recreated or a LAN added or
-/// removed restarts the task so the sockets follow.
-async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
-    let mut current = desired(&world_rx.borrow());
-    let mut indexes = Vec::new();
-    for listener in &current.listeners {
-        let (index, _mac) = wait_for_link(&mut world_rx, &listener.ifname).await?;
-        indexes.push((listener.ifname.clone(), index));
+/// What a World asks of a forwarder that is serving `current`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Nothing,
+    /// Other upstreams or local names: the core is reconfigured as it runs.
+    Configure,
+    /// Other LANs, or a LAN's other address: the sockets are bound again.
+    Rebind,
+}
+
+fn change(current: &DesiredDns, next: &DesiredDns) -> Change {
+    if next == current {
+        Change::Nothing
+    } else if next.listeners == current.listeners {
+        Change::Configure
+    } else {
+        Change::Rebind
     }
+}
+
+/// The index of each listener's bridge once every one exists, or `None` when the LANs changed
+/// first. A bridge need not have carrier: a LAN with no cable in must not keep DNS from the
+/// others, and the sockets are bound to the device, which is there either way.
+async fn bridges(
+    world_rx: &mut WorldRx,
+    current: &DesiredDns,
+) -> Result<Option<Vec<(String, u32)>>, TaskError> {
+    loop {
+        {
+            let world = world_rx.borrow_and_update();
+            if desired(&world).listeners != current.listeners {
+                return Ok(None);
+            }
+            let found: Option<Vec<(String, u32)>> = current
+                .listeners
+                .iter()
+                .map(|listener| {
+                    world
+                        .links
+                        .get(&listener.ifname)
+                        .map(|link| (listener.ifname.clone(), link.index))
+                })
+                .collect();
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        world_rx
+            .changed()
+            .await
+            .map_err(|_| "world publisher gone")?;
+    }
+}
+
+/// The task: serve the LANs the World has, and when they change (a LAN added or removed, an
+/// address moved) bind again from the start. That is not a failure: it is the config
+/// changing, and it counts toward nothing.
+async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
+    let mut waiting = false;
+    loop {
+        if desired(&world_rx.borrow_and_update()).listeners.is_empty() {
+            if !waiting {
+                info!("dns not started: no LAN to listen on");
+                waiting = true;
+            }
+            world_rx
+                .changed()
+                .await
+                .map_err(|_| "world publisher gone")?;
+            continue;
+        }
+        waiting = false;
+        serve(&mut world_rx).await?;
+        info!("dns: the LANs changed; binding again");
+    }
+}
+
+/// Serve until the LANs change: wait for every LAN bridge, run the driver, log what it says, and
+/// follow the World. New upstreams or local names reconfigure the core live; a bridge recreated
+/// is a failure the supervisor restarts.
+async fn serve(world_rx: &mut WorldRx) -> Result<(), TaskError> {
+    let mut current = desired(&world_rx.borrow());
+    let Some(indexes) = bridges(world_rx, &current).await? else {
+        return Ok(());
+    };
     // The World moved on while the bridges came up: leases, a WAN lease.
     current = desired(&world_rx.borrow_and_update());
     let config = forwarder_config(&current);
@@ -107,11 +179,10 @@ async fn run(mut world_rx: WorldRx) -> Result<(), TaskError> {
                     }
                     desired(&world)
                 };
-                if next == current {
-                    continue;
-                }
-                if next.listeners != current.listeners {
-                    return Err("dns: the LANs changed; restarting".into());
+                match change(&current, &next) {
+                    Change::Nothing => continue,
+                    Change::Rebind => return Ok(()),
+                    Change::Configure => {}
                 }
                 for event in driver.configure(forwarder_config(&next)) {
                     log_event(&event, &mut rebind);
@@ -278,6 +349,120 @@ mod tests {
         let lines = change_lines(&before, &named);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("dns local names "), "{lines:?}");
+    }
+
+    fn link(name: &str, index: u32, carrier: bool) -> openfeo_world::LinkFact {
+        openfeo_world::LinkFact {
+            index,
+            name: name.to_owned(),
+            up: true,
+            carrier,
+            mac: None,
+            mtu: 1500,
+            link_local6: None,
+            speed_mbps: None,
+        }
+    }
+
+    /// The static world with a second LAN, `lan1` on `p3` at `192.168.2.1/24`.
+    fn two_lans() -> World {
+        let mut world = static_world();
+        let mut config = (*world.config).clone();
+        config.lans.push(openfeo_config::Lan {
+            name: "lan1".to_owned(),
+            ports: vec!["p3".to_owned()],
+            ipv4: "192.168.2.1/24".to_owned(),
+            ..openfeo_config::Lan::default()
+        });
+        world.config = Arc::new(config);
+        world
+    }
+
+    #[test]
+    fn a_lan_added_later_gets_a_listener() {
+        let before = desired(&static_world());
+        let after = desired(&two_lans());
+        let names = |d: &DesiredDns| -> Vec<String> {
+            d.listeners.iter().map(|l| l.ifname.clone()).collect()
+        };
+        assert_eq!(names(&before), ["br-lan0"]);
+        assert_eq!(names(&after), ["br-lan0", "br-lan1"]);
+        assert_eq!(change(&before, &after), Change::Rebind);
+        assert_eq!(change(&after, &before), Change::Rebind);
+    }
+
+    #[test]
+    fn only_a_change_of_lans_rebinds() {
+        let before = desired(&static_world());
+        assert_eq!(change(&before, &before), Change::Nothing);
+        let mut learned = before.clone();
+        learned
+            .upstreams
+            .insert(0, Ipv4Addr::new(9, 9, 9, 9).into());
+        assert_eq!(change(&before, &learned), Change::Configure);
+        let mut moved = before.clone();
+        moved.listeners[0].address = Ipv4Addr::new(192, 168, 9, 1);
+        assert_eq!(change(&before, &moved), Change::Rebind);
+    }
+
+    /// The bridges are waited for until they exist, not until something is plugged into each:
+    /// a LAN with no cable in must not keep DNS from every other LAN.
+    #[tokio::test(start_paused = true)]
+    async fn the_bridges_are_awaited_without_their_carrier() {
+        let (publisher, mut world_rx) = Publisher::new(two_lans());
+        let current = desired(&publisher.current());
+        let waiting = {
+            let current = current.clone();
+            let mut world_rx = world_rx.clone();
+            tokio::spawn(async move { bridges(&mut world_rx, &current).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(!waiting.is_finished(), "no bridge exists yet");
+        publisher.update(|world| {
+            let links = Arc::make_mut(&mut world.links);
+            links.insert("br-lan0".to_owned(), link("br-lan0", 7, true));
+            links.insert("br-lan1".to_owned(), link("br-lan1", 8, false));
+        });
+        let found = waiting.await.unwrap().unwrap();
+        assert_eq!(
+            found,
+            Some(vec![("br-lan0".to_owned(), 7), ("br-lan1".to_owned(), 8)])
+        );
+        // A change of LANs while waiting ends the wait: the task starts again from the new set.
+        let (publisher, _) = Publisher::new(two_lans());
+        world_rx = publisher.subscribe();
+        let waiting = tokio::spawn(async move { bridges(&mut world_rx, &current).await });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let one = static_world().config.clone();
+        publisher.update(|world| world.config = one);
+        assert_eq!(waiting.await.unwrap().unwrap(), None);
+    }
+
+    /// A router with no LAN has nothing to listen on: the task waits for a config that has one
+    /// (until now it was never started, and a LAN added later got no DNS).
+    #[tokio::test(start_paused = true)]
+    async fn a_router_with_no_lan_starts_dns_when_one_is_added() {
+        let mut world = static_world();
+        let mut config = (*world.config).clone();
+        config.lans.clear();
+        world.config = Arc::new(config);
+        let (publisher, world_rx) = Publisher::new(world);
+        let task = tokio::spawn(run(world_rx));
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        assert!(!task.is_finished(), "waiting for a LAN, not gone");
+        // A LAN, and its bridge: the task goes on to bind, which cannot work here (no such
+        // device, and port 53 is not ours); that it tried is the point.
+        let with_lan = static_world().config.clone();
+        publisher.update(|world| {
+            world.config = with_lan;
+            Arc::make_mut(&mut world.links).insert("br-lan0".to_owned(), link("br-lan0", 7, true));
+        });
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the task went on once there was a LAN")
+            .unwrap();
+        let err = ended.expect_err("binding fails in a unit test").to_string();
+        assert!(err.starts_with("dns: "), "{err}");
     }
 
     #[test]

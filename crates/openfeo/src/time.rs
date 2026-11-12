@@ -22,7 +22,7 @@ use openfeo_runtime::{Publisher, Supervisor};
 use openfeo_world::TimeFact;
 use tracing::{debug, info};
 
-use crate::dhcp4::{seed, wait_for_link};
+use crate::dhcp4::seed;
 use crate::version::build_epoch;
 
 /// The salt of the clock fallback of [`seed`].
@@ -39,16 +39,77 @@ pub fn spawn(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &Wor
     });
 }
 
-/// The task: wait for every LAN bridge, run the driver on the box's clock, log what it says,
-/// publish the clock's state, and follow the World: new servers reconfigure the core live; a
-/// bridge recreated or a LAN added or removed restarts the task so the listeners follow.
-async fn run(publisher: &Publisher, mut world_rx: WorldRx) -> Result<(), TaskError> {
-    let mut current = desired(&world_rx.borrow());
-    let mut indexes = Vec::new();
-    for listener in &current.listeners {
-        let (index, _mac) = wait_for_link(&mut world_rx, listener).await?;
-        indexes.push((listener.clone(), index));
+/// What a World asks of a time service that is running on `current`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    Nothing,
+    /// Other servers: the core is reconfigured as it runs.
+    Configure,
+    /// Other LANs: the listeners are bound again.
+    Rebind,
+}
+
+fn change(current: &DesiredTime, next: &DesiredTime) -> Change {
+    if next == current {
+        Change::Nothing
+    } else if next.listeners == current.listeners {
+        Change::Configure
+    } else {
+        Change::Rebind
     }
+}
+
+/// The index of each listener's bridge once every one exists, or `None` when the LANs changed
+/// first. A bridge need not have carrier: a LAN with no cable in must not keep the time service
+/// from the others.
+async fn bridges(
+    world_rx: &mut WorldRx,
+    current: &DesiredTime,
+) -> Result<Option<Vec<(String, u32)>>, TaskError> {
+    loop {
+        {
+            let world = world_rx.borrow_and_update();
+            if desired(&world).listeners != current.listeners {
+                return Ok(None);
+            }
+            let found: Option<Vec<(String, u32)>> = current
+                .listeners
+                .iter()
+                .map(|listener| {
+                    world
+                        .links
+                        .get(listener)
+                        .map(|link| (listener.clone(), link.index))
+                })
+                .collect();
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        world_rx
+            .changed()
+            .await
+            .map_err(|_| "world publisher gone")?;
+    }
+}
+
+/// The task: run the time service on the LANs the World has, and when they change (a LAN added
+/// or removed) bind again from the start. That is the config changing, not a failure.
+async fn run(publisher: &Publisher, mut world_rx: WorldRx) -> Result<(), TaskError> {
+    loop {
+        serve(publisher, &mut world_rx).await?;
+        info!("time: the LANs changed; binding again");
+    }
+}
+
+/// Serve until the LANs change: wait for every LAN bridge, run the driver on the box's clock,
+/// log what it says, publish the clock's state, and follow the World. New servers reconfigure
+/// the core live; a bridge recreated is a failure the supervisor restarts.
+async fn serve(publisher: &Publisher, world_rx: &mut WorldRx) -> Result<(), TaskError> {
+    let mut current = desired(&world_rx.borrow());
+    let Some(indexes) = bridges(world_rx, &current).await? else {
+        return Ok(());
+    };
     // The World moved on while the bridges came up: a WAN lease, say.
     current = desired(&world_rx.borrow_and_update());
     let failed = |err: DriverError| TaskError::from(format!("time: {err}"));
@@ -99,11 +160,10 @@ async fn run(publisher: &Publisher, mut world_rx: WorldRx) -> Result<(), TaskErr
                     }
                     desired(&world)
                 };
-                if next == current {
-                    continue;
-                }
-                if next.listeners != current.listeners {
-                    return Err("time: the LANs changed; restarting".into());
+                match change(&current, &next) {
+                    Change::Nothing => continue,
+                    Change::Rebind => return Ok(()),
+                    Change::Configure => {}
                 }
                 for event in driver.configure(server_specs(&next), next.learned.clone()) {
                     log_event(&event);
@@ -249,6 +309,84 @@ mod tests {
             },
         )]));
         world
+    }
+
+    /// The DHCP world with a second LAN, `lan1` on `p3` at `192.168.2.1/24`.
+    fn two_lans() -> World {
+        let mut world = dhcp_world();
+        let mut config = (*world.config).clone();
+        config.lans.push(openfeo_config::Lan {
+            name: "lan1".to_owned(),
+            ports: vec!["p3".to_owned()],
+            ipv4: "192.168.2.1/24".to_owned(),
+            ..openfeo_config::Lan::default()
+        });
+        world.config = Arc::new(config);
+        world
+    }
+
+    fn link(name: &str, index: u32, carrier: bool) -> openfeo_world::LinkFact {
+        openfeo_world::LinkFact {
+            index,
+            name: name.to_owned(),
+            up: true,
+            carrier,
+            mac: None,
+            mtu: 1500,
+            link_local6: None,
+            speed_mbps: None,
+        }
+    }
+
+    #[test]
+    fn the_task_s_desired_state_follows_a_changed_config() {
+        let before = desired(&dhcp_world());
+        let after = desired(&two_lans());
+        assert_eq!(before.listeners, ["br-lan0"]);
+        assert_eq!(after.listeners, ["br-lan0", "br-lan1"]);
+        assert_eq!(change(&before, &after), Change::Rebind);
+        // Other servers are taken as it runs.
+        let mut world = dhcp_world();
+        let mut config = (*world.config).clone();
+        config
+            .system
+            .get_or_insert_with(Default::default)
+            .ntp_servers = vec!["192.0.2.123".to_owned()];
+        world.config = Arc::new(config);
+        let typed = desired(&world);
+        assert_eq!(typed.servers, ["192.0.2.123"]);
+        assert_eq!(change(&before, &typed), Change::Configure);
+        assert_eq!(change(&before, &before), Change::Nothing);
+    }
+
+    /// As for DNS: a LAN with no cable in must not keep the time service from the others.
+    #[tokio::test(start_paused = true)]
+    async fn the_bridges_are_awaited_without_their_carrier() {
+        let (publisher, world_rx) = Publisher::new(two_lans());
+        let current = desired(&publisher.current());
+        let waiting = {
+            let current = current.clone();
+            let mut world_rx = world_rx.clone();
+            tokio::spawn(async move { bridges(&mut world_rx, &current).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(!waiting.is_finished(), "no bridge exists yet");
+        publisher.update(|world| {
+            let links = Arc::make_mut(&mut world.links);
+            links.insert("br-lan0".to_owned(), link("br-lan0", 7, true));
+            links.insert("br-lan1".to_owned(), link("br-lan1", 8, false));
+        });
+        assert_eq!(
+            waiting.await.unwrap().unwrap(),
+            Some(vec![("br-lan0".to_owned(), 7), ("br-lan1".to_owned(), 8)])
+        );
+        // A change of LANs while waiting ends the wait.
+        let (publisher, mut world_rx) = Publisher::new(two_lans());
+        let waiting = tokio::spawn(async move { bridges(&mut world_rx, &current).await });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let one = dhcp_world().config.clone();
+        publisher.update(|world| world.config = one);
+        assert_eq!(waiting.await.unwrap().unwrap(), None);
     }
 
     #[test]

@@ -803,6 +803,45 @@ mod tests {
         assert_eq!(health_event(true, &good), None);
     }
 
+    /// The appliers take what they want from each World they are handed, so a config swapped
+    /// into the World reaches the kernel with no restart: here a second LAN.
+    #[test]
+    fn the_appliers_follow_a_changed_config() {
+        const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
+        let ports = openfeo_config::PortMap {
+            ports: (0..4)
+                .map(|i| openfeo_config::PortMapEntry {
+                    id: format!("pci-0000:00:0{}.0", i + 3),
+                    name: format!("p{i}"),
+                })
+                .collect(),
+        };
+        let mut world = World::new(openfeo_config::file::parse(VM_STATIC).unwrap(), ports);
+        let bridges = |world: &World| -> Vec<String> {
+            openfeo_reconcile::links::links(world)
+                .bridges
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(bridges(&world), ["br-lan0"]);
+        let before_nft = format!("{:?}", openfeo_reconcile::nft::nft(&world));
+        assert!(!before_nft.contains("br-lan1"));
+        let mut config = (*world.config).clone();
+        config.lans.push(openfeo_config::Lan {
+            name: "lan1".to_owned(),
+            ports: vec!["p3".to_owned()],
+            ipv4: "192.168.2.1/24".to_owned(),
+            ..openfeo_config::Lan::default()
+        });
+        world.config = Arc::new(config);
+        assert_eq!(bridges(&world), ["br-lan0", "br-lan1"]);
+        let routing = format!("{:?}", openfeo_reconcile::routing::routing(&world));
+        assert!(routing.contains("192.168.2.1/24"), "{routing}");
+        let nft = format!("{:?}", openfeo_reconcile::nft::nft(&world));
+        assert!(nft.contains("br-lan1"), "{nft}");
+    }
+
     #[test]
     fn every_kernel_address_becomes_a_fact_with_its_interface() {
         use openfeo_netlink::{Addr, Link};

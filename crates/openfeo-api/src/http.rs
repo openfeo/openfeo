@@ -777,4 +777,51 @@ mod tests {
         assert_eq!(crate::cert::fingerprint(&der), first.tls_fingerprint);
         assert_eq!(meta.names, ["openfeo", "openfeo.home.arpa"]);
     }
+
+    /// The API follows a config that changes while it runs: the router renamed is issued a
+    /// certificate for its new names (with the key it had) and answers to them at once.
+    #[tokio::test]
+    async fn a_renamed_router_is_reissued_a_certificate_and_takes_its_new_name() {
+        let api = spawn_api(ConfigState::Loaded).await;
+        let first: GetStatusResponse = api.get("/api/status?format=json").await.json();
+        let key = std::fs::read(api.tls_dir.join("key.pem")).unwrap();
+        assert_eq!(api.shared.names().fqdn, "openfeo.home.arpa");
+        let mut fingerprint = api.shared.fingerprint.subscribe();
+        api.shared.publisher.update(|world| {
+            let mut config = (*world.config).clone();
+            config.system.get_or_insert_with(Default::default).hostname = "edge".to_owned();
+            world.config = std::sync::Arc::new(config);
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fingerprint.wait_for(|now| *now != first.tls_fingerprint),
+        )
+        .await
+        .expect("the certificate was looked at again when the World changed")
+        .unwrap();
+        let (der, _, meta) = crate::cert::load(&api.tls_dir).unwrap().unwrap();
+        assert_eq!(meta.names, ["edge", "edge.home.arpa"]);
+        assert_eq!(
+            crate::cert::fingerprint(&der),
+            *api.shared.fingerprint.borrow()
+        );
+        assert_eq!(
+            std::fs::read(api.tls_dir.join("key.pem")).unwrap(),
+            key,
+            "reissued with its key"
+        );
+        // Which hosts pass follows too.
+        let names = api.shared.names();
+        assert_eq!(
+            (names.hostname.as_str(), names.fqdn.as_str()),
+            ("edge", "edge.home.arpa")
+        );
+        let world = api.shared.world.borrow().clone();
+        assert!(crate::gate::host_allowed("edge.home.arpa", &names, &world));
+        assert!(!crate::gate::host_allowed(
+            "openfeo.home.arpa",
+            &names,
+            &world
+        ));
+    }
 }
