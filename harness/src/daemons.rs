@@ -469,6 +469,37 @@ pub enum Auth {
     Chap,
 }
 
+/// The lab's access concentrator can run here, or the scenario skips with what is missing:
+/// `/dev/ppp` openable (from the sandbox, where `ppp_generic`'s `CAP_NET_ADMIN` check passes)
+/// and `pppd` and `pppoe-server` installed. CI sets `OPENFEO_NO_SKIP`, so a skip fails there.
+///
+/// # Errors
+///
+/// A [`Skip`](crate::scenario::Skip) that says what is missing.
+pub fn require_access_concentrator() -> Result<()> {
+    if let Err(err) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/ppp")
+    {
+        return Err(crate::scenario::Skip(format!(
+            "/dev/ppp: {err}: load ppp_generic and make it group-accessible \
+             (udev: KERNEL==\"ppp\", GROUP=\"<your group>\", MODE=\"0660\")"
+        ))
+        .into());
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for tool in ["pppd", "pppoe-server"] {
+        if !std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()) {
+            return Err(crate::scenario::Skip(format!(
+                "{tool} is not installed (packages ppp and pppoe, or rp-pppoe)"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// The lab's access concentrator (M3): rp-pppoe's `pppoe-server` spawning `pppd` per session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PppoeServerConfig {
