@@ -548,3 +548,79 @@ envelope's fuzz target takes the new requests into its corpus.
     named. Cost: such a LAN cannot be removed from the panel until part 3; dropping the
     forwards and rules with it would be the panel deleting firewall config nobody was shown a
     page for.
+
+## After part 2a
+
+What building the router half settled or changed. Part 2b plans from this section as well as
+from the design above.
+
+**As built, where the design left it open or said otherwise**
+
+- The request's field is `immediate`, not `commit_confirm = false`: a protobuf `bool` left out
+  is `false`, so a request that says nothing gets the countdown.
+- The keeper lives in `openfeo-api`, a core with no clock or file of its own and a driver
+  beside it. What is pending is a fact in the World, which the state and the DHCP server's
+  lease cap both read.
+- A refused apply is `INVALID_ARGUMENT` whose text names up to five violations; a validation
+  returns them all, each with its path.
+- The tag is a digest of the config without its secrets and without the admin table, so
+  setting a password moves no tag. It is opaque: the client sends back what it was given.
+- `GetConfig` also carries the router's default window (`confirm_secs`), for the dialog's
+  wording. The state's JSON name is `pending_config`, as every state field keeps its proto name.
+- The file as it was is kept beside the config (`config.toml.orig`) the first time the router
+  writes over a file with a comment in it, and not otherwise: the router's own rendering after
+  a password change differs from a fresh one and is nobody's hand-written file.
+- A router with no config file at all takes an apply; only a refused file refuses.
+- A window out of range is refused for an immediate apply too. A password change while a
+  change is pending is refused before the old password is looked at, so it costs no attempt.
+- A changed domain restarts the LAN's DHCP server as well as renaming the router: the server
+  hands the domain out.
+- What stopping means, family by family: the DHCPv4 client releases a lease it holds (not one
+  it is still confirming after a reboot); PPPoE sends Terminate-Request and PADT, cut short at
+  three seconds against a concentrator that says nothing; the router-advertisement and DHCPv6
+  clients say nothing and their facts go.
+- DNS and time bind their sockets again in place when the LANs change, which is no failure of
+  theirs, and serve the LANs that exist whether or not a cable is in. The DHCPv4 server keeps
+  the lease records it cannot use under the config of the moment, which is what lets a revert
+  give every client back the address it had.
+- The lease cap is its own setting beside the lease time: leases restored from the file keep
+  the time they were given.
+- On the console a change is said before what it sets off: `config: applied; confirm within
+  <n> s` or `config: applied immediately`, one `config: effect <subject> <what>` per effect,
+  then the tasks' own lines (`wan <wan> dhcp stopped`, `pppoe <wan> stopped`, `wan <wan> ipv6
+  stopped`, `dhcp6 <wan> stopped`, `lan <lan> dhcp stopped`); later `config: confirmed`,
+  `config: reverted (asked)`, `config: reverted (not confirmed in <n> s)`, or at the next start
+  `config: an unconfirmed change was discarded`.
+
+**For part 2b**
+
+- **An apply that takes away the address it arrived at may never be answered.** The call
+  answers once the config is published (call 3 above), and the router's old address can be
+  gone before the answer is out; the lab met it within three runs. A refusal is always
+  answered, since nothing moved. The client must not wait on the answer of an apply
+  whose validation said `connection_drops`: no answer means taken. It finds the router at
+  `router_after`, and reads the pending change, the countdown and the new tag there.
+  Answering before publishing would make the answer likely and not certain, and needs the
+  keeper's lock released between the two; it is left as a follow-up.
+- The browser run cannot name a window in the apply, because the panel always uses the
+  router's default (call 14): a harness build takes `openfeo.confirm_secs=<10..600>` on the
+  kernel command line.
+- A caller on a LAN the change leaves alone is still told its LAN and the router's address on
+  it; the two booleans say whether anything moves.
+
+**Known limits, found by the scenarios**
+
+- **A change that moves a WAN's own link can cut the old task's goodbye short.** The appliers
+  and the task managers both follow the World, and nothing makes an applier wait for the stop
+  of the task that is using a link. Fixed for the commonest case: a WAN changed from PPPoE to
+  another type keeps its port's MTU until the session has been ended in order (the kernel
+  drops every PPPoE session on a port whose MTU changes). Still open: a PPPoE WAN moved to
+  another port or tag loses its Terminate-Request (the concentrator still gets a PADT), and a
+  DHCP WAN whose tag changes loses its release (the lease runs out by itself). Ordering the
+  appliers after the stops is a change to the shape above: the keeper would announce a change,
+  the managers stop what it touches, and only then is the config published.
+- For as long as a stop takes, the World holds the new config beside the stopping task's
+  facts. On a tag change the old lease's address and routes sit on the new interface for some
+  milliseconds, and the new client first asks for the lease the old network gave.
+- A WAN changed from PPPoE to static keeps the port's MTU at 1508 until a reboot: a static
+  WAN's MTU is left as the kernel has it, which used to mean 1500.

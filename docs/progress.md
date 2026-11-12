@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | part 1 of 5, 2026-11-11 | #68, #81 |
+| M4 API and panel | part 1 and the router half of part 2, of 5, 2026-11-12 | #68, #81, #101 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -217,6 +217,43 @@ page is the console's) through setting the password, a reload, logging out and i
 carrier lost and returned with the page left as it stood. CI gains Node and Chromium and keeps
 the run's screenshots. Parts 2 to 5 (changing config, the remaining pages, diagnostics, first
 boot) follow.
+
+**2026-11-12, [#101](https://github.com/openfeo/openfeo/pull/101), part 2a: changing config, the
+router.** The design for part 2 and its router half; the two pages that use it are part 2b. A
+running router now takes a new config and restarts only what the change touches. `ConfigService`
+has five calls on the WebSocket and gRPC: get (without its secrets, with a tag), validate (what
+is wrong, or what the change interrupts and whether it moves whoever asks), apply, confirm and
+revert. An apply is pending for 120 s (ADR-0026; 10 s to 600 s on request) and is reverted by
+itself unless confirmed; "apply immediately" has no window; a router that restarts inside the
+window comes up on the confirmed config and says the change was discarded; a stale tag, a second
+change while one is pending, a password change while one is, and any apply on a router running
+on defaults over a file it refused are all refused whole. Secrets are write-only: a PPPoE
+password that is not sent is the one kept. One keeper in `openfeo-api` holds the confirmed and
+the pending config, as a core with no clock or file of its own. The five kinds of task that
+exist once per WAN or LAN (the DHCPv4 client, PPPoE, the router-advertisement client, the DHCPv6
+client, the DHCPv4 server) are each kept by a manager that compares the slice of the config an
+instance depends on, and stops, starts or restarts it; a stop is asked for, takes the task's
+facts out of the World and counts as no failure, and on the way out a DHCP lease is released
+and a PPPoE session ended with Terminate-Request and PADT. One pure function over the same
+slices says what a change does, for the log and for the validation. DNS and time bind again in
+place when the LANs change, and serve a LAN whose cable is out; a prefix taken off a LAN is
+advertised deprecated before it goes. While a change is pending the DHCP server hands out
+leases no longer than the window, and after a revert it has the leases it had: the lease file
+keeps the records it cannot use. The state says what is pending and when it reverts; the events
+are `config.applied`, `config.confirmed`, `config.reverted` and `config.discarded`. SPEC §1.2 now
+lets LANs be added and removed in the panel. Proven by fourteen new `m4` scenarios from the LAN
+side (32 in all), among them SPEC §12's "a subnet change not confirmed is reverted", a subnet
+change confirmed from the address it moved the router to, a WAN changed from DHCP to PPPoE and
+back with Kea seeing the release and `pppd` the Terminate-Request, a tag moved, a LAN added and
+removed, and leases across a change that is taken back; by a `dhcp4` and a `dns` sandbox
+scenario; and by the keeper's, the managers' and the slices' unit tests. The scenarios found
+what the unit tests could not: a pending file whose removal was not synced and came back after a
+power cut, the forwarder binding again before its old listener had closed, the port's MTU
+changing under a PPPoE session that was saying goodbye, and the console telling a change's
+consequences before the change. Left open and written into the design: an apply that takes away
+the address it arrived at may not be answered, and a change that moves a WAN's own link (another
+port, another tag) can cut the old task's goodbye short. Part 2b is the client's calls, the
+draft, and the WAN and LAN & DHCP pages.
 
 ## Follow-ups
 
