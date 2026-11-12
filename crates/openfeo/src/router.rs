@@ -218,7 +218,12 @@ fn spawn_families(
         world_rx,
     );
     crate::family::spawn(crate::dhcp6::Dhcp6Clients, supervisor, publisher, world_rx);
-    crate::dhcp4_server::spawn_all(supervisor, publisher, world_rx);
+    crate::family::spawn(
+        crate::dhcp4_server::Dhcp4Servers,
+        supervisor,
+        publisher,
+        world_rx,
+    );
 }
 
 /// What `/state/identity/` holds for IPv6, loaded before the World exists.

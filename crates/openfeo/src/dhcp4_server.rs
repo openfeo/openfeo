@@ -7,6 +7,7 @@
 //! `/state/leases`, written at most once per five seconds (SPEC §5.2). Every line logged here
 //! is a contract with the harness scenarios.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
@@ -24,16 +25,17 @@ use openfeo_proto_dhcp4::server::Timestamp;
 use openfeo_proto_dhcp4::{LeaseRecord, ServerEvent};
 use openfeo_reconcile::bridge_name;
 use openfeo_reconcile::dhcp::{DesiredDhcpServer, server_config, servers};
-use openfeo_runtime::supervise::TaskError;
+use openfeo_runtime::Publisher;
+use openfeo_runtime::supervise::{BoxedTask, Stop, TaskError};
 use openfeo_runtime::world::WorldRx;
-use openfeo_runtime::{Publisher, Supervisor};
-use openfeo_world::{LeaseFact, MacAddr};
+use openfeo_world::{LeaseFact, MacAddr, World};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use openfeo_net::throttle::{NOISY_WINDOW, Throttle};
 
 use crate::dhcp4::{LEASES_DIR, mac_text, wait_for_link};
+use crate::family::Family;
 use crate::state;
 
 /// The least time between two writes of a lease database (SPEC §5.2).
@@ -57,44 +59,85 @@ pub fn server_lease_path(lan: &str) -> PathBuf {
     Path::new(LEASES_DIR).join(format!("dhcp4-server-{lan}.toml"))
 }
 
-/// One task per LAN the configuration gives a DHCPv4 server.
-pub fn spawn_all(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    for lan in servers(&publisher.current()).into_keys() {
-        let publisher = publisher.clone();
-        let world_rx = world_rx.clone();
-        supervisor.spawn(format!("dhcp4-server-{lan}"), move || {
-            let lan = lan.clone();
-            let publisher = publisher.clone();
-            let world_rx = world_rx.clone();
-            async move { run(&lan, &publisher, world_rx).await }
-        });
+/// The DHCPv4 server of every LAN the configuration gives one (SPEC §7.6), kept in step with
+/// the config by its manager ([`crate::family`]). Its slice is its desired state, the cap on
+/// leases while a change is pending included: a server is restarted capped when a change
+/// touches its LAN and once more when the change is settled. A restart reads the lease database
+/// back, so no client sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Dhcp4Servers;
+
+impl Family for Dhcp4Servers {
+    type Slice = DesiredDhcpServer;
+    const PREFIX: &'static str = "dhcp4-server";
+
+    fn wanted(&self, world: &World) -> BTreeMap<String, DesiredDhcpServer> {
+        servers(world)
+    }
+
+    fn run(
+        &self,
+        key: &str,
+        slice: &DesiredDhcpServer,
+        publisher: Arc<Publisher>,
+        world_rx: WorldRx,
+        stop: Stop,
+    ) -> BoxedTask {
+        let (lan, desired) = (key.to_owned(), slice.clone());
+        Box::pin(async move { run(&lan, &desired, &publisher, world_rx, stop).await })
+    }
+
+    fn withdraw(&self, key: &str, world: &mut World) {
+        Arc::make_mut(&mut world.leases).remove(key);
     }
 }
 
+fn stopped_line(lan: &str) -> String {
+    format!("lan {lan} dhcp stopped")
+}
+
 /// The task: wait for the bridge, restore the lease database, run the driver, publish what it
-/// says, write the database when it changes (at most once per [`SAVE_INTERVAL`]).
-async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<(), TaskError> {
+/// says, write the database when it changes (at most once per [`SAVE_INTERVAL`]), and write
+/// what is still owed when it is asked to stop.
+async fn run(
+    lan: &str,
+    desired: &DesiredDhcpServer,
+    publisher: &Publisher,
+    mut world_rx: WorldRx,
+    mut stop: Stop,
+) -> Result<(), TaskError> {
     let bridge = bridge_name(lan);
-    let (ifindex, mac) = wait_for_link(&mut world_rx, &bridge).await?;
-    let desired = servers(&world_rx.borrow()).remove(lan);
-    let Some(desired) = desired else {
-        info!("lan {lan} dhcp server not configured");
-        return Ok(());
+    let (ifindex, mac) = tokio::select! {
+        link = wait_for_link(&mut world_rx, &bridge) => link?,
+        () = stop.requested() => {
+            info!("{}", stopped_line(lan));
+            return Ok(());
+        }
     };
     let path = server_lease_path(lan);
-    let records = read_leases(&path, lan, 0, unix_now());
+    let (records, file) = read_leases(&path, lan, 0, unix_now());
     let failed = |err: DriverError| TaskError::from(format!("dhcp4 server {lan}: {err}"));
     let mut driver = ServerDriver::new(ServerDriverConfig {
         ifname: bridge.clone(),
         ifindex,
         mac,
-        server: server_config(&desired),
-        leases: records.clone(),
+        server: server_config(desired),
+        leases: records,
     })
     .map_err(failed)?;
-    info!("{}", serving_line(lan, &desired));
-    if !records.is_empty() {
-        info!("lan {lan} dhcp restored {} leases", records.len());
+    info!("{}", serving_line(lan, desired));
+    let restored = driver.leases();
+    if !restored.is_empty() {
+        info!("lan {lan} dhcp restored {} leases", restored.len());
+    }
+    // What the file holds and this server cannot use (another subnet, outside the pool) stays
+    // in the file until it expires: a change of config that is taken back finds it there.
+    let aside = set_aside(&file, &restored, unix_now());
+    if !aside.is_empty() {
+        info!(
+            "lan {lan} dhcp keeping {} leases it cannot use",
+            aside.len()
+        );
     }
     publish_facts(lan, &driver, publisher);
     let mut last_save: Option<Instant> = None;
@@ -141,7 +184,7 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
                     // The bridge was recreated: the sockets are bound to the old index. A save
                     // still owed is written first; the restart reads it back.
                     if save_at.is_some() {
-                        save_leases(&path, lan, &driver).await;
+                        save_leases(&path, lan, &driver, &aside).await;
                     }
                     return Err(format!(
                         "dhcp4 server {lan}: {bridge} changed index {ifindex} -> {index}; restarting"
@@ -150,9 +193,17 @@ async fn run(lan: &str, publisher: &Publisher, mut world_rx: WorldRx) -> Result<
                 }
             }
             () = sleep_until(save_at) => {
-                save_leases(&path, lan, &driver).await;
+                save_leases(&path, lan, &driver, &aside).await;
                 last_save = Some(Instant::now());
                 save_at = None;
+            }
+            () = stop.requested() => {
+                // A save still owed is written first: whatever serves this LAN next reads it.
+                if save_at.is_some() {
+                    save_leases(&path, lan, &driver, &aside).await;
+                }
+                info!("{}", stopped_line(lan));
+                return Ok(());
             }
         }
     }
@@ -274,34 +325,94 @@ pub fn facts_from(records: &[LeaseRecord], now: Timestamp, unix_now: u64) -> Vec
     facts
 }
 
-fn read_leases(path: &Path, lan: &str, now: Timestamp, unix_now: u64) -> Vec<LeaseRecord> {
+/// The file's entries the server did not take: those that parse, have not expired, and whose
+/// address is not among `kept`, the leases the server holds after reading the file. They are
+/// another subnet's, or fell outside the pool.
+#[must_use]
+pub fn set_aside(
+    file: &Dhcp4ServerLeases,
+    kept: &[LeaseRecord],
+    unix_now: u64,
+) -> Vec<Dhcp4ServerLease> {
+    file.leases
+        .iter()
+        .filter(|lease| record_from(lease, 0, unix_now).is_ok())
+        .filter(|lease| {
+            lease
+                .address
+                .parse()
+                .is_ok_and(|address: Ipv4Addr| kept.iter().all(|record| record.address != address))
+        })
+        .cloned()
+        .collect()
+}
+
+/// `own`, the server's leases as a file, followed by what was set aside: each entry as it was,
+/// unless it has expired or the server has since leased its address to someone.
+#[must_use]
+pub fn file_with(
+    mut own: Dhcp4ServerLeases,
+    aside: &[Dhcp4ServerLease],
+    unix_now: u64,
+) -> Dhcp4ServerLeases {
+    let kept: Vec<Dhcp4ServerLease> = aside
+        .iter()
+        .filter(|lease| lease.expires_unix > unix_now)
+        .filter(|lease| own.leases.iter().all(|live| live.address != lease.address))
+        .cloned()
+        .collect();
+    own.leases.extend(kept);
+    own
+}
+
+/// The records of the file at `path` for the server to start from, and the file itself (empty
+/// when there is none or it cannot be read).
+fn read_leases(
+    path: &Path,
+    lan: &str,
+    now: Timestamp,
+    unix_now: u64,
+) -> (Vec<LeaseRecord>, Dhcp4ServerLeases) {
+    let nothing = || {
+        (
+            Vec::new(),
+            Dhcp4ServerLeases {
+                lan: lan.to_owned(),
+                leases: Vec::new(),
+            },
+        )
+    };
     match fs::read_to_string(path) {
         Ok(text) => match file::parse_dhcp4_server_leases(&text) {
-            Ok(leases) => {
+            Ok(leases) if leases.lan == lan => {
                 let (records, dropped) = records_from_file(&leases, lan, now, unix_now);
                 for why in dropped {
                     warn!("lan {lan} dhcp ignoring lease {why}");
                 }
-                records
+                (records, leases)
             }
+            // Another LAN's file under this name: none of it is this server's to keep.
+            Ok(_) => nothing(),
             Err(err) => {
                 warn!(
                     "lan {lan} dhcp ignoring unreadable lease database {}: {err}",
                     path.display()
                 );
-                Vec::new()
+                nothing()
             }
         },
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => nothing(),
         Err(err) => {
             warn!("lan {lan} dhcp cannot read {}: {err}", path.display());
-            Vec::new()
+            nothing()
         }
     }
 }
 
-async fn save_leases(path: &Path, lan: &str, driver: &ServerDriver) {
-    let leases = file_from_records(lan, &driver.leases(), driver.now(), unix_now());
+async fn save_leases(path: &Path, lan: &str, driver: &ServerDriver, aside: &[Dhcp4ServerLease]) {
+    let now_unix = unix_now();
+    let own = file_from_records(lan, &driver.leases(), driver.now(), now_unix);
+    let leases = file_with(own, aside, now_unix);
     let result = match file::render_dhcp4_server_leases(&leases) {
         Ok(text) => state::write(path, text).await,
         Err(err) => Err(io::Error::other(err.to_string())),
@@ -420,6 +531,7 @@ mod tests {
             prefix: 24,
             pool: (ip("192.168.1.100"), ip("192.168.1.200")),
             lease_secs: 43_200,
+            lease_cap: None,
             dns: vec![],
             ntp: vec![],
             domain: Some("home.arpa".into()),
@@ -548,6 +660,211 @@ mod tests {
             records_from_file(&file, "lan1", 50, 1_800_000_100).0,
             Vec::new(),
             "another LAN's file is ignored"
+        );
+    }
+
+    const NOW_UNIX: u64 = 1_800_000_000;
+
+    /// The other subnet: `192.168.2.1/24`, pool `.100` to `.200`, no reservations.
+    fn config2() -> ServerConfig {
+        ServerConfig {
+            server: ip("192.168.2.1"),
+            pool: (ip("192.168.2.100"), ip("192.168.2.200")),
+            reservations: Vec::new(),
+            ..config()
+        }
+    }
+
+    fn entry(mac: &str, address: &str, expires_unix: u64) -> Dhcp4ServerLease {
+        Dhcp4ServerLease {
+            mac: mac.into(),
+            address: address.into(),
+            granted_unix: NOW_UNIX - 100,
+            expires_unix,
+            ..Default::default()
+        }
+    }
+
+    fn addresses(file: &Dhcp4ServerLeases) -> Vec<&str> {
+        file.leases
+            .iter()
+            .map(|lease| lease.address.as_str())
+            .collect()
+    }
+
+    /// The file a server of `192.168.1.1/24` left, with two leases.
+    fn old_file() -> Dhcp4ServerLeases {
+        Dhcp4ServerLeases {
+            lan: "lan0".into(),
+            leases: vec![
+                entry("02:00:00:00:00:0a", "192.168.1.100", NOW_UNIX + 9_000),
+                entry("02:00:00:00:00:0b", "192.168.1.101", NOW_UNIX + 9_000),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_record_outside_the_subnet_is_kept_in_the_file_and_out_of_the_server() {
+        let file = old_file();
+        let (records, _) = records_from_file(&file, "lan0", 50, NOW_UNIX);
+        let kept = Server::new(config2(), records, 50).leases();
+        assert_eq!(
+            kept,
+            Vec::new(),
+            "the server of another subnet takes neither"
+        );
+        let aside = set_aside(&file, &kept, NOW_UNIX);
+        assert_eq!(aside, file.leases);
+        // A grant in the new subnet, and a save ten seconds on.
+        let granted = LeaseRecord {
+            address: ip("192.168.2.100"),
+            mac: MAC_A,
+            client_id: None,
+            hostname: None,
+            granted_at: 55,
+            expires_at: 175,
+        };
+        let own = file_from_records("lan0", &[granted], 60, NOW_UNIX + 10);
+        let saved = file_with(own, &aside, NOW_UNIX + 10);
+        assert_eq!(
+            addresses(&saved),
+            ["192.168.2.100", "192.168.1.100", "192.168.1.101"]
+        );
+        assert_eq!(
+            saved.leases[1..],
+            file.leases[..],
+            "kept exactly as they were"
+        );
+    }
+
+    #[test]
+    fn a_foreign_record_past_its_time_is_dropped_at_the_next_save() {
+        let aside = vec![
+            entry("02:00:00:00:00:0a", "192.168.1.100", NOW_UNIX + 100),
+            entry("02:00:00:00:00:0b", "192.168.1.101", NOW_UNIX + 9_000),
+        ];
+        let empty = file_from_records("lan0", &[], 0, NOW_UNIX + 100);
+        assert_eq!(
+            addresses(&file_with(empty, &aside, NOW_UNIX + 100)),
+            ["192.168.1.101"]
+        );
+    }
+
+    #[test]
+    fn going_back_finds_the_leases_where_they_were() {
+        // As the server of the other subnet left the file: its own lease, then the old ones.
+        let mut file = old_file();
+        file.leases.insert(
+            0,
+            entry("02:00:00:00:00:0c", "192.168.2.100", NOW_UNIX + 110),
+        );
+        let (records, _) = records_from_file(&file, "lan0", 50, NOW_UNIX + 20);
+        let kept = Server::new(config(), records, 50).leases();
+        assert_eq!(
+            kept.iter().map(|r| r.address).collect::<Vec<_>>(),
+            [ip("192.168.1.100"), ip("192.168.1.101")]
+        );
+        // Their time is what it was: 9 000 s from the first writing, 20 s of it gone.
+        assert_eq!(kept[0].expires_at, 50 + 9_000 - 20);
+        let aside = set_aside(&file, &kept, NOW_UNIX + 20);
+        assert_eq!(aside, [file.leases[0].clone()]);
+    }
+
+    #[test]
+    fn a_record_set_aside_gives_way_to_a_live_lease_of_its_address() {
+        let aside = vec![entry(
+            "02:00:00:00:00:0a",
+            "192.168.1.100",
+            NOW_UNIX + 9_000,
+        )];
+        let live = LeaseRecord {
+            address: ip("192.168.1.100"),
+            mac: MAC_B,
+            client_id: None,
+            hostname: None,
+            granted_at: 0,
+            expires_at: 43_200,
+        };
+        let own = file_from_records("lan0", &[live], 0, NOW_UNIX);
+        let saved = file_with(own, &aside, NOW_UNIX);
+        assert_eq!(addresses(&saved), ["192.168.1.100"]);
+        assert_eq!(saved.leases[0].mac, "02:00:00:00:00:0b");
+    }
+
+    #[test]
+    fn what_does_not_parse_or_has_expired_is_not_set_aside() {
+        let file = Dhcp4ServerLeases {
+            lan: "lan0".into(),
+            leases: vec![
+                entry("nope", "192.168.9.5", NOW_UNIX + 9_000),
+                entry("02:00:00:00:00:0a", "not-an-address", NOW_UNIX + 9_000),
+                entry("02:00:00:00:00:0b", "192.168.9.6", NOW_UNIX),
+                entry("02:00:00:00:00:0c", "192.168.9.7", NOW_UNIX + 1),
+            ],
+        };
+        assert_eq!(
+            addresses_of(&set_aside(&file, &[], NOW_UNIX)),
+            ["192.168.9.7"]
+        );
+    }
+
+    fn addresses_of(leases: &[Dhcp4ServerLease]) -> Vec<&str> {
+        leases.iter().map(|lease| lease.address.as_str()).collect()
+    }
+
+    #[test]
+    fn the_stopped_line_is_the_contract() {
+        assert_eq!(stopped_line("lan0"), "lan lan0 dhcp stopped");
+    }
+
+    #[test]
+    fn the_family_wants_one_server_per_lan_with_dhcp() {
+        let mut world = static_world();
+        let wanted = Dhcp4Servers.wanted(&world);
+        assert_eq!(wanted.keys().collect::<Vec<_>>(), ["lan0"]);
+        assert_eq!(wanted["lan0"].lease_cap, None);
+        // A pending change that touches the LAN changes its slice: the server is restarted
+        // capped, and once more when the change is settled.
+        world.pending = Some(Arc::new(openfeo_world::PendingFact {
+            applied_boot_ms: 0,
+            reverts_boot_ms: 120_000,
+            window_secs: 120,
+            effects: Vec::new(),
+            lans: ["lan0".to_owned()].into(),
+        }));
+        let capped = Dhcp4Servers.wanted(&world);
+        assert_eq!(capped["lan0"].lease_cap, Some(120));
+        assert_ne!(capped["lan0"], wanted["lan0"]);
+    }
+
+    #[test]
+    fn withdrawing_takes_the_lans_leases() {
+        let mut world = static_world();
+        for lan in ["lan0", "guest"] {
+            Arc::make_mut(&mut world.leases).insert(lan.to_owned(), Vec::new());
+        }
+        Dhcp4Servers.withdraw("lan0", &mut world);
+        assert_eq!(world.leases.keys().collect::<Vec<_>>(), ["guest"]);
+        Dhcp4Servers.withdraw("lan9", &mut world);
+    }
+
+    /// A LAN whose bridge is not up yet is waiting on the World: a stop ends it there.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_waiting_for_its_bridge_stops_at_once() {
+        let (publisher, world_rx) = Publisher::new(static_world());
+        let publisher = Arc::new(publisher);
+        let slice = Dhcp4Servers.wanted(&publisher.current())["lan0"].clone();
+        let supervisor = openfeo_runtime::Supervisor::new(openfeo_runtime::HealthTracker::new());
+        let task = supervisor.spawn_stoppable("dhcp4-server-lan0", move |stop| {
+            Dhcp4Servers.run("lan0", &slice, publisher.clone(), world_rx.clone(), stop)
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let asked = tokio::time::Instant::now();
+        task.stop().await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(1),
+            "took {:?}: the task did not hear the stop",
+            asked.elapsed()
         );
     }
 

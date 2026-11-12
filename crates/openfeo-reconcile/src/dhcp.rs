@@ -117,9 +117,8 @@ pub fn server_config(desired: &DesiredDhcpServer) -> ServerConfig {
         server: desired.server,
         prefix: desired.prefix,
         pool: desired.pool,
-        lease_secs: desired
-            .lease_cap
-            .map_or(desired.lease_secs, |cap| desired.lease_secs.min(cap)),
+        lease_secs: desired.lease_secs,
+        lease_cap: desired.lease_cap,
         dns: desired.dns.clone(),
         ntp: desired.ntp.clone(),
         domain: desired.domain.clone(),
@@ -321,7 +320,9 @@ mod tests {
             desired["lan0"].lease_secs, configured,
             "what the config says"
         );
-        assert_eq!(server_config(&desired["lan0"]).lease_secs, 120);
+        // The core is told both: it grants at most the cap and restores in full.
+        let core = server_config(&desired["lan0"]);
+        assert_eq!((core.lease_secs, core.lease_cap), (configured, Some(120)));
         // A LAN the change does not touch keeps its time.
         let other = desired
             .iter()
@@ -329,7 +330,7 @@ mod tests {
             .map(|(_, server)| server)
             .expect("the fixture has a second LAN with a server");
         assert_eq!(other.lease_cap, None);
-        assert_eq!(server_config(other).lease_secs, other.lease_secs);
+        assert_eq!(server_config(other).lease_cap, None);
         // What the config alone asks for carries no cap.
         assert_eq!(servers_of(&world.config)["lan0"].lease_cap, None);
     }
@@ -343,7 +344,8 @@ mod tests {
         world.pending = Some(pending(600, &["lan0"]));
         let desired = servers(&world);
         assert_eq!(desired["lan0"].lease_cap, Some(600));
-        assert_eq!(server_config(&desired["lan0"]).lease_secs, 60);
+        let core = server_config(&desired["lan0"]);
+        assert_eq!((core.lease_secs, core.lease_cap), (60, Some(600)));
     }
 
     #[test]
