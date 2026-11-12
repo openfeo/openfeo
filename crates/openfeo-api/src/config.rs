@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use openfeo_config::api::{ApplyConfigRequest, ApplyConfigResponse, ErrorCode, GetConfigResponse};
+use openfeo_config::api::{
+    ApplyConfigRequest, ApplyConfigResponse, ErrorCode, GetConfigResponse, ValidateConfigResponse,
+};
 use openfeo_config::state::ConfigViolation;
 use openfeo_config::{Config, file, secrets};
 use openfeo_runtime::clock::boot_ms;
@@ -23,6 +25,8 @@ use openfeo_world::{Effect, EventDraft, PendingFact};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
+use crate::gate;
+use crate::http::Arrival;
 use crate::keeper::{Keeper, Refusal, Why};
 use crate::server::{ApiError, Shared};
 
@@ -211,6 +215,36 @@ impl Shared {
                 // `check` refuses for nothing else.
                 _ => Vec::new(),
             })
+    }
+
+    /// What applying `proposed` would mean, for the router and for whoever asks from `at`
+    /// (SPEC §8.3): what is wrong with it and nothing more, or what it interrupts and whether
+    /// it moves the caller. Changes nothing.
+    pub async fn validate_config(&self, proposed: Config, at: Arrival) -> ValidateConfigResponse {
+        match self.check_config(proposed).await {
+            Err(violations) => ValidateConfigResponse {
+                violations,
+                effects: Vec::new(),
+                caller: None,
+            },
+            Ok((config, effects)) => {
+                let world = self.world.borrow().clone();
+                let lan = gate::caller_lan(&world, at.peer, at.local);
+                ValidateConfigResponse {
+                    violations: Vec::new(),
+                    effects: effects
+                        .iter()
+                        .map(openfeo_reconcile::state::effect_pb)
+                        .collect(),
+                    caller: Some(gate::caller(
+                        &world.config,
+                        &config,
+                        lan.as_deref(),
+                        at.local,
+                    )),
+                }
+            }
+        }
     }
 
     /// Apply a config (SPEC §5.5): pending until it is confirmed, or at once when the request

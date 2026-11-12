@@ -42,6 +42,28 @@ pub struct Peer(pub SocketAddr);
 #[derive(Debug, Clone, Copy)]
 pub struct Local(pub SocketAddr);
 
+/// Both ends of the connection a call came over: who asks, and at which of the router's
+/// addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arrival {
+    /// The caller's address.
+    pub peer: std::net::IpAddr,
+    /// The router's address the connection arrived at.
+    pub local: std::net::IpAddr,
+}
+
+impl Arrival {
+    /// From what the listener attached. Without the local end the peer's stands in: it is on
+    /// no bridge, so the caller's LAN is then told by its own address alone.
+    #[must_use]
+    pub fn of(peer: Peer, local: Option<Local>) -> Arrival {
+        Arrival {
+            peer: peer.0.ip(),
+            local: local.map_or(peer.0.ip(), |local| local.0.ip()),
+        }
+    }
+}
+
 const PROTOBUF: &str = "application/x-protobuf";
 const JSON: &str = "application/json";
 /// Own origin only: no inline script, no `eval`, nothing framed or fetched from elsewhere.

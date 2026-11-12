@@ -100,10 +100,12 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
     use tonic::server::NamedService;
 
     use pb::auth_service_server::AuthServiceServer;
+    use pb::config_service_server::ConfigServiceServer;
     use pb::state_service_server::StateServiceServer;
 
     let grpc = grpc::Grpc::new(shared.clone());
     let auth = AuthServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
+    let config = ConfigServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
     let state = StateServiceServer::new(grpc).max_decoding_message_size(limits::MAX_BODY);
     http::routes()
         .route("/ws", axum::routing::get(ws::upgrade))
@@ -114,6 +116,10 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
         .route_service(
             &format!("/{}/{{*call}}", StateServiceServer::<grpc::Grpc>::NAME),
             state,
+        )
+        .route_service(
+            &format!("/{}/{{*call}}", ConfigServiceServer::<grpc::Grpc>::NAME),
+            config,
         )
 }
 

@@ -11,10 +11,12 @@ use std::sync::Arc;
 
 use futures::Stream;
 use openfeo_config::api::{
-    ChangePasswordRequest, ChangePasswordResponse, ErrorCode, GetStateRequest, GetStateResponse,
-    LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, ServerMsg,
-    SetInitialPasswordRequest, SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse,
-    server_msg, subscribe_response, telemetry,
+    ApplyConfigRequest, ApplyConfigResponse, ChangePasswordRequest, ChangePasswordResponse,
+    ConfirmConfigRequest, ConfirmConfigResponse, ErrorCode, GetConfigRequest, GetConfigResponse,
+    GetStateRequest, GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse,
+    RevertConfigRequest, RevertConfigResponse, ServerMsg, SetInitialPasswordRequest,
+    SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse, ValidateConfigRequest,
+    ValidateConfigResponse, server_msg, subscribe_response, telemetry,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -22,14 +24,16 @@ use tonic::{Request, Response, Status};
 
 use crate::envelope::{Conn, Topic};
 use crate::events::to_pb;
-use crate::http::Peer;
+use crate::http::{Arrival, Local, Peer};
+use crate::keeper::Why;
 use crate::limits::EVENT_BACKLOG;
 use crate::pb::auth_service_server::AuthService;
+use crate::pb::config_service_server::ConfigService;
 use crate::pb::state_service_server::StateService;
 use crate::server::{ApiError, Shared};
 use crate::ws::Slot;
 
-/// Both services over the shared state.
+/// The services over the shared state.
 #[derive(Debug, Clone)]
 pub struct Grpc {
     shared: Arc<Shared>,
@@ -71,6 +75,19 @@ fn from<T>(request: &Request<T>) -> Result<IpAddr, Status> {
         .get::<Peer>()
         .map(|peer| peer.0.ip())
         .ok_or_else(|| Status::internal("the call carries no peer address"))
+}
+
+/// Both ends of the connection the call came over, as the listener attached them.
+fn arrival<T>(request: &Request<T>) -> Result<Arrival, Status> {
+    let peer = request
+        .extensions()
+        .get::<Peer>()
+        .copied()
+        .ok_or_else(|| Status::internal("the call carries no peer address"))?;
+    Ok(Arrival::of(
+        peer,
+        request.extensions().get::<Local>().copied(),
+    ))
 }
 
 /// The call's token, if it names a live session.
@@ -233,6 +250,65 @@ async fn feed(
 }
 
 #[tonic::async_trait]
+impl ConfigService for Grpc {
+    async fn get_config(
+        &self,
+        request: Request<GetConfigRequest>,
+    ) -> Result<Response<GetConfigResponse>, Status> {
+        token(&self.shared, &request)?;
+        Ok(Response::new(self.shared.config_view().await))
+    }
+
+    async fn validate_config(
+        &self,
+        request: Request<ValidateConfigRequest>,
+    ) -> Result<Response<ValidateConfigResponse>, Status> {
+        token(&self.shared, &request)?;
+        let at = arrival(&request)?;
+        let Some(config) = request.into_inner().config else {
+            return Err(Status::invalid_argument("a validation with no config"));
+        };
+        Ok(Response::new(self.shared.validate_config(config, at).await))
+    }
+
+    async fn apply_config(
+        &self,
+        request: Request<ApplyConfigRequest>,
+    ) -> Result<Response<ApplyConfigResponse>, Status> {
+        token(&self.shared, &request)?;
+        self.shared
+            .apply_config(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(|error| status(&error))
+    }
+
+    async fn confirm_config(
+        &self,
+        request: Request<ConfirmConfigRequest>,
+    ) -> Result<Response<ConfirmConfigResponse>, Status> {
+        token(&self.shared, &request)?;
+        self.shared
+            .confirm_config()
+            .await
+            .map_err(|error| status(&error))?;
+        Ok(Response::new(ConfirmConfigResponse {}))
+    }
+
+    async fn revert_config(
+        &self,
+        request: Request<RevertConfigRequest>,
+    ) -> Result<Response<RevertConfigResponse>, Status> {
+        token(&self.shared, &request)?;
+        self.shared
+            .revert_config(Why::Asked)
+            .await
+            .map_err(|error| status(&error))?;
+        Ok(Response::new(RevertConfigResponse {}))
+    }
+}
+
+#[tonic::async_trait]
 impl StateService for Grpc {
     type SubscribeStream = Pin<Box<dyn Stream<Item = Result<SubscribeResponse, Status>> + Send>>;
 
@@ -278,6 +354,369 @@ mod tests {
     use crate::pb::state_service_client::StateServiceClient;
     use crate::server::tests::PASSWORD;
     use crate::testing::{TestApi, with_token};
+
+    use openfeo_config::api::{
+        ApplyConfigRequest, ConfirmConfigRequest, GetConfigRequest, RevertConfigRequest,
+        ValidateConfigRequest,
+    };
+    use openfeo_config::state::ConfigEffectKind;
+    use openfeo_config::{Config, secrets};
+
+    use crate::pb::config_service_client::ConfigServiceClient;
+
+    /// What a socket was answered, or the error it was sent.
+    async fn asked(
+        ws: &mut crate::testing::Ws,
+        body: request::Body,
+    ) -> Result<response::Body, openfeo_config::api::Error> {
+        match ws.ask(body).await {
+            server_msg::Body::Response(openfeo_config::api::Response { body: Some(body) }) => {
+                Ok(body)
+            }
+            server_msg::Body::Error(error) => Err(error),
+            other => panic!("a response or an error, not {other:?}"),
+        }
+    }
+
+    /// The config as the socket reads it, and its tag.
+    async fn read(ws: &mut crate::testing::Ws) -> (Config, String) {
+        let Ok(response::Body::GetConfig(GetConfigResponse {
+            config: Some(config),
+            tag,
+            ..
+        })) = asked(ws, request::Body::GetConfig(GetConfigRequest {})).await
+        else {
+            panic!("the config");
+        };
+        (config, tag)
+    }
+
+    /// `config` with `lan0` at `192.168.2.1/24` and everything in it moved along.
+    fn moved(mut config: Config) -> Config {
+        let lan = &mut config.lans[0];
+        "192.168.2.1/24".clone_into(&mut lan.ipv4);
+        if let Some(dhcp) = &mut lan.dhcp {
+            dhcp.range = vec!["192.168.2.100".to_owned(), "192.168.2.200".to_owned()];
+            for lease in &mut dhcp.r#static {
+                lease.ip = lease.ip.replace("192.168.1.", "192.168.2.");
+            }
+        }
+        if let Some(firewall) = &mut config.firewall {
+            for forward in &mut firewall.port_forwards {
+                forward.to = forward.to.replace("192.168.1.", "192.168.2.");
+            }
+        }
+        config
+    }
+
+    #[tokio::test]
+    async fn a_config_is_read_without_its_secrets_over_the_socket_and_over_grpc() {
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        let (over_ws, tag) = read(&mut ws).await;
+        let mut client = ConfigServiceClient::new(api.channel().await);
+        let over_grpc = client
+            .get_config(with_token(GetConfigRequest {}, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(over_grpc.config.as_ref(), Some(&over_ws));
+        assert_eq!(over_grpc.tag, tag);
+        assert_eq!(over_grpc.confirm_secs, 120);
+        // A password is set, and it is not in what is read.
+        let running = api.shared.world.borrow().config.clone();
+        let hash = running.admin.as_ref().unwrap().password_hash.clone();
+        assert!(hash.starts_with("$argon2id$"));
+        assert_eq!(over_ws.admin.as_ref().unwrap().password_hash, "");
+        assert_eq!(over_ws, secrets::redact(&running));
+        assert_eq!(tag, secrets::tag(&running));
+    }
+
+    #[tokio::test]
+    async fn validate_says_the_effects_and_the_caller() {
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        // The test's connection arrives at 127.0.0.1: let the World hold that on lan0's bridge,
+        // so the router can tell which LAN is asking.
+        api.shared.publisher.update(|world| {
+            let mut addresses = (*world.addresses).clone();
+            addresses.insert(openfeo_world::AddrFact {
+                ifname: "br-lan0".to_owned(),
+                net: "127.0.0.1/8".parse().unwrap(),
+                peer: None,
+                deprecated: false,
+            });
+            world.addresses = Arc::new(addresses);
+        });
+        let mut ws = api.ws_with(&token).await;
+        let (config, _) = read(&mut ws).await;
+        let Ok(response::Body::ValidateConfig(over_ws)) = asked(
+            &mut ws,
+            request::Body::ValidateConfig(ValidateConfigRequest {
+                config: Some(moved(config.clone())),
+            }),
+        )
+        .await
+        else {
+            panic!("a validation");
+        };
+        assert_eq!(over_ws.violations, Vec::new());
+        assert_eq!(over_ws.effects.len(), 1);
+        assert_eq!(over_ws.effects[0].subject, "lan0");
+        assert_eq!(over_ws.effects[0].kind(), ConfigEffectKind::LanAddressMoves);
+        let caller = over_ws.caller.clone().expect("the caller");
+        assert_eq!(caller.lan, "lan0");
+        assert!(caller.lan_changes);
+        assert!(
+            !caller.connection_drops,
+            "it arrived at an address that is not the LAN's own"
+        );
+        assert_eq!(caller.router_after, "192.168.2.1");
+        // The same over gRPC, and nothing was changed by asking.
+        let mut client = ConfigServiceClient::new(api.channel().await);
+        let over_grpc = client
+            .validate_config(with_token(
+                ValidateConfigRequest {
+                    config: Some(moved(config.clone())),
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(over_grpc, over_ws);
+        assert_eq!(read(&mut ws).await.0, config);
+        assert_eq!(api.shared.world.borrow().pending, None);
+    }
+
+    #[tokio::test]
+    async fn validate_of_a_bad_config_says_only_what_is_wrong() {
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        let (mut config, _) = read(&mut ws).await;
+        config.lans[0].ipv4 = "192.168.2.1/24".to_owned();
+        let Ok(response::Body::ValidateConfig(said)) = asked(
+            &mut ws,
+            request::Body::ValidateConfig(ValidateConfigRequest {
+                config: Some(config),
+            }),
+        )
+        .await
+        else {
+            panic!("a validation");
+        };
+        assert!(said.violations.len() >= 2, "{:?}", said.violations);
+        assert!(
+            said.violations
+                .iter()
+                .any(|violation| violation.path.starts_with("lans[0].dhcp")),
+            "{:?}",
+            said.violations
+        );
+        assert_eq!(said.effects, Vec::new());
+        assert_eq!(said.caller, None);
+        // No config at all is the request's fault.
+        let error = asked(
+            &mut ws,
+            request::Body::ValidateConfig(ValidateConfigRequest { config: None }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn an_apply_over_the_socket_is_confirmed_over_grpc() {
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        let (config, tag) = read(&mut ws).await;
+        let Ok(response::Body::ApplyConfig(applied)) = asked(
+            &mut ws,
+            request::Body::ApplyConfig(ApplyConfigRequest {
+                config: Some(moved(config.clone())),
+                tag: tag.clone(),
+                immediate: false,
+                timeout_secs: 0,
+            }),
+        )
+        .await
+        else {
+            panic!("applied");
+        };
+        assert_ne!(applied.tag, tag);
+        assert!(api.shared.world.borrow().pending.is_some());
+        // A second one waits, over either transport.
+        let error = asked(
+            &mut ws,
+            request::Body::ApplyConfig(ApplyConfigRequest {
+                config: Some(config.clone()),
+                tag: applied.tag.clone(),
+                immediate: true,
+                timeout_secs: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        let mut client = ConfigServiceClient::new(api.channel().await);
+        client
+            .confirm_config(with_token(ConfirmConfigRequest {}, &token))
+            .await
+            .unwrap();
+        assert_eq!(api.shared.world.borrow().pending, None);
+        assert_eq!(
+            read(&mut ws).await,
+            (moved(config.clone()), applied.tag.clone())
+        );
+        // Nothing left to revert, said as the precondition it is on both.
+        let status = client
+            .revert_config(with_token(RevertConfigRequest {}, &token))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        let error = asked(&mut ws, request::Body::RevertConfig(RevertConfigRequest {}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+        // Applied over gRPC, reverted over the socket.
+        let back = client
+            .apply_config(with_token(
+                ApplyConfigRequest {
+                    config: Some(config.clone()),
+                    tag: applied.tag,
+                    immediate: false,
+                    timeout_secs: 30,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(back.tag, tag);
+        assert!(matches!(
+            asked(&mut ws, request::Body::RevertConfig(RevertConfigRequest {})).await,
+            Ok(response::Body::RevertConfig(_))
+        ));
+        assert_eq!(read(&mut ws).await.0, moved(config));
+        // A stale tag is a precondition too; a bad window is the request's fault.
+        let status = client
+            .apply_config(with_token(
+                ApplyConfigRequest {
+                    config: Some(Config::default()),
+                    tag,
+                    immediate: false,
+                    timeout_secs: 0,
+                },
+                &token,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn the_state_pushed_to_a_subscriber_carries_the_pending_change_and_then_does_not() {
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        let (config, tag) = read(&mut ws).await;
+        let mut watcher = api.ws_with(&token).await;
+        watcher.subscribe("state", 0).await;
+        let first = watcher.next_state().await;
+        assert_eq!(first.system.unwrap().pending_config, None);
+        asked(
+            &mut ws,
+            request::Body::ApplyConfig(ApplyConfigRequest {
+                config: Some(moved(config)),
+                tag,
+                immediate: false,
+                timeout_secs: 45,
+            }),
+        )
+        .await
+        .unwrap();
+        let pending = loop {
+            if let Some(pending) = watcher.next_state().await.system.unwrap().pending_config {
+                break pending;
+            }
+        };
+        assert_eq!(pending.window_secs, 45);
+        assert_eq!(
+            pending.reverts_uptime_ms - pending.applied_uptime_ms,
+            45_000
+        );
+        assert_eq!(pending.effects.len(), 1);
+        assert_eq!(pending.effects[0].kind(), ConfigEffectKind::LanAddressMoves);
+        asked(
+            &mut ws,
+            request::Body::ConfirmConfig(ConfirmConfigRequest {}),
+        )
+        .await
+        .unwrap();
+        loop {
+            if watcher
+                .next_state()
+                .await
+                .system
+                .unwrap()
+                .pending_config
+                .is_none()
+            {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_config_calls_need_a_session() {
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut client = ConfigServiceClient::new(api.channel().await);
+        assert_eq!(
+            client
+                .get_config(GetConfigRequest {})
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        for code in [
+            client
+                .validate_config(with_token(ValidateConfigRequest::default(), "not-a-token"))
+                .await
+                .unwrap_err()
+                .code(),
+            client
+                .apply_config(ApplyConfigRequest::default())
+                .await
+                .unwrap_err()
+                .code(),
+            client
+                .confirm_config(ConfirmConfigRequest {})
+                .await
+                .unwrap_err()
+                .code(),
+            client
+                .revert_config(RevertConfigRequest {})
+                .await
+                .unwrap_err()
+                .code(),
+        ] {
+            assert_eq!(code, tonic::Code::Unauthenticated);
+        }
+        // A socket that has not said who it is gets no answer to a request: it is closed.
+        let mut ws = api.ws(None).await.unwrap();
+        ws.send(openfeo_config::api::client_msg::Body::Request(
+            openfeo_config::api::Request {
+                body: Some(request::Body::GetConfig(GetConfigRequest {})),
+            },
+        ))
+        .await;
+        assert_eq!(
+            ws.closed_with().await,
+            Some(crate::envelope::CLOSE_UNAUTHENTICATED)
+        );
+        // With a session it answers.
+        let mut ws = api.ws_with(&token).await;
+        assert_eq!(read(&mut ws).await.1.len(), 32);
+    }
 
     #[tokio::test]
     async fn state_is_the_same_over_grpc_the_websocket_and_json() {

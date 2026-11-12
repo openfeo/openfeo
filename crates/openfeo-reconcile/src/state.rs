@@ -11,12 +11,12 @@ use ipnet::IpNet;
 use openfeo_config::load::{DEFAULT_DOMAIN, DEFAULT_HOSTNAME};
 use openfeo_config::portname::parse_port_ref;
 use openfeo_config::state::{
-    AddressOrigin, AddressState, ConfigProblem, LanState, PortState, PortUse, PortUseKind, State,
-    SystemState, WanKind, WanState,
+    AddressOrigin, AddressState, ConfigEffect, ConfigEffectKind, ConfigProblem, LanState,
+    PendingConfig, PortState, PortUse, PortUseKind, State, SystemState, WanKind, WanState,
 };
 use openfeo_config::{Lan, Wan, wan::Kind};
 use openfeo_world::health::HealthView;
-use openfeo_world::{AddrFact, WanPhase, World};
+use openfeo_world::{AddrFact, Effect, EffectKind, WanPhase, World};
 
 use crate::wan::{phase, reason};
 use crate::{bridge_name, wan_netdev};
@@ -85,8 +85,33 @@ fn system_state(world: &World, system: &SystemFacts) -> SystemState {
         unhealthy: system.health.unhealthy.clone(),
         tls_fingerprint: system.tls_fingerprint.clone(),
         config_problem: system.config_problem.clone(),
-        // Filled from the World's pending change where the state is completed (Task 16).
-        pending_config: None,
+        pending_config: world.pending.as_ref().map(|fact| PendingConfig {
+            applied_uptime_ms: fact.applied_boot_ms,
+            reverts_uptime_ms: fact.reverts_boot_ms,
+            window_secs: fact.window_secs,
+            effects: fact.effects.iter().map(effect_pb).collect(),
+        }),
+    }
+}
+
+/// One effect of a change of config as the API says it (SPEC §8.3).
+#[must_use]
+pub fn effect_pb(effect: &Effect) -> ConfigEffect {
+    let kind = match effect.kind {
+        EffectKind::WanAdded => ConfigEffectKind::WanAdded,
+        EffectKind::WanRemoved => ConfigEffectKind::WanRemoved,
+        EffectKind::WanReconnects => ConfigEffectKind::WanReconnects,
+        EffectKind::LanAdded => ConfigEffectKind::LanAdded,
+        EffectKind::LanRemoved => ConfigEffectKind::LanRemoved,
+        EffectKind::LanAddressMoves => ConfigEffectKind::LanAddressMoves,
+        EffectKind::LanDhcpStarts => ConfigEffectKind::LanDhcpStarts,
+        EffectKind::LanDhcpStops => ConfigEffectKind::LanDhcpStops,
+        EffectKind::LanDhcpRestarts => ConfigEffectKind::LanDhcpRestarts,
+        EffectKind::RouterRenamed => ConfigEffectKind::RouterRenamed,
+    };
+    ConfigEffect {
+        subject: effect.subject.clone(),
+        kind: kind.into(),
     }
 }
 
@@ -374,6 +399,76 @@ mod tests {
             },
             tls_fingerprint: "AB:CD".into(),
             config_problem: None,
+        }
+    }
+
+    #[test]
+    fn a_pending_change_is_in_the_state() {
+        use openfeo_config::state::{ConfigEffect, ConfigEffectKind, PendingConfig};
+        use openfeo_world::{Effect, EffectKind, PendingFact};
+        let mut world = fixtures::dhcp_world();
+        assert_eq!(
+            state(&world, &system()).system.unwrap().pending_config,
+            None
+        );
+        world.pending = Some(Arc::new(PendingFact {
+            applied_boot_ms: 3_590_000,
+            reverts_boot_ms: 3_710_000,
+            window_secs: 120,
+            effects: vec![
+                Effect {
+                    subject: "wan0".into(),
+                    kind: EffectKind::WanReconnects,
+                },
+                Effect {
+                    subject: "lan0".into(),
+                    kind: EffectKind::LanAddressMoves,
+                },
+            ],
+            lans: ["lan0".to_owned()].into(),
+        }));
+        assert_eq!(
+            state(&world, &system()).system.unwrap().pending_config,
+            Some(PendingConfig {
+                applied_uptime_ms: 3_590_000,
+                reverts_uptime_ms: 3_710_000,
+                window_secs: 120,
+                effects: vec![
+                    ConfigEffect {
+                        subject: "wan0".into(),
+                        kind: ConfigEffectKind::WanReconnects.into(),
+                    },
+                    ConfigEffect {
+                        subject: "lan0".into(),
+                        kind: ConfigEffectKind::LanAddressMoves.into(),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn every_effect_has_its_wire_kind() {
+        use openfeo_config::state::ConfigEffectKind as Wire;
+        use openfeo_world::{Effect, EffectKind as Kind};
+        for (kind, wire) in [
+            (Kind::WanAdded, Wire::WanAdded),
+            (Kind::WanRemoved, Wire::WanRemoved),
+            (Kind::WanReconnects, Wire::WanReconnects),
+            (Kind::LanAdded, Wire::LanAdded),
+            (Kind::LanRemoved, Wire::LanRemoved),
+            (Kind::LanAddressMoves, Wire::LanAddressMoves),
+            (Kind::LanDhcpStarts, Wire::LanDhcpStarts),
+            (Kind::LanDhcpStops, Wire::LanDhcpStops),
+            (Kind::LanDhcpRestarts, Wire::LanDhcpRestarts),
+            (Kind::RouterRenamed, Wire::RouterRenamed),
+        ] {
+            let effect = Effect {
+                subject: "x".into(),
+                kind,
+            };
+            assert_eq!(effect_pb(&effect).kind(), wire, "{kind:?}");
+            assert_eq!(effect_pb(&effect).subject, "x");
         }
     }
 
