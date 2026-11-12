@@ -239,16 +239,22 @@ fn wan_interfaces(
         {
             vlans.insert(ifname.clone(), (wan.port.clone(), id));
         }
-        let mtu = match &wan.kind {
-            Some(wan::Kind::Dhcp(_)) => wan_port_mtu(world, wan),
+        // A WAN that is no longer PPPoE while its session is still in the World: the PPPoE
+        // task has been asked to stop and is ending the session in order (SPEC §6.3). The
+        // kernel drops every PPPoE session on a port whose MTU changes, so the port keeps
+        // the session's MTU until the task has gone and taken its fact with it.
+        let carries_pppoe = rules::is_pppoe(wan) || world.pppoe.contains_key(&wan.name);
+        let mtu = if carries_pppoe {
             // The port, and a tagged WAN's parent, carry 1508-byte frames for RFC 4638.
-            Some(wan::Kind::Pppoe(_)) => {
-                if ifname != wan.port {
-                    wans.insert(wan.port.clone(), Some(PPPOE_PORT_MTU));
-                }
-                Some(PPPOE_PORT_MTU)
+            if ifname != wan.port {
+                wans.insert(wan.port.clone(), Some(PPPOE_PORT_MTU));
             }
-            Some(wan::Kind::Static(_)) | None => None,
+            Some(PPPOE_PORT_MTU)
+        } else {
+            match &wan.kind {
+                Some(wan::Kind::Dhcp(_)) => wan_port_mtu(world, wan),
+                Some(wan::Kind::Pppoe(_) | wan::Kind::Static(_)) | None => None,
+            }
         };
         wans.insert(ifname, mtu);
     }
@@ -290,6 +296,34 @@ mod tests {
             "the rename is wanted as soon as the unit exists"
         );
         insta::assert_yaml_snapshot!(desired);
+    }
+
+    /// A WAN that was PPPoE and is DHCP now, with its session still in the World: the PPPoE
+    /// task has been asked to stop and is ending the session in order. The kernel drops every
+    /// PPPoE session on a port whose MTU changes, so the port keeps 1508 until the task has
+    /// gone and taken its fact with it.
+    #[test]
+    fn a_port_keeps_the_pppoe_mtu_while_a_session_is_ending_on_it() {
+        let mut world = crate::fixtures::pppoe_world();
+        assert!(
+            world.pppoe.contains_key("wan0"),
+            "the fixture has a session"
+        );
+        let mut config = (*world.config).clone();
+        config.wans[0].kind = Some(wan::Kind::Dhcp(openfeo_config::DhcpWan::default()));
+        world.config = std::sync::Arc::new(config);
+        assert_eq!(links(&world).ports["p0"].mtu, Some(1508));
+        // Tagged, the sub-interface and its parent both keep it.
+        let mut tagged = world.clone();
+        let mut config = (*tagged.config).clone();
+        config.wans[0].vlan = 101;
+        tagged.config = std::sync::Arc::new(config);
+        let desired = links(&tagged);
+        assert_eq!(desired.ports["p0"].mtu, Some(1508));
+        assert_eq!(desired.ports["p0.101"].mtu, Some(1508));
+        // The task stopped: the port is the DHCP client's, at the default until a lease.
+        world.pppoe = std::sync::Arc::default();
+        assert_eq!(links(&world).ports["p0"].mtu, Some(DEFAULT_MTU));
     }
 
     #[test]
