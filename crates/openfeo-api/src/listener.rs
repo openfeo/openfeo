@@ -173,6 +173,7 @@ impl Server {
             version: deps.version,
             limits: deps.limits,
             extra_host: deps.extra_host,
+            default_window_secs: crate::keeper::DEFAULT_WINDOW_SECS,
         });
         let loaded = cert::load(&deps.tls_dir).unwrap_or_else(|err| {
             warn!("tls: {err}; issuing a new certificate");
@@ -250,7 +251,12 @@ impl Server {
             all: Arc::new(Semaphore::new(self.shared.limits.connections)),
             per_source: Arc::new(PerSource::default()),
         };
-        tasks.spawn(remember_events(self.shared.clone()));
+        // The recorder is listening before anything below can say something: an event of the
+        // API's own start is in the backlog.
+        let events = self.shared.publisher.events();
+        tasks.spawn(remember_events(self.shared.clone(), events));
+        self.shared.discard_pending();
+        tasks.spawn(crate::config::keep_window(self.shared.clone()));
         tasks.spawn({
             let telemetry = self.shared.telemetry.clone();
             async move {
@@ -284,8 +290,10 @@ impl Server {
 }
 
 /// Keep the recent events for later subscribers.
-async fn remember_events(shared: Arc<Shared>) -> Result<(), TaskError> {
-    let mut events = shared.publisher.events();
+async fn remember_events(
+    shared: Arc<Shared>,
+    mut events: broadcast::Receiver<Arc<openfeo_world::Event>>,
+) -> Result<(), TaskError> {
     loop {
         match events.recv().await {
             Ok(event) => shared.remember(event),

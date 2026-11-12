@@ -59,10 +59,15 @@ pub fn carry(running: &Config, proposed: &mut Config) {
 /// What tells one config from another, for an apply to name the config it was edited from
 /// (SPEC §5.5): 32 lowercase hex characters, the first 16 bytes of SHA-256 over the config
 /// without its secrets, in its protobuf encoding (which has no maps, so it is the same bytes
-/// every time). Two configs that differ only in a secret share a tag.
+/// every time). Two configs that differ only in a secret, or in having an admin table at all,
+/// share a tag.
 #[must_use]
 pub fn tag(config: &Config) -> String {
-    let digest = Sha256::digest(redact(config).encode_to_vec());
+    // The admin table is left out whole, present or not: the password is changed by its own
+    // call, and setting the first one must not make every config read before it stale.
+    let mut tagged = redact(config);
+    tagged.admin = None;
+    let digest = Sha256::digest(tagged.encode_to_vec());
     digest
         .iter()
         .take(16)
@@ -221,6 +226,21 @@ mod tests {
         other.admin.as_mut().unwrap().password_hash = "$argon2id$another".to_owned();
         assert_eq!(tag(&config), tag(&other));
         assert_eq!(tag(&config), tag(&redact(&config)));
+    }
+
+    /// The admin's password is not something an apply changes, so the tag does not see the
+    /// admin table at all: a first password set (no table, then one) leaves the tag as it was.
+    #[test]
+    fn the_admin_table_is_no_part_of_the_tag() {
+        let config = running();
+        let mut none = config.clone();
+        none.admin = None;
+        let mut empty = config.clone();
+        empty.admin = Some(Admin {
+            password_hash: String::new(),
+        });
+        assert_eq!(tag(&none), tag(&config));
+        assert_eq!(tag(&empty), tag(&config));
     }
 
     #[test]

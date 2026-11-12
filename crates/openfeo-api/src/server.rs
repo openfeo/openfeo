@@ -26,6 +26,7 @@ use crate::auth::password::check_policy;
 use crate::auth::{Backoff, Sessions, Source, Verifier};
 use crate::events::Recent;
 use crate::gate::Names;
+use crate::keeper::Keeper;
 use crate::limits::{
     AUTH_FRAME_TIMEOUT, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS,
     MAX_CONNECTIONS_PER_SOURCE, PING_INTERVAL, REQUEST_TIMEOUT, SESSION_IDLE_MS,
@@ -195,6 +196,14 @@ pub struct Shared {
     /// One password change at a time: the check for "no password yet" and the write are one
     /// step.
     password: tokio::sync::Mutex<()>,
+    /// Which config is confirmed, which is running and what is pending (SPEC §5.5). Held for
+    /// the whole of an apply, a confirm, a revert and the writing of a password, so that each
+    /// is one step to the others.
+    pub(crate) keeper: tokio::sync::Mutex<Keeper>,
+    /// The window of the pending change: which one it is and when it ends, for the timer.
+    pub(crate) window: watch::Sender<Option<(u64, tokio::time::Instant)>>,
+    /// Counts the windows, so that the timer of one cannot revert another.
+    pub(crate) window_turn: AtomicU64,
 }
 
 impl std::fmt::Debug for Shared {
@@ -203,6 +212,14 @@ impl std::fmt::Debug for Shared {
             .field("version", &self.version)
             .finish_non_exhaustive()
     }
+}
+
+/// What a password change is told while a change of config is pending (SPEC §5.5).
+fn pending_change() -> ApiError {
+    ApiError::new(
+        ErrorCode::FailedPrecondition,
+        "a change of config is pending; confirm or revert it before changing the password",
+    )
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -229,12 +246,19 @@ pub struct SharedParts {
     pub limits: Limits,
     /// One more host taken as the router's own; see [`ApiDeps::extra_host`](crate::ApiDeps).
     pub extra_host: Option<String>,
+    /// The window an apply is given when it names none (SPEC §5.5).
+    pub default_window_secs: u32,
 }
 
 impl Shared {
     /// The shared state, with no sessions and nobody waiting.
     #[must_use]
     pub fn new(parts: SharedParts) -> Arc<Self> {
+        let keeper = Keeper::new(
+            parts.world.borrow().config.clone(),
+            &parts.config_state,
+            parts.default_window_secs,
+        );
         Arc::new(Shared {
             world: parts.world,
             publisher: parts.publisher,
@@ -254,6 +278,9 @@ impl Shared {
             recent: Mutex::new(Recent::default()),
             verifier: Verifier::new(),
             password: tokio::sync::Mutex::new(()),
+            keeper: tokio::sync::Mutex::new(keeper),
+            window: watch::Sender::new(None),
+            window_turn: AtomicU64::new(0),
         })
     }
 
@@ -322,6 +349,12 @@ impl Shared {
             error!("admin: cannot hash the password: {err}");
             ApiError::new(ErrorCode::Internal, "the password could not be hashed")
         })?;
+        // From here to the end is one step to the keeper of the config: no apply writes the
+        // file between, and the keeper's own copies take the hash with the World's.
+        let mut keeper = self.keeper.lock().await;
+        if keeper.pending().is_some() {
+            return Err(pending_change());
+        }
         let (path, ports) = (self.config_path.clone(), self.world.borrow().ports.clone());
         let written = {
             let hash = hash.clone();
@@ -344,6 +377,7 @@ impl Shared {
                 ));
             }
         }
+        keeper.set_hash(&hash);
         self.publisher.update(|world| {
             Arc::make_mut(&mut world.config).admin = Some(Admin {
                 password_hash: hash,
@@ -478,6 +512,11 @@ impl Shared {
         new: String,
     ) -> Result<(), ApiError> {
         let _one_at_a_time = self.password.lock().await;
+        // Said before the old password is looked at: a change that cannot be made now does
+        // not cost an attempt. `store_password` asks again, under the keeper's lock.
+        if self.keeper.lock().await.pending().is_some() {
+            return Err(pending_change());
+        }
         check_policy(&new)
             .map_err(|err| ApiError::new(ErrorCode::InvalidArgument, &err.to_string()))?;
         self.check_password(from, old).await.map_err(|mut err| {
@@ -612,6 +651,7 @@ pub(crate) mod tests {
             version: "0.4.0-test".to_owned(),
             limits,
             extra_host: None,
+            default_window_secs: crate::keeper::DEFAULT_WINDOW_SECS,
         });
         shared.fingerprint.send_replace("AB:CD".to_owned());
         (shared, dir)

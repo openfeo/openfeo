@@ -11,6 +11,7 @@
 pub mod assets;
 pub mod auth;
 pub mod cert;
+pub mod config;
 pub mod envelope;
 pub mod events;
 pub mod gate;
