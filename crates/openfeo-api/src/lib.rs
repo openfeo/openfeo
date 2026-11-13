@@ -11,11 +11,13 @@
 pub mod assets;
 pub mod auth;
 pub mod cert;
+pub mod config;
 pub mod envelope;
 pub mod events;
 pub mod gate;
 pub mod grpc;
 pub mod http;
+pub mod keeper;
 pub mod limits;
 pub mod listener;
 pub mod pb;
@@ -81,6 +83,10 @@ pub struct ApiDeps {
     /// Always `None` in a release build: only a harness build reads the knob that sets it
     /// (`openfeo.panel_host=`, for the lab's relay).
     pub extra_host: Option<String>,
+    /// The window a change of config is given when its apply names none (SPEC §5.5):
+    /// [`keeper::DEFAULT_WINDOW_SECS`], unless a harness build was told a shorter one
+    /// (`openfeo.confirm_secs=`).
+    pub confirm_secs: u32,
 }
 
 /// Bind and serve the API until a listener fails.
@@ -98,10 +104,12 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
     use tonic::server::NamedService;
 
     use pb::auth_service_server::AuthServiceServer;
+    use pb::config_service_server::ConfigServiceServer;
     use pb::state_service_server::StateServiceServer;
 
     let grpc = grpc::Grpc::new(shared.clone());
     let auth = AuthServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
+    let config = ConfigServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
     let state = StateServiceServer::new(grpc).max_decoding_message_size(limits::MAX_BODY);
     http::routes()
         .route("/ws", axum::routing::get(ws::upgrade))
@@ -112,6 +120,10 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
         .route_service(
             &format!("/{}/{{*call}}", StateServiceServer::<grpc::Grpc>::NAME),
             state,
+        )
+        .route_service(
+            &format!("/{}/{{*call}}", ConfigServiceServer::<grpc::Grpc>::NAME),
+            config,
         )
 }
 

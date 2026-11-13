@@ -10,7 +10,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use ipnet::IpNet;
-use openfeo_config::System;
+use openfeo_config::api::Caller;
+use openfeo_config::{Config, System};
 use openfeo_reconcile::{bridge_name, public};
 use openfeo_world::World;
 
@@ -160,6 +161,75 @@ pub fn origin_allowed(origin: Option<&str>, names: &Names, world: &World) -> boo
         .is_some_and(|authority| !authority.contains('/') && host_allowed(authority, names, world))
 }
 
+/// The LAN a caller is on (SPEC §8.3): the one LAN whose bridge holds `local`, the router
+/// address the connection arrived at; failing that, the LAN whose IPv4 subnet holds `peer`, the
+/// caller's own address. `None` when neither says (a link-local address held on several
+/// bridges, an address of no LAN).
+#[must_use]
+pub fn caller_lan(world: &World, peer: IpAddr, local: IpAddr) -> Option<String> {
+    let (peer, local) = (peer.to_canonical(), local.to_canonical());
+    let lans = &world.config.lans;
+    let mut arrived_on = lans.iter().filter(|lan| {
+        let bridge = bridge_name(&lan.name);
+        world
+            .addresses
+            .iter()
+            .any(|addr| addr.ifname == bridge && addr.net.addr() == local)
+    });
+    if let (Some(lan), None) = (arrived_on.next(), arrived_on.next()) {
+        return Some(lan.name.clone());
+    }
+    lans.iter()
+        .find(|lan| {
+            lan.ipv4
+                .parse::<IpNet>()
+                .is_ok_and(|net| net.contains(&peer))
+        })
+        .map(|lan| lan.name.clone())
+}
+
+/// What applying `proposed` over `running` means for a caller on `lan` whose connection
+/// arrived at `local` (SPEC §8.3). Two separate facts: the connection drops when the address
+/// it arrived at goes (the LAN's IPv4 address or its typed IPv6 one changes, or the LAN is
+/// removed); the LAN changes under the caller when its IPv4 address or subnet does, since
+/// then the leases its devices hold no longer fit. A caller on no LAN the router can name is
+/// told nothing.
+#[must_use]
+pub fn caller(running: &Config, proposed: &Config, lan: Option<&str>, local: IpAddr) -> Caller {
+    let named = |config: &'_ Config, name: &str| {
+        config
+            .lans
+            .iter()
+            .find(|lan| lan.name == name)
+            .map(|lan| (lan.ipv4.clone(), lan.ipv6.clone()))
+    };
+    let Some((name, (ipv4_before, ipv6_before))) =
+        lan.and_then(|name| Some((name, named(running, name)?)))
+    else {
+        return Caller::default();
+    };
+    let Some((ipv4_after, ipv6_after)) = named(proposed, name) else {
+        return Caller {
+            connection_drops: true,
+            lan_changes: true,
+            lan: name.to_owned(),
+            router_after: String::new(),
+        };
+    };
+    let local = local.to_canonical();
+    let address = |cidr: &str| cidr.parse::<IpNet>().ok().map(|net| net.addr());
+    let goes =
+        |before: &str, after: &str| address(before) == Some(local) && address(after) != Some(local);
+    Caller {
+        connection_drops: goes(&ipv4_before, &ipv4_after) || goes(&ipv6_before, &ipv6_after),
+        lan_changes: ipv4_before != ipv4_after,
+        lan: name.to_owned(),
+        router_after: address(&ipv4_after)
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddrV6;
@@ -210,6 +280,172 @@ mod tests {
             .collect(),
         );
         world
+    }
+
+    fn running() -> Config {
+        (*world().config).clone()
+    }
+
+    /// `lan0` moved to `192.168.2.1/24`.
+    fn moved() -> Config {
+        let mut config = running();
+        config.lans[0].ipv4 = "192.168.2.1/24".to_owned();
+        config
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    fn asked(local: &str, peer: &str, proposed: &Config) -> Caller {
+        let world = world();
+        let lan = caller_lan(&world, ip(peer), ip(local));
+        caller(&running(), proposed, lan.as_deref(), ip(local))
+    }
+
+    #[test]
+    fn a_subnet_change_asked_from_that_lan_moves_the_caller() {
+        assert_eq!(
+            asked("192.168.1.1", "192.168.1.50", &moved()),
+            Caller {
+                connection_drops: true,
+                lan_changes: true,
+                lan: "lan0".to_owned(),
+                router_after: "192.168.2.1".to_owned(),
+            }
+        );
+        // Only the subnet's size changed: the address stays, the leases no longer fit.
+        let mut wider = running();
+        wider.lans[0].ipv4 = "192.168.1.1/23".to_owned();
+        assert_eq!(
+            asked("192.168.1.1", "192.168.1.50", &wider),
+            Caller {
+                connection_drops: false,
+                lan_changes: true,
+                lan: "lan0".to_owned(),
+                router_after: "192.168.1.1".to_owned(),
+            }
+        );
+    }
+
+    /// A tab opened by the router's name on a router with IPv6 is on IPv6: an IPv4 renumbering
+    /// leaves that connection alone and still strands the caller's IPv4 lease.
+    #[test]
+    fn over_ipv6_by_name_the_lan_changes_and_the_connection_stays() {
+        for local in ["fd12:3456:789a:1::1", "2001:db8:1:1::1", "fe80::1"] {
+            assert_eq!(
+                asked(local, "fd12:3456:789a:1::50", &moved()),
+                Caller {
+                    connection_drops: false,
+                    lan_changes: true,
+                    lan: "lan0".to_owned(),
+                    router_after: "192.168.2.1".to_owned(),
+                },
+                "{local}"
+            );
+        }
+    }
+
+    #[test]
+    fn asked_from_another_lan_nothing_moves() {
+        let said = asked("192.0.2.233", "192.0.2.235", &moved());
+        assert!(!said.connection_drops && !said.lan_changes, "{said:?}");
+        assert_eq!(said.lan, "dmz");
+        assert_eq!(said.router_after, "192.0.2.233");
+    }
+
+    #[test]
+    fn removing_the_callers_lan_drops_the_connection_and_names_no_address() {
+        let mut gone = running();
+        gone.lans.retain(|lan| lan.name != "lan0");
+        for local in ["192.168.1.1", "fd12:3456:789a:1::1"] {
+            assert_eq!(
+                asked(local, "192.168.1.50", &gone),
+                Caller {
+                    connection_drops: true,
+                    lan_changes: true,
+                    lan: "lan0".to_owned(),
+                    router_after: String::new(),
+                },
+                "{local}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_change_that_leaves_the_lan_alone_moves_nobody() {
+        let mut proposed = running();
+        proposed.lans[0]
+            .dhcp
+            .get_or_insert_with(Default::default)
+            .lease_secs = 600;
+        proposed.wans[0].priority += 1;
+        let said = asked("192.168.1.1", "192.168.1.50", &proposed);
+        assert!(!said.connection_drops && !said.lan_changes, "{said:?}");
+        assert_eq!(
+            (said.lan.as_str(), said.router_after.as_str()),
+            ("lan0", "192.168.1.1")
+        );
+        // The running config proposed again moves nobody either.
+        let said = asked("192.168.1.1", "192.168.1.50", &running());
+        assert!(!said.connection_drops && !said.lan_changes, "{said:?}");
+    }
+
+    #[test]
+    fn a_typed_ipv6_address_that_changes_drops_a_connection_made_to_it() {
+        let mut typed = running();
+        typed.lans[0].ipv6 = "2001:db8:1:1::1/64".to_owned();
+        let mut proposed = typed.clone();
+        proposed.lans[0].ipv6 = "2001:db8:1:9::1/64".to_owned();
+        let said = caller(&typed, &proposed, Some("lan0"), ip("2001:db8:1:1::1"));
+        assert!(said.connection_drops, "{said:?}");
+        assert!(!said.lan_changes, "the IPv4 leases still fit: {said:?}");
+        // By the ULA address, or the IPv4 one, the same change drops nothing.
+        for local in ["fd12:3456:789a:1::1", "192.168.1.1"] {
+            let said = caller(&typed, &proposed, Some("lan0"), ip(local));
+            assert!(!said.connection_drops, "{local}: {said:?}");
+        }
+        // IPv6 switched off on the LAN takes the typed address too.
+        proposed.lans[0].ipv6 = "none".to_owned();
+        assert!(caller(&typed, &proposed, Some("lan0"), ip("2001:db8:1:1::1")).connection_drops);
+    }
+
+    #[test]
+    fn the_caller_s_lan_is_found_by_the_address_it_arrived_at_and_then_by_its_own() {
+        let world = world();
+        // By the address the connection arrived at, whatever the caller's own is.
+        assert_eq!(
+            caller_lan(&world, ip("fe80::99"), ip("fe80::1")).as_deref(),
+            Some("lan0")
+        );
+        assert_eq!(
+            caller_lan(&world, ip("203.0.113.9"), ip("192.0.2.233")).as_deref(),
+            Some("dmz")
+        );
+        // An IPv4 client of the dual-stack listener, seen in its mapped form.
+        assert_eq!(
+            caller_lan(&world, ip("::ffff:192.168.1.50"), ip("::ffff:192.168.1.1")).as_deref(),
+            Some("lan0")
+        );
+        // An address the router does not hold on a LAN (the lab's relay): by the caller's own.
+        assert_eq!(
+            caller_lan(&world, ip("192.168.1.50"), ip("198.51.100.7")).as_deref(),
+            Some("lan0")
+        );
+        assert_eq!(
+            caller_lan(&world, ip("192.0.2.235"), ip("fd12:3456:789a::1")).as_deref(),
+            Some("dmz"),
+            "the loopback's address is on no LAN"
+        );
+        // Neither says.
+        assert_eq!(
+            caller_lan(&world, ip("203.0.113.9"), ip("203.0.113.2")),
+            None
+        );
+        assert_eq!(
+            caller(&running(), &moved(), None, ip("203.0.113.2")),
+            Caller::default()
+        );
     }
 
     fn names() -> Names {

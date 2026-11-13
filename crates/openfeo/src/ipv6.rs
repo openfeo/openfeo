@@ -7,6 +7,7 @@
 //! router-advertisement client on every WAN with `[wans.ipv6]`, publishing what it learns as
 //! the WAN's IPv6 fact. Every line logged here is a contract with the harness scenarios.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read as _};
 use std::net::Ipv6Addr;
@@ -21,14 +22,16 @@ use openfeo_platform::atomic;
 use openfeo_proto_dhcp4::identity::{from_hex, hex};
 use openfeo_proto_ndp::client::{Client, Config, Input, Learned, Note, Output};
 use openfeo_proto_ndp::wire::Preference as WirePreference;
-use openfeo_runtime::supervise::TaskError;
+use openfeo_reconcile::slices::{RaClientSlice, ra_clients};
+use openfeo_runtime::Publisher;
+use openfeo_runtime::supervise::{BoxedTask, Stop, TaskError};
 use openfeo_runtime::world::WorldRx;
-use openfeo_runtime::{Publisher, Supervisor};
-use openfeo_world::{Preference, WanIpv6Fact};
+use openfeo_world::{Preference, WanIpv6Fact, World};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::dhcp4::{LinkChange, link_change, wait_for_link, wait_for_netdev};
+use crate::family::Family;
 
 /// The ICMPv6 message buffer; advertisements are far smaller.
 const RECEIVE_BUFFER: usize = 1500;
@@ -79,39 +82,58 @@ pub fn random_secret() -> io::Result<[u8; 16]> {
     Ok(secret)
 }
 
-/// One task per WAN with `[wans.ipv6]` in mode `auto`. Without a persisted secret the client
-/// still runs, with an all-zero secret: addresses stay stable but are no longer private, which
-/// the router said on the console when it failed to keep the secret.
-pub fn spawn_all(
-    supervisor: &Supervisor,
-    publisher: &Arc<Publisher>,
-    world_rx: &WorldRx,
-    secret: Option<[u8; 16]>,
-) {
-    let config = publisher.current().config.clone();
-    for wan in &config.wans {
-        let Some(ipv6) = &wan.ipv6 else {
-            continue;
-        };
-        if ipv6.mode == "disabled" {
-            continue;
-        }
-        let task = WanTask {
-            wan: wan.name.clone(),
-            port: openfeo_reconcile::wan_ifname(wan),
-            netdev: openfeo_reconcile::wan_netdev(wan),
-            gateway: ipv6.gateway.parse().ok(),
-            secret: secret.unwrap_or([0; 16]),
-        };
-        let publisher = publisher.clone();
-        let world_rx = world_rx.clone();
-        supervisor.spawn(format!("ipv6-{}", wan.name), move || {
-            let task = task.clone();
-            let publisher = publisher.clone();
-            let world_rx = world_rx.clone();
-            async move { run(&task, &publisher, world_rx).await }
-        });
+/// The router-advertisement client of every WAN with `[wans.ipv6]` in mode `auto` (SPEC §7.3),
+/// kept in step with the config by its manager ([`crate::family`]). Without a persisted secret
+/// the client still runs, with an all-zero secret: addresses stay stable but are no longer
+/// private, which the router said on the console when it failed to keep the secret.
+#[derive(Clone, Copy)]
+pub struct RaClients {
+    /// The IPv6 stable-privacy secret (`identity/`), or zeros.
+    pub secret: [u8; 16],
+}
+
+impl Family for RaClients {
+    type Slice = RaClientSlice;
+    const PREFIX: &'static str = "ipv6";
+
+    fn wanted(&self, world: &World) -> BTreeMap<String, RaClientSlice> {
+        ra_clients(&world.config)
     }
+
+    fn run(
+        &self,
+        key: &str,
+        slice: &RaClientSlice,
+        publisher: Arc<Publisher>,
+        world_rx: WorldRx,
+        mut stop: Stop,
+    ) -> BoxedTask {
+        let task = WanTask {
+            wan: key.to_owned(),
+            port: slice.port.clone(),
+            netdev: slice.netdev.clone(),
+            gateway: slice.gateway,
+            secret: self.secret,
+        };
+        Box::pin(async move {
+            // The client has nothing to say on its way out: a stop ends it wherever it waits.
+            tokio::select! {
+                ended = run(&task, &publisher, world_rx) => ended,
+                () = stop.requested() => {
+                    info!("{}", stopped_line(&task.wan));
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    fn withdraw(&self, key: &str, world: &mut World) {
+        Arc::make_mut(&mut world.ipv6).remove(key);
+    }
+}
+
+fn stopped_line(wan: &str) -> String {
+    format!("wan {wan} ipv6 stopped")
 }
 
 #[derive(Debug, Clone)]
@@ -425,6 +447,91 @@ mod tests {
 
     fn ll(n: u16) -> Ipv6Addr {
         Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, n)
+    }
+
+    fn ipv6_wan(
+        name: &str,
+        port: &str,
+        ipv6: Option<openfeo_config::Ipv6Wan>,
+    ) -> openfeo_config::Wan {
+        openfeo_config::Wan {
+            name: name.to_owned(),
+            port: port.to_owned(),
+            kind: Some(openfeo_config::wan::Kind::Dhcp(
+                openfeo_config::DhcpWan::default(),
+            )),
+            ipv6,
+            ..openfeo_config::Wan::default()
+        }
+    }
+
+    fn world_with(wans: Vec<openfeo_config::Wan>) -> openfeo_world::World {
+        openfeo_world::World::new(
+            openfeo_config::Config {
+                wans,
+                ..openfeo_config::Config::default()
+            },
+            openfeo_config::PortMap::default(),
+        )
+    }
+
+    const FAMILY: RaClients = RaClients { secret: [7; 16] };
+
+    #[test]
+    fn the_stopped_line_is_the_contract() {
+        assert_eq!(stopped_line("wan0"), "wan wan0 ipv6 stopped");
+    }
+
+    #[test]
+    fn the_family_wants_one_client_per_wan_that_carries_ipv6() {
+        let off = openfeo_config::Ipv6Wan {
+            mode: "disabled".to_owned(),
+            ..openfeo_config::Ipv6Wan::default()
+        };
+        let world = world_with(vec![
+            ipv6_wan("wan0", "p0", Some(openfeo_config::Ipv6Wan::default())),
+            ipv6_wan("wan1", "p1", None),
+            ipv6_wan("wan2", "p4", Some(off)),
+        ]);
+        let wanted = FAMILY.wanted(&world);
+        assert_eq!(wanted.keys().collect::<Vec<_>>(), ["wan0"]);
+        assert_eq!(wanted["wan0"].netdev, "p0");
+    }
+
+    #[test]
+    fn withdrawing_takes_what_the_wan_learned() {
+        let mut world = world_with(Vec::new());
+        for wan in ["wan0", "wan1"] {
+            Arc::make_mut(&mut world.ipv6).insert(wan.to_owned(), WanIpv6Fact::default());
+        }
+        FAMILY.withdraw("wan0", &mut world);
+        assert_eq!(world.ipv6.keys().collect::<Vec<_>>(), ["wan1"]);
+        FAMILY.withdraw("wan9", &mut world);
+    }
+
+    /// The client says nothing on its way out, so a stop ends it wherever it is waiting: here
+    /// for a port with no link.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_stops_at_once_wherever_it_waits() {
+        let (publisher, world_rx) = Publisher::new(world_with(vec![ipv6_wan(
+            "wan0",
+            "p0",
+            Some(openfeo_config::Ipv6Wan::default()),
+        )]));
+        let publisher = Arc::new(publisher);
+        let slice = FAMILY.wanted(&publisher.current())["wan0"].clone();
+        let supervisor = openfeo_runtime::Supervisor::new(openfeo_runtime::HealthTracker::new());
+        let task = supervisor.spawn_stoppable("ipv6-wan0", move |stop| {
+            FAMILY.run("wan0", &slice, publisher.clone(), world_rx.clone(), stop)
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let asked = tokio::time::Instant::now();
+        task.stop().await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(1),
+            "took {:?}: the task did not hear the stop",
+            asked.elapsed()
+        );
     }
 
     /// #27: an advertisement that only refreshes the lifetimes prints no address line.

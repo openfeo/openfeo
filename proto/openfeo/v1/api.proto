@@ -5,6 +5,7 @@ syntax = "proto3";
 
 package openfeo.v1;
 
+import "openfeo/v1/config.proto";
 import "openfeo/v1/events.proto";
 import "openfeo/v1/state.proto";
 
@@ -56,6 +57,11 @@ message Request {
     GetStateRequest get_state = 1;
     LogoutRequest logout = 2;
     ChangePasswordRequest change_password = 3;
+    GetConfigRequest get_config = 4;
+    ValidateConfigRequest validate_config = 5;
+    ApplyConfigRequest apply_config = 6;
+    ConfirmConfigRequest confirm_config = 7;
+    RevertConfigRequest revert_config = 8;
   }
 }
 
@@ -65,6 +71,11 @@ message Response {
     GetStateResponse get_state = 1;
     LogoutResponse logout = 2;
     ChangePasswordResponse change_password = 3;
+    GetConfigResponse get_config = 4;
+    ValidateConfigResponse validate_config = 5;
+    ApplyConfigResponse apply_config = 6;
+    ConfirmConfigResponse confirm_config = 7;
+    RevertConfigResponse revert_config = 8;
   }
 }
 
@@ -167,6 +178,81 @@ message SubscribeResponse {
 service StateService {
   rpc GetState(GetStateRequest) returns (GetStateResponse);
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}
+
+// ---- Config (SPEC §5.5, §8.3) ----
+
+message GetConfigRequest {}
+
+message GetConfigResponse {
+  // The running config, without its secrets: the admin's password hash and every PPPoE
+  // password are empty.
+  Config config = 1;
+  // Tells this config from any other; an apply names the one it was edited from.
+  string tag = 2;
+  // The window an apply is given when it names none.
+  uint32 confirm_secs = 3;
+}
+
+message ValidateConfigRequest {
+  Config config = 1;
+}
+
+// What applying a config means for whoever asks.
+message Caller {
+  // The change takes away the router address this connection arrived at.
+  bool connection_drops = 1;
+  // The caller's LAN changes its IPv4 address or subnet, or is removed: the leases its
+  // devices hold, the caller's included, no longer fit.
+  bool lan_changes = 2;
+  // The caller's LAN, when the router could tell.
+  string lan = 3;
+  // The router's IPv4 address on that LAN afterwards; empty when the LAN is removed.
+  string router_after = 4;
+}
+
+message ValidateConfigResponse {
+  // What is wrong. When there is anything here the other fields are empty.
+  repeated ConfigViolation violations = 1;
+  // What applying it would interrupt.
+  repeated ConfigEffect effects = 2;
+  Caller caller = 3;
+}
+
+message ApplyConfigRequest {
+  // The whole config. An empty PPPoE password on a WAN that is PPPoE in the running config
+  // under the same name keeps the one in force; the admin's password hash is never taken.
+  Config config = 1;
+  // The tag of the config this one was edited from. Refused when that is no longer the one
+  // running.
+  string tag = 2;
+  // Apply with no window: the change stands at once and nothing reverts it. Left out, the
+  // change is pending until it is confirmed.
+  bool immediate = 3;
+  // The window, 10 to 600 s; 0 for the router's default.
+  uint32 timeout_secs = 4;
+}
+
+message ApplyConfigResponse {
+  // The tag of the config now running.
+  string tag = 1;
+}
+
+message ConfirmConfigRequest {}
+
+message ConfirmConfigResponse {}
+
+message RevertConfigRequest {}
+
+message RevertConfigResponse {}
+
+service ConfigService {
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+  // Changes nothing.
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+  rpc ApplyConfig(ApplyConfigRequest) returns (ApplyConfigResponse);
+  rpc ConfirmConfig(ConfirmConfigRequest) returns (ConfirmConfigResponse);
+  rpc RevertConfig(RevertConfigRequest) returns (RevertConfigResponse);
 }
 
 // ---- Plain HTTP, before login ----

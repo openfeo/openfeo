@@ -162,11 +162,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         });
     }
     spawn_health_events(&supervisor, &publisher, &health_view_rx);
-    crate::dhcp4::spawn_all(&supervisor, &publisher, &world_rx);
-    crate::pppoe::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
-    crate::ipv6::spawn_all(&supervisor, &publisher, &world_rx, ipv6_secret);
-    crate::dhcp6::spawn_all(&supervisor, &publisher, &world_rx);
-    crate::dhcp4_server::spawn_all(&supervisor, &publisher, &world_rx);
+    spawn_families(&supervisor, &publisher, &world_rx, ipv6_secret);
     crate::dns::spawn(&supervisor, &publisher, &world_rx);
     crate::ra::spawn(&supervisor, &publisher, &world_rx);
     crate::dhcp6_server::spawn(&supervisor, &publisher, &world_rx);
@@ -181,6 +177,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             config_state: config_state.clone(),
             version: version.to_owned(),
             extra_host: crate::panel_host::from_cmdline(cmdline),
+            confirm_secs: crate::confirm_secs::from_cmdline(cmdline),
         },
     );
     {
@@ -197,6 +194,37 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     }
 
     std::future::pending().await
+}
+
+/// The tasks that exist once per WAN or LAN (SPEC §6.3): the DHCPv4 client, PPPoE, the two
+/// IPv6 clients of a WAN, and the DHCPv4 server of a LAN.
+fn spawn_families(
+    supervisor: &Supervisor,
+    publisher: &Arc<Publisher>,
+    world_rx: &openfeo_runtime::world::WorldRx,
+    ipv6_secret: Option<[u8; 16]>,
+) {
+    crate::family::spawn(crate::dhcp4::Dhcp4Clients, supervisor, publisher, world_rx);
+    let secret = ipv6_secret.unwrap_or([0; 16]);
+    crate::family::spawn(
+        crate::pppoe::PppoeClients { secret },
+        supervisor,
+        publisher,
+        world_rx,
+    );
+    crate::family::spawn(
+        crate::ipv6::RaClients { secret },
+        supervisor,
+        publisher,
+        world_rx,
+    );
+    crate::family::spawn(crate::dhcp6::Dhcp6Clients, supervisor, publisher, world_rx);
+    crate::family::spawn(
+        crate::dhcp4_server::Dhcp4Servers,
+        supervisor,
+        publisher,
+        world_rx,
+    );
 }
 
 /// What `/state/identity/` holds for IPv6, loaded before the World exists.
@@ -774,6 +802,45 @@ mod tests {
         assert_eq!(health_event(false, &bad), None);
         assert_eq!(health_event(false, &good).unwrap().topic, "health.ok");
         assert_eq!(health_event(true, &good), None);
+    }
+
+    /// The appliers take what they want from each World they are handed, so a config swapped
+    /// into the World reaches the kernel with no restart: here a second LAN.
+    #[test]
+    fn the_appliers_follow_a_changed_config() {
+        const VM_STATIC: &str = include_str!("../../../harness/fixtures/vm-static.toml");
+        let ports = openfeo_config::PortMap {
+            ports: (0..4)
+                .map(|i| openfeo_config::PortMapEntry {
+                    id: format!("pci-0000:00:0{}.0", i + 3),
+                    name: format!("p{i}"),
+                })
+                .collect(),
+        };
+        let mut world = World::new(openfeo_config::file::parse(VM_STATIC).unwrap(), ports);
+        let bridges = |world: &World| -> Vec<String> {
+            openfeo_reconcile::links::links(world)
+                .bridges
+                .keys()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(bridges(&world), ["br-lan0"]);
+        let before_nft = format!("{:?}", openfeo_reconcile::nft::nft(&world));
+        assert!(!before_nft.contains("br-lan1"));
+        let mut config = (*world.config).clone();
+        config.lans.push(openfeo_config::Lan {
+            name: "lan1".to_owned(),
+            ports: vec!["p3".to_owned()],
+            ipv4: "192.168.2.1/24".to_owned(),
+            ..openfeo_config::Lan::default()
+        });
+        world.config = Arc::new(config);
+        assert_eq!(bridges(&world), ["br-lan0", "br-lan1"]);
+        let routing = format!("{:?}", openfeo_reconcile::routing::routing(&world));
+        assert!(routing.contains("192.168.2.1/24"), "{routing}");
+        let nft = format!("{:?}", openfeo_reconcile::nft::nft(&world));
+        assert!(nft.contains("br-lan1"), "{nft}");
     }
 
     #[test]

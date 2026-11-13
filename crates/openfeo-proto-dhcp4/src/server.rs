@@ -49,6 +49,9 @@ pub struct ServerConfig {
     /// Inclusive, host addresses inside the subnet.
     pub pool: (Ipv4Addr, Ipv4Addr),
     pub lease_secs: u32,
+    /// The longest lease granted or renewed from now on, when shorter than `lease_secs`: set
+    /// while a change of config is pending (SPEC §5.5). Restored leases keep their time.
+    pub lease_cap: Option<u32>,
     /// Empty means `[server]`.
     pub dns: Vec<Ipv4Addr>,
     /// Option 42; empty means `[server]`, which serves SNTP (SPEC §7.10).
@@ -268,6 +271,14 @@ impl Server {
     #[must_use]
     pub fn leases(&self) -> Vec<LeaseRecord> {
         self.leases.values().cloned().collect()
+    }
+
+    /// The time a lease granted or renewed now is given: the lease time, or the cap when that
+    /// is shorter.
+    fn granted_secs(&self) -> u32 {
+        self.config.lease_cap.map_or(self.config.lease_secs, |cap| {
+            self.config.lease_secs.min(cap)
+        })
     }
 
     #[must_use]
@@ -514,7 +525,7 @@ impl Server {
             },
             hostname,
             granted_at: now,
-            expires_at: now + Timestamp::from(self.config.lease_secs),
+            expires_at: now + Timestamp::from(self.granted_secs()),
         };
         self.leases.insert(address, record.clone());
         let reply = self.reply(
@@ -760,7 +771,7 @@ impl Server {
             DhcpOption::ServerIdentifier(self.config.server),
         ];
         if with_lease {
-            let lease = self.config.lease_secs;
+            let lease = self.granted_secs();
             options.push(DhcpOption::AddressLeaseTime(lease));
             options.push(DhcpOption::Renewal(lease / 2));
             options.push(DhcpOption::Rebinding(
@@ -980,6 +991,7 @@ mod tests {
             prefix: 24,
             pool: (first, last),
             lease_secs: 43_200,
+            lease_cap: None,
             dns: vec![],
             ntp: vec![],
             domain: Some("home.arpa".into()),
@@ -1838,6 +1850,77 @@ mod tests {
         let s = Server::new(config(), vec![record], 100);
         assert_eq!(s.leases()[0].expires_at, 100 + 43_200);
         assert_eq!(s.next_timeout(), Some(100 + 43_200));
+    }
+
+    /// While a change of config is pending (SPEC §5.5) the server is capped: what it grants
+    /// or renews lasts no longer than the cap, and says so in its three times.
+    #[test]
+    fn a_capped_server_grants_no_longer_than_the_cap() {
+        let capped = ServerConfig {
+            lease_cap: Some(20),
+            ..config()
+        };
+        let mut s = Server::new(capped, vec![], 0);
+        let address = offered(&mut s, MAC_A, 0);
+        let out = s.handle(
+            Input::Packet(request(
+                MAC_A,
+                0x7777,
+                Ipv4Addr::UNSPECIFIED,
+                vec![
+                    DhcpOption::RequestedIpAddress(address),
+                    DhcpOption::ServerIdentifier(ip("192.168.1.1")),
+                ],
+            )),
+            2_000,
+        );
+        let (_, ack) = sends(&out).remove(0);
+        assert_eq!(ack.message_type(), Some(MessageType::Ack));
+        assert_eq!(ack.option(51), Some(&DhcpOption::AddressLeaseTime(20)));
+        assert_eq!(ack.option(58), Some(&DhcpOption::Renewal(10)));
+        assert_eq!(ack.option(59), Some(&DhcpOption::Rebinding(17)));
+        assert_eq!(s.leases()[0].expires_at, 2_000 + 20);
+        // A renewal is capped the same.
+        let out = s.handle(
+            Input::Packet(request(MAC_A, 0x7778, address, vec![])),
+            2_010,
+        );
+        let (_, ack) = sends(&out).remove(0);
+        assert_eq!(ack.option(51), Some(&DhcpOption::AddressLeaseTime(20)));
+        assert_eq!(s.leases()[0].expires_at, 2_010 + 20);
+        // A cap longer than the lease time changes nothing.
+        let loose = ServerConfig {
+            lease_cap: Some(86_400),
+            ..config()
+        };
+        let mut s = Server::new(loose, vec![], 0);
+        s.handle(Input::Packet(discover(MAC_A, 1, vec![])), 0);
+        let out = s.handle(Input::Timeout, PROBE_TIMEOUT);
+        let (_, offer) = sends(&out).remove(0);
+        assert_eq!(
+            offer.option(51),
+            Some(&DhcpOption::AddressLeaseTime(43_200))
+        );
+    }
+
+    /// The cap is on what is granted from now on. A lease restored from before the change keeps
+    /// the time it was given: its holder was told that time and will not ask again sooner.
+    #[test]
+    fn a_capped_server_restores_its_leases_in_full() {
+        let record = LeaseRecord {
+            address: ip("192.168.1.120"),
+            mac: MAC_A,
+            client_id: None,
+            hostname: None,
+            granted_at: 0,
+            expires_at: 30_000,
+        };
+        let capped = ServerConfig {
+            lease_cap: Some(20),
+            ..config()
+        };
+        let s = Server::new(capped, vec![record.clone()], 100);
+        assert_eq!(s.leases(), vec![record]);
     }
 
     /// Review finding: a client that repeats DISCOVER forever gets its offer re-sent but must

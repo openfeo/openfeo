@@ -24,9 +24,12 @@ use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::TokioIo;
 use nix::sched::{CloneFlags, setns};
 use openfeo_api::pb::state_service_client::StateServiceClient;
+use openfeo_config::Config;
 use openfeo_config::api::{
-    Auth, ClientMsg, GetStateRequest, Request, ServerMsg, Subscribe, client_msg, request,
-    server_msg, telemetry,
+    ApplyConfigRequest, Auth, ClientMsg, ConfirmConfigRequest, Error, GetConfigRequest,
+    GetConfigResponse, GetStateRequest, Request, RevertConfigRequest, ServerMsg, Subscribe,
+    ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response, server_msg,
+    telemetry,
 };
 use openfeo_config::events::Event;
 use openfeo_config::state::{Counters, State};
@@ -606,6 +609,98 @@ impl Ws {
                 return message.body.context("a reply with no body");
             }
         }
+    }
+
+    /// Ask, and take the answer apart: the response's body, or the error the router sent.
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes, or it is neither.
+    pub fn answered(&mut self, body: request::Body) -> Result<Result<response::Body, Error>> {
+        match self.ask(body)? {
+            server_msg::Body::Response(reply) => {
+                Ok(Ok(reply.body.context("a response with no body")?))
+            }
+            server_msg::Body::Error(error) => Ok(Err(error)),
+            other => bail!("a response or an error, not {other:?}"),
+        }
+    }
+
+    /// The running config as the router hands it out (no secrets), its tag and the window an
+    /// apply is given by default.
+    ///
+    /// # Errors
+    ///
+    /// When the router does not answer with one.
+    pub fn config(&mut self) -> Result<GetConfigResponse> {
+        match self.answered(request::Body::GetConfig(GetConfigRequest {}))? {
+            Ok(response::Body::GetConfig(view)) => Ok(view),
+            other => bail!("no config: {other:?}"),
+        }
+    }
+
+    /// What applying `config` would do, or what is wrong with it. Changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// When the router does not answer with a validation.
+    pub fn validate(&mut self, config: &Config) -> Result<ValidateConfigResponse> {
+        let ask = ValidateConfigRequest {
+            config: Some(config.clone()),
+        };
+        match self.answered(request::Body::ValidateConfig(ask))? {
+            Ok(response::Body::ValidateConfig(said)) => Ok(said),
+            other => bail!("no validation: {other:?}"),
+        }
+    }
+
+    /// Apply `config`, edited from the config tagged `tag`: pending for `timeout_secs` (0 for
+    /// the router's default) unless `immediate`. The tag of the config now running, or the
+    /// router's refusal.
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes.
+    pub fn apply(
+        &mut self,
+        config: &Config,
+        tag: &str,
+        immediate: bool,
+        timeout_secs: u32,
+    ) -> Result<Result<String, Error>> {
+        let ask = ApplyConfigRequest {
+            config: Some(config.clone()),
+            tag: tag.to_owned(),
+            immediate,
+            timeout_secs,
+        };
+        Ok(match self.answered(request::Body::ApplyConfig(ask))? {
+            Ok(response::Body::ApplyConfig(applied)) => Ok(applied.tag),
+            Ok(other) => bail!("not the answer to an apply: {other:?}"),
+            Err(error) => Err(error),
+        })
+    }
+
+    /// Confirm the pending change.
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes.
+    pub fn confirm(&mut self) -> Result<Result<(), Error>> {
+        Ok(self
+            .answered(request::Body::ConfirmConfig(ConfirmConfigRequest {}))?
+            .map(|_| ()))
+    }
+
+    /// Revert the pending change.
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes.
+    pub fn revert(&mut self) -> Result<Result<(), Error>> {
+        Ok(self
+            .answered(request::Body::RevertConfig(RevertConfigRequest {}))?
+            .map(|_| ()))
     }
 
     /// Ask for the state over the socket.

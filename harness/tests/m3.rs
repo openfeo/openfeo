@@ -20,7 +20,7 @@ use openfeo_harness::lanclient;
 use openfeo_harness::lines::{Cursor, Match, Regex};
 use openfeo_harness::netns::NetNs;
 use openfeo_harness::sandbox;
-use openfeo_harness::scenario::{Scenario, Skip, run_all};
+use openfeo_harness::scenario::{Scenario, run_all};
 use openfeo_harness::vlanprobe;
 
 const SCENARIOS: &[Scenario] = &[
@@ -153,33 +153,6 @@ fn fetch(ns: &NetNs, addr: &str) -> anyhow::Result<String> {
         .with_context(|| format!("GET http://{addr}/ from {}", ns.name))
 }
 
-/// The lab's access concentrator can run here, or the scenario skips with what is missing:
-/// `/dev/ppp` openable (from the sandbox, where `ppp_generic`'s `CAP_NET_ADMIN` check passes)
-/// and `pppd` and `pppoe-server` installed. CI sets `OPENFEO_NO_SKIP`, so a skip fails there.
-fn require_access_concentrator() -> anyhow::Result<()> {
-    if let Err(err) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/ppp")
-    {
-        return Err(Skip(format!(
-            "/dev/ppp: {err}: load ppp_generic and make it group-accessible \
-             (udev: KERNEL==\"ppp\", GROUP=\"<your group>\", MODE=\"0660\")"
-        ))
-        .into());
-    }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for tool in ["pppd", "pppoe-server"] {
-        if !std::env::split_paths(&path).any(|dir| dir.join(tool).is_file()) {
-            return Err(Skip(format!(
-                "{tool} is not installed (packages ppp and pppoe, or rp-pppoe)"
-            ))
-            .into());
-        }
-    }
-    Ok(())
-}
-
 /// What a PPPoE boot established.
 struct Booted {
     /// The console after the last PPP line waited for.
@@ -214,7 +187,7 @@ fn parse_iid(text: &str) -> anyhow::Result<u64> {
 /// every PPPoE line of the contract waited for in order: discovery, the session, LCP,
 /// authentication (unless none was asked), IPCP and IPV6CP. The LAN host is placed last.
 fn boot_pppoe(lab: &mut Lab, server: &PppoeServerConfig, config: &str) -> anyhow::Result<Booted> {
-    require_access_concentrator()?;
+    daemons::require_access_concentrator()?;
     lab.start_pppoe_server(server)?;
     lab.with_config(config)?;
     lab.boot("")?;
@@ -461,7 +434,7 @@ fn carrier_loss_is_reported_and_the_session_returns_within_ten_seconds(
 /// Carrier lost while discovering (no access concentrator yet): discovery starts again when the
 /// link returns, with a fresh attempt, and the session comes up once the server does.
 fn carrier_loss_during_discovery_restarts_discovery(lab: &mut Lab) -> anyhow::Result<()> {
-    require_access_concentrator()?;
+    daemons::require_access_concentrator()?;
     lab.with_config(VM_PPPOE)?;
     lab.boot("")?;
     let c = lab.console()?;

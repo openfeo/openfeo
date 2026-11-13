@@ -6,7 +6,6 @@
 //! connection wants, and writes what the core says to write. A socket that does not take a
 //! frame in time, does not answer two pings, or whose session ends is closed.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -19,8 +18,8 @@ use axum::response::{IntoResponse, Response};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{Sink, SinkExt as _, StreamExt as _};
 use openfeo_config::api::{
-    ChangePasswordResponse, ErrorCode, GetStateResponse, LogoutResponse, Request, ServerMsg,
-    request, response,
+    ChangePasswordResponse, ConfirmConfigResponse, ErrorCode, GetStateResponse, LogoutResponse,
+    Request, RevertConfigResponse, ServerMsg, request, response,
 };
 use prost::Message as _;
 use tokio::sync::broadcast;
@@ -28,7 +27,8 @@ use tokio::sync::broadcast;
 use crate::envelope::{Backend, CLOSE_UNAUTHENTICATED, Conn, Out, Topic};
 use crate::events::to_pb;
 use crate::gate::origin_allowed;
-use crate::http::Peer;
+use crate::http::{Arrival, Local, Peer};
+use crate::keeper::Why;
 use crate::limits::{MAX_FRAME, MAX_SOCKETS};
 use crate::server::{ApiError, Shared};
 use crate::telemetry::CountersSub;
@@ -40,10 +40,12 @@ pub const CLOSE_TRY_LATER: u16 = 1013;
 /// not a browser.
 pub async fn upgrade(
     State(shared): State<Arc<Shared>>,
-    Extension(Peer(peer)): Extension<Peer>,
+    Extension(peer): Extension<Peer>,
+    local: Option<Extension<Local>>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let at = Arrival::of(peer, local.map(|Extension(local)| local));
     let origin = match headers.get(ORIGIN).map(|value| value.to_str()) {
         Some(Ok(origin)) => Some(origin),
         // An origin that is not text is not ours.
@@ -61,7 +63,7 @@ pub async fn upgrade(
     upgrade
         .max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
-        .on_upgrade(move |socket| drive(socket, slot, peer.ip()))
+        .on_upgrade(move |socket| drive(socket, slot, at))
 }
 
 /// A socket's place among the [`MAX_SOCKETS`], and its session's count of sockets. A place is
@@ -135,8 +137,8 @@ impl Backend for Slot {
 
 /// Perform what a connection asked: the same operations HTTP and gRPC call.
 pub(crate) async fn perform(
-    shared: &Shared,
-    from: IpAddr,
+    shared: &Arc<Shared>,
+    at: Arrival,
     token: &str,
     request: Request,
 ) -> Result<openfeo_config::api::Response, ApiError> {
@@ -150,9 +152,30 @@ pub(crate) async fn perform(
         }
         Some(request::Body::ChangePassword(change)) => {
             shared
-                .change_password(from, token, change.old_password, change.new_password)
+                .change_password(at.peer, token, change.old_password, change.new_password)
                 .await?;
             response::Body::ChangePassword(ChangePasswordResponse {})
+        }
+        Some(request::Body::GetConfig(_)) => response::Body::GetConfig(shared.config_view().await),
+        Some(request::Body::ValidateConfig(ask)) => {
+            let Some(config) = ask.config else {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidArgument,
+                    "a validation with no config",
+                ));
+            };
+            response::Body::ValidateConfig(shared.validate_config(config, at).await)
+        }
+        Some(request::Body::ApplyConfig(ask)) => {
+            response::Body::ApplyConfig(shared.apply_config(ask).await?)
+        }
+        Some(request::Body::ConfirmConfig(_)) => {
+            shared.confirm_config().await?;
+            response::Body::ConfirmConfig(ConfirmConfigResponse {})
+        }
+        Some(request::Body::RevertConfig(_)) => {
+            shared.revert_config(Why::Asked).await?;
+            response::Body::RevertConfig(RevertConfigResponse {})
         }
         None => {
             return Err(ApiError::new(
@@ -219,7 +242,7 @@ async fn next_counters(
     }
 }
 
-async fn drive(socket: WebSocket, mut slot: Slot, from: IpAddr) {
+async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
     let shared = slot.shared.clone();
     let limits = shared.limits;
     let (mut sink, mut stream): (SplitSink<WebSocket, Message>, SplitStream<WebSocket>) =
@@ -305,7 +328,7 @@ async fn drive(socket: WebSocket, mut slot: Slot, from: IpAddr) {
                 Vec::new()
             }
         };
-        if !act(outs, &mut conn, &mut sink, &slot, from).await {
+        if !act(outs, &mut conn, &mut sink, &slot, at).await {
             return;
         }
         // Follow what the connection now wants.
@@ -324,7 +347,7 @@ async fn act(
     conn: &mut Conn,
     sink: &mut SplitSink<WebSocket, Message>,
     slot: &Slot,
-    from: IpAddr,
+    at: Arrival,
 ) -> bool {
     let limit = slot.shared.limits.write;
     for out in outs {
@@ -336,7 +359,7 @@ async fn act(
             }
             Out::Ask { id, request } => {
                 let token = slot.token.clone().unwrap_or_default();
-                let result = perform(&slot.shared, from, &token, request).await;
+                let result = perform(&slot.shared, at, &token, request).await;
                 conn.reply(id, result.map_err(|error| error.to_pb()));
             }
             Out::Close(code) => {

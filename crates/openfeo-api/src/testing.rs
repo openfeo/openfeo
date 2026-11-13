@@ -178,6 +178,7 @@ pub(crate) async fn spawn_api_full(
         },
         limits,
         extra_host: None,
+        confirm_secs: crate::keeper::DEFAULT_WINDOW_SECS,
     })
     .await
     .unwrap();

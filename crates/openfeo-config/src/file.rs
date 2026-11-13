@@ -6,10 +6,14 @@
 //! canonical JSON mapping of the schema spelled in TOML; rendering is the reverse, with the proto
 //! field names.
 
+use std::path::{Path, PathBuf};
+
+use openfeo_platform::atomic;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::ConfigError;
+use crate::load::STATE_FILE_MODE;
 use crate::{Config, Dhcp4Lease, Dhcp6Lease, PortMap};
 
 /// Parse a `config.toml` text into a [`Config`]. Syntax, unknown keys and wrong types are
@@ -31,6 +35,29 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
 /// can for values produced by this crate).
 pub fn render(config: &Config) -> Result<String, ConfigError> {
     to_toml(config)
+}
+
+/// The name of the file a change of config is kept in until it is confirmed (SPEC §5.5).
+pub const PENDING_FILE: &str = "config.pending.toml";
+
+/// Where the pending config is kept: beside the config at `config_path`.
+#[must_use]
+pub fn pending_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name(PENDING_FILE)
+}
+
+/// Write `text` to `path` whole (SPEC §5.2, §5.5): a temporary file beside it, synced, renamed
+/// over it, the directory synced, at the mode of everything under `/state`. A power cut leaves
+/// the file as it was or as it is now.
+///
+/// # Errors
+///
+/// [`ConfigError::Io`]; the target is then untouched and no temporary file is left.
+pub fn write_whole(path: &Path, text: &str) -> Result<(), ConfigError> {
+    atomic::write(path, text.as_bytes(), STATE_FILE_MODE).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Parse `/state/identity/portmap`.
@@ -136,6 +163,63 @@ fn to_toml<T: Serialize>(value: &T) -> Result<String, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_pending_file_sits_beside_the_config() {
+        assert_eq!(
+            pending_path(Path::new("/state/config.toml")),
+            Path::new("/state/config.pending.toml")
+        );
+        assert_eq!(PENDING_FILE, "config.pending.toml");
+    }
+
+    /// A power cut at any instant leaves the old file or the new one, never a torn one
+    /// (SPEC §5.5): the text goes to a temporary file beside the target and is renamed over it.
+    #[test]
+    fn a_write_is_whole_or_absent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let names = || -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        write_whole(&path, "config_version = 1\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "config_version = 1\n"
+        );
+        assert_eq!(names(), ["config.toml"], "no temporary file is left");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        // Over an existing file.
+        write_whole(&path, "config_version = 2\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "config_version = 2\n"
+        );
+        assert_eq!(names(), ["config.toml"]);
+        // Into a directory that is not there: an error, and nothing made.
+        let nowhere = dir.path().join("missing").join("config.toml");
+        let err = write_whole(&nowhere, "x = 1\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Io { .. }), "{err}");
+        assert!(!dir.path().join("missing").exists());
+        // Over a target the rename cannot replace (a directory with something in it): an
+        // error, the target as it was, and no temporary file left beside it.
+        let blocked = dir.path().join("blocked.toml");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), "kept").unwrap();
+        assert!(write_whole(&blocked, "x = 1\n").is_err());
+        assert_eq!(
+            std::fs::read_to_string(blocked.join("keep")).unwrap(),
+            "kept"
+        );
+        assert_eq!(names(), ["blocked.toml", "config.toml"]);
+    }
+
     #[test]
     fn the_admin_table_round_trips() {
         let text = "config_version = 1\n[admin]\npassword_hash = \"$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA\"\n";

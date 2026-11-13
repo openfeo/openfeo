@@ -43,6 +43,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "client_survives_the_port_going_down_and_up",
         run: client_survives_the_port_going_down_and_up,
     },
+    Scenario {
+        name: "a_stopped_client_releases_its_lease",
+        run: a_stopped_client_releases_its_lease,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -269,6 +273,34 @@ fn client_obtains_a_lease_from_kea(lab: &mut Lab) -> anyhow::Result<()> {
         rig.kea_log_count("DHCP4_LEASE_ALLOC") >= 1,
         "Kea did not log the allocation"
     );
+    Ok(())
+}
+
+/// Stopped, the client gives its lease back (RFC 2131 §4.4.4): one DHCPRELEASE by unicast, which
+/// Kea takes, and the client holds nothing afterwards.
+fn a_stopped_client_releases_its_lease(lab: &mut Lab) -> anyhow::Result<()> {
+    let rig = Rig::create(lab, true)?;
+    let (events, state) = block_on(async {
+        let mut driver = rig.driver(None)?;
+        let events = run_until(&mut driver, LEASE_TIMEOUT, |event| {
+            matches!(event, Event::Bound { .. })
+        })
+        .await?;
+        let lease = bound_lease(&events).context("no lease")?.clone();
+        configure(&lease)?;
+        let events = driver.release()?;
+        anyhow::Ok((events, driver.state()))
+    })??;
+    ensure!(events.is_empty(), "a release is not news: {events:?}");
+    ensure!(state == State::Init, "state {state:?}");
+    let kea = rig.kea.as_ref().context("the rig has Kea")?;
+    kea.log
+        .wait_for(
+            &mut Cursor::default(),
+            &re("DHCP4_RELEASE "),
+            Duration::from_secs(5),
+        )
+        .context("Kea did not log the release")?;
     Ok(())
 }
 

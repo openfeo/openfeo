@@ -12,9 +12,14 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
-use openfeo_config::api::{GetStateResponse, GetStatusResponse};
-use openfeo_config::state::{State, WanPhase};
-use openfeo_harness::apiclient::Api;
+use openfeo_config::api::{
+    ApplyConfigRequest, ErrorCode, GetStateResponse, GetStatusResponse, Request, client_msg,
+    request, server_msg,
+};
+use openfeo_config::events::Event;
+use openfeo_config::state::{AddressOrigin, ConfigEffectKind, State, WanKind, WanPhase, WanState};
+use openfeo_config::{Config, Lan, LanDhcp, PppoeWan, StaticLease, wan};
+use openfeo_harness::apiclient::{Api, Ws};
 use openfeo_harness::daemons;
 use openfeo_harness::lab::{BOOT_TIMEOUT, ISP_HTTP_BODY, Lab};
 use openfeo_harness::lanclient;
@@ -97,6 +102,66 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "the_panel_in_a_browser_on_the_lan",
         run: the_panel_in_a_browser_on_the_lan,
+    },
+    Scenario {
+        name: "a_subnet_change_not_confirmed_is_reverted",
+        run: a_subnet_change_not_confirmed_is_reverted,
+    },
+    Scenario {
+        name: "a_subnet_change_is_confirmed_from_the_new_address",
+        run: a_subnet_change_is_confirmed_from_the_new_address,
+    },
+    Scenario {
+        name: "an_immediate_apply_stands_at_once",
+        run: an_immediate_apply_stands_at_once,
+    },
+    Scenario {
+        name: "a_restart_during_the_window_discards_the_change",
+        run: a_restart_during_the_window_discards_the_change,
+    },
+    Scenario {
+        name: "what_the_router_refuses_changes_nothing",
+        run: what_the_router_refuses_changes_nothing,
+    },
+    Scenario {
+        name: "a_router_on_defaults_over_a_refused_file_takes_no_apply",
+        run: a_router_on_defaults_over_a_refused_file_takes_no_apply,
+    },
+    Scenario {
+        name: "a_validation_says_who_it_moves",
+        run: a_validation_says_who_it_moves,
+    },
+    Scenario {
+        name: "no_secret_comes_back",
+        run: no_secret_comes_back,
+    },
+    Scenario {
+        name: "a_lan_change_leaves_a_dhcp_wan_alone",
+        run: a_lan_change_leaves_a_dhcp_wan_alone,
+    },
+    Scenario {
+        name: "a_lan_change_leaves_a_pppoe_session_alone",
+        run: a_lan_change_leaves_a_pppoe_session_alone,
+    },
+    Scenario {
+        name: "a_wan_changes_type_while_running",
+        run: a_wan_changes_type_while_running,
+    },
+    Scenario {
+        name: "a_vlan_tag_moves_the_wan",
+        run: a_vlan_tag_moves_the_wan,
+    },
+    Scenario {
+        name: "a_lan_is_added_and_removed_while_running",
+        run: a_lan_is_added_and_removed_while_running,
+    },
+    Scenario {
+        name: "leases_survive_a_change_that_is_taken_back",
+        run: leases_survive_a_change_that_is_taken_back,
+    },
+    Scenario {
+        name: "leases_survive_a_restart_after_the_clock_stepped",
+        run: leases_survive_a_restart_after_the_clock_stepped,
     },
 ];
 
@@ -809,9 +874,9 @@ fn a_restart_of_the_router_process_logs_everyone_out(lab: &mut Lab) -> anyhow::R
 /// The static IPv6 configuration of M2 part 2: lan0 at `2001:db8:1:222::1/64`.
 const VM_IPV6: &str = include_str!("../fixtures/vm-ipv6.toml");
 
-/// The router's name resolves to its LAN addresses and its loopback /128s; the API answers on
-/// every one of them over IPv6, and by an address literal in brackets.
-fn the_api_answers_by_name_over_ipv6(lab: &mut Lab) -> anyhow::Result<()> {
+/// Boot the IPv6 fixture (a routed /48, `lan0` with its /64 in it) with the ISP advertising,
+/// and give the LAN host an address of each family.
+fn boot_ipv6(lab: &mut Lab) -> anyhow::Result<()> {
     use openfeo_harness::daemons::RadvdConfig;
     lab.add_lan1()?;
     lab.start_radvd(&RadvdConfig::isp("wan0"))?;
@@ -834,6 +899,13 @@ fn the_api_answers_by_name_over_ipv6(lab: &mut Lab) -> anyhow::Result<()> {
     )?;
     // The LAN host's own address has to pass duplicate address detection before it is used.
     std::thread::sleep(Duration::from_secs(3));
+    Ok(())
+}
+
+/// The router's name resolves to its LAN addresses and its loopback /128s; the API answers on
+/// every one of them over IPv6, and by an address literal in brackets.
+fn the_api_answers_by_name_over_ipv6(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_ipv6(lab)?;
     let answer = lanclient::dig(
         &lab.lan0,
         "192.168.1.1".parse()?,
@@ -1061,4 +1133,1204 @@ fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()>
         "the changed password is on the console"
     );
     Ok(())
+}
+
+// ---- M4 part 2a: changing config (SPEC §5.5, §8.3) ----
+
+/// The window given to a change that is meant to run out.
+const SHORT_WINDOW: u32 = 20;
+/// The router once `lan0` has moved to `192.168.2.1/24`.
+const MOVED_ROUTER: &str = "192.168.2.1:443";
+const APPLIED_IMMEDIATELY: &str = r"openfeo: config: applied immediately";
+const DISCARDED: &str = r"openfeo: config: an unconfirmed change was discarded";
+
+/// Boot the DHCP fixture and set the password: the API by name, a session's token, and the
+/// WAN's leased address.
+fn boot_claimed(lab: &mut Lab) -> anyhow::Result<(Api, String, String)> {
+    let wan = boot(lab, "")?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    Ok((api, token, wan))
+}
+
+/// `config` with `lan0` at `192.168.2.1/24`, and every address of the old subnet moved with
+/// it: the pool, the reservations and the port forwards' targets, as the panel's draft does.
+fn moved(config: &Config) -> Config {
+    moved_to(config, "192.168.2.")
+}
+
+/// As [`moved`], to the /24 that begins `subnet` (`192.168.5.`).
+fn moved_to(config: &Config, subnet: &str) -> Config {
+    let mut config = config.clone();
+    let renumber = |address: &mut String| *address = address.replace("192.168.1.", subnet);
+    if let Some(lan) = config.lans.first_mut() {
+        renumber(&mut lan.ipv4);
+        if let Some(dhcp) = &mut lan.dhcp {
+            dhcp.range.iter_mut().for_each(renumber);
+            dhcp.r#static
+                .iter_mut()
+                .for_each(|lease| renumber(&mut lease.ip));
+        }
+    }
+    if let Some(firewall) = &mut config.firewall {
+        firewall
+            .port_forwards
+            .iter_mut()
+            .for_each(|forward| renumber(&mut forward.to));
+    }
+    config
+}
+
+/// `config` with one more reservation on `lan0`.
+fn with_reservation(config: &Config) -> Config {
+    let mut config = config.clone();
+    if let Some(dhcp) = config.lans.first_mut().and_then(|lan| lan.dhcp.as_mut()) {
+        dhcp.r#static.push(StaticLease {
+            mac: "02:00:00:00:00:77".to_owned(),
+            ip: "192.168.1.77".to_owned(),
+            hostname: "printer".to_owned(),
+            client_id: String::new(),
+        });
+    }
+    config
+}
+
+/// Give the LAN host another IPv4 address and gateway, and take the old one away: what a
+/// person does to follow a router that moved.
+fn rehome(lab: &Lab, cidr: &str, gateway: &str) -> anyhow::Result<()> {
+    lab.lan0.ip(&["-4", "addr", "flush", "dev", "lan0"])?;
+    Lab::host(&lab.lan0, "lan0", cidr, gateway)
+}
+
+/// Apply, and take a refusal for a failure of the scenario. The tag of the config now running.
+fn applied(
+    ws: &mut Ws,
+    config: &Config,
+    tag: &str,
+    immediate: bool,
+    timeout_secs: u32,
+) -> anyhow::Result<String> {
+    ws.apply(config, tag, immediate, timeout_secs)?
+        .map_err(|error| anyhow::anyhow!("the apply was refused: {error:?}"))
+}
+
+/// Apply a change that takes away the address this socket arrived at, and do not wait for
+/// the answer: the router answers once the config is published, and its old address may be
+/// gone before the answer is out. A validation says beforehand that the connection will drop
+/// (SPEC §8.3); that the change was taken is read on the console, and `cur` is left after
+/// the line.
+fn applied_moving(
+    lab: &Lab,
+    ws: &mut Ws,
+    config: &Config,
+    tag: &str,
+    timeout_secs: u32,
+    cur: &mut Cursor,
+) -> anyhow::Result<()> {
+    ws.send(client_msg::Body::Request(Request {
+        body: Some(request::Body::ApplyConfig(ApplyConfigRequest {
+            config: Some(config.clone()),
+            tag: tag.to_owned(),
+            immediate: false,
+            timeout_secs,
+        })),
+    }))?;
+    let taken = re(&format!(
+        "openfeo: config: applied; confirm within {timeout_secs} s"
+    ));
+    lab.console()?
+        .wait_for(cur, &taken, SOON)
+        .with_context(|| {
+            format!(
+                "the apply was not taken; the socket said {:?}",
+                ws.msg(Duration::from_secs(1))
+            )
+        })?;
+    Ok(())
+}
+
+/// A change of config is the config changing and a failure of nothing (SPEC §5.5): no task
+/// may have died anywhere on the console.
+fn no_task_failed(lab: &Lab) -> anyhow::Result<()> {
+    let failed = lab.console()?.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: task \S+ failed"),
+        Duration::from_millis(1),
+    );
+    match failed {
+        Ok(found) => anyhow::bail!("a task failed across the change: {}", found.line),
+        Err(_) => Ok(()),
+    }
+}
+
+/// The router refused, with `code`.
+fn refused<T: std::fmt::Debug>(
+    answer: Result<T, openfeo_config::api::Error>,
+    code: ErrorCode,
+) -> anyhow::Result<openfeo_config::api::Error> {
+    match answer {
+        Err(error) if error.code() == code => Ok(error),
+        other => anyhow::bail!("expected {code:?}, got {other:?}"),
+    }
+}
+
+/// The running config's first LAN address, and the config's tag.
+fn lan0_of(ws: &mut Ws) -> anyhow::Result<(String, String)> {
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let lan = config.lans.first().context("no LAN")?;
+    Ok((lan.ipv4.clone(), view.tag))
+}
+
+/// SPEC §12: the LAN's subnet changed and not confirmed. The router is at the new address
+/// while the change stands (and the port forward follows it there), then back at the old one
+/// by itself; nothing of the change is left on disk.
+fn a_subnet_change_not_confirmed_is_reverted(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, wan) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    ensure!(view.confirm_secs == 120, "the default window: {view:?}");
+    let config = view.config.context("no config")?;
+    let mut cur = Cursor::default();
+    applied_moving(
+        lab,
+        &mut ws,
+        &moved(&config),
+        &view.tag,
+        SHORT_WINDOW,
+        &mut cur,
+    )?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: config: effect lan0 address moves"),
+        SOON,
+    )?;
+    // Follow it: the same session, by the same name, at the new address.
+    rehome(lab, "192.168.2.2/24", "192.168.2.1")?;
+    let there = Api::on(&lab.lan0, MOVED_ROUTER.parse::<SocketAddr>()?, HOST);
+    let state = state_json(&there, &token)?;
+    let pending = state
+        .system
+        .and_then(|system| system.pending_config)
+        .context("the state does not say a change is pending")?;
+    ensure!(
+        pending.window_secs == SHORT_WINDOW
+            && pending.effects.len() == 1
+            && pending.effects[0].kind() == ConfigEffectKind::LanAddressMoves,
+        "{pending:?}"
+    );
+    // The forward was moved with the LAN and works where the host now is.
+    let dir = lab.run_dir.join("moved-http");
+    let target = daemons::http_server(&lab.lan0, "192.168.2.2", 8080, &dir, "moved lan host\n")?;
+    target
+        .log
+        .wait_for(&mut Cursor::default(), &re(r"Serving HTTP on"), SOON)?;
+    let body = lanclient::http_get(
+        &lab.isp0,
+        format!("{wan}:2222").parse()?,
+        "/",
+        Duration::from_secs(5),
+    )?;
+    ensure!(body == "moved lan host\n", "through the forward: {body:?}");
+    // Nobody confirms.
+    console.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: config: reverted \(not confirmed in {SHORT_WINDOW} s\)"
+        )),
+        Duration::from_secs(u64::from(SHORT_WINDOW) + 10),
+    )?;
+    rehome(lab, "192.168.1.2/24", "192.168.1.1")?;
+    let mut back = api.ws_with(&token)?;
+    let (ipv4, tag) = lan0_of(&mut back)?;
+    ensure!(
+        ipv4 == "192.168.1.1/24" && tag == view.tag,
+        "after the revert: {ipv4} {tag}"
+    );
+    let state = state_json(&api, &token)?;
+    ensure!(
+        state
+            .system
+            .is_some_and(|system| system.pending_config.is_none()),
+        "still pending after the revert"
+    );
+    back.subscribe("events", 16)?;
+    let reverted = back.event(SOON, "config.reverted")?;
+    ensure!(
+        reverted.fields.get("why").map(String::as_str) == Some("timeout"),
+        "{reverted:?}"
+    );
+    no_task_failed(lab)?;
+    // Nothing of it is on disk: a reset finds no pending file and the old config.
+    reset_and_wait(lab)?;
+    let token = api.login(PASSWORD)?;
+    let (ipv4, _) = lan0_of(&mut api.ws_with(&token)?)?;
+    ensure!(ipv4 == "192.168.1.1/24", "after the reset: {ipv4}");
+    // Looked for once the API has answered: the line, if any, follows the listening one.
+    ensure!(
+        lab.console()?.count(&re(DISCARDED)) == 0,
+        "a pending file was left behind"
+    );
+    password_never_logged(lab)
+}
+
+/// The same change, confirmed from where it put the router: the session and the name carry
+/// over, and the new config is what a reset comes up on.
+fn a_subnet_change_is_confirmed_from_the_new_address(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    applied_moving(
+        lab,
+        &mut ws,
+        &moved(&config),
+        &view.tag,
+        60,
+        &mut Cursor::default(),
+    )?;
+    rehome(lab, "192.168.2.2/24", "192.168.2.1")?;
+    let there = Api::on(&lab.lan0, MOVED_ROUTER.parse::<SocketAddr>()?, HOST);
+    let mut ws = there.ws_with(&token)?;
+    // The answer to the apply may never have come: the tag is read where the router now is.
+    let (ipv4, tag) = lan0_of(&mut ws)?;
+    ensure!(
+        ipv4 == "192.168.2.1/24" && tag != view.tag,
+        "while pending: {ipv4} {tag}"
+    );
+    ws.confirm()?
+        .map_err(|error| anyhow::anyhow!("the confirm was refused: {error:?}"))?;
+    lab.console()?.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: config: confirmed"),
+        SOON,
+    )?;
+    let (ipv4, now) = lan0_of(&mut ws)?;
+    ensure!(ipv4 == "192.168.2.1/24" && now == tag, "{ipv4} {now}");
+    refused(ws.revert()?, ErrorCode::FailedPrecondition)?;
+    no_task_failed(lab)?;
+    reset_and_wait(lab)?;
+    let token = there.login(PASSWORD)?;
+    let (ipv4, _) = lan0_of(&mut there.ws_with(&token)?)?;
+    ensure!(ipv4 == "192.168.2.1/24", "after the reset: {ipv4}");
+    ensure!(
+        lab.console()?.count(&re(DISCARDED)) == 0,
+        "a confirmed change left a pending file"
+    );
+    password_never_logged(lab)
+}
+
+/// An immediate apply has no window and no pending file: it is the config at once.
+fn an_immediate_apply_stands_at_once(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    let console = lab.console()?;
+    console.wait_for(&mut Cursor::default(), &re(APPLIED_IMMEDIATELY), SOON)?;
+    ensure!(
+        console.count(&re(r"openfeo: config: applied; confirm within")) == 0,
+        "an immediate apply was given a window"
+    );
+    let state = state_json(&api, &token)?;
+    ensure!(
+        state
+            .system
+            .is_some_and(|system| system.pending_config.is_none()),
+        "an immediate apply is pending"
+    );
+    refused(ws.confirm()?, ErrorCode::FailedPrecondition)?;
+    no_task_failed(lab)?;
+    reset_and_wait(lab)?;
+    let token = api.login(PASSWORD)?;
+    let config = api.ws_with(&token)?.config()?.config.context("no config")?;
+    ensure!(
+        lab.console()?.count(&re(DISCARDED)) == 0,
+        "an immediate apply left a pending file"
+    );
+    let kept = config
+        .lans
+        .first()
+        .and_then(|lan| lan.dhcp.as_ref())
+        .is_some_and(|dhcp| dhcp.r#static.iter().any(|lease| lease.ip == "192.168.1.77"));
+    ensure!(
+        kept,
+        "the reservation did not survive the reset: {config:?}"
+    );
+    Ok(())
+}
+
+/// A router that restarts with a change unconfirmed comes up on the confirmed config: the
+/// pending file is deleted, never applied, and that is said.
+fn a_restart_during_the_window_discards_the_change(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    applied_moving(
+        lab,
+        &mut ws,
+        &moved(&config),
+        &view.tag,
+        600,
+        &mut Cursor::default(),
+    )?;
+    no_task_failed(lab)?;
+    reset_and_wait(lab)?;
+    lab.console()?
+        .wait_for(&mut Cursor::default(), &re(DISCARDED), SOON)?;
+    // Still where it was: the LAN host never moved.
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let (ipv4, tag) = lan0_of(&mut ws)?;
+    ensure!(
+        ipv4 == "192.168.1.1/24" && tag == view.tag,
+        "after the restart: {ipv4} {tag}"
+    );
+    ws.subscribe("events", 16)?;
+    ws.event(SOON, "config.discarded")?;
+    Ok(())
+}
+
+/// Everything the router refuses, it refuses whole: the running config and its tag are what
+/// they were.
+fn what_the_router_refuses_changes_nothing(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    // A LAN moved without its pool: invalid, and said by its path.
+    let mut invalid = config.clone();
+    if let Some(lan) = invalid.lans.first_mut() {
+        "192.168.2.1/24".clone_into(&mut lan.ipv4);
+    }
+    let error = refused(
+        ws.apply(&invalid, &view.tag, false, 0)?,
+        ErrorCode::InvalidArgument,
+    )?;
+    ensure!(error.message.contains("lans[0].dhcp"), "{error:?}");
+    let said = ws.validate(&invalid)?;
+    ensure!(
+        !said.violations.is_empty() && said.effects.is_empty() && said.caller.is_none(),
+        "{said:?}"
+    );
+    // A window out of range.
+    refused(
+        ws.apply(&with_reservation(&config), &view.tag, false, 9)?,
+        ErrorCode::InvalidArgument,
+    )?;
+    ensure!(lan0_of(&mut ws)?.1 == view.tag, "a refusal moved the tag");
+    // A tag from before another change.
+    let newer = applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    ensure!(newer != view.tag, "a change kept the tag");
+    refused(
+        ws.apply(&moved(&config), &view.tag, false, 0)?,
+        ErrorCode::FailedPrecondition,
+    )?;
+    // With one pending: no second apply, no password change; then nothing to settle twice.
+    let pending = applied(&mut ws, &config, &newer, false, 60)?;
+    ensure!(pending == view.tag, "back to the first config, its tag");
+    refused(
+        ws.apply(&with_reservation(&config), &pending, true, 0)?,
+        ErrorCode::FailedPrecondition,
+    )?;
+    let change = ws.answered(openfeo_config::api::request::Body::ChangePassword(
+        openfeo_config::api::ChangePasswordRequest {
+            old_password: PASSWORD.to_owned(),
+            new_password: "another-lab-password".to_owned(),
+        },
+    ))?;
+    refused(change, ErrorCode::FailedPrecondition)?;
+    ws.revert()?
+        .map_err(|error| anyhow::anyhow!("the revert was refused: {error:?}"))?;
+    refused(ws.revert()?, ErrorCode::FailedPrecondition)?;
+    refused(ws.confirm()?, ErrorCode::FailedPrecondition)?;
+    ensure!(lan0_of(&mut ws)?.1 == newer, "after the revert");
+    // The password is the one it was.
+    api.login(PASSWORD)?;
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// A router running on defaults because it refused its file shows its config and takes no
+/// change: a confirm would put defaults where the owner's file is.
+fn a_router_on_defaults_over_a_refused_file_takes_no_apply(lab: &mut Lab) -> anyhow::Result<()> {
+    let hash = openfeo_api::auth::password::hash(PASSWORD)
+        .map_err(|err| anyhow::anyhow!("hashing the lab's password: {err}"))?;
+    let config = format!(
+        "{}\n[admin]\npassword_hash = \"{hash}\"\n",
+        VM_DHCP.replace("ipv4 = \"192.168.1.1/24\"", "ipv4 = \"not-an-address\"")
+    );
+    ensure!(config != VM_DHCP, "the fixture's LAN address was not found");
+    boot_config(lab, &config)?;
+    let api = api(lab)?;
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let running = view.config.context("no config")?;
+    ensure!(
+        running.wans.is_empty() && running.lans.len() == 1,
+        "not the first-boot defaults: {running:?}"
+    );
+    for immediate in [false, true] {
+        let error = refused(
+            ws.apply(&running, &view.tag, immediate, 0)?,
+            ErrorCode::FailedPrecondition,
+        )?;
+        ensure!(error.message.contains("refused"), "{error:?}");
+    }
+    // It still says what a change would do.
+    let said = ws.validate(&running)?;
+    ensure!(said.violations.is_empty(), "{said:?}");
+    // The file is as it was: the same refusal after a reset.
+    reset_and_wait(lab)?;
+    let status = status(&api)?;
+    ensure!(
+        status.config_refused && !status.needs_password,
+        "{status:?}"
+    );
+    password_never_logged(lab)
+}
+
+/// What a change means for whoever asks, by the address the question arrived at: over IPv4 at
+/// the LAN's own address the connection goes with it; over IPv6 the connection stays and the
+/// LAN still changes under the caller.
+fn a_validation_says_who_it_moves(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_ipv6(lab)?;
+    let over4 = api(lab)?;
+    let token = over4.claim(PASSWORD)?;
+    let mut ws4 = over4.ws_with(&token)?;
+    let config = ws4.config()?.config.context("no config")?;
+    let said = ws4.validate(&moved(&config))?;
+    ensure!(said.violations.is_empty(), "{:?}", said.violations);
+    ensure!(
+        said.effects.len() == 1
+            && said.effects[0].subject == "lan0"
+            && said.effects[0].kind() == ConfigEffectKind::LanAddressMoves,
+        "{:?}",
+        said.effects
+    );
+    let caller = said.caller.context("no caller")?;
+    ensure!(
+        caller.connection_drops
+            && caller.lan_changes
+            && caller.lan == "lan0"
+            && caller.router_after == "192.168.2.1",
+        "over IPv4: {caller:?}"
+    );
+    let over6 = Api::on(
+        &lab.lan0,
+        "[2001:db8:1:222::1]:443".parse::<SocketAddr>()?,
+        HOST,
+    );
+    let mut ws6 = over6.ws_with(&token)?;
+    let caller = ws6.validate(&moved(&config))?.caller.context("no caller")?;
+    ensure!(
+        !caller.connection_drops
+            && caller.lan_changes
+            && caller.lan == "lan0"
+            && caller.router_after == "192.168.2.1",
+        "over IPv6: {caller:?}"
+    );
+    // A change that leaves the LAN alone moves nobody, whichever way it is asked.
+    for ws in [&mut ws4, &mut ws6] {
+        let caller = ws
+            .validate(&with_reservation(&config))?
+            .caller
+            .context("no caller")?;
+        ensure!(
+            !caller.connection_drops && !caller.lan_changes && caller.lan == "lan0",
+            "{caller:?}"
+        );
+    }
+    // Asking changed nothing.
+    ensure!(
+        ws4.config()?.config.as_ref() == Some(&config),
+        "a validation changed the config"
+    );
+    Ok(())
+}
+
+/// Boot the PPPoE fixture against the lab's access concentrator and wait for IPv4 over the
+/// session; the scenario skips where the concentrator cannot run.
+fn boot_pppoe(lab: &mut Lab) -> anyhow::Result<()> {
+    use openfeo_harness::daemons::{Auth, PppoeServerConfig};
+    daemons::require_access_concentrator()?;
+    lab.start_pppoe_server(&PppoeServerConfig::isp("wan0", Auth::Chap))?;
+    lab.with_config(VM_PPPOE)?;
+    lab.boot("")?;
+    let console = lab.console()?;
+    console.wait_for(&mut Cursor::default(), &re(LISTENING), BOOT_TIMEOUT)?;
+    console.wait_for(&mut Cursor::default(), &re(PPPOE_UP), BOOT_TIMEOUT)?;
+    lab.lan_side_host()
+}
+
+const VM_PPPOE: &str = include_str!("../fixtures/vm-pppoe.toml");
+const PPPOE_UP: &str = r"openfeo: pppoe wan0 ipcp up ";
+const PPPOE_SESSION: &str = r"openfeo: pppoe wan0 session 0x";
+
+/// The config is read without its secrets and written back without them: the PPPoE password
+/// that was not sent is the one kept, and the session never notices.
+fn no_secret_comes_back(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_pppoe(lab)?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let Some(wan::Kind::Pppoe(account)) = config.wans.first().and_then(|wan| wan.kind.as_ref())
+    else {
+        anyhow::bail!("the WAN is not PPPoE: {config:?}");
+    };
+    ensure!(
+        account.username == daemons::PPP_USERNAME && account.password.is_empty(),
+        "the account as read: {} / {} characters of password",
+        account.username,
+        account.password.len()
+    );
+    ensure!(
+        config
+            .admin
+            .as_ref()
+            .is_none_or(|admin| admin.password_hash.is_empty()),
+        "the password hash was read back"
+    );
+    let sessions = lab.console()?.count(&re(PPPOE_SESSION));
+    // Back as it was read, with a reservation: the password is not in it.
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    lab.console()?
+        .wait_for(&mut Cursor::default(), &re(APPLIED_IMMEDIATELY), SOON)?;
+    std::thread::sleep(Duration::from_secs(5));
+    let console = lab.console()?;
+    ensure!(
+        console.count(&re(r"openfeo: pppoe wan0 stopped")) == 0
+            && console.count(&re(PPPOE_SESSION)) == sessions,
+        "a LAN change with no password in it disturbed the session"
+    );
+    let state = state_json(&api, &token)?;
+    ensure!(
+        state
+            .wans
+            .first()
+            .is_some_and(|wan| wan.phase() == WanPhase::Up),
+        "{:?}",
+        state.wans
+    );
+    ensure!(
+        console.count(&re(daemons::PPP_PASSWORD)) == 0,
+        "the PPPoE password is on the console"
+    );
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+// ---- M4 part 2a: a change restarts only what it touches (SPEC §5.5) ----
+
+/// udhcpc's four tries of three seconds, with margin.
+const UDHCPC_TIMEOUT: Duration = Duration::from_secs(20);
+const LAN0_DHCP_STOPPED: &str = r"openfeo: lan lan0 dhcp stopped";
+const WAN0_DHCP_STOPPED: &str = r"openfeo: wan wan0 dhcp stopped";
+const PPPOE_STOPPED: &str = r"openfeo: pppoe wan0 stopped";
+const INIT_REBOOT: &str = r"openfeo: wan wan0 dhcp init-reboot";
+/// How long a scenario watches for something that must not happen.
+const QUIET: Duration = Duration::from_secs(5);
+
+/// One variable udhcpc set for its `bound` event.
+fn udhcpc_env<'a>(events: &'a [lanclient::UdhcpcEvent], key: &str) -> anyhow::Result<&'a str> {
+    let bound = events
+        .iter()
+        .find(|event| event.kind == "bound")
+        .with_context(|| format!("udhcpc never bound: {events:?}"))?;
+    bound
+        .env
+        .get(key)
+        .map(String::as_str)
+        .with_context(|| format!("udhcpc bound without {key}: {:?}", bound.env))
+}
+
+/// Every event pushed to `ws` up to the end of `window`, those already waiting among them.
+fn events_during(ws: &mut Ws, window: Duration) -> Vec<Event> {
+    let deadline = Instant::now() + window;
+    let mut events = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return events;
+        }
+        match ws.msg(left) {
+            Ok(message) => {
+                if let Some(server_msg::Body::Event(event)) = message.body {
+                    events.push(event);
+                }
+            }
+            // Nothing in what was left of the window, or a socket that closed: the caller asks
+            // something of the socket afterwards, which tells the two apart.
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+/// The state, once it is as `wanted`.
+fn state_when(
+    api: &Api,
+    token: &str,
+    what: &str,
+    wanted: impl Fn(&State) -> bool,
+) -> anyhow::Result<State> {
+    let deadline = Instant::now() + SOON;
+    loop {
+        let state = state_json(api, token)?;
+        if wanted(&state) {
+            return Ok(state);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the state never showed {what}: {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// The state's first WAN.
+fn wan0_of(state: &State) -> anyhow::Result<&WanState> {
+    state.wans.first().context("no WAN in the state")
+}
+
+/// The lab's Kea.
+fn kea(lab: &Lab) -> anyhow::Result<&daemons::Daemon> {
+    lab.daemons
+        .iter()
+        .find(|daemon| daemon.name == "kea-dhcp4")
+        .context("Kea is not running")
+}
+
+/// How many lines of the ISP's `pppd` log on `wan0` contain `needle`.
+fn pppd_log_count(lab: &Lab, needle: &str) -> usize {
+    std::fs::read_to_string(lab.pppd_log("wan0"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .count()
+}
+
+/// Wait until the ISP's `pppd` log on `wan0` has a line containing `needle`.
+fn pppd_log_shows(lab: &Lab, needle: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + SOON;
+    while pppd_log_count(lab, needle) == 0 {
+        ensure!(
+            Instant::now() < deadline,
+            "pppd's log never showed {needle:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+/// A reservation added to the LAN restarts that LAN's DHCP server and nothing else: the
+/// WAN's lease, its phase and its address are what they were, and no event speaks of a WAN.
+fn a_lan_change_leaves_a_dhcp_wan_alone(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let before = state_json(&api, &token)?;
+    let before = wan0_of(&before)?.clone();
+    ensure!(before.phase() == WanPhase::Up, "{before:?}");
+    let bound = lab.console()?.count(&re(BOUND));
+    // A client holds a lease on the LAN whose server is about to be restarted.
+    let leased = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    udhcpc_env(&leased, "ip")?;
+    // A socket of its own for the events: a request discards the pushes that arrive before
+    // its answer.
+    let mut watch = api.ws_with(&token)?;
+    watch.subscribe("events", 0)?;
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: config: effect lan0 dhcp restarts"),
+        SOON,
+    )?;
+    console.wait_for(&mut Cursor::default(), &re(LAN0_DHCP_STOPPED), SOON)?;
+    let events = events_during(&mut watch, QUIET);
+    watch.config()?;
+    ensure!(
+        events.iter().any(|event| event.topic == "config.applied"),
+        "the watching socket saw no config.applied: {events:?}"
+    );
+    ensure!(
+        !events.iter().any(|event| event.topic.starts_with("wan.")),
+        "a LAN change made news of a WAN: {events:?}"
+    );
+    // Nor of a lease: the server that comes back has the leases the one that went had.
+    ensure!(
+        !events.iter().any(|event| event.topic.contains(".lease.")),
+        "a restarted server's leases were released and granted again: {events:?}"
+    );
+    ensure!(
+        state_json(&api, &token)?
+            .lans
+            .first()
+            .is_some_and(|lan| lan.leases == 1),
+        "the lease is not in the state after the restart"
+    );
+    let after = state_json(&api, &token)?;
+    let after = wan0_of(&after)?;
+    ensure!(
+        after.phase() == WanPhase::Up
+            && after.phase_since_unix_ms == before.phase_since_unix_ms
+            && after.ipv4 == before.ipv4,
+        "the WAN before {before:?} and after {after:?}"
+    );
+    ensure!(
+        console.count(&re(BOUND)) == bound && console.count(&re(WAN0_DHCP_STOPPED)) == 0,
+        "the WAN's DHCP client was restarted"
+    );
+    no_task_failed(lab)
+}
+
+/// The same change on a PPPoE line: the session is the one it was, on the router's console
+/// and in the access concentrator's own account.
+fn a_lan_change_leaves_a_pppoe_session_alone(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_pppoe(lab)?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let before = state_json(&api, &token)?;
+    let before = wan0_of(&before)?.clone();
+    ensure!(before.phase() == WanPhase::Up, "{before:?}");
+    let sessions = lab.console()?.count(&re(PPPOE_SESSION));
+    ensure!(
+        pppd_log_count(lab, "Using interface ") == 1,
+        "pppd's sessions before the change"
+    );
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: config: effect lan0 dhcp restarts"),
+        SOON,
+    )?;
+    console.wait_for(&mut Cursor::default(), &re(LAN0_DHCP_STOPPED), SOON)?;
+    std::thread::sleep(QUIET);
+    ensure!(
+        console.count(&re(PPPOE_SESSION)) == sessions && console.count(&re(PPPOE_STOPPED)) == 0,
+        "the PPPoE session was restarted"
+    );
+    ensure!(
+        pppd_log_count(lab, "Using interface ") == 1,
+        "pppd saw a second session"
+    );
+    let after = state_json(&api, &token)?;
+    let after = wan0_of(&after)?;
+    ensure!(
+        after.phase() == WanPhase::Up
+            && after.phase_since_unix_ms == before.phase_since_unix_ms
+            && after.ipv4 == before.ipv4,
+        "the WAN before {before:?} and after {after:?}"
+    );
+    no_task_failed(lab)
+}
+
+/// A WAN changed from DHCP to PPPoE and back while the router runs: the lease is given back
+/// to the ISP before the session starts, the session is ended with a Terminate-Request before
+/// the lease is taken again, and the state holds nothing of the type that went.
+fn a_wan_changes_type_while_running(lab: &mut Lab) -> anyhow::Result<()> {
+    use openfeo_harness::daemons::{Auth, PppoeServerConfig};
+    daemons::require_access_concentrator()?;
+    lab.start_pppoe_server(&PppoeServerConfig::isp("wan0", Auth::Chap))?;
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let dhcp = view.config.context("no config")?;
+    let mut pppoe = dhcp.clone();
+    pppoe.wans.first_mut().context("no WAN")?.kind = Some(wan::Kind::Pppoe(PppoeWan {
+        username: daemons::PPP_USERNAME.to_owned(),
+        password: daemons::PPP_PASSWORD.to_owned(),
+        ..Default::default()
+    }));
+    let mut cur = Cursor::default();
+    let tag = applied(&mut ws, &pppoe, &view.tag, true, 0)?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut cur,
+        &re(r"openfeo: config: effect wan0 reconnects"),
+        SOON,
+    )?;
+    console.wait_for(&mut cur, &re(WAN0_DHCP_STOPPED), SOON)?;
+    kea(lab)?
+        .log
+        .wait_for(&mut Cursor::default(), &re("DHCP4_RELEASE "), SOON)
+        .context("Kea did not log the release")?;
+    console.wait_for(&mut cur, &re(PPPOE_UP), Duration::from_secs(30))?;
+    let state = state_when(&api, &token, "a PPPoE WAN that is up", |state| {
+        state.wans.first().is_some_and(|wan| {
+            wan.kind() == WanKind::Pppoe && wan.phase() == WanPhase::Up && !wan.ipv4.is_empty()
+        })
+    })?;
+    ensure!(
+        !state
+            .addresses
+            .iter()
+            .any(|address| address.origin() == AddressOrigin::Dhcp),
+        "an address of the lease is still held: {:?}",
+        state.addresses
+    );
+    ensure!(wan0_of(&state)?.interface == "ppp-wan0", "{:?}", state.wans);
+    // And back. The two families work side by side: the DHCP client may have its lease
+    // before the session has finished ending, so each line is looked for from here.
+    let from_here = cur;
+    applied(&mut ws, &dhcp, &tag, true, 0)?;
+    console.wait_for(&mut { from_here }, &re(PPPOE_STOPPED), SOON)?;
+    pppd_log_shows(lab, "LCP terminated by peer")?;
+    console.wait_for(&mut { from_here }, &re(BOUND), Duration::from_secs(30))?;
+    let state = state_when(&api, &token, "a DHCP WAN that is up", |state| {
+        state.wans.first().is_some_and(|wan| {
+            wan.kind() == WanKind::Dhcp && wan.phase() == WanPhase::Up && !wan.ipv4.is_empty()
+        })
+    })?;
+    ensure!(
+        !state.addresses.iter().any(
+            |address| address.origin() == AddressOrigin::Ppp || address.interface == "ppp-wan0"
+        ),
+        "something of the session is still held: {:?}",
+        state.addresses
+    );
+    ensure!(wan0_of(&state)?.interface == "p0", "{:?}", state.wans);
+    // The lease was given back when the WAN became PPPoE: the client that came after began
+    // with a DISCOVER, not by asking for a lease it no longer holds.
+    ensure!(
+        console.count(&re(INIT_REBOOT)) == 0,
+        "a DHCP client started from a lease its predecessor had given back"
+    );
+    ensure!(
+        console.count(&re(daemons::PPP_PASSWORD)) == 0,
+        "the PPPoE password is on the console"
+    );
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// A WAN whose ISP wants a tag: untagged it finds no server; with `vlan = 101` it leases on
+/// `p0.101`; with the tag taken away again the sub-interface goes and the WAN is down.
+fn a_vlan_tag_moves_the_wan(lab: &mut Lab) -> anyhow::Result<()> {
+    openfeo_harness::vlanprobe::require_vlan_links()?;
+    let tagged = lab.isp0_tagged(101)?;
+    lab.start_kea_on(&tagged)?;
+    boot_config(lab, VM_DHCP)?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: wan wan0 dhcp discover"),
+        Duration::from_secs(30),
+    )?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let untagged = view.config.context("no config")?;
+    let mut with_tag = untagged.clone();
+    with_tag.wans.first_mut().context("no WAN")?.vlan = 101;
+    ensure!(
+        console.count(&re(BOUND)) == 0,
+        "an untagged WAN leased from a server that only hears tag 101"
+    );
+    let mut cur = Cursor::default();
+    let tag = applied(&mut ws, &with_tag, &view.tag, true, 0)?;
+    console.wait_for(
+        &mut cur,
+        &re(r"openfeo: config: effect wan0 reconnects"),
+        SOON,
+    )?;
+    console.wait_for(&mut cur, &re(BOUND), Duration::from_secs(30))?;
+    let state = state_when(&api, &token, "the WAN up on p0.101", |state| {
+        state
+            .wans
+            .first()
+            .is_some_and(|wan| wan.phase() == WanPhase::Up && wan.interface == "p0.101")
+    })?;
+    ensure!(wan0_of(&state)?.vlan == 101, "{:?}", state.wans);
+    // The tag taken away: the client stops, the sub-interface goes, nobody answers. (The
+    // lease is not always given back: the sub-interface can go before the release is out.)
+    applied(&mut ws, &untagged, &tag, true, 0)?;
+    console.wait_for(&mut cur, &re(WAN0_DHCP_STOPPED), SOON)?;
+    let state = state_when(&api, &token, "the WAN down on p0", |state| {
+        state.wans.first().is_some_and(|wan| {
+            wan.phase() != WanPhase::Up && wan.interface == "p0" && wan.ipv4.is_empty()
+        }) && !state
+            .addresses
+            .iter()
+            .any(|address| address.interface == "p0.101")
+    })?;
+    ensure!(
+        !serde_json::to_string(&state)?.contains("p0.101"),
+        "the state still names p0.101: {state:?}"
+    );
+    // The client on the untagged port starts from nothing: the lease it would otherwise ask
+    // for again was given on another network.
+    console.wait_for(&mut cur, &re(r"openfeo: wan wan0 dhcp discover"), SOON)?;
+    ensure!(
+        console.count(&re(INIT_REBOOT)) == 0,
+        "a DHCP client started from the lease of the network it left"
+    );
+    no_task_failed(lab)
+}
+
+/// With `two` running (`lan0` and `lan1`): asked from `lan1`, a change that moves `lan0`
+/// moves neither the caller's connection nor the caller's LAN; asked from `lan0` (`ws`) it
+/// moves both.
+fn a_change_moves_only_those_on_the_lan_it_moves(
+    lan1: &openfeo_harness::netns::NetNs,
+    ws: &mut Ws,
+    token: &str,
+    two: &Config,
+) -> anyhow::Result<()> {
+    let elsewhere = moved_to(two, "192.168.5.");
+    let from_lan1 = Api::on(lan1, "192.168.2.1:443".parse::<SocketAddr>()?, HOST);
+    let caller = from_lan1
+        .ws_with(token)?
+        .validate(&elsewhere)?
+        .caller
+        .context("no caller")?;
+    ensure!(
+        !caller.connection_drops
+            && !caller.lan_changes
+            && caller.lan == "lan1"
+            && caller.router_after == "192.168.2.1",
+        "asked from lan1: {caller:?}"
+    );
+    let caller = ws.validate(&elsewhere)?.caller.context("no caller")?;
+    ensure!(
+        caller.connection_drops
+            && caller.lan_changes
+            && caller.lan == "lan0"
+            && caller.router_after == "192.168.5.1",
+        "asked from lan0: {caller:?}"
+    );
+    Ok(())
+}
+
+/// A second LAN added while the router runs serves its clients at once, DHCP and the
+/// router's own name; taken away again, its bridge and its server go.
+fn a_lan_is_added_and_removed_while_running(lab: &mut Lab) -> anyhow::Result<()> {
+    lab.add_lan1()?;
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let one = view.config.context("no config")?;
+    let mut two = one.clone();
+    two.lans.push(Lan {
+        name: "lan1".to_owned(),
+        ports: vec!["p3".to_owned()],
+        ipv4: "192.168.2.1/24".to_owned(),
+        dhcp: Some(LanDhcp {
+            range: vec!["192.168.2.100".to_owned(), "192.168.2.200".to_owned()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let mut cur = Cursor::default();
+    let tag = applied(&mut ws, &two, &view.tag, true, 0)?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut cur,
+        &re(r"openfeo: config: effect lan1 is added"),
+        SOON,
+    )?;
+    let lan1 = lab.lan1.as_ref().context("the lab has no lan1")?;
+    lan1.ip(&["link", "set", "lan1", "up"])?;
+    let events = lanclient::udhcpc(lan1, "lan1", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&events, "ip")?;
+    ensure!(
+        re(r"^192\.168\.2\.(?:1\d\d|200)$").is_match(ip),
+        "leased {ip}, not in lan1's pool"
+    );
+    ensure!(
+        udhcpc_env(&events, "router")? == "192.168.2.1",
+        "{events:?}"
+    );
+    let answer = lanclient::dig(lan1, "192.168.2.1".parse()?, HOST, "A", &[], SOON)?;
+    ensure!(
+        answer.status == "NOERROR"
+            && answer
+                .answers
+                .iter()
+                .any(|(_, _, kind, data)| kind == "A" && data == "192.168.2.1"),
+        "the router's name on lan1: {answer:?}"
+    );
+    let state = state_json(&api, &token)?;
+    ensure!(
+        state
+            .lans
+            .iter()
+            .any(|lan| lan.name == "lan1" && lan.interface == "br-lan1" && lan.dhcp),
+        "{:?}",
+        state.lans
+    );
+    // The first LAN's server was not touched by a neighbour arriving.
+    ensure!(
+        console.count(&re(LAN0_DHCP_STOPPED)) == 0,
+        "adding lan1 restarted lan0's DHCP server"
+    );
+    a_change_moves_only_those_on_the_lan_it_moves(lan1, &mut ws, &token, &two)?;
+    // And away again.
+    applied(&mut ws, &one, &tag, true, 0)?;
+    console.wait_for(
+        &mut cur,
+        &re(r"openfeo: config: effect lan1 is removed"),
+        SOON,
+    )?;
+    console.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: lan lan1 dhcp stopped"),
+        SOON,
+    )?;
+    let state = state_when(&api, &token, "no lan1", |state| {
+        !state.lans.iter().any(|lan| lan.name == "lan1")
+            && !state
+                .addresses
+                .iter()
+                .any(|address| address.interface == "br-lan1")
+    })?;
+    ensure!(
+        !serde_json::to_string(&state)?.contains("br-lan1"),
+        "the state still names br-lan1: {state:?}"
+    );
+    ensure!(
+        console.count(&re(LAN0_DHCP_STOPPED)) == 0,
+        "removing lan1 restarted lan0's DHCP server"
+    );
+    no_task_failed(lab)
+}
+
+/// A lease given before a change is there again when the change is taken back: while the
+/// change stands a client is given the new subnet for no longer than the window, and after
+/// the revert the first client has the address it had.
+fn leases_survive_a_change_that_is_taken_back(lab: &mut Lab) -> anyhow::Result<()> {
+    const WINDOW: u32 = 30;
+    let (api, token, _) = boot_claimed(lab)?;
+    let first = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&first, "ip")?.to_owned();
+    ensure!(
+        re(r"^192\.168\.1\.(?:1\d\d|200)$").is_match(&ip),
+        "leased {ip}, not in the pool"
+    );
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let mut cur = Cursor::default();
+    applied_moving(lab, &mut ws, &moved(&config), &view.tag, WINDOW, &mut cur)?;
+    let console = lab.console()?;
+    let since_applied = cur;
+    console.wait_for(&mut cur, &re(LAN0_DHCP_STOPPED), SOON)?;
+    // Another client while the change stands: the new subnet, for no longer than the window.
+    let second = lanclient::udhcpc(
+        &lab.lan0,
+        "lan0",
+        &lab.run_dir,
+        &["-x", "0x3d:01020000000042"],
+        UDHCPC_TIMEOUT,
+    )?;
+    let there = udhcpc_env(&second, "ip")?;
+    ensure!(
+        there.starts_with("192.168.2."),
+        "leased {there} from a LAN at 192.168.2.1/24"
+    );
+    let lease: u32 = udhcpc_env(&second, "lease")?.parse()?;
+    ensure!(
+        (1..=WINDOW).contains(&lease),
+        "a lease of {lease} s under a change that may be gone in {WINDOW} s"
+    );
+    // Nobody confirms: the server comes back on the old subnet with what it had given.
+    console.wait_for(
+        &mut cur,
+        &re(&format!(
+            r"openfeo: config: reverted \(not confirmed in {WINDOW} s\)"
+        )),
+        Duration::from_secs(u64::from(WINDOW) + 10),
+    )?;
+    let restored = console.wait_for(
+        &mut { since_applied },
+        &re(r"openfeo: lan lan0 dhcp restored (\d+) leases"),
+        SOON,
+    )?;
+    let count: u32 = restored
+        .groups
+        .first()
+        .cloned()
+        .flatten()
+        .context("no count in the restored line")?
+        .parse()?;
+    ensure!(count >= 1, "{:?}", restored.line);
+    let again = lanclient::udhcpc(
+        &lab.lan0,
+        "lan0",
+        &lab.run_dir,
+        &["-r", &ip],
+        UDHCPC_TIMEOUT,
+    )?;
+    ensure!(
+        udhcpc_env(&again, "ip")? == ip,
+        "after the revert the first client was given {:?}, not {ip}",
+        udhcpc_env(&again, "ip")
+    );
+    no_task_failed(lab)
+}
+
+/// A router whose clock SNTP sets a year forward after a client took its lease, as a box with
+/// no clock of its own does at every boot: a change of config that restarts the LAN's DHCP
+/// server still finds the lease. The file carries wall-clock times, and the server writes it
+/// as it stops, on the clock of that moment.
+fn leases_survive_a_restart_after_the_clock_stepped(lab: &mut Lab) -> anyhow::Result<()> {
+    const YEAR: i64 = 31_536_000;
+    let (api, _, _) = boot_claimed(lab)?;
+    let first = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, &[], UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&first, "ip")?.to_owned();
+    // The first write of the database follows the lease at once; give the disk a moment.
+    std::thread::sleep(Duration::from_secs(2));
+    // The ISP's time server comes to life a year ahead; the router steps at its next poll.
+    lab.start_sntp(YEAR)?;
+    let console = lab.console()?;
+    console.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: time step \+3153\d{4}\.\d{3}s from 203\.0\.113\.1"),
+        Duration::from_secs(90),
+    )?;
+    // A session need not outlive a year.
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let mut cur = Cursor::default();
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    console.wait_for(&mut cur, &re(APPLIED_IMMEDIATELY), SOON)?;
+    console.wait_for(&mut cur, &re(LAN0_DHCP_STOPPED), SOON)?;
+    console
+        .wait_for(
+            &mut cur,
+            &re(r"openfeo: lan lan0 dhcp restored 1 leases"),
+            SOON,
+        )
+        .context("the restarted server did not restore the lease")?;
+    ensure!(
+        console.count(&re(r"openfeo: lan lan0 dhcp ignoring lease")) == 0,
+        "the restarted server read a lease as expired"
+    );
+    let again = lanclient::udhcpc(
+        &lab.lan0,
+        "lan0",
+        &lab.run_dir,
+        &["-r", &ip],
+        UDHCPC_TIMEOUT,
+    )?;
+    ensure!(
+        udhcpc_env(&again, "ip")? == ip,
+        "after the restart the client was given {:?}, not {ip}",
+        udhcpc_env(&again, "ip")
+    );
+    no_task_failed(lab)
 }

@@ -21,6 +21,7 @@ fn config() -> ServerConfig {
         prefix: 24,
         pool: (POOL_START, Ipv4Addr::new(192, 168, 1, 200)),
         lease_secs: 43_200,
+        lease_cap: None,
         dns: vec![],
         ntp: vec![],
         domain: Some("home.arpa".to_owned()),

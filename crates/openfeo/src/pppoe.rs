@@ -13,28 +13,30 @@
 //! after a loss, the full 60 s after an authentication failure. A configuration change restarts
 //! the task, as it does every task. Nothing here prints the password.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::sync::Arc;
 use std::time::Duration;
 
-use openfeo_config::wan;
 use openfeo_net::pppoe::{Discovery, Session as KernelSession, dev_ppp_unavailable};
 use openfeo_proto_ppp::discovery::{self, Client as DiscoveryClient};
 use openfeo_proto_ppp::ipcp::Ipv4Up;
 use openfeo_proto_ppp::ipv6cp::Ipv6Up;
 use openfeo_proto_ppp::lcp::{AuthProto, ECHO_MISSES};
 use openfeo_proto_ppp::session::{self, Input, Output, Reason, Session};
+use openfeo_reconcile::slices::{PppoeSlice, pppoe_clients};
+use openfeo_runtime::Publisher;
 use openfeo_runtime::clock;
-use openfeo_runtime::supervise::TaskError;
+use openfeo_runtime::supervise::{BoxedTask, Stop, TaskError};
 use openfeo_runtime::world::WorldRx;
-use openfeo_runtime::{Publisher, Supervisor};
-use openfeo_world::{PppIpv4, PppIpv6, PppoeFact};
+use openfeo_world::{PppIpv4, PppIpv6, PppoeFact, World};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use openfeo_reconcile::links::PPPOE_PORT_MTU;
 
-use crate::dhcp4::{mac_text, seed, wait_for_link};
+use crate::dhcp4::{clear_wan_cause, mac_text, seed, wait_for_link};
+use crate::family::Family;
 
 /// The PPP payload without RFC 4638.
 const DEFAULT_PAYLOAD: u16 = 1492;
@@ -48,40 +50,42 @@ const RECEIVE_BUFFER: usize = 2048;
 const NO_PPP_WAIT: Duration = Duration::from_secs(60);
 const SEED_SALT: u64 = 0x7070_6f65;
 
-/// One supervised task per `[wans.pppoe]` WAN in the current configuration. Without a persisted
-/// IPv6 secret the IPV6CP identifier derives from an all-zero one, as the `ipv6` task's
-/// addresses do.
-pub fn spawn_all(
-    supervisor: &Supervisor,
-    publisher: &Arc<Publisher>,
-    world_rx: &WorldRx,
-    secret: Option<[u8; 16]>,
-) {
-    let config = publisher.current().config.clone();
-    for wan in &config.wans {
-        let Some(wan::Kind::Pppoe(pppoe)) = &wan.kind else {
-            continue;
-        };
-        let task = WanTask {
-            wan: wan.name.clone(),
-            port: openfeo_reconcile::wan_ifname(wan),
-            username: pppoe.username.clone(),
-            password: pppoe.password.clone().into_bytes(),
-            service: (!pppoe.service.is_empty()).then(|| pppoe.service.clone()),
-            ac: (!pppoe.ac.is_empty()).then(|| pppoe.ac.clone()),
-            secret: secret.unwrap_or([0; 16]),
-        };
-        let publisher = publisher.clone();
-        let world_rx = world_rx.clone();
-        supervisor.spawn(format!("pppoe-{}", wan.name), move || {
-            let task = task.clone();
-            let publisher = publisher.clone();
-            let world_rx = world_rx.clone();
-            async move { run(&task, &publisher, world_rx).await }
-        });
+/// The PPPoE client of every `[wans.pppoe]` WAN (SPEC §7.2), kept in step with the config by its
+/// manager ([`crate::family`]). Without a persisted IPv6 secret the IPV6CP identifier derives
+/// from an all-zero one, as the `ipv6` task's addresses do.
+#[derive(Clone, Copy)]
+pub struct PppoeClients {
+    /// The IPv6 stable-privacy secret (`identity/`), or zeros.
+    pub secret: [u8; 16],
+}
+
+impl Family for PppoeClients {
+    type Slice = PppoeSlice;
+    const PREFIX: &'static str = "pppoe";
+
+    fn wanted(&self, world: &World) -> BTreeMap<String, PppoeSlice> {
+        pppoe_clients(&world.config)
+    }
+
+    fn run(
+        &self,
+        key: &str,
+        slice: &PppoeSlice,
+        publisher: Arc<Publisher>,
+        world_rx: WorldRx,
+        stop: Stop,
+    ) -> BoxedTask {
+        let task = WanTask::of(key, slice, self.secret);
+        Box::pin(async move { run(&task, &publisher, world_rx, stop).await })
+    }
+
+    fn withdraw(&self, key: &str, world: &mut World) {
+        Arc::make_mut(&mut world.pppoe).remove(key);
+        clear_wan_cause(world, key);
     }
 }
 
+/// What one WAN's task runs on: its slice of the config and the secret.
 #[derive(Clone)]
 struct WanTask {
     wan: String,
@@ -92,6 +96,20 @@ struct WanTask {
     service: Option<String>,
     ac: Option<String>,
     secret: [u8; 16],
+}
+
+impl WanTask {
+    fn of(wan: &str, slice: &PppoeSlice, secret: [u8; 16]) -> WanTask {
+        WanTask {
+            wan: wan.to_owned(),
+            port: slice.port.clone(),
+            username: slice.username.clone(),
+            password: slice.password.clone(),
+            service: slice.service.clone(),
+            ac: slice.ac.clone(),
+            secret,
+        }
+    }
 }
 
 impl fmt::Debug for WanTask {
@@ -173,104 +191,165 @@ struct Ended {
     auth: Option<AuthProto>,
 }
 
-/// The task: port, discovery, kernel session, PPP; again after every end.
+/// What follows one attempt.
+enum Next {
+    /// Try again after this long.
+    After(Duration),
+    /// The session was ended because the task was asked to stop, and the console told.
+    Stopped,
+}
+
+/// The task: an attempt after every end, until it is asked to stop.
 async fn run(
     task: &WanTask,
     publisher: &Publisher,
     mut world_rx: WorldRx,
+    mut stop: Stop,
 ) -> Result<(), TaskError> {
     let wan = &task.wan;
-    let failed =
-        |err: openfeo_net::dhcp4::DriverError| TaskError::from(format!("pppoe {wan}: {err}"));
     let mut backoff = Backoff::new();
     let mut first = true;
     loop {
-        let (ifindex, _) = wait_for_link(&mut world_rx, &task.port).await?;
-        let mut port_mtu = port_mtu_of(&world_rx, &task.port);
-        if let Some(wait) = mtu_settle_wait(first, port_mtu) {
-            port_mtu = wait_for_port_mtu(&mut world_rx, &task.port, wait).await?;
-        }
-        first = false;
-        let max_payload = offered_payload(port_mtu);
-        info!(
-            "{}",
-            discovering_line(
-                wan,
-                &task.port,
-                task.service.as_deref(),
-                max_payload.unwrap_or(DEFAULT_PAYLOAD)
-            )
-        );
-        let socket = Discovery::open(ifindex, &task.port).map_err(failed)?;
-        let mut client = DiscoveryClient::new(
-            discovery::Config {
-                service: task.service.clone(),
-                ac: task.ac.clone(),
-                max_payload,
-            },
-            seed(SEED_SALT ^ u64::from(ifindex)),
-        );
-        let Some(found) = discover(task, &socket, &mut client, max_payload, &mut world_rx).await?
-        else {
-            // Carrier went while discovering, or the port now carries another payload: begin
-            // again with what the port offers.
-            continue;
-        };
-        info!(
-            "{}",
-            session_line(
-                wan,
-                found.id,
-                found.ac_mac,
-                &found.ac_name,
-                found.max_payload
-            )
-        );
-        let kernel = match KernelSession::attach(&task.port, found.id, found.ac_mac) {
-            Ok(kernel) => kernel,
-            Err(err) => {
-                if dev_ppp_unavailable(&err) {
-                    warn!("{}", no_ppp_line(wan, &err.to_string(), NO_PPP_WAIT));
-                } else {
-                    warn!(
-                        "pppoe {wan}: cannot attach the session: {err}; retry in {} s",
-                        NO_PPP_WAIT.as_secs()
-                    );
-                }
-                send_padt(&socket, &mut client);
-                tokio::time::sleep(NO_PPP_WAIT).await;
-                continue;
-            }
-        };
-        let mtu = found.max_payload.unwrap_or(DEFAULT_PAYLOAD);
-        publish_session(publisher, wan, &found, kernel.unit(), mtu);
-        let ended = run_session(
+        let next = attempt(
             task,
             publisher,
-            &socket,
-            &mut client,
-            &kernel,
-            mtu,
+            first,
+            &mut backoff,
             &mut world_rx,
+            &mut stop,
         )
-        .await;
-        publisher.update(|world| {
-            Arc::make_mut(&mut world.pppoe).remove(wan);
-            if let Ok(ended) = &ended {
-                world.set_wan_cause(wan, &cause_text(&ended.cause));
+        .await?;
+        first = false;
+        let wait = match next {
+            Next::Stopped => return Ok(()),
+            Next::After(wait) => wait,
+        };
+        let stopped = stop.is_requested();
+        if !stopped && let Some(wait) = wait_after(stopped, wait) {
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                () = stop.requested() => {}
             }
-        });
-        drop(kernel);
-        let ended = ended?;
-        let wait = backoff.next(&ended.cause, ended.uptime);
-        announce_end(wan, &ended, wait);
-        if ended.cause != Cause::Padt {
-            send_padt(&socket, &mut client);
         }
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+        if stop.is_requested() {
+            info!("{}", stopped_line(wan));
+            return Ok(());
         }
     }
+}
+
+/// One attempt: port, discovery, kernel session, PPP until it ends. Before there is a session
+/// a stop ends the attempt wherever it is waiting; a session is ended in order.
+async fn attempt(
+    task: &WanTask,
+    publisher: &Publisher,
+    first: bool,
+    backoff: &mut Backoff,
+    world_rx: &mut WorldRx,
+    stop: &mut Stop,
+) -> Result<Next, TaskError> {
+    let wan = &task.wan;
+    let failed =
+        |err: openfeo_net::dhcp4::DriverError| TaskError::from(format!("pppoe {wan}: {err}"));
+    let waited = tokio::select! {
+        waited = async {
+            let (ifindex, _) = wait_for_link(world_rx, &task.port).await?;
+            let mut port_mtu = port_mtu_of(world_rx, &task.port);
+            if let Some(wait) = mtu_settle_wait(first, port_mtu) {
+                port_mtu = wait_for_port_mtu(world_rx, &task.port, wait).await?;
+            }
+            Ok::<_, TaskError>((ifindex, port_mtu))
+        } => Some(waited?),
+        () = stop.requested() => None,
+    };
+    let Some((ifindex, port_mtu)) = waited else {
+        return Ok(Next::After(Duration::ZERO));
+    };
+    let max_payload = offered_payload(port_mtu);
+    info!(
+        "{}",
+        discovering_line(
+            wan,
+            &task.port,
+            task.service.as_deref(),
+            max_payload.unwrap_or(DEFAULT_PAYLOAD)
+        )
+    );
+    let socket = Discovery::open(ifindex, &task.port).map_err(failed)?;
+    let mut client = DiscoveryClient::new(
+        discovery::Config {
+            service: task.service.clone(),
+            ac: task.ac.clone(),
+            max_payload,
+        },
+        seed(SEED_SALT ^ u64::from(ifindex)),
+    );
+    let Some(found) = discover(task, &socket, &mut client, max_payload, world_rx, stop).await?
+    else {
+        // Carrier went while discovering, the port now carries another payload, or the task
+        // was asked to stop: begin again with what the port offers, or not at all.
+        return Ok(Next::After(Duration::ZERO));
+    };
+    info!(
+        "{}",
+        session_line(
+            wan,
+            found.id,
+            found.ac_mac,
+            &found.ac_name,
+            found.max_payload
+        )
+    );
+    let kernel = match KernelSession::attach(&task.port, found.id, found.ac_mac) {
+        Ok(kernel) => kernel,
+        Err(err) => {
+            if dev_ppp_unavailable(&err) {
+                warn!("{}", no_ppp_line(wan, &err.to_string(), NO_PPP_WAIT));
+            } else {
+                warn!(
+                    "pppoe {wan}: cannot attach the session: {err}; retry in {} s",
+                    NO_PPP_WAIT.as_secs()
+                );
+            }
+            send_padt(&socket, &mut client);
+            return Ok(Next::After(NO_PPP_WAIT));
+        }
+    };
+    let mtu = found.max_payload.unwrap_or(DEFAULT_PAYLOAD);
+    publish_session(publisher, wan, &found, kernel.unit(), mtu);
+    let ended = run_session(
+        task,
+        publisher,
+        &socket,
+        &mut client,
+        &kernel,
+        mtu,
+        world_rx,
+        stop,
+    )
+    .await;
+    publisher.update(|world| {
+        Arc::make_mut(&mut world.pppoe).remove(wan);
+        if let Ok(ended) = &ended {
+            world.set_wan_cause(wan, &cause_text(&ended.cause));
+        }
+    });
+    drop(kernel);
+    let ended = ended?;
+    let wait = backoff.next(&ended.cause, ended.uptime);
+    announce_end(wan, &ended, wait);
+    if ended.cause != Cause::Padt {
+        send_padt(&socket, &mut client);
+    }
+    if ended.cause == Cause::Session(Reason::Stopped) {
+        return Ok(Next::Stopped);
+    }
+    Ok(Next::After(wait))
+}
+
+/// The wait before the next attempt: none for a task that was asked to stop.
+fn wait_after(stopped: bool, wait: Duration) -> Option<Duration> {
+    (!stopped && !wait.is_zero()).then_some(wait)
 }
 
 /// The fact as discovery and the kernel know it; LCP, IPCP and IPV6CP fill the rest in.
@@ -316,6 +395,7 @@ async fn discover(
     client: &mut DiscoveryClient,
     asked: Option<u16>,
     world_rx: &mut WorldRx,
+    stop: &mut Stop,
 ) -> Result<Option<Found>, TaskError> {
     let wan = &task.wan;
     let start = Instant::now();
@@ -372,6 +452,11 @@ async fn discover(
                     client.handle(discovery::Input::Stop, millis(start));
                     return Ok(None);
                 }
+            }
+            () = stop.requested() => {
+                // No session yet: nothing to end on the wire.
+                client.handle(discovery::Input::Stop, millis(start));
+                return Ok(None);
             }
         };
     }
@@ -432,9 +517,11 @@ async fn run_session(
     kernel: &KernelSession,
     mtu: u16,
     world_rx: &mut WorldRx,
+    stop: &mut Stop,
 ) -> Result<Ended, TaskError> {
     let wan = &task.wan;
     let start = Instant::now();
+    let mut stopping = false;
     let mut ppp = Session::new(
         session::Config {
             username: task.username.clone(),
@@ -500,6 +587,12 @@ async fn run_session(
                 } else {
                     ppp.handle(Input::CarrierLost, millis(start))
                 }
+            }
+            () = stop.requested(), if !stopping => {
+                // End it in order (SPEC §7.2): the core sends its Terminate-Requests and then
+                // says the session is down; our PADT follows where the session is cleared up.
+                stopping = true;
+                ppp.handle(Input::Stop, millis(start))
             }
         };
     }
@@ -776,6 +869,114 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    fn pppoe_wan(name: &str, port: &str) -> openfeo_config::Wan {
+        openfeo_config::Wan {
+            name: name.to_owned(),
+            port: port.to_owned(),
+            kind: Some(openfeo_config::wan::Kind::Pppoe(openfeo_config::PppoeWan {
+                username: "openfeo@isp.example".to_owned(),
+                password: "example-secret".to_owned(),
+                ..openfeo_config::PppoeWan::default()
+            })),
+            ..openfeo_config::Wan::default()
+        }
+    }
+
+    fn world_with(wans: Vec<openfeo_config::Wan>) -> World {
+        World::new(
+            openfeo_config::Config {
+                wans,
+                ..openfeo_config::Config::default()
+            },
+            openfeo_config::PortMap::default(),
+        )
+    }
+
+    const FAMILY: PppoeClients = PppoeClients { secret: [7; 16] };
+
+    #[test]
+    fn the_family_wants_one_client_per_pppoe_wan() {
+        let world = world_with(vec![
+            pppoe_wan("wan0", "p0"),
+            openfeo_config::Wan {
+                name: "wan1".to_owned(),
+                port: "p1".to_owned(),
+                kind: Some(openfeo_config::wan::Kind::Dhcp(
+                    openfeo_config::DhcpWan::default(),
+                )),
+                ..openfeo_config::Wan::default()
+            },
+        ]);
+        let wanted = FAMILY.wanted(&world);
+        assert_eq!(wanted.keys().collect::<Vec<_>>(), ["wan0"]);
+        // The task is started with the slice and the family's secret.
+        let task = WanTask::of("wan0", &wanted["wan0"], FAMILY.secret);
+        assert_eq!((task.wan.as_str(), task.port.as_str()), ("wan0", "p0"));
+        assert_eq!(task.username, "openfeo@isp.example");
+        assert_eq!(task.password, b"example-secret");
+        assert_eq!(task.secret, [7; 16]);
+        let printed = format!("{task:?}");
+        assert!(!printed.contains("example-secret"), "{printed}");
+    }
+
+    #[test]
+    fn withdrawing_takes_the_session() {
+        let mut world = world_with(vec![pppoe_wan("wan0", "p0"), pppoe_wan("wan1", "p1")]);
+        for wan in ["wan0", "wan1"] {
+            Arc::make_mut(&mut world.pppoe).insert(
+                wan.to_owned(),
+                PppoeFact {
+                    session_id: 1,
+                    ac_mac: [2, 0, 0, 0, 0, 1],
+                    ac_name: "isp".to_owned(),
+                    unit: 0,
+                    mtu: 1492,
+                    ipv4: None,
+                    ipv6: None,
+                    up_since_ms: 0,
+                },
+            );
+            world.set_wan_cause(wan, "padt from ac");
+        }
+        FAMILY.withdraw("wan0", &mut world);
+        assert!(!world.pppoe.contains_key("wan0"));
+        assert_eq!(world.wan_status["wan0"].cause, None);
+        assert!(world.pppoe.contains_key("wan1"));
+        assert_eq!(
+            world.wan_status["wan1"].cause.as_deref(),
+            Some("padt from ac")
+        );
+    }
+
+    /// A WAN whose port never gets a link, or whose port is waiting to be raised to 1508, is
+    /// waiting on the World: a stop must end it there.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_waiting_for_its_port_stops_at_once() {
+        let (publisher, world_rx) = Publisher::new(world_with(vec![pppoe_wan("wan0", "p0")]));
+        let publisher = Arc::new(publisher);
+        let slice = FAMILY.wanted(&publisher.current())["wan0"].clone();
+        let supervisor = openfeo_runtime::Supervisor::new(openfeo_runtime::HealthTracker::new());
+        let task = supervisor.spawn_stoppable("pppoe-wan0", move |stop| {
+            FAMILY.run("wan0", &slice, publisher.clone(), world_rx.clone(), stop)
+        });
+        tokio::time::sleep(secs(1)).await;
+        let asked = tokio::time::Instant::now();
+        task.stop().await;
+        assert!(
+            asked.elapsed() < Duration::from_millis(1),
+            "took {:?}: the task did not hear the stop",
+            asked.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_stopped_task_does_not_wait_out_a_backoff() {
+        // Stopped by us: nothing to wait for, whatever the session's end would have earned.
+        assert_eq!(wait_after(true, secs(60)), None);
+        assert_eq!(wait_after(false, secs(60)), Some(secs(60)));
+        assert_eq!(wait_after(false, Duration::ZERO), None);
     }
 
     #[test]

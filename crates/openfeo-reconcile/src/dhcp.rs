@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 use ipnet::Ipv4Net;
 use openfeo_config::load::DEFAULT_DOMAIN;
 use openfeo_config::validate::parse_mac;
-use openfeo_config::{LanDhcp, StaticLease};
+use openfeo_config::{Config, LanDhcp, StaticLease};
 use openfeo_proto_dhcp4::identity::from_hex;
 use openfeo_proto_dhcp4::server::DEFAULT_LEASE_SECS;
 use openfeo_proto_dhcp4::{Reservation, ServerConfig};
@@ -47,6 +47,10 @@ pub struct DesiredDhcpServer {
     /// `[system] domain`, else `home.arpa`.
     pub domain: Option<String>,
     pub reservations: Vec<DesiredReservation>,
+    /// While a change of config is pending and touches this LAN: the longest lease granted,
+    /// the change's window (SPEC §5.5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_cap: Option<u32>,
 }
 
 /// The servers the World calls for, keyed by LAN name. A LAN without `[lans.dhcp]`, or whose
@@ -54,8 +58,22 @@ pub struct DesiredDhcpServer {
 /// skipped (validation already refused all of these).
 #[must_use]
 pub fn servers(world: &World) -> BTreeMap<String, DesiredDhcpServer> {
-    let domain = world
-        .config
+    let mut desired = servers_of(&world.config);
+    if let Some(pending) = &world.pending {
+        for (lan, server) in &mut desired {
+            if pending.lans.contains(lan) {
+                server.lease_cap = Some(pending.window_secs);
+            }
+        }
+    }
+    desired
+}
+
+/// The servers a config calls for by itself, keyed by LAN name: [`servers`] without what is
+/// pending.
+#[must_use]
+pub fn servers_of(config: &Config) -> BTreeMap<String, DesiredDhcpServer> {
+    let domain = config
         .system
         .as_ref()
         .map(|system| system.domain.as_str())
@@ -63,7 +81,7 @@ pub fn servers(world: &World) -> BTreeMap<String, DesiredDhcpServer> {
         .unwrap_or(DEFAULT_DOMAIN)
         .to_owned();
     let mut desired = BTreeMap::new();
-    for lan in &world.config.lans {
+    for lan in &config.lans {
         let Some(dhcp) = &lan.dhcp else {
             continue;
         };
@@ -85,6 +103,7 @@ pub fn servers(world: &World) -> BTreeMap<String, DesiredDhcpServer> {
                 ntp: addrs_or_router(&dhcp.ntp, net.addr()),
                 domain: Some(domain.clone()),
                 reservations: dhcp.r#static.iter().filter_map(reservation).collect(),
+                lease_cap: None,
             },
         );
     }
@@ -99,6 +118,7 @@ pub fn server_config(desired: &DesiredDhcpServer) -> ServerConfig {
         prefix: desired.prefix,
         pool: desired.pool,
         lease_secs: desired.lease_secs,
+        lease_cap: desired.lease_cap,
         dns: desired.dns.clone(),
         ntp: desired.ntp.clone(),
         domain: desired.domain.clone(),
@@ -275,5 +295,64 @@ mod tests {
                 hostname: None,
             }
         );
+    }
+
+    fn pending(window_secs: u32, lans: &[&str]) -> Arc<openfeo_world::PendingFact> {
+        Arc::new(openfeo_world::PendingFact {
+            confirmed: Arc::default(),
+            applied_boot_ms: 1_000,
+            reverts_boot_ms: 1_000 + u64::from(window_secs) * 1_000,
+            window_secs,
+            effects: Vec::new(),
+            lans: lans.iter().map(|lan| (*lan).to_owned()).collect(),
+        })
+    }
+
+    #[test]
+    fn a_pending_change_caps_the_leases_of_a_lan_it_touches() {
+        let mut world = fixtures::vlans_world();
+        assert_eq!(servers(&world)["lan0"].lease_cap, None);
+        let configured = servers(&world)["lan0"].lease_secs;
+        assert!(configured > 120, "the fixture's lease is {configured} s");
+        world.pending = Some(pending(120, &["lan0"]));
+        let desired = servers(&world);
+        assert_eq!(desired["lan0"].lease_cap, Some(120));
+        assert_eq!(
+            desired["lan0"].lease_secs, configured,
+            "what the config says"
+        );
+        // The core is told both: it grants at most the cap and restores in full.
+        let core = server_config(&desired["lan0"]);
+        assert_eq!((core.lease_secs, core.lease_cap), (configured, Some(120)));
+        // A LAN the change does not touch keeps its time.
+        let other = desired
+            .iter()
+            .find(|(name, _)| name.as_str() != "lan0")
+            .map(|(_, server)| server)
+            .expect("the fixture has a second LAN with a server");
+        assert_eq!(other.lease_cap, None);
+        assert_eq!(server_config(other).lease_cap, None);
+        // What the config alone asks for carries no cap.
+        assert_eq!(servers_of(&world.config)["lan0"].lease_cap, None);
+    }
+
+    #[test]
+    fn a_cap_longer_than_the_lease_changes_nothing() {
+        let mut world = fixtures::static_world();
+        let mut config = (*world.config).clone();
+        config.lans[0].dhcp.as_mut().unwrap().lease_secs = 60;
+        world.config = Arc::new(config);
+        world.pending = Some(pending(600, &["lan0"]));
+        let desired = servers(&world);
+        assert_eq!(desired["lan0"].lease_cap, Some(600));
+        let core = server_config(&desired["lan0"]);
+        assert_eq!((core.lease_secs, core.lease_cap), (60, Some(600)));
+    }
+
+    #[test]
+    fn a_server_with_no_cap_serialises_as_it_did() {
+        let desired = servers_of(&fixtures::static_world().config);
+        let text = serde_json::to_string(&desired["lan0"]).unwrap();
+        assert!(!text.contains("lease_cap"), "{text}");
     }
 }

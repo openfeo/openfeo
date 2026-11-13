@@ -7,6 +7,7 @@
 //! the box's DUID under `/state/identity` (SPEC §5.2). Every line logged here is a contract with
 //! the harness scenarios.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read as _};
@@ -17,18 +18,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ipnet::Ipv4Net;
 use openfeo_config::load::STATE_FILE_MODE;
-use openfeo_config::{Dhcp4Lease, Dhcp4Route, file, wan};
+use openfeo_config::{Dhcp4Lease, Dhcp4Route, file};
 use openfeo_net::dhcp4::{Driver, DriverConfig, Event};
 use openfeo_platform::atomic;
 use openfeo_proto_dhcp4::identity::{client_id, duid_ll, from_hex, hex, iaid};
 use openfeo_proto_dhcp4::wire::ClasslessRoute;
 use openfeo_proto_dhcp4::{ClientConfig, Lease, Unbound};
-use openfeo_runtime::supervise::TaskError;
+use openfeo_reconcile::slices::{Dhcp4ClientSlice, dhcp4_clients};
+use openfeo_runtime::Publisher;
+use openfeo_runtime::supervise::{BoxedTask, Stop, TaskError};
 use openfeo_runtime::world::WorldRx;
-use openfeo_runtime::{Publisher, Supervisor};
 use openfeo_world::{Dhcp4Fact, LinkFact, World};
 use tracing::{debug, info, warn};
 
+use crate::family::Family;
 use crate::state;
 
 /// The box's DUID (DUID-LL, RFC 8415 §11.4) as lowercase hex (SPEC §5.2 `identity/`).
@@ -221,47 +224,71 @@ fn options_line(wan: &str, lease: &Lease) -> String {
     )
 }
 
-/// One supervised task per `[wans.dhcp]` WAN in the current configuration.
-pub fn spawn_all(supervisor: &Supervisor, publisher: &Arc<Publisher>, world_rx: &WorldRx) {
-    let config = publisher.current().config.clone();
-    for wan in &config.wans {
-        let Some(wan::Kind::Dhcp(dhcp)) = &wan.kind else {
-            continue;
-        };
-        let task = WanTask {
-            wan: wan.name.clone(),
-            port: openfeo_reconcile::wan_ifname(wan),
-            hostname: (!dhcp.hostname.is_empty()).then(|| dhcp.hostname.clone()),
-            vendor_class: (!dhcp.vendor_class.is_empty())
-                .then(|| dhcp.vendor_class.clone().into_bytes()),
-        };
-        let publisher = publisher.clone();
-        let world_rx = world_rx.clone();
-        supervisor.spawn(format!("dhcp4-{}", wan.name), move || {
-            let task = task.clone();
-            let publisher = publisher.clone();
-            let world_rx = world_rx.clone();
-            async move { run(&task, &publisher, world_rx).await }
-        });
+/// The DHCPv4 client of every WAN of kind DHCP (SPEC §7.2), kept in step with the config by
+/// its manager ([`crate::family`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Dhcp4Clients;
+
+impl Family for Dhcp4Clients {
+    type Slice = Dhcp4ClientSlice;
+    const PREFIX: &'static str = "dhcp4";
+
+    fn wanted(&self, world: &World) -> BTreeMap<String, Dhcp4ClientSlice> {
+        dhcp4_clients(&world.config)
+    }
+
+    fn run(
+        &self,
+        key: &str,
+        slice: &Dhcp4ClientSlice,
+        publisher: Arc<Publisher>,
+        world_rx: WorldRx,
+        stop: Stop,
+    ) -> BoxedTask {
+        let (wan, slice) = (key.to_owned(), slice.clone());
+        Box::pin(async move { run(&wan, &slice, &publisher, world_rx, stop).await })
+    }
+
+    /// The lease goes, and with it the address and routes the appliers made of it; the lease
+    /// file stays, for a WAN that is given this kind again.
+    fn withdraw(&self, key: &str, world: &mut World) {
+        Arc::make_mut(&mut world.dhcp4).remove(key);
+        clear_wan_cause(world, key);
     }
 }
 
-#[derive(Debug, Clone)]
-struct WanTask {
-    wan: String,
-    port: String,
-    hostname: Option<String>,
-    vendor_class: Option<Vec<u8>>,
+/// Forget the cause a WAN's stopped task last gave: whatever runs the WAN next says its own.
+pub(crate) fn clear_wan_cause(world: &mut World, wan: &str) {
+    if world
+        .wan_status
+        .get(wan)
+        .is_some_and(|status| status.cause.is_some())
+        && let Some(status) = Arc::make_mut(&mut world.wan_status).get_mut(wan)
+    {
+        status.cause = None;
+    }
+}
+
+fn stopped_line(wan: &str) -> String {
+    format!("wan {wan} dhcp stopped")
 }
 
 /// The task: wait for the port, settle the identity, run the driver, publish what it says, and
 /// tell it about carrier changes.
 async fn run(
-    task: &WanTask,
+    wan: &str,
+    slice: &Dhcp4ClientSlice,
     publisher: &Publisher,
     mut world_rx: WorldRx,
+    mut stop: Stop,
 ) -> Result<(), TaskError> {
-    let (ifindex, mac) = wait_for_link(&mut world_rx, &task.port).await?;
+    let (ifindex, mac) = tokio::select! {
+        link = wait_for_link(&mut world_rx, &slice.port) => link?,
+        () = stop.requested() => {
+            info!("{}", stopped_line(wan));
+            return Ok(());
+        }
+    };
     let lowest = lowest_port_mac(&world_rx.borrow()).unwrap_or(mac);
     let duid = match load_or_create_duid(Path::new(DUID_PATH), lowest) {
         Ok((duid, new)) => {
@@ -277,16 +304,15 @@ async fn run(
             duid_ll(lowest)
         }
     };
-    let path = lease_path(&task.wan);
-    let initial_lease = read_lease(&path, &task.wan, mac);
+    let path = lease_path(wan);
+    let initial_lease = read_lease(&path, wan, mac);
     let mut client = ClientConfig::new(mac, client_id(iaid(mac), &duid));
-    client.hostname = task.hostname.clone();
-    client.vendor_class = task.vendor_class.clone();
-    let failed = |err: openfeo_net::dhcp4::DriverError| {
-        TaskError::from(format!("dhcp4 {}: {err}", task.wan))
-    };
+    client.hostname = slice.hostname.clone();
+    client.vendor_class = slice.vendor_class.clone();
+    let failed =
+        |err: openfeo_net::dhcp4::DriverError| TaskError::from(format!("dhcp4 {wan}: {err}"));
     let mut driver = Driver::new(DriverConfig {
-        ifname: task.port.clone(),
+        ifname: slice.port.clone(),
         ifindex,
         mac,
         client,
@@ -302,7 +328,7 @@ async fn run(
                 changed.map_err(|_| "world publisher gone")?;
                 let (up, index) = {
                     let world = world_rx.borrow_and_update();
-                    let link = world.links.get(&task.port);
+                    let link = world.links.get(&slice.port);
                     (
                         link.is_some_and(|link| link.up && link.carrier),
                         link.map(|link| link.index),
@@ -314,8 +340,8 @@ async fn run(
                     // The device was replaced (a USB NIC re-plugged, say): the sockets are bound
                     // to the old index, so start over.
                     return Err(format!(
-                        "dhcp4 {}: {} changed index {ifindex} -> {index}; restarting",
-                        task.wan, task.port
+                        "dhcp4 {wan}: {} changed index {ifindex} -> {index}; restarting",
+                        slice.port
                     )
                     .into());
                 }
@@ -325,10 +351,35 @@ async fn run(
                 carrier = up;
                 driver.link(carrier).map_err(failed)?
             }
+            () = stop.requested() => {
+                // The lease goes back while its address is still on the port: the manager
+                // takes the fact out, and with it the appliers the address, once this returns.
+                // (A WAN moved to another port or tag is the exception: SPEC §6.3.)
+                if let Err(err) = driver.release() {
+                    warn!("wan {wan} dhcp release: {err}");
+                }
+                // A client stopped on purpose leaves nothing to start from: the lease was
+                // given back, or belongs to a port, a tag or a network the WAN is leaving. A
+                // successor that asked for it again would wait out a server with no record of
+                // it (RFC 2131 §4.3.2) before it began again with a DISCOVER.
+                forget_lease(&path, wan);
+                info!("{}", stopped_line(wan));
+                return Ok(());
+            }
         };
         for event in events {
-            publish(task, mac, &path, publisher, event).await;
+            publish(wan, mac, &path, publisher, event).await;
         }
+    }
+}
+
+/// Remove the stored lease, so that whatever runs this WAN next starts with a DISCOVER. A
+/// file that is not there is no trouble.
+fn forget_lease(path: &Path, wan: &str) {
+    if let Err(err) = fs::remove_file(path)
+        && err.kind() != io::ErrorKind::NotFound
+    {
+        warn!("wan {wan} dhcp cannot remove {}: {err}", path.display());
     }
 }
 
@@ -472,8 +523,7 @@ async fn save_lease(path: &Path, wan: &str, mac: [u8; 6], lease: &Lease) {
 /// Keep the file, log the contract line, publish the fact: `bound` promises the lease is on disk
 /// for INIT-REBOOT (SPEC §5.2), so the save comes first, and a reset the moment the line shows
 /// finds the lease.
-async fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publisher, event: Event) {
-    let wan = &task.wan;
+async fn publish(wan: &str, mac: [u8; 6], path: &Path, publisher: &Publisher, event: Event) {
     match event {
         Event::Discover => info!("wan {wan} dhcp discover"),
         Event::Offer { address, server } => info!("wan {wan} dhcp offer {address} from {server}"),
@@ -492,18 +542,14 @@ async fn publish(task: &WanTask, mac: [u8; 6], path: &Path, publisher: &Publishe
             }
             let fact = fact_from(&lease);
             publisher.update(|world| {
-                Arc::make_mut(&mut world.dhcp4).insert(wan.clone(), fact);
+                Arc::make_mut(&mut world.dhcp4).insert(wan.to_owned(), fact);
             });
         }
         Event::Unbound(why) => {
             match &why {
                 Unbound::Nak(text) => {
                     info!("wan {wan} dhcp nak {}", text.as_deref().unwrap_or("-"));
-                    if let Err(err) = fs::remove_file(path)
-                        && err.kind() != io::ErrorKind::NotFound
-                    {
-                        warn!("wan {wan} dhcp cannot remove {}: {err}", path.display());
-                    }
+                    forget_lease(path, wan);
                 }
                 Unbound::Expired => info!("wan {wan} dhcp expired"),
                 Unbound::RebootTimedOut => info!("wan {wan} dhcp reboot timed out"),
@@ -739,6 +785,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_stopped_line_is_the_contract() {
+        assert_eq!(stopped_line("wan0"), "wan wan0 dhcp stopped");
+    }
+
+    fn world_with(config: openfeo_config::Config) -> World {
+        World::new(config, openfeo_config::PortMap::default())
+    }
+
+    fn dhcp_wan(name: &str, port: &str) -> openfeo_config::Wan {
+        openfeo_config::Wan {
+            name: name.to_owned(),
+            port: port.to_owned(),
+            kind: Some(openfeo_config::wan::Kind::Dhcp(
+                openfeo_config::DhcpWan::default(),
+            )),
+            ..openfeo_config::Wan::default()
+        }
+    }
+
+    #[test]
+    fn the_family_wants_one_client_per_dhcp_wan() {
+        let config = openfeo_config::Config {
+            wans: vec![
+                dhcp_wan("wan0", "p0"),
+                openfeo_config::Wan {
+                    name: "wan1".to_owned(),
+                    port: "p1".to_owned(),
+                    kind: Some(openfeo_config::wan::Kind::Static(
+                        openfeo_config::StaticWan::default(),
+                    )),
+                    ..openfeo_config::Wan::default()
+                },
+                dhcp_wan("wan2", "p4"),
+            ],
+            ..openfeo_config::Config::default()
+        };
+        let wanted = Dhcp4Clients.wanted(&world_with(config));
+        assert_eq!(wanted.keys().collect::<Vec<_>>(), ["wan0", "wan2"]);
+        assert_eq!(wanted["wan2"].port, "p4");
+    }
+
+    /// What a client stopped on purpose does to its stored lease, and a NAK before it.
+    #[test]
+    fn a_forgotten_lease_is_gone_and_a_missing_one_is_no_trouble() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dhcp4-wan0.toml");
+        std::fs::write(&path, "lease").unwrap();
+        forget_lease(&path, "wan0");
+        assert!(!path.exists());
+        forget_lease(&path, "wan0");
+    }
+
+    #[test]
+    fn withdrawing_takes_the_lease_and_the_cause() {
+        let mut world = world_with(openfeo_config::Config::default());
+        for wan in ["wan0", "wan1"] {
+            Arc::make_mut(&mut world.dhcp4).insert(wan.to_owned(), fact_from(&sample_lease()));
+            world.set_wan_cause(wan, "nak");
+        }
+        Dhcp4Clients.withdraw("wan0", &mut world);
+        assert!(!world.dhcp4.contains_key("wan0"));
+        assert_eq!(world.wan_status["wan0"].cause, None);
+        // The other WAN's are its own.
+        assert!(world.dhcp4.contains_key("wan1"));
+        assert_eq!(world.wan_status["wan1"].cause.as_deref(), Some("nak"));
+        // A WAN with nothing published is no trouble.
+        Dhcp4Clients.withdraw("wan9", &mut world);
+    }
+
+    /// A WAN whose port never gets a link must still be stoppable: its task is waiting for the
+    /// World, not for the driver.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_waiting_for_its_port_stops_at_once() {
+        let config = openfeo_config::Config {
+            wans: vec![dhcp_wan("wan0", "p0")],
+            ..openfeo_config::Config::default()
+        };
+        let (publisher, world_rx) = Publisher::new(world_with(config));
+        let publisher = Arc::new(publisher);
+        let slice = Dhcp4Clients.wanted(&publisher.current())["wan0"].clone();
+        let supervisor = openfeo_runtime::Supervisor::new(openfeo_runtime::HealthTracker::new());
+        let task = supervisor.spawn_stoppable("dhcp4-wan0", move |stop| {
+            Dhcp4Clients.run("wan0", &slice, publisher.clone(), world_rx.clone(), stop)
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let asked = tokio::time::Instant::now();
+        task.stop().await;
+        assert!(
+            asked.elapsed() < std::time::Duration::from_millis(1),
+            "took {:?}: the task did not hear the stop",
+            asked.elapsed()
+        );
+    }
+
     /// `bound` is the contract that the lease is kept for INIT-REBOOT (SPEC §5.2): the file is
     /// on disk before the line is logged, so a reset the moment the line appears finds it.
     #[tokio::test]
@@ -751,18 +892,12 @@ mod tests {
             ring.clone(),
             Some(Box::new(std::io::sink())),
         ));
-        let task = WanTask {
-            wan: "wan0".to_owned(),
-            port: "p0".to_owned(),
-            hostname: None,
-            vendor_class: None,
-        };
         let (publisher, _rx) = Publisher::new(World::new(
             openfeo_config::Config::default(),
             openfeo_config::PortMap::default(),
         ));
         publish(
-            &task,
+            "wan0",
             MAC,
             &path,
             &publisher,

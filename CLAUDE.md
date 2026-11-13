@@ -111,7 +111,20 @@ and Chromium fails a first connection made in that instant with `ERR_NETWORK_CHA
 asks the lab to take a port's carrier away and give it back through a control directory (`harness::web::LabCtl`,
 `web/scripts/labctl.mjs`). They need Node 22.12 or later with `web/node_modules` installed, and the browser run
 needs `make panel-browser`; without them they skip with the reason and `make check-env` says which. The browser
-run leaves a screenshot of each screen in both themes in `$(BUILD)/panel-shots`.
+run leaves a screenshot of each screen in both themes in `$(BUILD)/panel-shots`. Fifteen `m4` scenarios (M4 part
+2a) change the config of a running router through `ConfigService` (`Ws::{config, validate, apply, confirm, revert}`
+in `harness::apiclient`). A scenario names its own window in the apply (10 s is the least); a harness build also
+takes `openfeo.confirm_secs=<10..600>` on the kernel command line as the default window, for a run that cannot name
+one (release builds carry no such knob). A scenario that moves `lan0` sends the apply without waiting for its answer
+(`applied_moving`: the router answers once the config is published, and the address the socket arrived at may be gone
+first), reads `config: applied; confirm within <n> s` on the console and follows the router by re-homing the LAN host
+(`rehome`); every change scenario ends with `no_task_failed`, since a change is the config changing and not a task
+failing. Two of them boot `vm-pppoe.toml` against the access concentrator and one starts it beside Kea on isp0 for a
+WAN that changes type (`daemons::require_access_concentrator`: they skip as the `m3` suite does); the tag scenario
+needs `8021q`, the added-LAN one calls `Lab::add_lan1`, and one starts the lab's SNTP server a year ahead after a
+lease was taken (`Lab::start_sntp`), so the router steps its clock at its next poll, up to 16 s later. `FILTER` picks scenarios by name across every suite, not a
+suite: one suite alone is `cargo test -p openfeo-harness --test m4` with `OPENFEO_KERNEL` (and `OPENFEO_SHOTS` for the
+browser run) set as `make test-harness` sets them.
 
 ## Cloud sandbox
 `scripts/cloud-setup.sh` is the setup script for an ephemeral Ubuntu 24.04 sandbox (a Claude Code on the web

@@ -263,6 +263,7 @@ pub fn routing(world: &World) -> DesiredRouting {
             }
             None => {}
         }
+        departing_lease(world, wan_config, &mut desired);
     }
     for block in public::blocks(&world.config) {
         desired.routes.insert(DesiredRoute {
@@ -277,6 +278,23 @@ pub fn routing(world: &World) -> DesiredRouting {
         });
     }
     desired
+}
+
+/// A WAN that is no longer DHCP while its lease is still in the World: the DHCPv4 client has
+/// been asked to stop and gives the lease back from its address (RFC 2131 §4.4.4), so the
+/// address stays on the port until the client has gone and taken the fact with it (SPEC §6.3).
+/// The lease's routes go at once: they could contend with the new type's.
+fn departing_lease(world: &World, wan_config: &openfeo_config::Wan, desired: &mut DesiredRouting) {
+    if !matches!(wan_config.kind, Some(wan::Kind::Dhcp(_)))
+        && let Some(lease) = world.dhcp4.get(&wan_config.name)
+    {
+        desired.addrs.insert(DesiredAddr {
+            ifname: crate::wan_ifname(wan_config),
+            net: IpNet::V4(lease.address),
+            peer: None,
+            lifetimes: None,
+        });
+    }
 }
 
 /// Every LAN's address on its bridge: IPv4 from the configuration, IPv6 `::1/64` of every
@@ -1239,6 +1257,43 @@ mod tests {
             ],
             "nothing via the ignored router option"
         );
+    }
+
+    /// A WAN that was DHCP and is PPPoE now, with its lease still in the World: the DHCPv4
+    /// client has been asked to stop and gives the lease back from its address (RFC 2131
+    /// §4.4.4), which stays on the port until the client has gone and taken the fact with it.
+    /// The lease's routes are not kept.
+    #[test]
+    fn a_wan_keeps_its_lease_address_while_its_dhcp_client_is_stopping() {
+        let mut world = fixtures::dhcp_world();
+        let leased = IpNet::V4(world.dhcp4["wan0"].address);
+        let mut config = (*world.config).clone();
+        config.wans[0].kind = Some(wan::Kind::Pppoe(openfeo_config::PppoeWan {
+            username: "someone@isp.example".into(),
+            password: "example-secret".into(),
+            ..Default::default()
+        }));
+        world.config = std::sync::Arc::new(config);
+        let desired = routing(&world);
+        assert!(
+            desired
+                .addrs
+                .iter()
+                .any(|addr| addr.ifname == "p0" && addr.net == leased),
+            "{:?}",
+            desired.addrs
+        );
+        assert!(
+            !desired
+                .routes
+                .iter()
+                .any(|route| route.ifname.as_deref() == Some("p0")),
+            "{:?}",
+            desired.routes
+        );
+        // The client gone, nothing of the lease is left on the port.
+        world.dhcp4 = std::sync::Arc::default();
+        assert!(!routing(&world).addrs.iter().any(|addr| addr.ifname == "p0"));
     }
 
     #[test]

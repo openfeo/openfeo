@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 use crate::auth::Source;
 use crate::cert::{self, Action, CertError, CertMeta, Clock};
 use crate::gate::{host_allowed, https_authority};
-use crate::http::Peer;
+use crate::http::{Local, Peer};
 use crate::limits::MAX_STREAMS;
 use crate::server::Shared;
 use crate::watched::Watched;
@@ -173,6 +173,7 @@ impl Server {
             version: deps.version,
             limits: deps.limits,
             extra_host: deps.extra_host,
+            default_window_secs: deps.confirm_secs,
         });
         let loaded = cert::load(&deps.tls_dir).unwrap_or_else(|err| {
             warn!("tls: {err}; issuing a new certificate");
@@ -250,7 +251,12 @@ impl Server {
             all: Arc::new(Semaphore::new(self.shared.limits.connections)),
             per_source: Arc::new(PerSource::default()),
         };
-        tasks.spawn(remember_events(self.shared.clone()));
+        // The recorder is listening before anything below can say something: an event of the
+        // API's own start is in the backlog.
+        let events = self.shared.publisher.events();
+        tasks.spawn(remember_events(self.shared.clone(), events));
+        self.shared.settle_at_start();
+        tasks.spawn(crate::config::keep_window(self.shared.clone()));
         tasks.spawn({
             let telemetry = self.shared.telemetry.clone();
             async move {
@@ -284,8 +290,10 @@ impl Server {
 }
 
 /// Keep the recent events for later subscribers.
-async fn remember_events(shared: Arc<Shared>) -> Result<(), TaskError> {
-    let mut events = shared.publisher.events();
+async fn remember_events(
+    shared: Arc<Shared>,
+    mut events: broadcast::Receiver<Arc<openfeo_world::Event>>,
+) -> Result<(), TaskError> {
     loop {
         match events.recv().await {
             Ok(event) => shared.remember(event),
@@ -436,7 +444,15 @@ async fn accept_https(
             shared.limits.handshake,
             shared.limits.idle,
         );
-        let service = TowerToHyperService::new(router.clone().layer(Extension(Peer(peer))));
+        // Where the connection arrived, as canonical as where it came from. A socket that
+        // cannot say is gone already; the peer's own address then stands in and names no LAN.
+        let local = stream.local_addr().map_or(peer, canonical);
+        let service = TowerToHyperService::new(
+            router
+                .clone()
+                .layer(Extension(Peer(peer)))
+                .layer(Extension(Local(local))),
+        );
         tokio::spawn(async move {
             let Ok(Ok(tls)) = tokio::time::timeout(limit, acceptor.accept(stream)).await else {
                 debug!("api: {peer} did not finish its handshake");
