@@ -46,7 +46,8 @@ enum ConfigEffectKind {
   CONFIG_EFFECT_KIND_UNSPECIFIED = 0;
   CONFIG_EFFECT_KIND_WAN_ADDED = 1;
   CONFIG_EFFECT_KIND_WAN_REMOVED = 2;
-  // Its clients are restarted: it drops and comes back.
+  // It drops and comes back: its clients are restarted, or a static WAN's address, gateway,
+  // port or tag is replaced.
   CONFIG_EFFECT_KIND_WAN_RECONNECTS = 3;
   CONFIG_EFFECT_KIND_LAN_ADDED = 4;
   CONFIG_EFFECT_KIND_LAN_REMOVED = 5;

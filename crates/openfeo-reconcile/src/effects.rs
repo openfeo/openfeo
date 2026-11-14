@@ -5,7 +5,8 @@
 //! which LANs move or have their DHCP server restarted, what is added and removed. It is
 //! worked out from the same slices the task managers compare ([`crate::slices`],
 //! [`crate::dhcp::servers_of`]), so what the router says a change will interrupt is what it
-//! then interrupts. A change that touches no slice (a priority, a firewall rule, a DNS
+//! then interrupts. A static WAN has no task; its address, gateway, port and tag are compared
+//! too, since replacing any of them drops what was running over it. A change that touches no slice (a priority, a firewall rule, a DNS
 //! record) has no effects: it takes hold without restarting anything.
 
 use std::collections::BTreeSet;
@@ -24,9 +25,11 @@ fn effect(subject: &str, kind: EffectKind) -> Effect {
     }
 }
 
-/// Whether every slice of the WAN `name` is the same in both configs.
+/// Whether every slice of the WAN `name` is the same in both configs: those its tasks are
+/// started from, and where a static WAN sits and what was typed for it.
 fn wan_unchanged(old: &Config, new: &Config, name: &str) -> bool {
-    slices::dhcp4_clients(old).get(name) == slices::dhcp4_clients(new).get(name)
+    slices::static_wans(old).get(name) == slices::static_wans(new).get(name)
+        && slices::dhcp4_clients(old).get(name) == slices::dhcp4_clients(new).get(name)
         && slices::pppoe_clients(old).get(name) == slices::pppoe_clients(new).get(name)
         && slices::ra_clients(old).get(name) == slices::ra_clients(new).get(name)
         && slices::dhcp6_clients(old).get(name) == slices::dhcp6_clients(new).get(name)
@@ -163,6 +166,18 @@ mod tests {
         (*fixtures::vlans_world().config).clone()
     }
 
+    /// `vm-static.toml`: `wan0` on `p0` at 203.0.113.10/24 by way of 203.0.113.1.
+    fn fixed() -> Config {
+        (*fixtures::static_world().config).clone()
+    }
+
+    fn fixed_wan(config: &mut Config) -> &mut openfeo_config::StaticWan {
+        let Some(wan::Kind::Static(fixed)) = &mut config.wans[0].kind else {
+            panic!("the fixture's WAN is static");
+        };
+        fixed
+    }
+
     fn effect(subject: &str, kind: EffectKind) -> Effect {
         Effect {
             subject: subject.to_owned(),
@@ -282,6 +297,61 @@ mod tests {
         assert_eq!(
             effects(&new, &dhcp()),
             [effect("wan1", EffectKind::WanRemoved)]
+        );
+    }
+
+    #[test]
+    fn a_static_wan_whose_address_or_gateway_changes_reconnects() {
+        let mut new = fixed();
+        fixed_wan(&mut new).address = "203.0.113.20/24".to_owned();
+        assert_eq!(
+            effects(&fixed(), &new),
+            [effect("wan0", EffectKind::WanReconnects)]
+        );
+        let mut new = fixed();
+        fixed_wan(&mut new).gateway = "203.0.113.254".to_owned();
+        assert_eq!(
+            effects(&fixed(), &new),
+            [effect("wan0", EffectKind::WanReconnects)]
+        );
+    }
+
+    #[test]
+    fn a_static_wan_moved_to_another_port_or_tag_reconnects() {
+        let mut new = fixed();
+        new.wans[0].port = "p1".to_owned();
+        assert_eq!(
+            effects(&fixed(), &new),
+            [effect("wan0", EffectKind::WanReconnects)]
+        );
+        let mut new = fixed();
+        new.wans[0].vlan = 911;
+        assert_eq!(
+            effects(&fixed(), &new),
+            [effect("wan0", EffectKind::WanReconnects)]
+        );
+    }
+
+    #[test]
+    fn a_static_wan_whose_priority_or_dns_changes_interrupts_nothing() {
+        let mut new = fixed();
+        new.wans[0].priority += 5;
+        fixed_wan(&mut new).dns = vec!["203.0.113.53".to_owned()];
+        assert_eq!(effects(&fixed(), &new), Vec::new());
+    }
+
+    #[test]
+    fn a_static_wan_that_becomes_dhcp_reconnects_once() {
+        let mut new = fixed();
+        new.wans[0].kind = Some(wan::Kind::Dhcp(openfeo_config::DhcpWan::default()));
+        assert_eq!(
+            effects(&fixed(), &new),
+            [effect("wan0", EffectKind::WanReconnects)]
+        );
+        // And the other way: the client stops and the address is typed.
+        assert_eq!(
+            effects(&new, &fixed()),
+            [effect("wan0", EffectKind::WanReconnects)]
         );
     }
 
@@ -423,6 +493,7 @@ mod tests {
                 for wan in &new.wans {
                     let name = &wan.name;
                     let same = old.wans.iter().any(|other| &other.name == name)
+                        && slices::static_wans(old).get(name) == slices::static_wans(new).get(name)
                         && slices::dhcp4_clients(old).get(name)
                             == slices::dhcp4_clients(new).get(name)
                         && slices::pppoe_clients(old).get(name)
