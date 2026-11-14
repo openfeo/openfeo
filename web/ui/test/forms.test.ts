@@ -8,7 +8,21 @@
 import { mount } from '@vue/test-utils'
 import { expect, test } from 'vitest'
 
-import { OfoAdvanced, OfoChoice, OfoChoiceGroup, OfoFormSection, OfoInput, OfoSelect, OfoToggle } from '../src/index'
+import {
+  ICONS,
+  OfoAdvanced,
+  OfoChangeList,
+  OfoChoice,
+  OfoChoiceGroup,
+  OfoDialog,
+  OfoFormSection,
+  OfoInput,
+  OfoSaveBar,
+  OfoSelect,
+  OfoTabs,
+  OfoToggle,
+  type TabEntry,
+} from '../src/index'
 
 /** Every piece of markup a test here mounted, for the last test to look through. */
 const mounted: string[] = []
@@ -212,6 +226,228 @@ test('a disabled control cannot be changed', () => {
   expect((toggle.find('input').element as HTMLInputElement).disabled).toBe(true)
   const select = seen(mount(OfoSelect, { props: { modelValue: 'a', options: [{ value: 'a', label: 'A' }], disabled: true } }))
   expect((select.element as HTMLSelectElement).disabled).toBe(true)
+})
+
+const TABS: TabEntry[] = [
+  { id: 'lan0', label: 'lan0', count: '14 clients' },
+  { id: 'guest', label: 'guest', count: '1 client' },
+  { id: 'iot', label: 'iot', pill: { text: 'problem', tone: 'danger' } },
+]
+
+test('tabs are a tablist; the chosen one is selected and the only one in the tab order', () => {
+  const tabs = seen(mount(OfoTabs, { props: { tabs: TABS, modelValue: 'guest', panel: 'lan-panel' } }))
+  expect(tabs.element.tagName).toBe('DIV')
+  expect(tabs.classes()).toEqual(['ofo-tabs'])
+  expect(tabs.attributes('role')).toBe('tablist')
+  const buttons = tabs.findAll('button')
+  expect(buttons.map((button) => button.attributes('role'))).toEqual(['tab', 'tab', 'tab'])
+  expect(buttons.map((button) => button.attributes('type'))).toEqual(['button', 'button', 'button'])
+  expect(buttons.map((button) => button.attributes('aria-selected'))).toEqual(['false', 'true', 'false'])
+  expect(buttons.map((button) => button.attributes('tabindex'))).toEqual(['-1', '0', '-1'])
+  expect(buttons.map((button) => button.attributes('aria-controls'))).toEqual(['lan-panel', 'lan-panel', 'lan-panel'])
+})
+
+test('a click on a tab chooses it', async () => {
+  const tabs = seen(mount(OfoTabs, { props: { tabs: TABS, modelValue: 'lan0', panel: 'p' } }))
+  await tabs.findAll('button')[2]?.trigger('click')
+  expect(tabs.emitted('update:modelValue')).toEqual([['iot']])
+})
+
+test('arrow keys move between tabs and choose, and stop at neither end', async () => {
+  const tabs = seen(mount(OfoTabs, { props: { tabs: TABS, modelValue: 'lan0', panel: 'p' }, attachTo: document.body }))
+  const buttons = tabs.findAll('button')
+  const chosen = () => tabs.emitted('update:modelValue')?.at(-1)?.[0]
+  await buttons[0]?.trigger('keydown', { key: 'ArrowRight' })
+  expect(chosen()).toBe('guest')
+  // The focus goes with the choice, so the next key is heard by the tab it chose.
+  expect(document.activeElement).toBe(buttons[1]?.element)
+  await tabs.setProps({ modelValue: 'guest' })
+  await buttons[1]?.trigger('keydown', { key: 'End' })
+  expect(chosen()).toBe('iot')
+  await tabs.setProps({ modelValue: 'iot' })
+  await buttons[2]?.trigger('keydown', { key: 'ArrowRight' })
+  expect(chosen()).toBe('lan0')
+  await tabs.setProps({ modelValue: 'lan0' })
+  await buttons[0]?.trigger('keydown', { key: 'ArrowLeft' })
+  expect(chosen()).toBe('iot')
+  await tabs.setProps({ modelValue: 'iot' })
+  await buttons[2]?.trigger('keydown', { key: 'Home' })
+  expect(chosen()).toBe('lan0')
+  // Any other key is the page's.
+  const before = tabs.emitted('update:modelValue')?.length
+  await buttons[0]?.trigger('keydown', { key: 'a' })
+  expect(tabs.emitted('update:modelValue')?.length).toBe(before)
+  tabs.unmount()
+})
+
+test('a tab shows its count or its pill', () => {
+  const tabs = seen(mount(OfoTabs, { props: { tabs: TABS, modelValue: 'lan0', panel: 'p' } }))
+  const buttons = tabs.findAll('button')
+  expect(buttons[0]?.find('.ofo-tabs__count').text()).toBe('14 clients')
+  expect(buttons[0]?.find('.ofo-pill').exists()).toBe(false)
+  expect(buttons[2]?.find('.ofo-tabs__count').exists()).toBe(false)
+  expect(buttons[2]?.find('.ofo-pill').classes()).toEqual(['ofo-pill', 'ofo-pill--danger'])
+  expect(buttons[2]?.find('.ofo-pill').text()).toBe('problem')
+  expect(buttons[2]?.text()).toContain('iot')
+})
+
+test('the save bar is absent with nothing to apply', () => {
+  const bar = seen(mount(OfoSaveBar, { props: { count: 0 } }))
+  expect(bar.find('.ofo-savebar').exists()).toBe(false)
+  expect(bar.text()).toBe('')
+})
+
+test('the save bar counts in the singular and the plural, and gives discard and apply', async () => {
+  const bar = seen(mount(OfoSaveBar, { props: { count: 1 } }))
+  expect(bar.classes()).toEqual(['ofo-savebar'])
+  expect(bar.text()).toContain('1 change not applied yet')
+  expect(bar.find('strong').text()).toBe('1')
+  const buttons = bar.findAll('.ofo-savebar__actions button')
+  expect(buttons.map((button) => button.text())).toEqual(['Discard', 'Apply changes'])
+  expect(buttons[0]?.classes()).toContain('ofo-btn--ghost')
+  expect(buttons[1]?.classes()).toContain('ofo-btn--primary')
+  await buttons[0]?.trigger('click')
+  await buttons[1]?.trigger('click')
+  expect(bar.emitted('discard')).toHaveLength(1)
+  expect(bar.emitted('apply')).toHaveLength(1)
+
+  await bar.setProps({ count: 3 })
+  expect(bar.text()).toContain('3 changes not applied yet')
+  expect(bar.find('strong').text()).toBe('3')
+
+  // While something is under way neither can be pressed.
+  await bar.setProps({ busy: true })
+  expect(bar.findAll('button').map((button) => (button.element as HTMLButtonElement).disabled)).toEqual([true, true])
+})
+
+test('the save bar says why an apply is held, and offers none', () => {
+  const bar = seen(mount(OfoSaveBar, { props: { count: 2, held: 'Confirm or revert the change that is waiting first.' } }))
+  expect(bar.findAll('button').map((button) => button.text())).toEqual(['Discard'])
+  expect(bar.find('.ofo-savebar__actions').text()).toContain('Confirm or revert the change that is waiting first.')
+})
+
+const DIALOG = {
+  props: { title: 'Apply 3 changes to openfeo?' },
+  slots: {
+    default: '<label><input id="box" type="checkbox"> Apply immediately</label>',
+    foot: '<button id="cancel" type="button">Cancel</button><button id="apply" type="button">Apply changes</button>',
+  },
+}
+
+test('a dialog is labelled by its title and says its role', () => {
+  const dialog = seen(mount(OfoDialog, { ...DIALOG, attachTo: document.body }))
+  expect(dialog.classes()).toEqual(['ofo-scrim'])
+  const box = dialog.find('.ofo-dialog')
+  expect(box.attributes('role')).toBe('alertdialog')
+  expect(box.attributes('aria-modal')).toBe('true')
+  const title = dialog.find('.ofo-dialog__body h2.ofo-dialog__title')
+  expect(title.text()).toBe('Apply 3 changes to openfeo?')
+  expect(title.attributes('id')).toBeTruthy()
+  expect(box.attributes('aria-labelledby')).toBe(title.attributes('id'))
+  expect(dialog.find('.ofo-dialog__body #box').exists()).toBe(true)
+  expect(dialog.findAll('.ofo-dialog__foot button')).toHaveLength(2)
+  dialog.unmount()
+
+  const form = seen(mount(OfoDialog, { props: { title: 'Add a WAN', role: 'dialog' }, attachTo: document.body }))
+  expect(form.find('.ofo-dialog').attributes('role')).toBe('dialog')
+  form.unmount()
+})
+
+test('a dialog takes the focus, keeps it, and gives it back', async () => {
+  const opener = document.createElement('button')
+  document.body.append(opener)
+  opener.focus()
+  const dialog = seen(mount(OfoDialog, { ...DIALOG, attachTo: document.body }))
+  const box = dialog.find('#box').element
+  const apply = dialog.find('#apply').element as HTMLElement
+  // It opens on its first control.
+  expect(document.activeElement).toBe(box)
+  // Tab from the last control comes round to the first, and Shift+Tab from the first to the last.
+  apply.focus()
+  const forward = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+  apply.dispatchEvent(forward)
+  expect(forward.defaultPrevented).toBe(true)
+  expect(document.activeElement).toBe(box)
+  const back = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true })
+  box.dispatchEvent(back)
+  expect(back.defaultPrevented).toBe(true)
+  expect(document.activeElement).toBe(apply)
+  // In the middle a Tab is the browser's own.
+  const cancel = dialog.find('#cancel').element as HTMLElement
+  cancel.focus()
+  const middle = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+  cancel.dispatchEvent(middle)
+  expect(middle.defaultPrevented).toBe(false)
+  // Focus that got out (a click on the page behind) is brought back by the next Tab.
+  opener.focus()
+  const stray = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+  opener.dispatchEvent(stray)
+  expect(document.activeElement).toBe(box)
+
+  dialog.unmount()
+  expect(document.activeElement).toBe(opener)
+  opener.remove()
+})
+
+test('a dialog opens on the control it is told to, when it is told', () => {
+  const dialog = seen(
+    mount(OfoDialog, {
+      props: { title: 'Apply 1 change to openfeo?' },
+      slots: {
+        default: '<input id="box" type="checkbox">',
+        foot: '<button id="cancel" type="button" autofocus>Cancel</button><button id="apply" type="button">Apply changes</button>',
+      },
+      attachTo: document.body,
+    }),
+  )
+  expect(document.activeElement).toBe(dialog.find('#cancel').element)
+  dialog.unmount()
+})
+
+test('escape cancels a dialog and a click on the scrim does not', async () => {
+  let cancels = 0
+  const dialog = seen(mount(OfoDialog, { ...DIALOG, props: { ...DIALOG.props, onCancel: () => (cancels += 1) }, attachTo: document.body }))
+  await dialog.trigger('click')
+  expect(cancels).toBe(0)
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  expect(cancels).toBe(1)
+  dialog.unmount()
+  // Gone, it listens to nothing.
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  expect(cancels).toBe(1)
+})
+
+test('a change is its subject, what was, and what will be', () => {
+  const list = seen(
+    mount(OfoChangeList, {
+      props: {
+        changes: [
+          { subject: 'lan0', what: 'address', before: '192.168.1.1/24', after: '192.168.2.1/24' },
+          { subject: 'wan1', what: 'WAN', before: '', after: 'added: PPPoE on p1.911' },
+          { subject: 'guest', what: 'LAN', before: '192.168.3.1/24 on p3', after: '' },
+          { subject: 'firewall.wan_ping', what: '', before: 'true', after: 'false' },
+        ],
+      },
+    }),
+  )
+  expect(list.element.tagName).toBe('UL')
+  expect(list.classes()).toEqual(['ofo-changes'])
+  const rows = list.findAll('li')
+  expect(rows).toHaveLength(4)
+  expect(rows[0]?.find('.ofo-changes__key').text()).toBe('lan0 address')
+  expect(rows[0]?.find('.ofo-changes__value s').text()).toBe('192.168.1.1/24')
+  expect(rows[0]?.find('.ofo-changes__value').text()).toBe('192.168.1.1/24 → 192.168.2.1/24')
+  // With nothing before, nothing is struck through; with nothing after, only what was.
+  expect(rows[1]?.find('s').exists()).toBe(false)
+  expect(rows[1]?.find('.ofo-changes__value').text()).toBe('added: PPPoE on p1.911')
+  expect(rows[2]?.find('.ofo-changes__value').text()).toBe('192.168.3.1/24 on p3')
+  expect(rows[2]?.find('s').exists()).toBe(true)
+  expect(rows[3]?.find('.ofo-changes__key').text()).toBe('firewall.wan_ping')
+})
+
+test('the icons of the two pages under Network are there', () => {
+  expect(ICONS.globe).toContain('<')
+  expect(ICONS.network).toContain('<')
 })
 
 test('no component carries a style attribute', () => {

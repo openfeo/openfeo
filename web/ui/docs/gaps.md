@@ -30,3 +30,11 @@ across, the working answer lives in `additions.css` or in a component, as noted.
   `additions.css` does.
 - There is one height of input. A table edited in place needs a smaller one:
   `ofo-input--sm` (30px) in `additions.css`.
+- There is no list for the changes a dialog confirms. `ofo-changes` in `additions.css` is the
+  approved mockup's: a 96px column for whose setting it is, then what it was (struck through,
+  muted) and what it becomes, in mono.
+- The save bar has no place for a sentence beside its buttons. `ofo-savebar__held` in
+  `additions.css` holds why an apply is not offered (another change is waiting to be
+  confirmed).
+- The Dialog guideline does not say which control takes the focus when it opens. Here it is
+  the one marked `autofocus`, or else the first.

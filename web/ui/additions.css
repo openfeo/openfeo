@@ -33,3 +33,16 @@
 /* ofo.css has one height of input. A table edited in place (a LAN's reservations) needs one
    that fits a row. */
 .ofo-input--sm { height: 30px; }
+
+/* ofo.css has no list for what a change of config alters (the apply dialog of the approved
+   mockup): whose setting in a narrow column, then what it was, struck through, and what it
+   becomes, in mono because a machine reads them. */
+.ofo-changes { list-style: none; margin: var(--space-4) 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.ofo-changes li { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: var(--space-3); font-size: 13px; line-height: 20px; }
+.ofo-changes__key { color: var(--ink-muted); overflow-wrap: anywhere; }
+.ofo-changes__value { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.ofo-changes__value s { color: var(--ink-muted); }
+
+/* ofo.css gives the save bar its count and its buttons and no place for a sentence beside
+   them: why an apply is not offered while another change waits to be confirmed. */
+.ofo-savebar__held { align-self: center; font-size: 13px; color: var(--ink-muted); }

@@ -7,10 +7,12 @@
 
 import circleAlert from 'lucide-static/icons/circle-alert.svg?raw'
 import circleCheck from 'lucide-static/icons/circle-check.svg?raw'
+import globe from 'lucide-static/icons/globe.svg?raw'
 import info from 'lucide-static/icons/info.svg?raw'
 import layoutDashboard from 'lucide-static/icons/layout-dashboard.svg?raw'
 import logOut from 'lucide-static/icons/log-out.svg?raw'
 import moon from 'lucide-static/icons/moon.svg?raw'
+import network from 'lucide-static/icons/network.svg?raw'
 import sun from 'lucide-static/icons/sun.svg?raw'
 import triangleAlert from 'lucide-static/icons/triangle-alert.svg?raw'
 
@@ -22,10 +24,12 @@ function shapes(file: string): string {
 export const ICONS = {
   'circle-alert': shapes(circleAlert),
   'circle-check': shapes(circleCheck),
+  globe: shapes(globe),
   info: shapes(info),
   'layout-dashboard': shapes(layoutDashboard),
   'log-out': shapes(logOut),
   moon: shapes(moon),
+  network: shapes(network),
   sun: shapes(sun),
   'triangle-alert': shapes(triangleAlert),
 } as const
