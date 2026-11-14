@@ -6,7 +6,10 @@
 // apply), with `clone`, `equals` and `toJson` for one that edits a config and says what it
 // changed. The generated code under gen/ is not imported from outside this package.
 
-export { clone, create, equals, toJson } from '@bufbuild/protobuf'
+export { clone, create, equals, ScalarType, toJson } from '@bufbuild/protobuf'
+// A schema's own account of its fields, for a caller that has to treat every field of a
+// config alike (what a renumbered LAN carries with it) and so walks them.
+export type { DescField, DescMessage } from '@bufbuild/protobuf'
 
 export {
   ErrorCode,
