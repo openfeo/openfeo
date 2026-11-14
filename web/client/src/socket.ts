@@ -40,6 +40,8 @@ export type Ask = NonNullable<MessageInitShape<typeof RequestSchema>['body']>
 interface Waiting {
   resolve: (reply: Reply) => void
   reject: (error: RouterError) => void
+  /** The timer of a call that does not wait for ever, cleared when the call settles. */
+  deadline: unknown
 }
 
 interface EventListener {
@@ -138,15 +140,30 @@ export class Link {
     return () => this.#onSessionEnd.delete(listener)
   }
 
-  /** Ask the router something and wait for its answer. */
-  request(ask: Ask): Promise<Reply> {
+  /**
+   * Ask the router something and wait for its answer. With `withinMs`, an answer that has not
+   * come by then is `UNAVAILABLE` and the socket is not believed, as after a failed probe: a
+   * change of config can take away the address the socket arrived at without closing it.
+   */
+  request(ask: Ask, withinMs?: number): Promise<Reply> {
     try {
       this.#open()
     } catch (error) {
       return Promise.reject(error instanceof Error ? error : new Error(String(error)))
     }
     const id = this.#nextId++
-    const answer = new Promise<Reply>((resolve, reject) => this.#waiting.set(id, { resolve, reject }))
+    const answer = new Promise<Reply>((resolve, reject) => {
+      const deadline =
+        withinMs === undefined
+          ? undefined
+          : this.#deps.timers.set(() => {
+              if (this.#waiting.delete(id)) {
+                reject(new RouterError(ErrorCode.UNAVAILABLE, 'the router did not answer'))
+                this.#gone()
+              }
+            }, withinMs)
+      this.#waiting.set(id, { resolve, reject, deadline })
+    })
     if (this.#authenticated) {
       this.#send(id, { case: 'request', value: { body: ask } })
     } else {
@@ -323,6 +340,7 @@ export class Link {
       const waiting = this.#waiting.get(message.id)
       if (waiting !== undefined) {
         this.#waiting.delete(message.id)
+        this.#deps.timers.clear(waiting.deadline)
         if (message.body.case === 'response') {
           waiting.resolve(message.body.value)
         } else if (message.body.case === 'error') {
@@ -462,7 +480,8 @@ export class Link {
     }
     const waiting = [...this.#waiting.values()]
     this.#waiting.clear()
-    for (const { reject } of waiting) {
+    for (const { reject, deadline } of waiting) {
+      this.#deps.timers.clear(deadline)
       reject(new RouterError(ErrorCode.UNAVAILABLE, why))
     }
   }
