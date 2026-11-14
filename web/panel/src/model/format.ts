@@ -44,6 +44,24 @@ export function duration(secs: number): string {
   return `${seconds}s`
 }
 
+const WORDS: [secs: number, unit: string][] = [
+  [604_800, 'week'],
+  [86_400, 'day'],
+  [3_600, 'hour'],
+  [60, 'minute'],
+]
+
+/**
+ * A length of time in words, for a sentence: the largest of weeks, days, hours and minutes
+ * that divides it, and seconds when none does. `2 minutes`, `12 hours`, `90 seconds`.
+ */
+export function durationWords(secs: number): string {
+  const whole = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0
+  const [size, unit] = WORDS.find(([each]) => whole >= each && whole % each === 0) ?? [1, 'second']
+  const count = whole / size
+  return `${count} ${unit}${count === 1 ? '' : 's'}`
+}
+
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const two = (n: number) => String(n).padStart(2, '0')
 

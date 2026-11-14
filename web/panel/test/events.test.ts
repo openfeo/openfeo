@@ -87,3 +87,22 @@ test('an event from before the clock was set is timed by how long ago it happene
   // An uptime ahead of the router's own (a state that is a moment stale) is "now", not the future.
   expect(when(event('wan.wan0.up', {}, built, 61_000n), true, NOW, 60_000)).toBe('19:42:30')
 })
+
+test('a change of config is said as what became of it', () => {
+  expect(text(said('config.applied', { mode: 'pending', effects: '1', window_secs: '120' }))).toBe('A change of config was applied and waits to be confirmed.')
+  expect(text(said('config.applied', { mode: 'immediate', effects: '0', window_secs: '0' }))).toBe('A change of config was applied immediately.')
+  expect(text(said('config.confirmed'))).toBe('The change of config was confirmed.')
+  expect(text(said('config.reverted', { why: 'asked' }))).toBe('The change of config was reverted.')
+  expect(text(said('config.reverted', { why: 'timeout' }))).toBe('The change of config was not confirmed in time: the router went back.')
+  expect(text(said('config.reverted', { why: 'restart' }))).toBe('The change of config was reverted: the API restarted before it was confirmed.')
+  expect(text(said('config.discarded'))).toBe('An unconfirmed change of config was discarded when the router started.')
+  // Nothing in them is a machine's word.
+  expect(mono(said('config.reverted', { why: 'timeout' }))).toEqual([])
+})
+
+test('a config event with a field it does not know is shown as it came', () => {
+  expect(text(said('config.applied', { mode: 'staged' }))).toBe('config.applied mode=staged')
+  expect(text(said('config.reverted', { why: 'operator' }))).toBe('config.reverted why=operator')
+  expect(text(said('config.reverted'))).toBe('config.reverted')
+  expect(text(said('config.exported'))).toBe('config.exported')
+})

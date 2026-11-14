@@ -26,6 +26,34 @@ function asItCame(topic: string, fields: Record<string, string>): Part[] {
   return parts
 }
 
+/** What became of a change of config (SPEC §5.5). A mode or a reason this code does not know is not guessed at. */
+function configEvent(topic: string, field: (key: string) => string): Part[] | null {
+  switch (topic) {
+    case 'config.applied':
+      if (field('mode') === 'pending') {
+        return [said('A change of config was applied and waits to be confirmed.')]
+      }
+      return field('mode') === 'immediate' ? [said('A change of config was applied immediately.')] : null
+    case 'config.confirmed':
+      return [said('The change of config was confirmed.')]
+    case 'config.reverted':
+      switch (field('why')) {
+        case 'asked':
+          return [said('The change of config was reverted.')]
+        case 'timeout':
+          return [said('The change of config was not confirmed in time: the router went back.')]
+        case 'restart':
+          return [said('The change of config was reverted: the API restarted before it was confirmed.')]
+        default:
+          return null
+      }
+    case 'config.discarded':
+      return [said('An unconfirmed change of config was discarded when the router started.')]
+    default:
+      return null
+  }
+}
+
 function known(topic: string, fields: Record<string, string>): Part[] | null {
   const [family, name = '', ...rest] = topic.split('.')
   const what = rest.join('.')
@@ -39,6 +67,9 @@ function known(topic: string, fields: Record<string, string>): Part[] | null {
       return unhealthy === '' ? [said('The router is degraded.')] : [said('The router is degraded: '), machine(unhealthy), said('.')]
     }
     return null
+  }
+  if (family === 'config') {
+    return configEvent(topic, field)
   }
   if (name === '') {
     return null
