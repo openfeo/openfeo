@@ -100,6 +100,10 @@ const SCENARIOS: &[Scenario] = &[
         run: the_javascript_client_works_from_the_lan,
     },
     Scenario {
+        name: "the_javascript_client_changes_config_from_the_lan",
+        run: the_javascript_client_changes_config_from_the_lan,
+    },
+    Scenario {
         name: "the_panel_in_a_browser_on_the_lan",
         run: the_panel_in_a_browser_on_the_lan,
     },
@@ -1069,7 +1073,7 @@ fn the_panel_in_a_browser_on_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
         playwright,
         &lab.run_dir.join("playwright.log"),
         Duration::from_secs(360),
-        |verb| lab_verb(&mut qmp, verb),
+        |verb| lab_verb(lab, &mut qmp, verb),
     )?;
     password_never_logged(lab)
 }
@@ -1093,14 +1097,18 @@ fn a_harness_build_takes_one_extra_host_name(lab: &mut Lab) -> anyhow::Result<()
 }
 
 /// What a test inside the lab may ask of it (`web/scripts/labctl.mjs`): the WAN port's carrier
-/// and the LAN port's, taken away and given back as the link-flap scenarios do.
-fn lab_verb(qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
-    match verb {
-        "wan-down" => qmp.set_link("p0", false),
-        "wan-up" => qmp.set_link("p0", true),
-        "lan-down" => qmp.set_link("p2", false),
-        "lan-up" => qmp.set_link("p2", true),
-        other => anyhow::bail!("no such verb: {other}"),
+/// and the LAN port's, taken away and given back as the link-flap scenarios do, and the LAN
+/// host moved to another subnet (`lan-to <cidr> <gateway>`: [`rehome`]), as a person follows a
+/// router whose address they changed.
+fn lab_verb(lab: &Lab, qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
+    let words: Vec<&str> = verb.split_whitespace().collect();
+    match words.as_slice() {
+        ["wan-down"] => qmp.set_link("p0", false),
+        ["wan-up"] => qmp.set_link("p0", true),
+        ["lan-down"] => qmp.set_link("p2", false),
+        ["lan-up"] => qmp.set_link("p2", true),
+        ["lan-to", cidr, gateway] => rehome(lab, cidr, gateway),
+        _ => anyhow::bail!("no such verb: {verb}"),
     }
 }
 
@@ -1115,7 +1123,12 @@ fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()>
     let mut qmp = lab.qmp()?;
     let mut vitest = web::tool(&lab.lan0, "vitest")?;
     vitest
-        .args(["run", "--config", "client/itest/vitest.config.ts"])
+        .args([
+            "run",
+            "--config",
+            "client/itest/vitest.config.ts",
+            "lab.test",
+        ])
         .env("OPENFEO_ROUTER", "https://192.168.1.1")
         .env("OPENFEO_PASSWORD", PASSWORD)
         .env("OPENFEO_LAB_CTL", ctl.dir())
@@ -1125,7 +1138,7 @@ fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()>
         vitest,
         &lab.run_dir.join("client-itest.log"),
         Duration::from_secs(300),
-        |verb| lab_verb(&mut qmp, verb),
+        |verb| lab_verb(lab, &mut qmp, verb),
     )?;
     password_never_logged(lab)?;
     ensure!(
@@ -1133,6 +1146,51 @@ fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()>
         "the changed password is on the console"
     );
     Ok(())
+}
+
+/// `@openfeo/client`'s config calls (SPEC §8.3, M4 part 2b), run by Node inside the LAN
+/// namespace against the booted router (`web/client/itest/config.test.ts`): the config without
+/// its secrets, a validation, an apply that is confirmed, one that is reverted, an immediate
+/// one, a stale tag, and a change that moves the router's own address, which the test follows
+/// by asking the lab to re-home the LAN host and confirms from the new address. What the
+/// router made of each is read on the console. Skipped as the other client scenario is.
+fn the_javascript_client_changes_config_from_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
+    web::node_ready()?;
+    boot(lab, "")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut vitest = web::tool(&lab.lan0, "vitest")?;
+    vitest
+        .args([
+            "run",
+            "--config",
+            "client/itest/vitest.config.ts",
+            "config.test",
+        ])
+        .env("OPENFEO_ROUTER", "https://192.168.1.1")
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir())
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    ctl.serve_while(
+        vitest,
+        &lab.run_dir.join("client-config-itest.log"),
+        Duration::from_secs(300),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+    let console = lab.console()?;
+    for (line, times) in [
+        (r"openfeo: config: confirmed", 2),
+        (r"openfeo: config: reverted \(asked\)", 1),
+        (APPLIED_IMMEDIATELY, 1),
+    ] {
+        let found = console.count(&re(line));
+        ensure!(
+            found == times,
+            "{line} is on the console {found} times, not {times}"
+        );
+    }
+    no_task_failed(lab)?;
+    password_never_logged(lab)
 }
 
 // ---- M4 part 2a: changing config (SPEC §5.5, §8.3) ----
