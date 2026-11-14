@@ -660,8 +660,7 @@ pub fn udhcpc6_info(
         answered
             .env
             .get(key)
-            .map(|value| value.split_whitespace().map(str::to_owned).collect())
-            .unwrap_or_default()
+            .map_or_default(|value| value.split_whitespace().map(str::to_owned).collect())
     };
     let dns = list("dns")
         .iter()

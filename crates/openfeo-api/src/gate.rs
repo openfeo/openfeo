@@ -224,9 +224,7 @@ pub fn caller(running: &Config, proposed: &Config, lan: Option<&str>, local: IpA
         connection_drops: goes(&ipv4_before, &ipv4_after) || goes(&ipv6_before, &ipv6_after),
         lan_changes: ipv4_before != ipv4_after,
         lan: name.to_owned(),
-        router_after: address(&ipv4_after)
-            .map(|address| address.to_string())
-            .unwrap_or_default(),
+        router_after: address(&ipv4_after).map_or_default(|address| address.to_string()),
     }
 }
 

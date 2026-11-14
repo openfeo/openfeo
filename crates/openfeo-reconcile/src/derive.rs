@@ -72,16 +72,12 @@ fn was_up(world: &World, name: &str) -> bool {
 }
 
 fn prefixes(world: &World, name: &str) -> BTreeSet<String> {
-    world
-        .dhcp6
-        .get(name)
-        .map(|fact| {
-            fact.prefixes
-                .iter()
-                .map(|prefix| prefix.net.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    world.dhcp6.get(name).map_or_default(|fact| {
+        fact.prefixes
+            .iter()
+            .map(|prefix| prefix.net.to_string())
+            .collect()
+    })
 }
 
 fn wan_events(prev: &World, next: &World, wan: &Wan, events: &mut Vec<EventDraft>) {
@@ -126,22 +122,18 @@ fn wan_events(prev: &World, next: &World, wan: &Wan, events: &mut Vec<EventDraft
 
 /// A lease is a MAC holding an address: `(mac, address, host)`.
 fn leases(world: &World, lan: &str) -> BTreeSet<(String, String, String)> {
-    world
-        .leases
-        .get(lan)
-        .map(|leases| {
-            leases
-                .iter()
-                .map(|lease| {
-                    (
-                        lease.mac.to_string(),
-                        lease.address.to_string(),
-                        lease.hostname.clone().unwrap_or_default(),
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    world.leases.get(lan).map_or_default(|leases| {
+        leases
+            .iter()
+            .map(|lease| {
+                (
+                    lease.mac.to_string(),
+                    lease.address.to_string(),
+                    lease.hostname.clone().unwrap_or_default(),
+                )
+            })
+            .collect()
+    })
 }
 
 fn lease_events(prev: &World, next: &World, lan: &str, events: &mut Vec<EventDraft>) {

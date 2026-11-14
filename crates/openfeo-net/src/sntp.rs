@@ -444,9 +444,7 @@ impl Lookup {
             addrs: if ok {
                 addrs
             } else {
-                previous
-                    .map(|lookup| lookup.addrs.clone())
-                    .unwrap_or_default()
+                previous.map_or_default(|lookup| lookup.addrs.clone())
             },
             at: now,
             ok,
@@ -505,7 +503,7 @@ async fn serve_loop<C: Clock>(
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, peer)) => {
-                let state = shared.lock().map(|state| *state).unwrap_or_default();
+                let state = shared.lock().map_or_default(|state| *state);
                 if let Some(reply) = respond(&buf[..len], clock.now().unix_ns, &state) {
                     match socket.send_to(&reply, peer).await {
                         Ok(_) => {
