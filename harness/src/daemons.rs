@@ -652,14 +652,13 @@ fn pppoe_server_usage() -> String {
     Command::new("pppoe-server")
         .arg("-h")
         .output()
-        .map(|out| {
+        .map_or_default(|out| {
             format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             )
         })
-        .unwrap_or_default()
 }
 
 /// Whether a usage text lists `option` as one of its own (`   -g path   -- ...`).

@@ -48,8 +48,7 @@ fn main() -> anyhow::Result<()> {
     }
     let cmdline = std::fs::read_to_string("/proc/cmdline")
         .ok()
-        .map(|s| cmdline::parse(&s))
-        .unwrap_or_default();
+        .map_or_default(|s| cmdline::parse(&s));
     let mode = cli::resolve_mode(cli.mode, cmdline.mode);
     router::run(mode, &cmdline, &version::version())
 }

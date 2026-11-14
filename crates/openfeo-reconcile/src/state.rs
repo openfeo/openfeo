@@ -146,8 +146,7 @@ fn ports(world: &World) -> Vec<PortState> {
                 id: port.id.clone(),
                 mac: link
                     .and_then(|link| link.mac)
-                    .map(|mac| mac.to_string())
-                    .unwrap_or_default(),
+                    .map_or_default(|mac| mac.to_string()),
                 carrier: link.is_some_and(|link| link.carrier),
                 speed_mbps: link.and_then(|link| link.speed_mbps),
                 uses,
@@ -172,9 +171,7 @@ fn wan_state(world: &World, wan: &Wan, system: &SystemFacts) -> WanState {
         ),
         Some(Kind::Dhcp(_)) => (
             WanKind::Dhcp,
-            lease
-                .map(|lease| lease.address.to_string())
-                .unwrap_or_default(),
+            lease.map_or_default(|lease| lease.address.to_string()),
             String::new(),
             lease
                 .and_then(|lease| {
@@ -186,18 +183,14 @@ fn wan_state(world: &World, wan: &Wan, system: &SystemFacts) -> WanState {
                             .map(|(_, via)| *via)
                     })
                 })
-                .map(|gateway| gateway.to_string())
-                .unwrap_or_default(),
+                .map_or_default(|gateway| gateway.to_string()),
         ),
         Some(Kind::Pppoe(_)) => (
             WanKind::Pppoe,
-            session
-                .map(|ipv4| ipv4.local.to_string())
-                .unwrap_or_default(),
+            session.map_or_default(|ipv4| ipv4.local.to_string()),
             session
                 .and_then(|ipv4| ipv4.peer)
-                .map(|peer| peer.to_string())
-                .unwrap_or_default(),
+                .map_or_default(|peer| peer.to_string()),
             String::new(),
         ),
         None => (
@@ -217,8 +210,7 @@ fn wan_state(world: &World, wan: &Wan, system: &SystemFacts) -> WanState {
                 .get(&wan.name)
                 .and_then(|fact| fact.addresses.first())
         })
-        .map(|address| address.net.to_string())
-        .unwrap_or_default();
+        .map_or_default(|address| address.net.to_string());
     let mut ipv6_prefixes: Vec<String> = wan
         .ipv6
         .iter()
@@ -322,7 +314,7 @@ fn address_state(world: &World, addr: &AddrFact) -> AddressState {
     AddressState {
         interface: addr.ifname.clone(),
         address: addr.net.to_string(),
-        peer: addr.peer.map(|peer| peer.to_string()).unwrap_or_default(),
+        peer: addr.peer.map_or_default(|peer| peer.to_string()),
         origin: origin(world, addr).into(),
         deprecated: addr.deprecated,
     }

@@ -253,15 +253,13 @@ fn wan_dns(world: &World, wan: &Wan) -> Vec<IpAddr> {
         Some(wan::Kind::Dhcp(_)) => world
             .dhcp4
             .get(&wan.name)
-            .map(|lease| reachable(&lease.dns))
-            .unwrap_or_default(),
+            .map_or_default(|lease| reachable(&lease.dns)),
         // IPCP's resolvers, behind the IPv4 route like a lease's (ADR-0019).
         Some(wan::Kind::Pppoe(_)) => world
             .pppoe
             .get(&wan.name)
             .and_then(|fact| fact.ipv4.as_ref())
-            .map(|ipv4| reachable(&ipv4.dns))
-            .unwrap_or_default(),
+            .map_or_default(|ipv4| reachable(&ipv4.dns)),
         None => Vec::new(),
         Some(wan::Kind::Static(static_wan)) => static_wan
             .dns

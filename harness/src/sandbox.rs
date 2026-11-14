@@ -30,7 +30,7 @@ pub fn enter() -> Result<()> {
     }
     let (uid, gid) = (geteuid(), getegid());
     unshare(CloneFlags::CLONE_NEWUSER).map_err(|err| {
-        let hint = hint(&err).map(|h| format!(": {h}")).unwrap_or_default();
+        let hint = hint(&err).map_or_default(|h| format!(": {h}"));
         anyhow::anyhow!("unshare(CLONE_NEWUSER): {err}{hint}")
     })?;
     fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).context("write uid_map")?;

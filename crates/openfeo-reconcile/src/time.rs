@@ -38,8 +38,7 @@ pub fn desired(world: &World) -> DesiredTime {
         .config
         .system
         .as_ref()
-        .map(|system| system.ntp_servers.clone())
-        .unwrap_or_default();
+        .map_or_default(|system| system.ntp_servers.clone());
     let servers: Vec<String> = if typed.is_empty() {
         DEFAULT_NTP_SERVERS
             .iter()

@@ -138,8 +138,7 @@ fn not_written(what: &str, err: &dyn std::fmt::Display) -> ApiError {
 fn original_path(config_path: &Path) -> PathBuf {
     let mut name = config_path
         .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
+        .map_or_default(std::ffi::OsStr::to_os_string);
     name.push(".orig");
     config_path.with_file_name(name)
 }

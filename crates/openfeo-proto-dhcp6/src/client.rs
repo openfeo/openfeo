@@ -782,7 +782,7 @@ impl Client {
         // Only a Renew or Rebind leaves an unlisted lease unchanged (§18.2.10.1); a Reply to a
         // Solicit or a Request is the server's whole word, so what it does not list is gone.
         let refreshing = matches!(self.state, State::Renewing | State::Rebinding);
-        let server = message.server_id().map(<[u8]>::to_vec).unwrap_or_default();
+        let server = message.server_id().map_or_default(<[u8]>::to_vec);
         if let Some((code, _)) = message.status()
             && code != StatusCode::Success
         {

@@ -305,7 +305,7 @@ pub fn file_from_records(
             .iter()
             .map(|record| Dhcp4ServerLease {
                 mac: mac_text(record.mac),
-                client_id: record.client_id.as_deref().map(hex).unwrap_or_default(),
+                client_id: record.client_id.as_deref().map_or_default(hex),
                 address: record.address.to_string(),
                 hostname: record.hostname.clone().unwrap_or_default(),
                 granted_unix: unix_now.saturating_sub(now.saturating_sub(record.granted_at)),
