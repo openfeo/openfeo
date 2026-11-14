@@ -3,29 +3,17 @@
 
 import { create, StateSchema } from '@openfeo/client'
 import { THEME_KEY } from '@openfeo/ui'
-import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import Dashboard from '../src/pages/Dashboard.vue'
-import { ROUTER, SESSION, useSession } from '../src/session'
-import { FakeRouter } from './fake-router'
 import { counters, event, NOW, state } from './fixtures'
+import { panelAt, unmountAll } from './mounting'
 
-const wrappers: VueWrapper[] = []
-
-async function dashboard() {
-  const router = new FakeRouter()
-  router.authenticated = true
-  router.connection = 'open'
-  const session = useSession(router)
-  await session.refresh()
-  const wrapper = mount(Dashboard, {
-    global: { provide: { [ROUTER as symbol]: router, [SESSION as symbol]: session } },
-    attachTo: document.body,
-  })
-  wrappers.push(wrapper)
-  await flushPromises()
-  return { wrapper, router, session }
+// The dashboard as it is reached: in the shell, at /. What the shell itself holds (the
+// sidebar, the top bar, what is said above every page) is shell.test.ts's; the tests here
+// that look at those are the ones part 1b wrote when the dashboard was the whole page.
+function dashboard() {
+  return panelAt('/')
 }
 
 async function loaded() {
@@ -53,9 +41,7 @@ beforeEach(() => {
   vi.stubGlobal('matchMedia', (query: string) => ({ matches: query.includes('light') && systemPrefersLight }))
 })
 afterEach(() => {
-  for (const wrapper of wrappers.splice(0)) {
-    wrapper.unmount()
-  }
+  unmountAll()
   vi.unstubAllGlobals()
   vi.useRealTimers()
 })
@@ -123,12 +109,11 @@ test('with the fixture state it shows the headline, four tiles, three cards, fou
   expect(wrapper.find('.dash__events a').exists()).toBe(false)
 })
 
-test('the sidebar holds the dashboard alone, and marks it', async () => {
+test('the sidebar marks the dashboard', async () => {
   const { wrapper } = await loaded()
   const items = wrapper.findAll('.ofo-nav__item')
-  expect(items.map((item) => item.text())).toEqual(['Dashboard'])
-  expect(items[0]?.attributes('aria-current')).toBe('page')
-  expect(wrapper.find('.ofo-nav__group').exists()).toBe(false)
+  expect(items[0]?.text()).toBe('Dashboard')
+  expect(items.map((item) => item.attributes('aria-current'))).toEqual(['page', undefined, undefined])
 })
 
 test('a router that has seen nothing happen says so', async () => {
@@ -196,8 +181,9 @@ test('a refused config is said above everything, with its violations', async () 
   ])
   expect(banner.findAll('li code').map((code) => code.text())).toEqual(['lans[0].ipv4', 'wans[0].port'])
   expect(banner.text()).toContain('The router is running on first-boot defaults.')
-  // It is the first thing on the page.
-  expect(wrapper.find('.dash').element.firstElementChild).toBe(banner.element)
+  // It is the first thing on the page, above the dashboard itself.
+  expect(wrapper.find('.ofo-shell__content').element.firstElementChild?.contains(banner.element)).toBe(true)
+  expect(wrapper.find('.dash .ofo-banner').exists()).toBe(false)
   expect((await loaded()).wrapper.find('.ofo-banner').exists()).toBe(false)
 })
 
@@ -278,9 +264,8 @@ test('with storage blocked the dashboard still comes up, and a theme can be chos
 })
 
 test('leaving the page lets go of the router', async () => {
-  const { wrapper, router } = await loaded()
-  wrapper.unmount()
-  wrappers.length = 0
+  const { router } = await loaded()
+  unmountAll()
   expect(router.open('state')).toHaveLength(0)
   expect(router.open('counters')).toHaveLength(0)
   expect(router.open('events')).toHaveLength(0)

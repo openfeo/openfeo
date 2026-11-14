@@ -130,3 +130,34 @@ test('told that events were lost, it asks for the backlog again and replaces its
   router.push('events', event('wan.wan0.down', { n: 'new' }))
   expect(live.events.value.map((each) => each.fields.n)).toEqual(['new'])
 })
+
+test('the clock ticks while it is listening, and the uptime moves on between the router\'s words', () => {
+  const { router, live } = started()
+  expect(live.now.value.getTime()).toBe(NOW.getTime())
+  // Before the router has said anything there is no uptime to count from.
+  expect(live.sinceBootMs.value).toBeUndefined()
+  router.push('state', state())
+  expect(live.sinceBootMs.value).toBe(273_600_000)
+  vi.advanceTimersByTime(5_000)
+  expect(live.now.value.getTime()).toBe(NOW.getTime() + 5_000)
+  expect(live.sinceBootMs.value).toBe(273_605_000)
+  // What the router says next is taken as it is said, not added to what was counted.
+  const later = state()
+  if (later.system !== undefined) {
+    later.system.uptimeSecs = 273_700n
+  }
+  router.push('state', later)
+  expect(live.sinceBootMs.value).toBe(273_700_000)
+  live.stop()
+  vi.advanceTimersByTime(5_000)
+  expect(live.now.value.getTime()).toBe(NOW.getTime() + 5_000)
+})
+
+test('a browser clock set back does not take the uptime back', () => {
+  const { router, live } = started()
+  router.push('state', state())
+  vi.setSystemTime(new Date(NOW.getTime() - 3_600_000))
+  vi.advanceTimersByTime(1_000)
+  expect(live.sinceBootMs.value).toBe(273_600_000)
+  live.stop()
+})

@@ -61,8 +61,9 @@ export default tseslint.config(
     },
   },
   {
-    // A page is a route's component, named for what it is, and never written as a tag.
-    files: ['panel/src/pages/**/*.vue', 'panel/src/App.vue'],
+    // A page is a route's component, named for what it is, and never written as a tag; so
+    // is the shell the pages behind the login sit in.
+    files: ['panel/src/pages/**/*.vue', 'panel/src/App.vue', 'panel/src/Shell.vue'],
     rules: { 'vue/multi-word-component-names': 'off' },
   },
   {
