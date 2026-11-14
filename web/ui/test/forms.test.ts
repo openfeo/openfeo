@@ -7,6 +7,7 @@
 
 import { mount } from '@vue/test-utils'
 import { expect, test } from 'vitest'
+import { nextTick } from 'vue'
 
 import {
   ICONS,
@@ -198,9 +199,15 @@ test('a toggle and a select are v-models over real controls', async () => {
   ;(select.element as HTMLSelectElement).value = '25'
   await select.trigger('change')
   expect(select.emitted('update:modelValue')).toEqual([['25']])
-  // What is shown is the model, not what was last picked.
-  await select.setProps({ modelValue: '24' })
+  // What is shown is the model, not what was last picked: a choice that was not taken is put back.
+  await nextTick()
   expect((select.element as HTMLSelectElement).value).toBe('24')
+  // And one that was taken stays.
+  ;(select.element as HTMLSelectElement).value = '25'
+  await select.trigger('change')
+  await select.setProps({ modelValue: '25' })
+  await nextTick()
+  expect((select.element as HTMLSelectElement).value).toBe('25')
 })
 
 test('an input takes a placeholder and a small size', () => {
