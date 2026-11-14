@@ -16,6 +16,7 @@ import {
 import { computed, inject, onBeforeUnmount, onMounted, provide, ref } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 
+import { CONFIG, useConfig } from './config'
 import { LIVE, useLive } from './live'
 import { clock, duration } from './model/format'
 import { PAGES } from './routes'
@@ -32,12 +33,23 @@ const live = useLive(router)
 provide(LIVE, live)
 const { state, lostAt, now, sinceBootMs } = live
 
-onMounted(() => live.start())
-onBeforeUnmount(() => live.stop())
-
 const host = computed(() => {
   const status = session.status.value
   return status === null ? '' : [status.hostname, status.domain].filter((part) => part !== '').join('.')
+})
+
+// One draft of the config for every settings page, beside the session: it is read when the
+// shell comes up and dropped when it goes.
+const config = useConfig(router, live, () => host.value)
+provide(CONFIG, config)
+
+onMounted(() => {
+  live.start()
+  config.start()
+})
+onBeforeUnmount(() => {
+  config.stop()
+  live.stop()
 })
 const meta = computed(() => {
   const system = state.value?.system

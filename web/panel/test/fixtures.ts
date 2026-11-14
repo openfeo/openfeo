@@ -168,3 +168,19 @@ export function labConfig(): Config {
     firewall: { wanPing: true, portForwards: [{ name: 'lan-http', proto: 'tcp', port: 2222, to: '192.168.1.2', toPort: 8080 }] },
   })
 }
+
+/**
+ * The fixture's state while a change of config waits to be confirmed: applied `agoSecs`
+ * before the router's uptime at NOW, with `windowSecs` to confirm it in.
+ */
+export function pendingState(agoSecs = 13, windowSecs = 120, effects: { subject: string; kind: number }[] = []): State {
+  const applied = BigInt((UPTIME_SECS - agoSecs) * 1000)
+  const made = create(StateSchema, {
+    system: { pendingConfig: { appliedUptimeMs: applied, revertsUptimeMs: applied + BigInt(windowSecs * 1000), windowSecs, effects } },
+  })
+  const base = state()
+  if (base.system !== undefined && made.system?.pendingConfig !== undefined) {
+    base.system.pendingConfig = made.system.pendingConfig
+  }
+  return base
+}

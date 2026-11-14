@@ -5,19 +5,26 @@
 // no socket and no network. It has the client's surface as far as the panel uses it.
 
 import {
+  clone,
+  ConfigSchema,
   create,
   ErrorCode,
   GetStatusResponseSchema,
   RouterError,
   SessionSchema,
+  type Applied,
+  type Config,
+  type ConfigView,
   type Connection,
   type Counters,
   type Event,
   type GetStatusResponse,
+  type Reverted,
   type Session,
   type SessionEnd,
   type State,
   type Subscription,
+  type Validation,
 } from '@openfeo/client'
 
 import type { PanelRouter } from '../src/session'
@@ -59,8 +66,33 @@ export class FakeRouter implements PanelRouter {
   /** When set, password calls wait on it: a test can look at the page while a call is under way. */
   gate: ReturnType<typeof held<void>> | null = null
   stateNow: State | null = null
+  /** What `config` answers: the running config, its tag and the router's window. */
+  configNow: ConfigView = { config: create(ConfigSchema, {}), tag: 't0', confirmSecs: 120 }
+  /** While set, `config` fails as a router that cannot be reached. */
+  configUnreachable = false
+  /** What `validate` answers. */
+  validation: Validation = { violations: [], effects: [], caller: undefined }
+  /** What `apply` answers, or the refusal it throws. */
+  applyAnswer: Applied | RouterError = { answered: true, tag: 't-applied' }
+  /** The refusal `confirm` throws, when it does. */
+  confirmRefusal: RouterError | null = null
+  /** What `revert` answers, or the refusal it throws. */
+  revertAnswer: Reverted | RouterError = { answered: true }
+  /** Calls that wait until a test lets them go, by name. */
+  readonly #held = new Map<string, ReturnType<typeof held<void>>>()
 
-  readonly calls = { status: 0, login: [] as string[], setInitialPassword: [] as string[], logout: 0, state: 0 }
+  readonly calls = {
+    status: 0,
+    login: [] as string[],
+    setInitialPassword: [] as string[],
+    logout: 0,
+    state: 0,
+    config: 0,
+    validate: [] as Config[],
+    apply: [] as { config: Config; tag: string; immediate: boolean }[],
+    confirm: 0,
+    revert: 0,
+  }
   readonly listening: Listening[] = []
   readonly #connectionListeners = new Set<(connection: Connection) => void>()
   readonly #endListeners = new Set<(reason: SessionEnd) => void>()
@@ -106,6 +138,48 @@ export class FakeRouter implements PanelRouter {
     return this.stateNow === null
       ? Promise.reject(new RouterError(ErrorCode.UNAVAILABLE, 'no state in this script'))
       : Promise.resolve(this.stateNow)
+  }
+
+  async config(): Promise<ConfigView> {
+    this.calls.config += 1
+    await this.#held.get('config')?.promise
+    if (this.configUnreachable) {
+      throw new RouterError(ErrorCode.UNAVAILABLE, 'the connection to the router was lost')
+    }
+    // A copy: what the page does to the config it was handed is not done to the router's.
+    return { ...this.configNow, config: clone(ConfigSchema, this.configNow.config) }
+  }
+
+  async validate(config: Config): Promise<Validation> {
+    this.calls.validate.push(clone(ConfigSchema, config))
+    await this.#held.get('validate')?.promise
+    return this.validation
+  }
+
+  async apply(config: Config, tag: string, options: { immediate?: boolean; timeoutSecs?: number } = {}): Promise<Applied> {
+    this.calls.apply.push({ config: clone(ConfigSchema, config), tag, immediate: options.immediate ?? false })
+    await this.#held.get('apply')?.promise
+    if (this.applyAnswer instanceof RouterError) {
+      throw this.applyAnswer
+    }
+    return this.applyAnswer
+  }
+
+  async confirm(): Promise<void> {
+    this.calls.confirm += 1
+    await this.#held.get('confirm')?.promise
+    if (this.confirmRefusal !== null) {
+      throw this.confirmRefusal
+    }
+  }
+
+  async revert(): Promise<Reverted> {
+    this.calls.revert += 1
+    await this.#held.get('revert')?.promise
+    if (this.revertAnswer instanceof RouterError) {
+      throw this.revertAnswer
+    }
+    return this.revertAnswer
   }
 
   subscribe(topic: 'state', onPush: (state: State) => void): Subscription
@@ -173,6 +247,16 @@ export class FakeRouter implements PanelRouter {
     }
     for (const listener of [...this.#endListeners]) {
       listener(reason)
+    }
+  }
+
+  /** Make calls of one kind wait until the returned function is called. */
+  holdCall(name: 'config' | 'validate' | 'apply' | 'confirm' | 'revert'): () => void {
+    const gate = held<void>()
+    this.#held.set(name, gate)
+    return () => {
+      this.#held.delete(name)
+      gate.resolve()
     }
   }
 

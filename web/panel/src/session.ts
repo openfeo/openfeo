@@ -11,7 +11,21 @@ import { ref, type InjectionKey, type Ref } from 'vue'
 /** As much of the client as the panel uses: what a test's fake has to be. */
 export type PanelRouter = Pick<
   Router,
-  'authenticated' | 'connection' | 'status' | 'setInitialPassword' | 'login' | 'logout' | 'state' | 'subscribe' | 'onConnection' | 'onSessionEnd'
+  | 'authenticated'
+  | 'connection'
+  | 'status'
+  | 'setInitialPassword'
+  | 'login'
+  | 'logout'
+  | 'state'
+  | 'subscribe'
+  | 'onConnection'
+  | 'onSessionEnd'
+  | 'config'
+  | 'validate'
+  | 'apply'
+  | 'confirm'
+  | 'revert'
 >
 
 export type Screen = 'first-password' | 'config-unreadable' | 'login' | 'dashboard'
