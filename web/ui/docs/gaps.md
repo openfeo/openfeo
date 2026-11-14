@@ -22,3 +22,11 @@ across, the working answer lives in `additions.css` or in a component, as noted.
   assigned prefix. The router's repository is public and uses documentation
   addresses in every example, so its copy has `02:00:00:0a:11:3e`; the design system's sample
   should change to match.
+- There is no class for an "Advanced" disclosure in a form section. `ofo-adv` and
+  `ofo-adv__grid` in `additions.css` are a `details` that spans the section's columns and
+  lays its fields out in the same two-column grid.
+- The Choice guideline groups choices in a `fieldset` with a `legend`, and the stylesheet has
+  no rule that resets a fieldset (its border, padding and minimum width). `ofo-choices` in
+  `additions.css` does.
+- There is one height of input. A table edited in place needs a smaller one:
+  `ofo-input--sm` (30px) in `additions.css`.
