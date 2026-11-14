@@ -14,6 +14,7 @@ import ConfigUnreadable from './pages/ConfigUnreadable.vue'
 import Dashboard from './pages/Dashboard.vue'
 import FirstPassword from './pages/FirstPassword.vue'
 import Login from './pages/Login.vue'
+import Wan from './pages/Wan.vue'
 import type { PanelSession, Screen } from './session'
 import Shell from './Shell.vue'
 
@@ -53,7 +54,7 @@ export function panelRoutes(session: PanelSession, history: RouterHistory = crea
         children: [
           { path: '', component: Dashboard },
           // The WAN or LAN shown is in the address, so a reload and a link come back to it.
-          { path: 'wan/:name?', component: soon('WAN') },
+          { path: 'wan/:name?', component: Wan },
           { path: 'lan/:name?', component: soon('LAN & DHCP') },
         ],
       },

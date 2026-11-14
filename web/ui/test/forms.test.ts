@@ -194,7 +194,9 @@ test('a toggle and a select are v-models over real controls', async () => {
       },
     }),
   )
-  await select.setValue('25')
+  // (Chosen in the element itself: setting a mounted component's value only emits.)
+  ;(select.element as HTMLSelectElement).value = '25'
+  await select.trigger('change')
   expect(select.emitted('update:modelValue')).toEqual([['25']])
   // What is shown is the model, not what was last picked.
   await select.setProps({ modelValue: '24' })
@@ -217,6 +219,24 @@ test('an input says when it is left, and when it is not valid', async () => {
   expect(input.emitted('blur')).toHaveLength(1)
   await input.setProps({ invalid: true })
   expect(input.attributes('aria-invalid')).toBe('true')
+})
+
+test('an input for a whole number lets nothing but digits in', async () => {
+  const input = seen(mount(OfoInput, { props: { modelValue: '', digits: true } }))
+  expect(input.attributes('inputmode')).toBe('numeric')
+  // (Typed into the element itself: setting a mounted component's value only emits.)
+  const typeInto = async (box: typeof input, text: string) => {
+    ;(box.element as HTMLInputElement).value = text
+    await box.trigger('input')
+  }
+  await typeInto(input, '12a.5-')
+  expect(input.emitted('update:modelValue')).toEqual([['125']])
+  expect((input.element as HTMLInputElement).value).toBe('125')
+  // Any other input is left as it was typed, and asks for no number pad.
+  const plain = seen(mount(OfoInput, { props: { modelValue: '' } }))
+  expect(plain.attributes('inputmode')).toBeUndefined()
+  await typeInto(plain, '12a')
+  expect(plain.emitted('update:modelValue')).toEqual([['12a']])
 })
 
 test('a disabled control cannot be changed', () => {

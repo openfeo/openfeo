@@ -184,3 +184,41 @@ export function pendingState(agoSecs = 13, windowSecs = 120, effects: { subject:
   }
   return base
 }
+
+/**
+ * The config of the router whose state is {@link state}: a PPPoE WAN on a tagged port that
+ * carries IPv6, a LAN across three ports and a second LAN as a VLAN of one of them. As the
+ * router hands it out: the account's password is not in it.
+ */
+export function routerConfig(): Config {
+  return create(ConfigSchema, {
+    configVersion: 1,
+    system: { hostname: 'openfeo', domain: 'home.arpa' },
+    wans: [
+      {
+        name: 'wan0',
+        port: 'p0',
+        vlan: 911,
+        priority: 10,
+        kind: { case: 'pppoe', value: { username: 'openfeo@isp.example' } },
+        ipv6: { prefix: '2001:db8:1::/48' },
+      },
+    ],
+    lans: [
+      {
+        name: 'lan0',
+        ports: ['p1', 'p2', 'p3'],
+        ipv4: '192.168.1.1/24',
+        dhcp: {
+          range: ['192.168.1.100', '192.168.1.249'],
+          static: [
+            { mac: '52:54:00:fe:10:10', ip: '192.168.1.10', hostname: 'nas' },
+            { mac: '52:54:00:fe:10:11', ip: '192.168.1.11', hostname: 'printer' },
+          ],
+        },
+      },
+      { name: 'iot', ports: ['p3.20'], ipv4: '192.168.20.1/24', dhcp: { range: ['192.168.20.100', '192.168.20.149'] }, reaches: ['wan'] },
+    ],
+    firewall: { portForwards: [{ name: 'lan-http', proto: 'tcp', port: 8080, to: '192.168.1.10' }] },
+  })
+}

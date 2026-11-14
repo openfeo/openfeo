@@ -158,3 +158,28 @@ body {
   margin: var(--space-1) 0;
   padding-left: var(--space-5);
 }
+
+/* A settings page: what is said above the form, the row of tabs, and what stands at its foot. */
+.page > .ofo-banner,
+.page [role='tabpanel'] > .ofo-banner {
+  margin-bottom: var(--space-4);
+}
+
+.tabsrow {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+
+.tabsrow .ofo-tabs {
+  flex: 1;
+}
+
+.page__foot {
+  margin-top: var(--space-6);
+}
+
+.page__none {
+  margin: 0;
+}

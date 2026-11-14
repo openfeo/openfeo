@@ -13,6 +13,10 @@ export function address4(text: string): string | null {
   return text === '' || parse4(text) !== null ? null : 'Not an IPv4 address.'
 }
 
+export function address6(text: string): string | null {
+  return text === '' || isIp6(text) ? null : 'Not an IPv6 address.'
+}
+
 /** Addresses of either family, separated by commas. */
 export function addressList(text: string): string | null {
   if (text === '') {

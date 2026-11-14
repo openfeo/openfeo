@@ -6,13 +6,20 @@
 
 import { expect, test } from 'vitest'
 
-import { address4, addressList, between, cidr4, cidr6, inSubnet, mac, pool } from '../src/model/check'
+import { address4, address6, addressList, between, cidr4, cidr6, inSubnet, mac, pool } from '../src/model/check'
 
 test('an IPv4 address', () => {
   expect(address4('203.0.113.1')).toBeNull()
   expect(address4('')).toBeNull()
   expect(address4('203.0.113')).toBe('Not an IPv4 address.')
   expect(address4('203.0.113.1/24')).toBe('Not an IPv4 address.')
+})
+
+test('an IPv6 address', () => {
+  expect(address6('fe80::1')).toBeNull()
+  expect(address6('')).toBeNull()
+  expect(address6('fe80::zz')).toBe('Not an IPv6 address.')
+  expect(address6('203.0.113.1')).toBe('Not an IPv6 address.')
 })
 
 test('a list of addresses of either family', () => {

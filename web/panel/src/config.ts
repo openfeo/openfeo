@@ -14,7 +14,7 @@
 // says when it is next reached.
 
 import { clone, ConfigSchema, equals, type Caller, type Config, type ConfigEffect, type ConfigView, type ConfigViolation, type Event, type PendingConfig } from '@openfeo/client'
-import { computed, effectScope, ref, shallowRef, triggerRef, watch, type ComputedRef, type EffectScope, type InjectionKey, type Ref } from 'vue'
+import { computed, effectScope, ref, shallowRef, watch, type ComputedRef, type EffectScope, type InjectionKey, type Ref } from 'vue'
 
 import type { LiveData } from './live'
 import { changes as changesOf, type Change } from './model/changes'
@@ -138,7 +138,9 @@ function whyOf(event: Event): 'asked' | 'timeout' | 'unknown' {
  */
 export function useConfig(router: PanelRouter, live: LiveData, host: () => string): ConfigStore {
   const base = shallowRef<Config | null>(null)
-  const draft = shallowRef<Config | null>(null)
+  // Reactive all the way down: a page that shows one field of one WAN is told when that
+  // field changes, and `changes` when anything does.
+  const draft = ref(null) as Ref<Config | null>
   const confirmSecs = ref(120)
   const violations = ref<ConfigViolation[]>([])
   const unfit = ref<Unfit[]>([])
@@ -388,7 +390,6 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       return
     }
     change(draft.value)
-    triggerRef(draft)
   }
 
   return {

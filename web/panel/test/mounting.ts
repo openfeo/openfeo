@@ -9,6 +9,7 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { createMemoryHistory } from 'vue-router'
 
 import App from '../src/App.vue'
+import { CONFIG, type ConfigStore } from '../src/config'
 import { panelRoutes } from '../src/routes'
 import { ROUTER, SESSION, useSession } from '../src/session'
 import { FakeRouter } from './fake-router'
@@ -41,7 +42,21 @@ export async function panelAt(path: string, router: FakeRouter = signedIn()) {
   wrappers.push(wrapper)
   await routes.isReady()
   await flushPromises()
-  return { wrapper, router, session, routes, errors }
+  /** The config store the shell made, as its pages are handed it. */
+  const store = (): ConfigStore => {
+    const provided = (wrapper.findComponent({ name: 'Shell' }).vm.$ as unknown as { provides: Record<symbol, unknown> }).provides
+    return provided[CONFIG as symbol] as ConfigStore
+  }
+  return { wrapper, router, session, routes, errors, store }
+}
+
+/** The field of a page with this label: its wrapper, for its input, its help and its error. */
+export function fieldLabelled(within: { findAll: VueWrapper['findAll'] }, label: string) {
+  const found = within.findAll('.ofo-field').filter((field) => field.find('.ofo-field__label').text() === label)
+  if (found.length !== 1) {
+    throw new Error(`${found.length} fields are labelled ${label}`)
+  }
+  return found[0]!
 }
 
 /** Take down every panel a test put up (for `afterEach`). */
