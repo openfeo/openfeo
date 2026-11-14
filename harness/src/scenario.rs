@@ -60,7 +60,7 @@ pub fn select<'a>(all: &'a [Scenario], filter: Option<&str>) -> Vec<&'a Scenario
 }
 
 /// Run the selected scenarios one after another, each in a fresh lab, and summarise.
-#[must_use]
+#[must_use = "the exit code says whether every scenario passed"]
 pub fn run_all(all: &[Scenario], filter: Option<&str>) -> ExitCode {
     let selected = select(all, filter);
     println!("running {} scenarios", selected.len());
@@ -77,7 +77,7 @@ pub fn run_all(all: &[Scenario], filter: Option<&str>) -> ExitCode {
             }
             Outcome::Skipped => {
                 skipped += 1;
-                let reason = result.err().map(|err| err.to_string()).unwrap_or_default();
+                let reason = result.err().map_or_default(|err| err.to_string());
                 println!("scenario {} ... skipped ({reason})", scenario.name);
             }
             Outcome::Failed => {

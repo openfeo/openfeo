@@ -301,8 +301,7 @@ impl Shared {
             .config
             .admin
             .as_ref()
-            .map(|admin| admin.password_hash.clone())
-            .unwrap_or_default()
+            .map_or_default(|admin| admin.password_hash.clone())
     }
 
     /// Whether the config file is there but cannot be read: no password can be set over it.

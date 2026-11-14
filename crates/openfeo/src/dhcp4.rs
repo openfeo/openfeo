@@ -105,7 +105,7 @@ pub fn lease_file(wan: &str, mac: [u8; 6], lease: &Lease, obtained_unix: u64) ->
         mac: mac_text(mac),
         address: format!("{}/{}", lease.address, lease.prefix),
         server: lease.server.to_string(),
-        gateway: lease.gateway.map(|g| g.to_string()).unwrap_or_default(),
+        gateway: lease.gateway.map_or_default(|g| g.to_string()),
         dns: lease.dns.iter().map(ToString::to_string).collect(),
         domain: lease.domain.clone().unwrap_or_default(),
         mtu: lease.mtu.map_or(0, u32::from),
@@ -122,7 +122,7 @@ pub fn lease_file(wan: &str, mac: [u8; 6], lease: &Lease, obtained_unix: u64) ->
         t2_secs: lease.t2_secs,
         obtained_unix,
         ntp: lease.ntp.iter().map(ToString::to_string).collect(),
-        broadcast: lease.broadcast.map(|b| b.to_string()).unwrap_or_default(),
+        broadcast: lease.broadcast.map_or_default(|b| b.to_string()),
     }
 }
 

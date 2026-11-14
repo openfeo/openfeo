@@ -85,7 +85,7 @@ pub enum DriverError {
     },
     #[error("interface index {0} does not fit a packet-socket address")]
     Address(u32),
-    #[error("bind {kind} {addr}{}: {source}", device.as_deref().map(|d| format!(" on {d}")).unwrap_or_default())]
+    #[error("bind {kind} {addr}{}: {source}", device.as_deref().map_or_default(|d| format!(" on {d}")))]
     Bind {
         kind: &'static str,
         addr: std::net::SocketAddr,
