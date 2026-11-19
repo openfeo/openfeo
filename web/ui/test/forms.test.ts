@@ -70,6 +70,12 @@ test('advanced is a disclosure labelled Advanced, its fields in a grid of their 
   expect(advanced.find('.ofo-adv__grid input').exists()).toBe(true)
 })
 
+test('a disclosure can be called something other than Advanced', () => {
+  const what = seen(mount(OfoAdvanced, { props: { summary: 'What changed' }, slots: { default: '<ul class="ofo-span-2"></ul>' } }))
+  expect(what.find('summary').text()).toBe('What changed')
+  expect(what.classes()).toEqual(['ofo-adv'])
+})
+
 test('advanced is closed until told or clicked', async () => {
   const advanced = seen(mount(OfoAdvanced, { attachTo: document.body }))
   const details = advanced.element as HTMLDetailsElement

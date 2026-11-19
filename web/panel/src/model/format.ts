@@ -62,8 +62,19 @@ export function durationWords(secs: number): string {
   return `${count} ${unit}${count === 1 ? '' : 's'}`
 }
 
+/** The time left on a countdown, as minutes and seconds: `1:47`, `0:05`. A part of a second counts; less than none is none. */
+export function countdown(ms: number): string {
+  const secs = Number.isFinite(ms) && ms > 0 ? Math.ceil(ms / 1000) : 0
+  return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+}
+
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const two = (n: number) => String(n).padStart(2, '0')
+
+/** A time of day to the minute, in the reader's own zone: `22:41`. */
+export function hourMinute(at: Date): string {
+  return `${two(at.getHours())}:${two(at.getMinutes())}`
+}
 
 /** A date and a time to the minute, in the reader's own zone: `7 Nov 09:14`. */
 export function since(unixMs: bigint): string {

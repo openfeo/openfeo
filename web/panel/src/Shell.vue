@@ -21,6 +21,8 @@ import { CONFIG, useConfig, type Review } from './config'
 import { LIVE, useLive } from './live'
 import { clock, duration } from './model/format'
 import ApplyDialog from './parts/ApplyDialog.vue'
+import NoticeBanner from './parts/NoticeBanner.vue'
+import PendingBanner from './parts/PendingBanner.vue'
 import { PAGES } from './routes'
 import { ROUTER, SESSION, storageOr } from './session'
 
@@ -135,7 +137,7 @@ const lostAtClock = computed(() => (lostAt.value === null ? '' : clock(BigInt(lo
       <OfoButton size="sm" variant="ghost" icon="log-out" @click="router.logout()">Log out</OfoButton>
     </template>
 
-    <div v-if="lostAt || problem" class="said">
+    <div v-if="lostAt || problem || config.pending.value || config.notice.value" class="said">
       <OfoBanner v-if="lostAt" tone="danger">The connection to the router was lost at {{ lostAtClock }}. Retrying.</OfoBanner>
       <OfoBanner v-if="problem" tone="warn" title="config.toml was refused">
         <p class="said__line">{{ problem.reason }}</p>
@@ -146,6 +148,18 @@ const lostAtClock = computed(() => (lostAt.value === null ? '' : clock(BigInt(lo
         </ul>
         <p class="said__line">The router is running on first-boot defaults.</p>
       </OfoBanner>
+      <!-- A change that is waiting, on every page of every session; then what became of one. -->
+      <PendingBanner
+        v-if="config.pending.value"
+        class="pending"
+        :pending="config.pending.value"
+        :since-boot-ms="sinceBootMs"
+        :now="now"
+        :busy="config.busy.value"
+        @confirm="config.confirm()"
+        @revert="config.revert()"
+      />
+      <NoticeBanner v-if="config.notice.value" :notice="config.notice.value" @dismiss="config.notice.value = null" />
     </div>
 
     <RouterView />

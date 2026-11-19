@@ -3,7 +3,7 @@
 
 import { expect, test } from 'vitest'
 
-import { clock, duration, durationWords, portSpeed, rate, since } from '../src/model/format'
+import { clock, countdown, duration, durationWords, hourMinute, portSpeed, rate, since } from '../src/model/format'
 
 test('rates step by a thousand and keep one decimal', () => {
   expect(rate(941_200_000)).toEqual({ value: '941.2', unit: 'Mbit/s' })
@@ -79,4 +79,21 @@ test('a length of time in words is the largest unit that divides it', () => {
   expect(durationWords(1209600)).toBe('2 weeks')
   expect(durationWords(172800)).toBe('2 days')
   expect(durationWords(0)).toBe('0 seconds')
+})
+
+test('the time left is minutes and seconds, and never less than none', () => {
+  expect(countdown(107_000)).toBe('1:47')
+  expect(countdown(5_000)).toBe('0:05')
+  expect(countdown(60_000)).toBe('1:00')
+  expect(countdown(600_000)).toBe('10:00')
+  // A part of a second is still time left.
+  expect(countdown(400)).toBe('0:01')
+  expect(countdown(0)).toBe('0:00')
+  expect(countdown(-30_000)).toBe('0:00')
+  expect(countdown(Number.NaN)).toBe('0:00')
+})
+
+test('a time of day is hours and minutes', () => {
+  expect(hourMinute(new Date(2026, 10, 10, 22, 41, 59))).toBe('22:41')
+  expect(hourMinute(new Date(2026, 10, 10, 9, 5, 0))).toBe('09:05')
 })

@@ -228,3 +228,19 @@ body {
 .apply__window {
   margin-top: var(--space-4);
 }
+
+/* The banner of a change that is waiting, and of what became of one: what it says on the
+   left, its buttons on the right, level with it. */
+.pending,
+.notice {
+  align-items: center;
+}
+
+.pending .ofo-row,
+.notice > .ofo-btn {
+  flex: none;
+}
+
+.pending .ofo-adv {
+  margin-top: var(--space-2);
+}
