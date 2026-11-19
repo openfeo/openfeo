@@ -6,13 +6,13 @@
 // corrected to it. The pages behind the login sit in one shell and are reachable only while
 // the screen is the dashboard's; each part adds its pages beside the dashboard.
 
-import { OfoPageHeader } from '@openfeo/ui'
-import { defineComponent, h, watch } from 'vue'
+import { watch } from 'vue'
 import { createRouter, createWebHistory, type Router, type RouterHistory } from 'vue-router'
 
 import ConfigUnreadable from './pages/ConfigUnreadable.vue'
 import Dashboard from './pages/Dashboard.vue'
 import FirstPassword from './pages/FirstPassword.vue'
+import Lan from './pages/Lan.vue'
 import Login from './pages/Login.vue'
 import Wan from './pages/Wan.vue'
 import type { PanelSession, Screen } from './session'
@@ -27,11 +27,6 @@ export const PATHS: Record<Screen, string> = {
 
 /** The pages behind the login, each by the address it starts at. */
 export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan' } as const
-
-/** A page a later task builds: for now its title, in the shell. */
-function soon(title: string) {
-  return defineComponent({ name: 'PageToCome', render: () => h(OfoPageHeader, { title }) })
-}
 
 /** The gates: a screen that is one of these has exactly one address. */
 const GATES = new Set<string>([PATHS.login, PATHS['first-password'], PATHS['config-unreadable']])
@@ -55,7 +50,7 @@ export function panelRoutes(session: PanelSession, history: RouterHistory = crea
           { path: '', component: Dashboard },
           // The WAN or LAN shown is in the address, so a reload and a link come back to it.
           { path: 'wan/:name?', component: Wan },
-          { path: 'lan/:name?', component: soon('LAN & DHCP') },
+          { path: 'lan/:name?', component: Lan },
         ],
       },
       { path: PATHS.login, component: Login },

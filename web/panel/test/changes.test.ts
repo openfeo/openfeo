@@ -127,6 +127,18 @@ test('each setting of a LAN is one change; a pool is one and the reservations ar
   for (const [edit, change] of table) {
     expect(after(edit), `${change.what} ${change.after}`).toEqual([change])
   }
+  // IPv6 switched off takes what only an IPv6 LAN may have with it, in the one line.
+  const advertising = labConfig()
+  advertising.lans[0]!.ra = false
+  advertising.lans[0]!.ipv6Index = 7
+  expect(
+    after((d) => {
+      d.lans[0]!.ipv6 = 'none'
+      d.lans[0]!.ra = undefined
+      d.lans[0]!.ipv6Index = 0
+    }, advertising),
+  ).toEqual([{ subject: 'lan0', what: 'IPv6', before: 'on', after: 'off' }])
+
   // A lease time left to the router's default is the default, said either way.
   expect(after((d) => (d.lans[0]!.dhcp!.leaseSecs = 0))).toHaveLength(1)
   expect(after((d) => (d.lans[0]!.dhcp!.leaseSecs = 0))[0]?.subject).toBe('lans[0].dhcp.lease_secs')

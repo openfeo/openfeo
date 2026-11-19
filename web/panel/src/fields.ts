@@ -8,6 +8,8 @@
 
 import { reactive, type InjectionKey } from 'vue'
 
+export { under } from './model/path'
+
 export interface PageFields {
   /** The paths of the fields that have been left. */
   left: Set<string>
@@ -21,10 +23,6 @@ export function pageFields(): PageFields {
   return { left: reactive(new Set<string>()), typed: reactive(new Map<string, string>()) }
 }
 
-/** Whether `path` is `at` or beneath it: `lans[0].dhcp.range[1]` is beneath `lans[0].dhcp.range`. */
-export function under(path: string, at: string): boolean {
-  return path === at || path.startsWith(`${at}.`) || path.startsWith(`${at}[`)
-}
 
 /** A list as it is typed, separated by commas, into the list it means. */
 export function parseList(text: string): string[] {

@@ -144,6 +144,22 @@ function place(address: number, from: Cidr4, to: Cidr4): number | null {
 }
 
 /**
+ * What the renumbering makes of one address that lay in `from`'s subnet, when the LAN goes
+ * to `to`: where it is carried to (itself, when it stays), or `null` when it is not such an
+ * address or has no place. For a field to say that it was moved with the subnet.
+ */
+export function carried(address: string, from: string, to: string): string | null {
+  const before = parseCidr4(from)
+  const after = parseCidr4(to)
+  const value = parse4(address)
+  if (before === null || after === null || value === null || !contains(before, value)) {
+    return null
+  }
+  const placed = place(value, before, after)
+  return placed === null ? null : format4(placed)
+}
+
+/**
  * A rule's target after the move: itself when it need not change, `null` when it has no
  * place, `undefined` when it is not IPv4 or does not lie in the old subnet. A range moves
  * whole or not at all. The old subnet itself becomes the new one; a smaller block moves by

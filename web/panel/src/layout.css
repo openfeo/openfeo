@@ -183,3 +183,27 @@ body {
 .page__none {
   margin: 0;
 }
+
+.page__why {
+  margin-left: var(--space-3);
+}
+
+/* A table edited in place: a field in each cell, and what is said of one beneath it. */
+.res td {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  vertical-align: top;
+}
+
+.res td > code {
+  line-height: 30px;
+}
+
+.res .ofo-field__help {
+  display: block;
+  margin-top: 4px;
+}
+
+.res__add {
+  margin-top: var(--space-3);
+}

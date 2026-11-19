@@ -324,14 +324,16 @@ function lanSettings(base: Lan, draft: Lan): Setting[] {
 
   const on = draft.ipv6 !== 'none'
   if ((base.ipv6 !== 'none') !== on) {
-    found.push({ what: 'IPv6', before: on ? 'off' : 'on', after: on ? 'on' : 'off', covers: ['ipv6'] })
+    // Whether it advertises, and its number in a delegation, go with IPv6 and come with it:
+    // the router takes neither on a LAN that carries none.
+    found.push({ what: 'IPv6', before: on ? 'off' : 'on', after: on ? 'on' : 'off', covers: on ? ['ipv6'] : ['ipv6', 'ra', 'ipv6_index'] })
   }
   if (on) {
     differing(found, 'routed /64', base.ipv6 === 'none' ? '' : base.ipv6, draft.ipv6, 'ipv6')
+    const advertises = (lan: Lan) => (lan.ra === false ? 'off' : 'on')
+    differing(found, 'router advertisements', advertises(base), advertises(draft), 'ra')
+    differing(found, 'subnet number', base.ipv6Index === 0 ? '' : String(base.ipv6Index), draft.ipv6Index === 0 ? '' : String(draft.ipv6Index), 'ipv6_index')
   }
-  const advertises = (lan: Lan) => (lan.ra === false ? 'off' : 'on')
-  differing(found, 'router advertisements', advertises(base), advertises(draft), 'ra')
-  differing(found, 'subnet number', base.ipv6Index === 0 ? '' : String(base.ipv6Index), draft.ipv6Index === 0 ? '' : String(draft.ipv6Index), 'ipv6_index')
   return found
 }
 
