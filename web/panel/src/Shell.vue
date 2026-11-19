@@ -6,6 +6,7 @@ import {
   OfoBanner,
   OfoButton,
   OfoNav,
+  OfoSaveBar,
   OfoShell,
   OfoThemeSwitch,
   storedTheme,
@@ -13,12 +14,13 @@ import {
   type NavEntry,
   type Theme,
 } from '@openfeo/ui'
-import { computed, inject, onBeforeUnmount, onMounted, provide, ref } from 'vue'
+import { computed, inject, nextTick, onBeforeUnmount, onMounted, provide, ref } from 'vue'
 import { RouterView, useRoute, useRouter } from 'vue-router'
 
-import { CONFIG, useConfig } from './config'
+import { CONFIG, useConfig, type Review } from './config'
 import { LIVE, useLive } from './live'
 import { clock, duration } from './model/format'
+import ApplyDialog from './parts/ApplyDialog.vue'
 import { PAGES } from './routes'
 import { ROUTER, SESSION, storageOr } from './session'
 
@@ -78,6 +80,47 @@ function setTheme(chosen: Theme): void {
   theme.value = chosen
 }
 
+// What the settings pages have changed is applied from here, whichever of them is shown:
+// the bar beneath the page counts it, and one dialog says what an apply does before it is sent.
+const settings = computed(() => at(PAGES.wan) || at(PAGES.lan))
+const held = computed(() => (config.pending.value === undefined ? undefined : 'Confirm or revert the change that is waiting first.'))
+/** What the router made of the draft, while the dialog that shows it is open. */
+const reviewed = ref<Review | null>(null)
+
+/** Take the person to something on the page: the control of a field, or what is there. */
+function bring(to: Element | null): void {
+  const control = to?.querySelector<HTMLElement>('input, select') ?? (to as HTMLElement | null)
+  control?.scrollIntoView?.({ block: 'center' })
+  control?.focus()
+}
+
+async function review(): Promise<void> {
+  // What the page itself finds wrong in a field is not in the draft, so the router would not
+  // see it: it is put right first.
+  await nextTick()
+  const typed = document.querySelector('.page [data-typed]')
+  if (typed !== null) {
+    bring(typed)
+    return
+  }
+  const found = await config.review()
+  if (found === null) {
+    // The page shows what the router refused: the first of it is where to start.
+    await nextTick()
+    bring(document.querySelector('.page .ofo-field--error, .page .refused'))
+    return
+  }
+  reviewed.value = found
+}
+
+async function apply(immediate: boolean): Promise<void> {
+  if (reviewed.value !== null) {
+    await config.apply(reviewed.value, immediate)
+    // Whatever became of it: the notice says.
+    reviewed.value = null
+  }
+}
+
 const problem = computed(() => state.value?.system?.configProblem)
 const lostAtClock = computed(() => (lostAt.value === null ? '' : clock(BigInt(lostAt.value.getTime()), now.value)))
 </script>
@@ -106,5 +149,24 @@ const lostAtClock = computed(() => (lostAt.value === null ? '' : clock(BigInt(lo
     </div>
 
     <RouterView />
+
+    <OfoSaveBar
+      v-if="settings && config.readOnly.value === null"
+      :count="config.changes.value.length"
+      :busy="config.busy.value"
+      :held="held"
+      @discard="config.discard()"
+      @apply="review"
+    />
+    <ApplyDialog
+      v-if="reviewed"
+      :review="reviewed"
+      :host="session.status.value?.hostname ?? ''"
+      :name="host"
+      :confirm-secs="config.confirmSecs.value"
+      :busy="config.busy.value"
+      @apply="apply"
+      @cancel="reviewed = null"
+    />
   </OfoShell>
 </template>

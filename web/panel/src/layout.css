@@ -207,3 +207,24 @@ body {
 .res__add {
   margin-top: var(--space-3);
 }
+
+/* The dialog before an apply: wider than a plain question, for the list of changes. */
+.apply .ofo-dialog {
+  width: min(560px, 100%);
+}
+
+.apply .ofo-banner {
+  margin: var(--space-4) 0;
+}
+
+.apply__head {
+  margin: var(--space-4) 0 var(--space-2);
+}
+
+.apply__effects {
+  padding-left: var(--space-5);
+}
+
+.apply__window {
+  margin-top: var(--space-4);
+}

@@ -7,6 +7,15 @@ import OfoButton from './OfoButton.vue'
 // something to apply. `held` is why an apply is not offered just now, shown in its place.
 withDefaults(defineProps<{ count: number; busy?: boolean; held?: string }>(), { busy: false })
 const emit = defineEmits<{ discard: []; apply: [] }>()
+
+/**
+ * Apply opens a dialog, and a dialog gives the focus back to what had it. Not every browser
+ * gives a button the focus when it is clicked, so the button takes it.
+ */
+function apply(event: MouseEvent): void {
+  ;(event.currentTarget as HTMLElement).focus()
+  emit('apply')
+}
 </script>
 
 <template>
@@ -15,7 +24,7 @@ const emit = defineEmits<{ discard: []; apply: [] }>()
     <div class="ofo-savebar__actions">
       <span v-if="held" class="ofo-savebar__held">{{ held }}</span>
       <OfoButton variant="ghost" :disabled="busy" @click="emit('discard')">Discard</OfoButton>
-      <OfoButton v-if="!held" variant="primary" :disabled="busy" @click="emit('apply')">Apply changes</OfoButton>
+      <OfoButton v-if="!held" variant="primary" :disabled="busy" @click="apply">Apply changes</OfoButton>
     </div>
   </div>
 </template>

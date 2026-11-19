@@ -347,6 +347,17 @@ test('the save bar counts in the singular and the plural, and gives discard and 
   expect(bar.findAll('button').map((button) => (button.element as HTMLButtonElement).disabled)).toEqual([true, true])
 })
 
+test('the button that applies has the focus once it is pressed', async () => {
+  // A dialog opened from it gives the focus back to it, in a browser that would have left the focus where it was.
+  const bar = seen(mount(OfoSaveBar, { props: { count: 1 }, attachTo: document.body }))
+  const apply = bar.findAll('button')[1]
+  expect(document.activeElement).not.toBe(apply?.element)
+  await apply?.trigger('click')
+  expect(document.activeElement).toBe(apply?.element)
+  expect(bar.emitted('apply')).toHaveLength(1)
+  bar.unmount()
+})
+
 test('the save bar says why an apply is held, and offers none', () => {
   const bar = seen(mount(OfoSaveBar, { props: { count: 2, held: 'Confirm or revert the change that is waiting first.' } }))
   expect(bar.findAll('button').map((button) => button.text())).toEqual(['Discard'])
