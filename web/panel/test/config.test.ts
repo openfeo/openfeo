@@ -588,6 +588,30 @@ test('leaving the page asks only while there are changes', async () => {
   removed.mockRestore()
 })
 
+test('leaving the page does not ask about changes that were sent and await the router', async () => {
+  // An apply that had no answer has moved the router, most likely, and the tab says where it
+  // went: following it there must not be met with "leave this page?" over changes that are
+  // already the router's. A draft edited since is asked about.
+  const { router, store } = await started()
+  const review = await moving(store, router)
+  await flushPromises()
+  const leaving = () => {
+    const event = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(event)
+    return event.defaultPrevented
+  }
+  expect(leaving()).toBe(true)
+  router.applyAnswer = { answered: false }
+  router.configUnreachable = true
+  await store.apply(review, false)
+  await flushPromises()
+  expect(store.changes.value.length).toBeGreaterThan(0)
+  expect(leaving()).toBe(false)
+  store.edit(reserve)
+  await flushPromises()
+  expect(leaving()).toBe(true)
+})
+
 test('a read that fails is made again when the socket opens, and reads are one at a time', async () => {
   const router = signedIn()
   router.configNow = { config: labConfig(), tag: 't1', confirmSecs: 120 }

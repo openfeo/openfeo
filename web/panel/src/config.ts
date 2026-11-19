@@ -150,6 +150,19 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
   const pending = computed(() => live.state.value?.system?.pendingConfig)
   const readOnly = computed(() => (live.state.value?.system?.configProblem === undefined ? null : READ_ONLY))
 
+  /** What an apply with no answer sent, until the router has said whether it took it. */
+  const awaited = shallowRef<Config | null>(null)
+  /**
+   * Whether leaving the page would lose something: the draft has changes, and they are not
+   * simply what was sent and awaits the router's word.
+   */
+  const unsaved = computed(() => {
+    if (changes.value.length === 0) {
+      return false
+    }
+    return !(awaited.value !== null && draft.value !== null && equals(ConfigSchema, draft.value, awaited.value))
+  })
+
   /** The tag of `base`. */
   let tag = ''
   let mine: Mine | null = null
@@ -236,6 +249,7 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       return
     }
     const now = pending.value
+    awaited.value = null
     if (mine.read.tag !== mine.fromTag || now !== undefined) {
       // Taken. A draft nobody touched since is the router's config now.
       if (draft.value === null || equals(ConfigSchema, draft.value, mine.sent)) {
@@ -377,6 +391,7 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
     draft.value = null
     tag = ''
     mine = null
+    awaited.value = null
     watched = null
     saidUnknown = null
     leftBehind = false
@@ -456,6 +471,7 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
           mine = immediate ? null : remembered
         } else {
           mine = remembered
+          awaited.value = sent
         }
         violations.value = []
         unfit.value = []
@@ -516,7 +532,7 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
         )
         watch(live.state, stateChanged, { flush: 'sync' })
         watch(live.events, eventsChanged, { flush: 'sync' })
-        watch(() => changes.value.length > 0, guard, { immediate: true })
+        watch(unsaved, guard, { immediate: true })
       })
       unhearEnd = router.onSessionEnd(forget)
       void read()
