@@ -284,7 +284,7 @@ immediately, no confirmation countdown", clear every time. While a change is pen
 page of every session counts down on the router's clock with Confirm and Revert now; a change
 that goes back leaves its changes as a draft in the tab that made it, a typed password
 included, and the tab says why. `effects` now says that a static WAN whose address, gateway,
-port or tag changes drops and comes back. Proven by 375 unit tests on the web side (among them
+port or tag changes drops and comes back. Proven by 383 unit tests on the web side (among them
 one that alters every leaf of the config's schema and finds each in the list of changes, and
 one that holds the renumbering rule to every string field the schema has) and by two new `m4`
 scenarios (35 in all): the client's config calls under Node, ending with a change that moves
@@ -293,9 +293,18 @@ Chromium, with the window shortened to 40 s, editing the pool and adding a reser
 applying and confirming, reverting a WAN change by hand, letting a window run out with the page
 open and finding the draft still there, adding and removing a LAN with no going back, and
 moving the LAN's subnet from under itself: the page says where the router went, and the test
-logs in at the new address and confirms there. Left open and written into the design: the
-countdown is a second coarse and trusts the browser's clock between the router's words, and
-what was typed for a type that was switched away from is kept only while its page is open.
+logs in at the new address and confirms there. The whole-branch review found what the tests
+had not asked, fixed in the same pull request: an apply sent the draft and the tag of the
+moment, so a config changed from elsewhere while the dialog was open was overwritten unseen
+(it now sends what the dialog showed, against the config it was shown for); what was typed
+while a change waited was lost when the change went back; a change that was answered and
+never seen pending, because the address went first, was forgotten in silence; a refusal on a
+tab that was not open left Apply changes looking dead; a flag that can be left unset was
+missing from the list of changes when it was spelt out; and a reservation matched by client
+identifier was never shown as one, because the router wants a MAC on those too. Left open and
+written into the design: the countdown is a second coarse and trusts the browser's clock
+between the router's words, what was typed for a type that was switched away from is kept only
+while its page is open, and no test against a real router meets an apply that is not answered.
 Part 3 is the remaining pages.
 
 ## Follow-ups

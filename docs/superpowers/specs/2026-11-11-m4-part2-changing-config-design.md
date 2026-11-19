@@ -665,13 +665,17 @@ from the design above.
   config when it starts, when the socket opens again, when a `config.*` event comes and when a
   pending change appears or goes. A draft with changes is kept whole when the config changes
   under it: there is no merge, and what the other session changed shows in the draft as a
-  change back, in the bar's count and in the dialog.
+  change back, in the bar's count and in the dialog. An apply sends the config and the tag
+  that the dialog was shown for, so a config changed from elsewhere while the dialog is open
+  is refused as stale and not overwritten unseen.
 - **What became of a pending change is read, not guessed.** A `config.confirmed` or
   `config.reverted` event stamped no earlier than the change decides; with none yet, a tag
   other than the one read while it was pending, or a router that has been up for less time
   than when the change was applied, means it went back. Two configs that differ only in a
   PPPoE password share a tag, so the tag alone is not enough. The tab that made a change that
-  went back has its draft again, password included; a confirmed change is forgotten.
+  went back has its draft again, password included, with whatever was typed while the change
+  waited; so does a tab whose apply was answered and that never saw the change pending,
+  because the address went first. A confirmed change is forgotten.
 - **"The same place in the new subnet"** is, for an address that lay in the old one: what was
   the router's own address becomes the router's new one; an address a device can still have in
   the new subnet stays; one left outside takes the place the same distance from the start; one
@@ -683,12 +687,13 @@ from the design above.
   each setting of a WAN or LAN that differs, named as its page names it; one for a pool; one
   for a LAN's reservations together; one for a WAN or LAN added or removed; one for each
   address elsewhere that a renumbering carried, by what it belongs to; and anything else by
-  its path. A test alters every leaf of the schema in turn and finds a change each time, so
-  nothing an apply would alter can go unlisted. A password is said to have changed, never what
-  to.
+  its path. A test alters every leaf of the schema in turn, and a flag that can be left unset
+  both ways, and finds a change each time, so nothing an apply would alter can go unlisted. A
+  password is said to have changed, never what to.
 - **A field** is checked when it is left, not before. What the router refuses is shown at the
   field whose path it is at or beneath, and is dropped when that field is edited; what has no
-  field is listed at the top of its tab, and what is another page's above the page. Something
+  field is listed at the top of its tab, and what is another page's, or another tab's, above
+  the page (the router reports a clash between two WANs or two LANs at the later one). Something
   the page itself finds wrong in what was typed is not in the draft, so Apply changes is held
   until it is put right.
 - **The countdown** is the change's revert time against the router's uptime, counted on in the
@@ -701,6 +706,9 @@ from the design above.
   elsewhere, and the list says where; a LAN's ticks offer its own ports and the free ones. A
   new WAN or LAN is named once, in a small dialog. A DHCP server switched on for the first
   time is proposed the 100th to the 200th address of a subnet that has them.
+- **A reservation matched by client identifier** has a MAC as well: the router wants one on
+  every reservation and matches by the identifier whenever there is one. Such a row shows the
+  identifier, says its MAC beneath, and can only be removed.
 - **IPv6 switched off on a LAN** also clears whether it advertises and its number in a
   delegation, which the router accepts only on a LAN that carries IPv6; on brings back what
   the router's config has.
@@ -709,7 +717,10 @@ from the design above.
   the banners every page needs, the save bar and the apply dialog.
 - **The browser run** boots with `openfeo.confirm_secs=40` and proves the return by address:
   the page says where the router went, the lab re-homes the LAN host, and the test logs in at
-  `https://192.168.2.1` and confirms there. The return by name is the client's own test.
+  `https://192.168.2.1` and confirms there. The client's own test returns by address too, with
+  the same token; the return by name is part 2a's scenario, by the Rust client. No test
+  against a real router meets an apply that is not answered: on the lab's machine the answer
+  got out every time, so that path is proven against a scripted socket and a scripted router.
 
 **For part 3**
 
