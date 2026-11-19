@@ -63,7 +63,7 @@ test('an IPv6 address or prefix is told from what is not one', () => {
   for (const good of ['2001:db8::1', '::', '::1', 'fe80::1', '2001:db8:1:2:3:4:5:6', '2001:db8::', '::ffff:192.0.2.1', '2001:DB8::a']) {
     expect(isIp6(good), good).toBe(true)
   }
-  for (const not of ['2001:db8', '2001:db8:::1', '1:2:3:4:5:6:7:8:9', '2001:db8::1::2', '2001:db8::g', '12345::1', '192.0.2.1', '', ' ::1', '::1 ', '1:2:3:4:5:6:7::8']) {
+  for (const not of ['2001:db8', '2001:db8:::1', '2001:db8:1:2:3:4:5:6:7', '2001:db8::1::2', '2001:db8::g', '12345::1', '192.0.2.1', '', ' ::1', '::1 ', '2001:db8:1:2:3:4:5::8']) {
     expect(isIp6(not), JSON.stringify(not)).toBe(false)
   }
   expect(isCidr6('2001:db8:1::/48')).toBe(true)
