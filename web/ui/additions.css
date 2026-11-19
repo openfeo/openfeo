@@ -25,10 +25,11 @@
 @media (max-width: 900px) { .ofo-adv__grid { grid-template-columns: 1fr; } }
 
 /* The Choice guideline groups choices in a fieldset with a legend, and ofo.css has no rule
-   that takes a fieldset's own border, padding and minimum width away. */
+   that takes a fieldset's own border, padding and minimum width away. The choices in a group
+   line up at the top: one with a hint beneath it is taller than one without. */
 .ofo-choices { border: 0; padding: 0; margin: 0; min-width: 0; }
 .ofo-choices legend { padding: 0; margin-bottom: 6px; }
-.ofo-choices .ofo-row { gap: var(--space-5); }
+.ofo-choices .ofo-row { gap: var(--space-5); align-items: flex-start; }
 
 /* ofo.css has one height of input. A table edited in place (a LAN's reservations) needs one
    that fits a row. */

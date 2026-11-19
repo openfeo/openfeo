@@ -108,6 +108,10 @@ const SCENARIOS: &[Scenario] = &[
         run: the_panel_in_a_browser_on_the_lan,
     },
     Scenario {
+        name: "the_panel_changes_config_in_a_browser",
+        run: the_panel_changes_config_in_a_browser,
+    },
+    Scenario {
         name: "a_subnet_change_not_confirmed_is_reverted",
         run: a_subnet_change_not_confirmed_is_reverted,
     },
@@ -1061,7 +1065,12 @@ fn the_panel_in_a_browser_on_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
     let mut qmp = lab.qmp()?;
     let mut playwright = web::tool(&lab.lan0, "playwright")?;
     playwright
-        .args(["test", "--config", "panel/playwright.config.ts"])
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "panel.spec",
+        ])
         .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
         .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
         .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e"))
@@ -1191,6 +1200,91 @@ fn the_javascript_client_changes_config_from_the_lan(lab: &mut Lab) -> anyhow::R
     }
     no_task_failed(lab)?;
     password_never_logged(lab)
+}
+
+/// The panel changing the router's config, in a real browser (SPEC §8.4, §12; M4 part 2b,
+/// `web/panel/e2e/config.spec.ts`). The router is booted with a 40 s window to confirm in,
+/// since the panel always uses the router's own: long enough to re-home the LAN host and log
+/// in again where the router went, short enough to wait out once. Chromium, inside the LAN
+/// namespace and by the router's name, edits the pool and adds a reservation, applies and
+/// confirms; applies a WAN change and reverts it by hand; lets one window run out with the
+/// page open; adds a LAN and removes it with no going back; then moves `lan0`'s subnet from
+/// under itself, asks the lab to re-home the LAN host, goes to the router's new address,
+/// logs in there and confirms. What the router made of each is read on the console, and what
+/// it ended up with from its config at the new address. Screenshots of the new screens join
+/// part 1's. Skipped as the other browser scenario is.
+fn the_panel_changes_config_in_a_browser(lab: &mut Lab) -> anyhow::Result<()> {
+    const WINDOW: u32 = 40;
+    web::ready()?;
+    boot(lab, &format!("openfeo.confirm_secs={WINDOW}"))?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    web::settle(&lab.lan0, "lan0")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "config.spec",
+        ])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e-config"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright-config.log"),
+        Duration::from_secs(360),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+    let console = lab.console()?;
+    let ran_out = format!(r"openfeo: config: reverted \(not confirmed in {WINDOW} s\)");
+    for (line, times) in [
+        (r"openfeo: config: confirmed", 2),
+        (r"openfeo: config: reverted \(asked\)", 1),
+        (ran_out.as_str(), 1),
+        (APPLIED_IMMEDIATELY, 2),
+    ] {
+        let found = console.count(&re(line));
+        ensure!(
+            found == times,
+            "{line} is on the console {found} times, not {times}"
+        );
+    }
+    no_task_failed(lab)?;
+    password_never_logged(lab)?;
+    // What the router ended up with, asked where it now is: the subnet that was confirmed
+    // from there, and the reservation the first change added, carried into it.
+    let there = Api::on(&lab.lan0, MOVED_ROUTER.parse::<SocketAddr>()?, HOST);
+    let token = there.login(PASSWORD)?;
+    let config = there
+        .ws_with(&token)?
+        .config()?
+        .config
+        .context("no config")?;
+    let lan = config.lans.first().context("no LAN in the config")?;
+    ensure!(lan.ipv4 == "192.168.2.1/24", "lan0 is at {}", lan.ipv4);
+    let reserved: Vec<(&str, &str)> = lan
+        .dhcp
+        .iter()
+        .flat_map(|dhcp| &dhcp.r#static)
+        .map(|lease| (lease.hostname.as_str(), lease.ip.as_str()))
+        .collect();
+    ensure!(
+        reserved.contains(&("printer", "192.168.2.20")),
+        "the reservations are {reserved:?}"
+    );
+    ensure!(
+        config.lans.len() == 1,
+        "the LAN that was added and removed is still there: {:?}",
+        config.lans.iter().map(|lan| &lan.name).collect::<Vec<_>>()
+    );
+    Ok(())
 }
 
 // ---- M4 part 2a: changing config (SPEC §5.5, §8.3) ----
