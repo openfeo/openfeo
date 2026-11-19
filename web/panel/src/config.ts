@@ -37,6 +37,13 @@ export interface Review {
   changes: Change[]
   effects: ConfigEffect[]
   caller: Caller | undefined
+  /**
+   * The draft as the router validated it, and the tag of the config it was edited from. An
+   * apply sends these: what was shown is what is applied, and a config that was changed
+   * from elsewhere while the dialog was open is refused as stale, not overwritten unseen.
+   */
+  config: Config
+  tag: string
 }
 
 export interface ConfigStore {
@@ -94,6 +101,8 @@ interface Mine {
   fromTag: string
   /** `false` while the apply has had no answer and the router has not yet said whether it took it. */
   answered: boolean
+  /** The tag the router answered with: that of the config while this change runs. */
+  appliedTag: string | null
   immediate: boolean
   /** The router's uptime when the apply returned, where known. */
   at: number | undefined
@@ -227,11 +236,22 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       // The draft waits for the router to say whether it took the apply.
       mine.read = view
       settleUnanswered()
-    } else if (first || !changed) {
-      draft.value = clone(ConfigSchema, view.config)
-    } else if (another && notice.value?.kind !== 'refused') {
-      // (A refusal that is already up says it in the router's own words.)
-      notice.value = { kind: 'changed-elsewhere' }
+    } else {
+      if (first || !changed) {
+        draft.value = clone(ConfigSchema, view.config)
+      } else if (another && notice.value?.kind !== 'refused') {
+        // (A refusal that is already up says it in the router's own words.)
+        notice.value = { kind: 'changed-elsewhere' }
+      }
+      if (mine !== null && mine.applied === null && mine.appliedTag !== mine.fromTag && view.tag === mine.fromTag) {
+        // This tab's change was answered and then never seen pending: the address went
+        // before the state could follow the answer. The config is the one it was edited
+        // from again, so the change went back while the tab was away.
+        const own = mine
+        mine = null
+        restore(own.sent)
+        notice.value = { kind: 'reverted', why: 'unknown', appliedAt: null, draftKept: true }
+      }
     }
     if (watched !== null) {
       if (watched.gone) {
@@ -241,6 +261,25 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       }
     }
     settlePending()
+  }
+
+  /**
+   * Give the tab that made a change its changes back, over the config just read. A draft
+   * that was not touched since the apply is what was sent. One that was (the fields stay
+   * open while a change waits) already holds what was sent and what was typed since: it is
+   * kept as it is, with the passwords that were emptied when the change was applied.
+   */
+  function restore(sent: Config): void {
+    if (draft.value === null || changes.value.length === 0) {
+      draft.value = clone(ConfigSchema, sent)
+      return
+    }
+    for (const was of sent.wans) {
+      const now = draft.value.wans.find((wan) => wan.name === was.name)
+      if (was.kind.case === 'pppoe' && was.kind.value.password !== '' && now?.kind.case === 'pppoe' && now.kind.value.password === '') {
+        now.kind.value.password = was.kind.value.password
+      }
+    }
   }
 
   /** An apply that had no answer: once the config has been read and the state heard, the router has said. */
@@ -257,13 +296,18 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       }
       if (now !== undefined && !mine.immediate) {
         mine.answered = true
+        mine.appliedTag = mine.read.tag
         mine.applied = now.appliedUptimeMs
       } else {
         mine = null
       }
     } else {
-      // Neither pending nor in force: refused where nobody heard, or gone back already.
-      draft.value = clone(ConfigSchema, mine.sent)
+      // Neither pending nor in force: refused where nobody heard, or gone back already. The
+      // draft was not touched while the router's word was awaited: it is what was sent, and
+      // whatever was typed since.
+      if (draft.value === null) {
+        draft.value = clone(ConfigSchema, mine.sent)
+      }
       mine = null
       notice.value = { kind: 'reverted', why: 'unknown', appliedAt: null, draftKept: true }
     }
@@ -274,7 +318,9 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
     if (!change.readSinceGone) {
       return null
     }
-    const said = live.events.value.find((event) => (event.topic === 'config.reverted' || event.topic === 'config.confirmed') && event.uptimeMs >= change.applied)
+    // The first word after the change is the one about it: a later one may be about another
+    // change, made from elsewhere while this tab was away. (The events are newest first.)
+    const said = [...live.events.value].reverse().find((event) => (event.topic === 'config.reverted' || event.topic === 'config.confirmed') && event.uptimeMs >= change.applied)
     if (said !== undefined) {
       return { reverted: said.topic === 'config.reverted', why: whyOf(said) }
     }
@@ -308,8 +354,7 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       return
     }
     if (own !== null) {
-      // The tab that made the change has its changes back, over the config just read.
-      draft.value = clone(ConfigSchema, own.sent)
+      restore(own.sent)
     }
     notice.value = { kind: 'reverted', why: became.why, appliedAt: change.appliedAt, draftKept: own !== null }
     saidUnknown = became.why === 'unknown' ? change.applied : null
@@ -441,9 +486,13 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       }
       busy.value = true
       try {
-        const answer = await router.validate(draft.value)
+        // A copy, and the tag as it is now: what the router is asked about is what an apply sends.
+        const reviewed = clone(ConfigSchema, draft.value)
+        const from = tag
+        const listed = changes.value
+        const answer = await router.validate(reviewed)
         violations.value = answer.violations
-        return answer.violations.length > 0 ? null : { changes: changes.value, effects: answer.effects, caller: answer.caller }
+        return answer.violations.length > 0 ? null : { changes: listed, effects: answer.effects, caller: answer.caller, config: reviewed, tag: from }
       } catch (error) {
         refused(error)
         return null
@@ -456,17 +505,30 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
         return
       }
       busy.value = true
-      const sent = clone(ConfigSchema, draft.value)
-      const fromTag = tag
+      // What was reviewed, against the config it was reviewed against.
+      const sent = clone(ConfigSchema, review.config)
+      const fromTag = review.tag
       try {
         const applied = await router.apply(sent, fromTag, { immediate })
-        const remembered: Mine = { sent, fromTag, answered: applied.answered, immediate, at: live.sinceBootMs.value, applied: null, read: null, stateSeen: false }
+        const remembered: Mine = {
+          sent,
+          fromTag,
+          answered: applied.answered,
+          appliedTag: applied.answered ? applied.tag : null,
+          immediate,
+          at: live.sinceBootMs.value,
+          applied: null,
+          read: null,
+          stateSeen: false,
+        }
         if (applied.answered) {
           // It is the router's config now. The password that was typed has been sent and is
           // kept nowhere a page can show it: only with what is remembered of this change,
           // so that its going back gives the draft back whole.
           base.value = withoutPasswords(sent)
-          draft.value = clone(ConfigSchema, base.value)
+          if (draft.value === null || equals(ConfigSchema, draft.value, sent)) {
+            draft.value = clone(ConfigSchema, base.value)
+          }
           tag = applied.tag
           mine = immediate ? null : remembered
         } else {

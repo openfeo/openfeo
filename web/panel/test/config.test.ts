@@ -62,11 +62,11 @@ async function taken(router: FakeRouter, config: Config, tag: string, agoSecs = 
   await flushPromises()
 }
 
-/** The pending change is gone: the router's config is now this, and it says why. */
-async function settled(router: FakeRouter, config: Config, tag: string, topic: string, fields: Record<string, string> = {}) {
+/** The pending change is gone: the router's config is now this, and it says why (and when it said so). */
+async function settled(router: FakeRouter, config: Config, tag: string, topic: string, fields: Record<string, string> = {}, at: Date = NOW) {
   router.configNow = { config: clone(ConfigSchema, config), tag, confirmSecs: 120 }
   router.push('state', state())
-  router.push('events', event(topic, fields, NOW))
+  router.push('events', event(topic, fields, at))
   await flushPromises()
 }
 
@@ -423,15 +423,126 @@ test('a reverted change whose event comes late is still known, and then says why
   expect(other.store.notice.value).toEqual({ kind: 'reverted', why: 'unknown', appliedAt: NOW, draftKept: true })
 })
 
+test('what was typed while a change waited is kept when it goes back', async () => {
+  const { router, store } = await started(pppoeConfig())
+  store.edit(typePassword)
+  store.edit(reserve)
+  router.applyAnswer = { answered: true, tag: 't2' }
+  await store.apply((await store.review())!, false)
+  await taken(router, reserved(pppoeConfig()), 't2')
+  // The fields stay open while the change waits, and the person goes on.
+  store.edit((draft) => (draft.lans[0]!.dhcp!.range[1] = '192.168.1.220'))
+  expect(store.changes.value.map((change) => change.what)).toEqual(['pool'])
+  await settled(router, pppoeConfig(), 't1', 'config.reverted', { why: 'timeout' })
+  // Everything is still there: what was sent, what was typed since, and the password.
+  expect(store.draft.value!.lans[0]!.dhcp!.static).toHaveLength(2)
+  expect(store.draft.value!.lans[0]!.dhcp!.range[1]).toBe('192.168.1.220')
+  expect(passwordOf(store.draft.value)).toBe('a-typed-secret')
+  expect(store.changes.value.map((change) => change.what)).toEqual(['password', 'pool', 'reservations'])
+  expect(store.notice.value).toEqual({ kind: 'reverted', why: 'timeout', appliedAt: NOW, draftKept: true })
+})
+
+test('an apply that was not taken keeps what was typed since it was sent', async () => {
+  const { router, store } = await started()
+  const review = await moving(store, router)
+  router.applyAnswer = { answered: false }
+  router.configUnreachable = true
+  await store.apply(review, false)
+  await flushPromises()
+  store.edit(reserve)
+  router.setConnection('reconnecting')
+  router.configUnreachable = false
+  router.setConnection('open')
+  router.push('state', state())
+  await flushPromises()
+  expect(store.draft.value!.lans[0]!.ipv4).toBe('192.168.2.1/24')
+  expect(store.draft.value!.lans[0]!.dhcp!.static.map((lease) => lease.hostname)).toEqual(['nas', 'printer'])
+  expect(store.notice.value).toEqual({ kind: 'reverted', why: 'unknown', appliedAt: null, draftKept: true })
+})
+
+test('an apply names the config and the tag that were reviewed, whatever was read since', async () => {
+  const { router, store } = await started()
+  store.edit(reserve)
+  const review = (await store.review())!
+  // While the dialog is open another session changes the config, and this tab reads it.
+  const other = labConfig()
+  other.lans[0]!.dhcp!.leaseSecs = 3600
+  router.configNow = { config: other, tag: 't2', confirmSecs: 120 }
+  router.push('events', event('config.applied', { mode: 'immediate' }))
+  await flushPromises()
+  expect(store.base.value!.lans[0]!.dhcp!.leaseSecs).toBe(3600)
+  // What is sent is what the dialog showed, against the config it was shown against: the
+  // router refuses it as stale, and the other session's change is not undone unseen.
+  router.applyAnswer = new RouterError(ErrorCode.FAILED_PRECONDITION, 'the config has changed since it was read; read it again')
+  await store.apply(review, false)
+  await flushPromises()
+  expect(router.calls.apply).toHaveLength(1)
+  expect(router.calls.apply[0]?.tag).toBe('t1')
+  expect(equals(ConfigSchema, router.calls.apply[0]!.config, reserved())).toBe(true)
+  expect(store.notice.value).toEqual({ kind: 'refused', message: 'the config has changed since it was read; read it again' })
+  expect(store.draft.value!.lans[0]!.dhcp!.static).toHaveLength(2)
+  // Reviewed again, it is shown the other session's change as one it would undo, and names the new tag.
+  const again = (await store.review())!
+  expect(again.changes.map((change) => change.what)).toEqual(['lease time', 'reservations'])
+  router.applyAnswer = { answered: true, tag: 't3' }
+  await store.apply(again, true)
+  expect(router.calls.apply[1]?.tag).toBe('t2')
+})
+
+test('a change this tab applied and never saw pending is still known to have gone back', async () => {
+  // The answer got out, and the address went before the state that says "pending" could
+  // follow it. The tab finds the router again after the window ran out.
+  const { router, store } = await started()
+  store.edit(reserve)
+  router.applyAnswer = { answered: true, tag: 't2' }
+  await store.apply((await store.review())!, false)
+  expect(store.changes.value).toEqual([])
+  router.setConnection('reconnecting')
+  router.configNow = { config: labConfig(), tag: 't1', confirmSecs: 120 }
+  router.setConnection('open')
+  router.push('state', state())
+  await flushPromises()
+  expect(store.base.value!.lans[0]!.dhcp!.static).toHaveLength(1)
+  expect(store.draft.value!.lans[0]!.dhcp!.static).toHaveLength(2)
+  expect(store.changes.value).toEqual([{ subject: 'lan0', what: 'reservations', before: '', after: '1 added' }])
+  expect(store.notice.value).toEqual({ kind: 'reverted', why: 'unknown', appliedAt: null, draftKept: true })
+  // It is settled once: a later read brings nothing back a second time.
+  store.discard()
+  store.notice.value = null
+  router.push('events', event('config.applied', { mode: 'immediate' }, new Date(NOW.getTime() + 5)))
+  await flushPromises()
+  expect(store.changes.value).toEqual([])
+  expect(store.notice.value).toBeNull()
+})
+
+test("what became of this tab's change is the first word after it, not a later change's", async () => {
+  const { router, store } = await started()
+  store.edit(reserve)
+  router.applyAnswer = { answered: true, tag: 't2' }
+  await store.apply((await store.review())!, false)
+  await taken(router, reserved(), 't2', 50)
+  // While this tab was away its change ran out, and another session applied one and confirmed it.
+  const theirs = labConfig()
+  theirs.lans[0]!.dhcp!.leaseSecs = 3600
+  router.configNow = { config: theirs, tag: 't3', confirmSecs: 120 }
+  router.push('state', state())
+  router.push('events', event('config.reverted', { why: 'timeout' }, new Date(NOW.getTime() - 30_000)))
+  router.push('events', event('config.confirmed', {}, new Date(NOW.getTime() - 10_000)))
+  await flushPromises()
+  expect(store.notice.value).toEqual({ kind: 'reverted', why: 'timeout', appliedAt: new Date(NOW.getTime() - 50_000), draftKept: true })
+  expect(store.draft.value!.lans[0]!.dhcp!.static).toHaveLength(2)
+})
+
 test('a change that is confirmed is forgotten', async () => {
   const { router, store } = await started()
   store.edit(reserve)
   router.applyAnswer = { answered: true, tag: 't2' }
   await store.apply((await store.review())!, false)
-  await taken(router, reserved(), 't2')
+  // Applied twenty seconds ago, confirmed ten seconds ago.
+  await taken(router, reserved(), 't2', 20)
   await store.confirm()
   expect(router.calls.confirm).toBe(1)
-  await settled(router, reserved(), 't2', 'config.confirmed')
+  await settled(router, reserved(), 't2', 'config.confirmed', {}, new Date(NOW.getTime() - 10_000))
   expect(store.pending.value).toBeUndefined()
   expect(store.notice.value).toBeNull()
   expect(store.changes.value).toEqual([])
@@ -442,6 +553,7 @@ test('a change that is confirmed is forgotten', async () => {
   await taken(router, third, 't3')
   await settled(router, reserved(), 't2', 'config.reverted', { why: 'asked' })
   expect(store.changes.value).toEqual([])
+  // (Said of the later change, and not answered by the earlier one's confirmation.)
   expect(store.notice.value).toEqual({ kind: 'reverted', why: 'asked', appliedAt: NOW, draftKept: false })
 })
 
