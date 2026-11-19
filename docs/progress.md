@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | part 1 and the router half of part 2, of 5, 2026-11-12 | #68, #81, #101 |
+| M4 API and panel | parts 1 and 2 of 5, 2026-11-19 | #68, #81, #101, #103 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -259,6 +259,44 @@ open and written into the design: an apply that takes away the address it arrive
 answered, and a WAN that is removed, or moved to another port or tag, loses its link before its
 old task has said goodbye. Part 2b is the client's calls, the
 draft, and the WAN and LAN & DHCP pages.
+
+**2026-11-19, [#103](https://github.com/openfeo/openfeo/pull/103), part 2b: changing config, the
+web.** The router's config can now be changed from the panel. `@openfeo/client` gains the five
+config calls; an apply or a revert that is not answered (a change that moves the router's
+address takes the answer's way home with it) is a result, not an error, and is never sent
+twice. `@openfeo/ui` gains the components a settings page is made of: form sections, choices, a
+toggle, a select, the Advanced disclosure, tabs, the save bar, the dialog and the list of
+changes. The panel gains a shell that every page behind the login sits in, which listens to the
+router once; one draft of the whole config in the tab's memory, never stored, so what no page
+shows is sent back as it was; and two pages in the approved mockup's words. **WAN**: a tab per
+WAN, its type as three choices each with its own fields, the port with its link and where it is
+in use, the VLAN tag, the priority, IPv6, and Add and Remove. **LAN & DHCP**: the router's
+address and the subnet's size, the ports as ticks, the DHCP server with its pool and lease
+time, reservations edited in place, IPv6, and Add and Remove (refused, with what is in the
+way, while a forward or a rule still points into the LAN). Changing a LAN's address or size
+carries along every address in the config that lay in its subnet, each field saying what it
+was and one that found no place saying so. A field is checked when it is left; what the router
+refuses is shown at the field its path names, and what has no field is listed, so nothing
+refused is silent. One bar counts the changes of every page, and one dialog lists them before
+and after, with what the router says they interrupt, a warning with the router's name and new
+address when the change moves whoever is asking, the router's own window, and the box "Apply
+immediately, no confirmation countdown", clear every time. While a change is pending every
+page of every session counts down on the router's clock with Confirm and Revert now; a change
+that goes back leaves its changes as a draft in the tab that made it, a typed password
+included, and the tab says why. `effects` now says that a static WAN whose address, gateway,
+port or tag changes drops and comes back. Proven by 375 unit tests on the web side (among them
+one that alters every leaf of the config's schema and finds each in the list of changes, and
+one that holds the renumbering rule to every string field the schema has) and by two new `m4`
+scenarios (35 in all): the client's config calls under Node, ending with a change that moves
+the router, which the test follows and confirms from the new address; and Playwright's
+Chromium, with the window shortened to 40 s, editing the pool and adding a reservation,
+applying and confirming, reverting a WAN change by hand, letting a window run out with the page
+open and finding the draft still there, adding and removing a LAN with no going back, and
+moving the LAN's subnet from under itself: the page says where the router went, and the test
+logs in at the new address and confirms there. Left open and written into the design: the
+countdown is a second coarse and trusts the browser's clock between the router's words, and
+what was typed for a type that was switched away from is kept only while its page is open.
+Part 3 is the remaining pages.
 
 ## Follow-ups
 
