@@ -97,8 +97,12 @@ const unplaced = computed(() =>
     return !WAN_FIELDS.some((field) => under(within, field))
   }),
 )
-/** What it refused that is not about a WAN at all: another page's, said here so that it is said. */
-const elsewhere = computed(() => store.violations.value.filter((violation) => !violation.path.startsWith('wans[')))
+/**
+ * What it refused that is not about the WAN shown: another page's, or another WAN's (a clash
+ * between two is reported at the later one, which is often not the tab that is open). Said
+ * above the page, so that pressing Apply changes never looks like nothing happened.
+ */
+const elsewhere = computed(() => store.violations.value.filter((violation) => !under(violation.path, at.value)))
 
 const local = computed(() => (wan.value === undefined ? {} : wanProblems(wan.value)))
 /** Whether a field of this WAN is showing something wrong. */

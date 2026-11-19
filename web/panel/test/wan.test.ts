@@ -280,6 +280,28 @@ test("the router's violation is shown at its field, and one with no field at the
   expect(tabs(wrapper)[0]?.find('.ofo-pill').text()).toBe('up')
 })
 
+test('what the router refuses on a WAN that is not shown is said above the page', async () => {
+  // Two WANs on one port: the router says so at the later one, whichever was just edited.
+  const { wrapper, router, store } = await page('/wan', twoWans())
+  await fieldLabelled(wrapper, 'Port').find('select').setValue('p2')
+  router.validation = {
+    violations: [{ $typeName: 'openfeo.v1.ConfigViolation', path: 'wans[1].port', code: 'port_used_twice', message: '"p2" is already assigned' }],
+    effects: [],
+    caller: undefined,
+  }
+  expect(await store().review()).toBeNull()
+  await flushPromises()
+  // Nothing on the tab that is shown is wrong, and the refusal is still on the page.
+  expect(wrapper.find('[role="tabpanel"] .ofo-field--error').exists()).toBe(false)
+  const above = () => wrapper.findAll('.refused').find((list) => !list.element.closest('[role="tabpanel"]'))
+  expect(above()?.findAll('li').map((item) => item.text())).toEqual(['wans[1].port: "p2" is already assigned'])
+  expect(tabs(wrapper)[1]?.find('.ofo-pill').text()).toBe('problem')
+  await tabs(wrapper)[1]?.trigger('click')
+  await flushPromises()
+  expect(fieldLabelled(wrapper, 'Port').find('[role="alert"]').text()).toBe('"p2" is already assigned')
+  expect(above()).toBeUndefined()
+})
+
 test('advanced opens for a field that is set', async () => {
   const closed = await page()
   const groups = () => closed.wrapper.findAll('details.ofo-adv')

@@ -123,8 +123,12 @@ const tabs = computed<TabEntry[]>(() =>
 
 /** What the router refused under this LAN at a path no field of the page is for. */
 const unplaced = computed(() => store.violations.value.filter((violation) => under(violation.path, at.value) && !claimed(violation.path.slice(at.value.length + 1))))
-/** What it refused that is not about a LAN at all: another page's, said here so that it is said. */
-const elsewhere = computed(() => store.violations.value.filter((violation) => !violation.path.startsWith('lans[')))
+/**
+ * What it refused that is not about the LAN shown: another page's, or another LAN's (a clash
+ * between two is reported at the later one, which is often not the tab that is open). Said
+ * above the page, so that pressing Apply changes never looks like nothing happened.
+ */
+const elsewhere = computed(() => store.violations.value.filter((violation) => !under(violation.path, at.value)))
 
 const local = computed(() => (lan.value === undefined ? {} : lanProblems(lan.value)))
 function wrong(field: string): boolean {
@@ -233,14 +237,18 @@ function chooseLease(choice: string): void {
 
 // ---- Reservations ----
 
-/** A reservation is the same one when its MAC is, or its client identifier where it has no MAC. */
+/** A reservation is the same one when its MAC is (every one the router takes has a MAC), or its client identifier while it has none. */
 const key = (lease: StaticLease) => (lease.mac !== '' ? lease.mac : `id:${lease.clientId}`)
 /** The same reservation as the router has it. */
 function wasLease(lease: StaticLease): StaticLease | undefined {
   return key(lease) === 'id:' ? undefined : wasDhcp.value?.static.find((each) => key(each) === key(lease))
 }
-/** Matched by client identifier: shown and kept, and only to be removed. */
-const byIdentifier = (lease: StaticLease) => lease.mac === '' && lease.clientId !== ''
+/**
+ * Matched by client identifier: shown and kept, and only to be removed. The router matches
+ * by the identifier whenever there is one, and still wants a MAC on every reservation, so
+ * such a reservation has both and its MAC decides nothing.
+ */
+const byIdentifier = (lease: StaticLease) => lease.clientId !== ''
 function lease(at: number, edit: (lease: StaticLease) => void): void {
   change((shown) => {
     const row = shown.dhcp?.static[at]
@@ -475,6 +483,7 @@ function remove(): void {
                   />
                   <td v-if="byIdentifier(row)">
                     <code class="ofo-mono">{{ row.clientId }}</code>
+                    <span class="ofo-field__help">Matched by this client identifier.{{ row.mac === '' ? '' : ` Its MAC address is ${row.mac}.` }}</span>
                   </td>
                   <SettingCell
                     v-else

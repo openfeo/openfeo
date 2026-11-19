@@ -287,6 +287,23 @@ test('a difference no page shows is listed by its path', () => {
   ])
 })
 
+test('a flag that can be left unset is a change when it is spelt out, and when it is left unset again', () => {
+  // Unset, the forwarder also uses the WAN's resolvers; `false` spelt out stops that. JSON
+  // leaves an unset flag out and writes `false` when it is spelt out: the two are not the
+  // same config, though both read "false" to a comparison that fills in a default.
+  const flag = (config: Config, value: boolean | undefined) => {
+    config.dns = create(ConfigSchema, { dns: value === undefined ? {} : { useWanDns: value } }).dns
+  }
+  const unset = labConfig()
+  flag(unset, undefined)
+  expect(after((d) => flag(d, false), unset)).toEqual([{ subject: 'dns.use_wan_dns', what: '', before: 'not set', after: 'false' }])
+  expect(after((d) => flag(d, true), unset)).toEqual([{ subject: 'dns.use_wan_dns', what: '', before: 'false', after: 'true' }])
+  const spelt = labConfig()
+  flag(spelt, false)
+  expect(after((d) => flag(d, undefined), spelt)).toEqual([{ subject: 'dns.use_wan_dns', what: '', before: 'false', after: 'not set' }])
+  expect(after((d) => flag(d, false), spelt)).toEqual([])
+})
+
 test('the admin’s hash is never listed', () => {
   // It is not sent and not taken (SPEC §8.3): a draft that carries one changes nothing.
   expect(after((d) => (d.admin = create(ConfigSchema, { admin: { passwordHash: '$argon2id$not-a-real-hash' } }).admin))).toEqual([])
@@ -304,8 +321,12 @@ function leaves(schema: DescMessage, under: Step[] = [], depth = 0): Step[][] {
   })
 }
 
-/** Change the one leaf the steps lead to, making whatever stands on the way that is not there. */
-function alter(config: Config, steps: Step[]): void {
+/**
+ * Change the one leaf the steps lead to, making whatever stands on the way that is not
+ * there. `spelt` sets a flag to `false` outright: for one that can be left unset, that is a
+ * change of its own.
+ */
+function alter(config: Config, steps: Step[], spelt = false): void {
   let holder = config as unknown as Record<string, unknown>
   for (const [at, { field }] of steps.entries()) {
     const last = at === steps.length - 1
@@ -333,7 +354,8 @@ function alter(config: Config, steps: Step[]): void {
       continue
     }
     const scalar = field.fieldKind === 'scalar' || (field.fieldKind === 'list' && field.listKind === 'scalar') ? field.scalar : undefined
-    const other = (value: unknown): unknown => (scalar === ScalarType.STRING ? `${String(value ?? '')}x` : scalar === ScalarType.BOOL ? value !== true : Number(value ?? 0) + 1)
+    const other = (value: unknown): unknown =>
+      scalar === ScalarType.STRING ? `${String(value ?? '')}x` : scalar === ScalarType.BOOL ? (spelt ? false : value !== true) : Number(value ?? 0) + 1
     if (field.fieldKind === 'list') {
       ;(owner[slot] as unknown[]).push(other(undefined))
     } else {
@@ -346,7 +368,12 @@ test('nothing an apply would alter is left out', () => {
   const all = leaves(ConfigSchema)
   expect(all.length).toBeGreaterThan(50)
   const name = (steps: Step[]) => steps.map((step) => step.field.name).join('.')
-  for (const base of [labConfig(), pppoeConfig()]) {
+  // Three configs to start from; the third has the tables the other two leave out, so that a
+  // leaf inside one is changed on its own and not by the table's arriving.
+  const whole = pppoeConfig()
+  whole.dns = create(ConfigSchema, { dns: { upstreams: ['203.0.113.1'], records: [{ name: 'nas', address: '192.168.1.10' }] } }).dns
+  whole.publicIpv4 = create(ConfigSchema, { publicIpv4: [{ prefix: '198.51.100.0/29' }] }).publicIpv4
+  for (const base of [labConfig(), pppoeConfig(), whole]) {
     for (const steps of all) {
       if (name(steps) === 'admin.password_hash') {
         continue
@@ -354,6 +381,13 @@ test('nothing an apply would alter is left out', () => {
       const draft = clone(ConfigSchema, base)
       alter(draft, steps)
       expect(changes(base, draft).length, name(steps)).toBeGreaterThan(0)
+      // A flag that can be left unset, spelt out as `false`.
+      const leaf = steps.at(-1)?.field
+      if (leaf?.fieldKind === 'scalar' && leaf.scalar === ScalarType.BOOL && leaf.proto.proto3Optional) {
+        const explicit = clone(ConfigSchema, base)
+        alter(explicit, steps, true)
+        expect(changes(base, explicit).length, `${name(steps)} = false`).toBeGreaterThan(0)
+      }
     }
   }
 })

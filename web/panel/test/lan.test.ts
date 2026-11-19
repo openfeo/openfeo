@@ -261,14 +261,20 @@ test('a reservation is added, edited and removed in place', async () => {
 })
 
 test('a reservation by client identifier is shown, kept, and can only be removed', async () => {
+  // The router wants a MAC on every reservation and matches by the identifier when there is
+  // one: such a reservation has both.
   const config = routerConfig()
   const lease = config.lans[0]!.dhcp!.static[1]!
-  lease.mac = ''
   lease.clientId = '01020000aa0122'
   const { wrapper, store } = await page('/lan', config)
   const row = () => rows(wrapper)[1]!
-  // Its identifier stands where the MAC would be, as a machine wrote it, and nothing in the row is a field to change.
+  // Its identifier stands where the MAC would be, as a machine wrote it, with the MAC said
+  // beneath; nothing in the row is a field to change.
   expect(row().find('code.ofo-mono').text()).toBe('01020000aa0122')
+  expect(row().findAll('td')[1]?.find('.ofo-field__help').text()).toBe('Matched by this client identifier. Its MAC address is 52:54:00:fe:10:11.')
+  // The reservation beside it, matched by its MAC, is an ordinary row.
+  expect(rows(wrapper)[0]!.find('code').exists()).toBe(false)
+  expect(rows(wrapper)[0]!.findAll('input')).toHaveLength(3)
   expect(row().findAll('input').map((input) => (input.element as HTMLInputElement).disabled)).toEqual([true, true])
   expect(row().findAll('input').map((input) => (input.element as HTMLInputElement).value)).toEqual(['printer', '192.168.1.11'])
   // Other edits leave it as it is.
@@ -320,6 +326,27 @@ test('a MAC address is checked when its field is left', async () => {
   expect(wrapper.find('[role="tabpanel"] .refused').findAll('li').map((item) => item.text())).toEqual(['lans[0].ports[1]: no such port'])
   const above = wrapper.findAll('.refused').find((list) => !list.element.closest('[role="tabpanel"]'))
   expect(above?.findAll('li').map((item) => item.text())).toEqual(['wans[0].port: in use by lan0'])
+})
+
+test('what the router refuses on a LAN that is not shown is said above the page', async () => {
+  // A clash between two LANs is reported at the later one, which is often not the tab that
+  // is open: pressing Apply changes must not look like nothing happened.
+  const { wrapper, router, store } = await page()
+  router.validation = {
+    violations: [{ $typeName: 'openfeo.v1.ConfigViolation', path: 'lans[1].ipv4', code: 'overlap', message: 'overlaps lan0 (192.168.1.1/24)' }],
+    effects: [],
+    caller: undefined,
+  }
+  expect(await store().review()).toBeNull()
+  await flushPromises()
+  const above = () => wrapper.findAll('.refused').find((list) => !list.element.closest('[role="tabpanel"]'))
+  expect(above()?.findAll('li').map((item) => item.text())).toEqual(['lans[1].ipv4: overlaps lan0 (192.168.1.1/24)'])
+  expect(tabs(wrapper)[1]?.find('.ofo-pill').text()).toBe('problem')
+  // On its own tab it is at its field, and no longer above the page.
+  await tabs(wrapper)[1]?.trigger('click')
+  await flushPromises()
+  expect(fieldLabelled(wrapper, 'Router address').find('[role="alert"]').text()).toBe('overlaps lan0 (192.168.1.1/24)')
+  expect(above()).toBeUndefined()
 })
 
 test('Other… takes the lease time in seconds', async () => {

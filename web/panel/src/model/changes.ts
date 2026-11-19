@@ -99,6 +99,11 @@ function differ(a: unknown, b: unknown, path: string, found: Leaf[]): void {
     const after = b === undefined ? leftOut(a) : written(b)
     if (before !== after) {
       found.push({ path, before, after })
+    } else {
+      // The one that is there is its kind's default, spelt out. JSON writes a default only
+      // for a field that can be left unset, and for such a field unset is not the default
+      // (a flag may mean "yes" when nobody says): the two are different configs.
+      found.push(a === undefined ? { path, before: 'not set', after } : { path, before, after: 'not set' })
     }
     return
   }
