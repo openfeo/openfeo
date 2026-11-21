@@ -633,4 +633,14 @@ mod tests {
             insta::assert_yaml_snapshot!(name, state(&world, &system()));
         }
     }
+
+    /// The World carries the config, and the config a PPPoE password: its `Debug` prints
+    /// none (the repository's rule is about `Debug` output, not only what is logged today).
+    #[test]
+    fn the_debug_of_a_world_prints_no_secret() {
+        let world = crate::fixtures::pppoe_world();
+        let text = format!("{world:?}");
+        assert!(text.contains("isp.example"), "the account is there: {text}");
+        assert!(!text.contains("example-secret"), "{text}");
+    }
 }

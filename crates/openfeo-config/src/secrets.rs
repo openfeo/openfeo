@@ -6,11 +6,116 @@
 //! that comes in takes the running ones where it names none ([`carry`]); and the tag that
 //! tells one config from another ([`tag`]) is made from the config without them, so that it
 //! says nothing about a secret.
+//!
+//! And no secret is ever printed (SPEC §9): the wire messages that carry one, in the config
+//! and in the API's envelope, have their `Debug` written here, so that neither they nor any
+//! message that holds them can put a password, a token or a hash into a log line, an error
+//! or a panic message.
+
+use std::fmt;
 
 use prost::Message as _;
 use sha2::{Digest as _, Sha256};
 
-use crate::{Config, wan};
+use crate::api::{Auth, ChangePasswordRequest, LoginRequest, Session, SetInitialPasswordRequest};
+use crate::{Admin, Config, PppoeWan, wan};
+
+/// Every field of the wire that holds a secret, as `(message, field)`. `build.rs` derives no
+/// `Debug` for these messages; the impls below print the field as [`hidden`] has it.
+pub const SECRET_FIELDS: &[(&str, &str)] = &[
+    ("Admin", "password_hash"),
+    ("PppoeWan", "password"),
+    ("Auth", "token"),
+    ("Session", "token"),
+    ("LoginRequest", "password"),
+    ("SetInitialPasswordRequest", "password"),
+    ("ChangePasswordRequest", "old_password"),
+    ("ChangePasswordRequest", "new_password"),
+];
+
+/// A secret as `Debug` shows it: that there is one, or that there is none, and never which.
+fn hidden(secret: &str) -> &'static str {
+    if secret.is_empty() { "" } else { "<redacted>" }
+}
+
+// Each impl takes its message apart by name, so that a field added to the message later
+// does not compile until it is printed here, or hidden.
+
+impl fmt::Debug for Admin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { password_hash } = self;
+        f.debug_struct("Admin")
+            .field("password_hash", &hidden(password_hash))
+            .finish()
+    }
+}
+
+impl fmt::Debug for PppoeWan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            username,
+            password,
+            service,
+            ac,
+        } = self;
+        f.debug_struct("PppoeWan")
+            .field("username", username)
+            .field("password", &hidden(password))
+            .field("service", service)
+            .field("ac", ac)
+            .finish()
+    }
+}
+
+impl fmt::Debug for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { token } = self;
+        f.debug_struct("Auth")
+            .field("token", &hidden(token))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { token, idle_secs } = self;
+        f.debug_struct("Session")
+            .field("token", &hidden(token))
+            .field("idle_secs", idle_secs)
+            .finish()
+    }
+}
+
+impl fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { password } = self;
+        f.debug_struct("LoginRequest")
+            .field("password", &hidden(password))
+            .finish()
+    }
+}
+
+impl fmt::Debug for SetInitialPasswordRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { password } = self;
+        f.debug_struct("SetInitialPasswordRequest")
+            .field("password", &hidden(password))
+            .finish()
+    }
+}
+
+impl fmt::Debug for ChangePasswordRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            old_password,
+            new_password,
+        } = self;
+        f.debug_struct("ChangePasswordRequest")
+            .field("old_password", &hidden(old_password))
+            .field("new_password", &hidden(new_password))
+            .finish()
+    }
+}
 
 /// `config` without its secrets: the admin's password hash and every PPPoE password are empty.
 /// This is the config as the API hands it out.
@@ -106,6 +211,137 @@ mod tests {
             panic!("{} is not PPPoE", wan.name);
         };
         account
+    }
+
+    /// A password, a token or a hash never reaches `Debug` output (the repository's rule):
+    /// not of the message that holds it, and not of any message that holds that one.
+    #[test]
+    fn no_wire_type_prints_a_secret() {
+        use crate::api::{
+            Auth, ChangePasswordRequest, ClientMsg, LoginRequest, LoginResponse, Request, Session,
+            SetInitialPasswordRequest, client_msg, request,
+        };
+        let printed = |what: &dyn std::fmt::Debug| format!("{what:?}\n{what:#?}");
+        let mut all = vec![
+            printed(&running()),
+            printed(&running().admin),
+            printed(&running().wans[1]),
+            printed(&Auth {
+                token: "a-session-token".to_owned(),
+            }),
+            printed(&ClientMsg {
+                id: 1,
+                body: Some(client_msg::Body::Auth(Auth {
+                    token: "a-session-token".to_owned(),
+                })),
+            }),
+            printed(&LoginRequest {
+                password: "lab-admin-password".to_owned(),
+            }),
+            printed(&SetInitialPasswordRequest {
+                password: "lab-admin-password".to_owned(),
+            }),
+            printed(&Request {
+                body: Some(request::Body::ChangePassword(ChangePasswordRequest {
+                    old_password: "lab-admin-password".to_owned(),
+                    new_password: "lab-other-password".to_owned(),
+                })),
+            }),
+            printed(&LoginResponse {
+                session: Some(Session {
+                    token: "a-session-token".to_owned(),
+                    idle_secs: 1800,
+                }),
+            }),
+        ];
+        // The whole envelope around a config that came in over the API.
+        all.push(printed(&Request {
+            body: Some(request::Body::ApplyConfig(crate::api::ApplyConfigRequest {
+                config: Some(running()),
+                tag: "t1".to_owned(),
+                immediate: false,
+                timeout_secs: 0,
+            })),
+        }));
+        for text in &all {
+            for secret in [
+                HASH,
+                "example-secret",
+                "another-secret",
+                "a-session-token",
+                "lab-admin-password",
+                "lab-other-password",
+            ] {
+                assert!(!text.contains(secret), "{secret} is in {text}");
+            }
+            assert!(
+                text.contains("<redacted>"),
+                "nothing was redacted in {text}"
+            );
+        }
+        // What is not a secret is still said: a name, a number.
+        assert!(all[0].contains("isp.example"), "{}", all[0]);
+        assert!(all.last().unwrap().contains("t1"));
+        assert!(all[8].contains("1800"), "{}", all[8]);
+    }
+
+    #[test]
+    fn an_empty_secret_reads_as_empty() {
+        // "No password is set" is worth reading in a debug line, and gives nothing away.
+        assert_eq!(
+            format!("{:?}", Admin::default()),
+            r#"Admin { password_hash: "" }"#
+        );
+        let none = format!("{:?}", PppoeWan::default());
+        assert!(none.contains(r#"password: """#), "{none}");
+        assert!(!none.contains("redacted"), "{none}");
+    }
+
+    /// Every field of the wire that is a secret by its name belongs to a message whose
+    /// `Debug` is written by hand above. A field added later fails here until it is.
+    #[test]
+    fn a_field_that_holds_a_secret_is_named_here() {
+        const PROTOS: &[&str] = &[
+            include_str!("../../../proto/openfeo/v1/config.proto"),
+            include_str!("../../../proto/openfeo/v1/state.proto"),
+            include_str!("../../../proto/openfeo/v1/events.proto"),
+            include_str!("../../../proto/openfeo/v1/api.proto"),
+        ];
+        let mut found = Vec::new();
+        for proto in PROTOS {
+            let mut message = String::new();
+            for line in proto.lines() {
+                let line = line.trim();
+                if let Some(name) = line.strip_prefix("message ") {
+                    message = name.trim_end_matches('{').trim().to_owned();
+                    continue;
+                }
+                let mut words = line.split_whitespace();
+                let (Some(kind), Some(field)) = (words.next(), words.next()) else {
+                    continue;
+                };
+                let kind = if kind == "optional" || kind == "repeated" {
+                    let Some(next) = words.next() else { continue };
+                    (field, next)
+                } else {
+                    (kind, field)
+                };
+                let (kind, field) = kind;
+                let secret = ["password", "token", "secret", "hash", "key"]
+                    .iter()
+                    .any(|word| field.contains(word));
+                if matches!(kind, "string" | "bytes") && secret {
+                    found.push((message.clone(), field.to_owned()));
+                }
+            }
+        }
+        found.sort();
+        let mut named: Vec<(String, String)> = SECRET_FIELDS
+            .iter()
+            .map(|(message, field)| ((*message).to_owned(), (*field).to_owned()))
+            .collect();
+        named.sort();
+        assert_eq!(found, named);
     }
 
     fn password(config: &Config, index: usize) -> &str {

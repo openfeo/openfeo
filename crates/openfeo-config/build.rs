@@ -24,7 +24,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = prost::Message::encode_to_vec(&fds);
     std::fs::write(out.join("descriptors.bin"), &bytes)?;
 
-    prost_build::Config::new().out_dir(&out).compile_fds(fds)?;
+    // The messages that carry a secret get no derived `Debug`: theirs is written by hand in
+    // `src/secrets.rs`, so that a password, a token or a hash is never printed, by them or by
+    // any message that holds them. A test there holds this list to the proto files.
+    prost_build::Config::new()
+        .out_dir(&out)
+        .skip_debug([
+            ".openfeo.v1.Admin",
+            ".openfeo.v1.PppoeWan",
+            ".openfeo.v1.Auth",
+            ".openfeo.v1.Session",
+            ".openfeo.v1.LoginRequest",
+            ".openfeo.v1.SetInitialPasswordRequest",
+            ".openfeo.v1.ChangePasswordRequest",
+        ])
+        .compile_fds(fds)?;
     pbjson_build::Builder::new()
         .register_descriptors(&bytes)?
         .preserve_proto_field_names()
