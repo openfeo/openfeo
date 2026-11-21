@@ -9,14 +9,17 @@ import {
   LoginResponseSchema,
   SetInitialPasswordRequestSchema,
   SetInitialPasswordResponseSchema,
+  type Caller,
   type GetStatusResponse,
+  type Response as Reply,
   type Session,
 } from './gen/openfeo/v1/api_pb.js'
+import type { Config } from './gen/openfeo/v1/config_pb.js'
 import type { Event } from './gen/openfeo/v1/events_pb.js'
-import type { Counters, State } from './gen/openfeo/v1/state_pb.js'
+import type { ConfigEffect, ConfigViolation, Counters, State } from './gen/openfeo/v1/state_pb.js'
 import { call, type Http } from './http.js'
 import type { RouterOptions, Timers, WebSocketLike } from './options.js'
-import { Link, type Connection, type SessionEnd, type Subscription } from './socket.js'
+import { Link, type Ask, type Connection, type SessionEnd, type Subscription } from './socket.js'
 import { memoryTokenStore, type TokenStore } from './token-store.js'
 
 /**
@@ -33,6 +36,40 @@ const realTimers: Timers = {
   random: () => Math.random(),
 }
 
+/** The running config as it is read: without its secrets, and with what an apply needs. */
+export interface ConfigView {
+  /** The admin's password hash and every PPPoE password are empty. */
+  config: Config
+  /** Tells this config from any other. An apply names the one it was edited from. */
+  tag: string
+  /** The window the router gives an apply that names none, in seconds. */
+  confirmSecs: number
+}
+
+/** What the router makes of a config it was shown and did not apply. */
+export interface Validation {
+  /** What is wrong with it. When there is anything here the rest is empty. */
+  violations: ConfigViolation[]
+  /** What applying it would interrupt. */
+  effects: ConfigEffect[]
+  /** Whether applying it moves whoever asked, and where the router would then be. */
+  caller: Caller | undefined
+}
+
+/**
+ * How an apply ended. `answered: false` is no answer within the wait, or a socket lost before
+ * one: the router answers an apply once the config is published, and a change that takes away
+ * the address the socket arrived at takes the answer's way home with it. It does not say the
+ * change was refused or taken; the router's config and state, read when it is next reached,
+ * say which.
+ */
+export type Applied = { answered: true; tag: string } | { answered: false }
+
+/** How a revert ended. No answer is likely a revert that was done: the address goes with the change. */
+export interface Reverted {
+  answered: boolean
+}
+
 /** The page's origin when there is a page (a browser), and nothing when there is not (Node). */
 function pageOrigin(): string | undefined {
   const page = (globalThis as { location?: { origin?: string } }).location
@@ -47,6 +84,8 @@ export class Router {
   readonly #http: Http
   readonly #store: TokenStore
   readonly #link: Link
+  /** How long an apply, a confirm or a revert waits for its answer. */
+  readonly #answerMs: number
 
   constructor(options: RouterOptions = {}) {
     const base = options.baseUrl ?? pageOrigin()
@@ -62,6 +101,7 @@ export class Router {
       timeoutMs: probeTimeoutMs,
     }
     this.#store = options.tokenStore ?? memoryTokenStore()
+    this.#answerMs = probeTimeoutMs
     const socket = new URL('/ws', this.#http.baseUrl)
     socket.protocol = socket.protocol === 'http:' ? 'ws:' : 'wss:'
     this.#link = new Link({
@@ -126,6 +166,64 @@ export class Router {
     return reply.body.value.state
   }
 
+  /** The running config without its secrets, the tag an apply must name, and the router's default window. */
+  async config(): Promise<ConfigView> {
+    const reply = await this.#link.request({ case: 'getConfig', value: {} })
+    if (reply.body.case !== 'getConfig' || reply.body.value.config === undefined) {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered without a config')
+    }
+    const { config, tag, confirmSecs } = reply.body.value
+    return { config, tag, confirmSecs }
+  }
+
+  /**
+   * What is wrong with a config, or what applying it would interrupt and whether it moves
+   * whoever asks. Changes nothing.
+   */
+  async validate(config: Config): Promise<Validation> {
+    const reply = await this.#link.request({ case: 'validateConfig', value: { config } })
+    if (reply.body.case !== 'validateConfig') {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered a validation with something else')
+    }
+    const { violations, effects, caller } = reply.body.value
+    return { violations, effects, caller }
+  }
+
+  /**
+   * Apply a config that was edited from the one `tag` names. It is pending until
+   * {@link confirm}, and the router goes back by itself when its window runs out
+   * (`timeoutSecs`, 10 to 600; the router's default when left out), unless `immediate`: then
+   * it stands at once and nothing undoes it. A PPPoE password left empty keeps the one in
+   * force. A refusal is a {@link RouterError}: `INVALID_ARGUMENT` for a config with
+   * violations, `FAILED_PRECONDITION` for a stale tag or a change already pending. No answer
+   * is not an error: see {@link Applied}.
+   */
+  async apply(config: Config, tag: string, options: { immediate?: boolean; timeoutSecs?: number } = {}): Promise<Applied> {
+    const ask: Ask = {
+      case: 'applyConfig',
+      value: { config, tag, immediate: options.immediate ?? false, timeoutSecs: options.timeoutSecs ?? 0 },
+    }
+    const reply = await this.#unlessUnanswered(this.#link.request(ask, this.#answerMs))
+    if (reply === undefined) {
+      return { answered: false }
+    }
+    if (reply.body.case !== 'applyConfig') {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered an apply with something else')
+    }
+    return { answered: true, tag: reply.body.value.tag }
+  }
+
+  /** Keep the pending change: it becomes the router's config. `UNAVAILABLE` when no answer comes. */
+  async confirm(): Promise<void> {
+    await this.#link.request({ case: 'confirmConfig', value: {} }, this.#answerMs)
+  }
+
+  /** Give the pending change up now: the router goes back to the config it had. */
+  async revert(): Promise<Reverted> {
+    const reply = await this.#unlessUnanswered(this.#link.request({ case: 'revertConfig', value: {} }, this.#answerMs))
+    return { answered: reply !== undefined }
+  }
+
   /** End this session, here and on the router. */
   logout(): Promise<void> {
     return this.#link.logout()
@@ -165,6 +263,18 @@ export class Router {
   /** Drop the socket and every subscription. The session and its token stay. */
   close(): void {
     this.#link.close()
+  }
+
+  /** A call's answer, or nothing when the router was not there to give one. A refusal stays an error. */
+  async #unlessUnanswered(answer: Promise<Reply>): Promise<Reply | undefined> {
+    try {
+      return await answer
+    } catch (error) {
+      if (error instanceof RouterError && error.code === ErrorCode.UNAVAILABLE) {
+        return undefined
+      }
+      throw error
+    }
   }
 
   #begin(session: Session | undefined): Session {

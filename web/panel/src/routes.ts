@@ -3,17 +3,20 @@
 
 // The panel's addresses. The screen decides the address, never the reverse: what the router
 // says of itself chooses the screen (session.ts), and an address typed or kept from before is
-// corrected to it. Later parts add pages beside the dashboard; they are reachable only while
-// the screen is the dashboard's.
+// corrected to it. The pages behind the login sit in one shell and are reachable only while
+// the screen is the dashboard's; each part adds its pages beside the dashboard.
 
 import { watch } from 'vue'
-import { createRouter, createWebHistory, type Router } from 'vue-router'
+import { createRouter, createWebHistory, type Router, type RouterHistory } from 'vue-router'
 
 import ConfigUnreadable from './pages/ConfigUnreadable.vue'
 import Dashboard from './pages/Dashboard.vue'
 import FirstPassword from './pages/FirstPassword.vue'
+import Lan from './pages/Lan.vue'
 import Login from './pages/Login.vue'
+import Wan from './pages/Wan.vue'
 import type { PanelSession, Screen } from './session'
+import Shell from './Shell.vue'
 
 export const PATHS: Record<Screen, string> = {
   dashboard: '/',
@@ -21,6 +24,9 @@ export const PATHS: Record<Screen, string> = {
   'first-password': '/first-password',
   'config-unreadable': '/config-unreadable',
 }
+
+/** The pages behind the login, each by the address it starts at. */
+export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan' } as const
 
 /** The gates: a screen that is one of these has exactly one address. */
 const GATES = new Set<string>([PATHS.login, PATHS['first-password'], PATHS['config-unreadable']])
@@ -33,11 +39,20 @@ export function correction(screen: Screen, path: string): string | null {
   return path === PATHS[screen] ? null : PATHS[screen]
 }
 
-export function panelRoutes(session: PanelSession): Router {
+export function panelRoutes(session: PanelSession, history: RouterHistory = createWebHistory()): Router {
   const routes = createRouter({
-    history: createWebHistory(),
+    history,
     routes: [
-      { path: PATHS.dashboard, component: Dashboard },
+      {
+        path: PAGES.dashboard,
+        component: Shell,
+        children: [
+          { path: '', component: Dashboard },
+          // The WAN or LAN shown is in the address, so a reload and a link come back to it.
+          { path: 'wan/:name?', component: Wan },
+          { path: 'lan/:name?', component: Lan },
+        ],
+      },
       { path: PATHS.login, component: Login },
       { path: PATHS['first-password'], component: FirstPassword },
       { path: PATHS['config-unreadable'], component: ConfigUnreadable },

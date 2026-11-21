@@ -6,6 +6,7 @@
 
 import {
   AddressOrigin,
+  ConfigSchema,
   CountersSchema,
   create,
   EventSchema,
@@ -13,6 +14,7 @@ import {
   StateSchema,
   WanKind,
   WanPhase,
+  type Config,
   type Counters,
   type Event,
   type State,
@@ -140,4 +142,83 @@ export function counters(monotonicMs: bigint, links: [name: string, rx: bigint, 
 export function event(topic: string, fields: Record<string, string> = {}, at: Date = NOW, uptimeMs?: bigint): Event {
   const sinceBoot = BigInt(Math.max(0, at.getTime() - BOOTED.getTime()))
   return create(EventSchema, { topic, fields, timeUnixMs: BigInt(at.getTime()), uptimeMs: uptimeMs ?? sinceBoot })
+}
+
+/**
+ * The lab's config (`harness/fixtures/vm-dhcp.toml`) as the router hands it out: a DHCP WAN
+ * on p0, one LAN on p2 with a pool and a reservation, and a port forward into that LAN.
+ */
+export function labConfig(): Config {
+  return create(ConfigSchema, {
+    configVersion: 1,
+    system: { hostname: 'openfeo', domain: 'home.arpa' },
+    wans: [{ name: 'wan0', port: 'p0', priority: 10, kind: { case: 'dhcp', value: { hostname: 'openfeo-lab' } } }],
+    lans: [
+      {
+        name: 'lan0',
+        ports: ['p2'],
+        ipv4: '192.168.1.1/24',
+        dhcp: {
+          range: ['192.168.1.100', '192.168.1.200'],
+          leaseSecs: 43200,
+          static: [{ mac: '52:54:00:fe:10:10', ip: '192.168.1.10', hostname: 'nas' }],
+        },
+      },
+    ],
+    firewall: { wanPing: true, portForwards: [{ name: 'lan-http', proto: 'tcp', port: 2222, to: '192.168.1.2', toPort: 8080 }] },
+  })
+}
+
+/**
+ * The fixture's state while a change of config waits to be confirmed: applied `agoSecs`
+ * before the router's uptime at NOW, with `windowSecs` to confirm it in.
+ */
+export function pendingState(agoSecs = 13, windowSecs = 120, effects: { subject: string; kind: number }[] = []): State {
+  const applied = BigInt((UPTIME_SECS - agoSecs) * 1000)
+  const made = create(StateSchema, {
+    system: { pendingConfig: { appliedUptimeMs: applied, revertsUptimeMs: applied + BigInt(windowSecs * 1000), windowSecs, effects } },
+  })
+  const base = state()
+  if (base.system !== undefined && made.system?.pendingConfig !== undefined) {
+    base.system.pendingConfig = made.system.pendingConfig
+  }
+  return base
+}
+
+/**
+ * The config of the router whose state is {@link state}: a PPPoE WAN on a tagged port that
+ * carries IPv6, a LAN across three ports and a second LAN as a VLAN of one of them. As the
+ * router hands it out: the account's password is not in it.
+ */
+export function routerConfig(): Config {
+  return create(ConfigSchema, {
+    configVersion: 1,
+    system: { hostname: 'openfeo', domain: 'home.arpa' },
+    wans: [
+      {
+        name: 'wan0',
+        port: 'p0',
+        vlan: 911,
+        priority: 10,
+        kind: { case: 'pppoe', value: { username: 'openfeo@isp.example' } },
+        ipv6: { prefix: '2001:db8:1::/48' },
+      },
+    ],
+    lans: [
+      {
+        name: 'lan0',
+        ports: ['p1', 'p2', 'p3'],
+        ipv4: '192.168.1.1/24',
+        dhcp: {
+          range: ['192.168.1.100', '192.168.1.249'],
+          static: [
+            { mac: '52:54:00:fe:10:10', ip: '192.168.1.10', hostname: 'nas' },
+            { mac: '52:54:00:fe:10:11', ip: '192.168.1.11', hostname: 'printer' },
+          ],
+        },
+      },
+      { name: 'iot', ports: ['p3.20'], ipv4: '192.168.20.1/24', dhcp: { range: ['192.168.20.100', '192.168.20.149'] }, reaches: ['wan'] },
+    ],
+    firewall: { portForwards: [{ name: 'lan-http', proto: 'tcp', port: 8080, to: '192.168.1.10' }] },
+  })
 }

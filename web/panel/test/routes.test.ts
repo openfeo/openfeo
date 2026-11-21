@@ -3,7 +3,7 @@
 
 import { expect, test } from 'vitest'
 
-import { correction, PATHS } from '../src/routes'
+import { correction, PAGES, PATHS } from '../src/routes'
 
 test('a gate screen has one address, and any other is corrected to it', () => {
   expect(correction('login', '/login')).toBeNull()
@@ -27,4 +27,12 @@ test('on the dashboard a gate address goes home, and any other stays where it is
 test('every screen has an address of its own', () => {
   expect(new Set(Object.values(PATHS)).size).toBe(4)
   expect(PATHS.dashboard).toBe('/')
+})
+
+test('the pages behind the login each have an address, and none is a gate', () => {
+  expect(PAGES).toEqual({ dashboard: '/', wan: '/wan', lan: '/lan' })
+  for (const path of [...Object.values(PAGES), '/wan/wan0', '/lan/lan0']) {
+    expect(correction('dashboard', path), path).toBeNull()
+    expect(correction('login', path), path).toBe('/login')
+  }
 })

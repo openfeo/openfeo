@@ -17,7 +17,8 @@ pub enum EffectKind {
     WanAdded,
     /// A WAN that will be gone.
     WanRemoved,
-    /// A WAN whose clients are restarted: it drops and comes back.
+    /// A WAN that drops and comes back: its clients are restarted, or a static WAN's
+    /// address, gateway, port or tag is replaced.
     WanReconnects,
     /// A LAN that was not there.
     LanAdded,

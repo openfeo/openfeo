@@ -13,3 +13,37 @@
 
 /* ofo.css sizes an icon inside a button, a nav item and a banner, and nowhere else. */
 .ofo-icon { width: 16px; height: 16px; flex: none; }
+
+/* ofo.css has no class for the settings most people never touch. A disclosure that spans the
+   form section's two columns and lays its own fields out in the same grid (the approved
+   mockup of the WAN and LAN pages). */
+.ofo-adv { grid-column: 1 / -1; }
+.ofo-adv summary { cursor: pointer; color: var(--ink-muted); font: 600 13px/20px var(--font-sans); }
+.ofo-adv[open] summary { margin-bottom: var(--space-4); }
+.ofo-adv__grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-4); }
+.ofo-adv__grid > .ofo-span-2 { grid-column: 1 / -1; }
+@media (max-width: 900px) { .ofo-adv__grid { grid-template-columns: 1fr; } }
+
+/* The Choice guideline groups choices in a fieldset with a legend, and ofo.css has no rule
+   that takes a fieldset's own border, padding and minimum width away. The choices in a group
+   line up at the top: one with a hint beneath it is taller than one without. */
+.ofo-choices { border: 0; padding: 0; margin: 0; min-width: 0; }
+.ofo-choices legend { padding: 0; margin-bottom: 6px; }
+.ofo-choices .ofo-row { gap: var(--space-5); align-items: flex-start; }
+
+/* ofo.css has one height of input. A table edited in place (a LAN's reservations) needs one
+   that fits a row. */
+.ofo-input--sm { height: 30px; }
+
+/* ofo.css has no list for what a change of config alters (the apply dialog of the approved
+   mockup): whose setting in a narrow column, then what it was, struck through, and what it
+   becomes, in mono because a machine reads them. */
+.ofo-changes { list-style: none; margin: var(--space-4) 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.ofo-changes li { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: var(--space-3); font-size: 13px; line-height: 20px; }
+.ofo-changes__key { color: var(--ink-muted); overflow-wrap: anywhere; }
+.ofo-changes__value { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.ofo-changes__value s { color: var(--ink-muted); }
+
+/* ofo.css gives the save bar its count and its buttons and no place for a sentence beside
+   them: why an apply is not offered while another change waits to be confirmed. */
+.ofo-savebar__held { align-self: center; font-size: 13px; color: var(--ink-muted); }

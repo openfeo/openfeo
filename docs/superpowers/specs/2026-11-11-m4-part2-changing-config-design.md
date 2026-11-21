@@ -642,3 +642,115 @@ from the design above.
   milliseconds.
 - A WAN changed from PPPoE to static keeps the port's MTU at 1508 until a reboot: a static
   WAN's MTU is left as the kernel has it, which used to mean 1500.
+
+## After part 2b
+
+What building the web half settled or changed. Part 3's pages plan from this section as well as
+from the design above.
+
+**As built, where the design left it open or said otherwise**
+
+- **An apply that is not answered is a result, not an error.** `@openfeo/client`'s `apply` and
+  `revert` wait as long as a probe does (10 s) and then answer `answered: false`; so does one
+  whose socket is lost first. The socket is then not believed and is made again, and the call
+  is never sent a second time. A confirm that is not answered is `UNAVAILABLE`. The panel
+  settles such an apply by what the router says when it is next reached: taken, when the tag
+  moved or a change is pending; otherwise the draft is back with its changes and the tab says
+  the change is not in force.
+- **`effects` covers a static WAN.** It has no task and so had no slice, and a change to its
+  address, gateway, port or tag was reported as interrupting nothing. It is now
+  `WAN_RECONNECTS`; its DNS servers and its priority still interrupt nothing.
+- **One store beside the session** (`web/panel/src/config.ts`) holds the config as read, the
+  draft, their difference, the router's violations, what is pending and a notice. It reads the
+  config when it starts, when the socket opens again, when a `config.*` event comes and when a
+  pending change appears or goes. A draft with changes is kept whole when the config changes
+  under it: there is no merge, and what the other session changed shows in the draft as a
+  change back, in the bar's count and in the dialog. An apply sends the config and the tag
+  that the dialog was shown for, so a config changed from elsewhere while the dialog is open
+  is refused as stale and not overwritten unseen.
+- **What became of a pending change is read, not guessed.** A `config.confirmed` or
+  `config.reverted` event stamped no earlier than the change decides; with none yet, a tag
+  other than the one read while it was pending, or a router that has been up for less time
+  than when the change was applied, means it went back. Two configs that differ only in a
+  PPPoE password share a tag, so the tag alone is not enough. The tab that made a change that
+  went back has its draft again, password included, with whatever was typed while the change
+  waited; so does a tab whose apply was answered and that never saw the change pending,
+  because the address went first. A confirmed change is forgotten.
+- **"The same place in the new subnet"** is, for an address that lay in the old one: what was
+  the router's own address becomes the router's new one; an address a device can still have in
+  the new subnet stays; one left outside takes the place the same distance from the start; one
+  with no such place is left as it was and says so at its field, or above the page when it is a
+  setting of a page this part does not have. A rule's target moves as an address, as a range
+  (whole or not at all) or as a block. Which fields hold such addresses is one table over every
+  string field of the config (`model/renumber.ts`), and a test holds the table to the schema.
+- **A change is counted per setting, as the dialog lists it** (`model/changes.ts`): one for
+  each setting of a WAN or LAN that differs, named as its page names it; one for a pool; one
+  for a LAN's reservations together; one for a WAN or LAN added or removed; one for each
+  address elsewhere that a renumbering carried, by what it belongs to; and anything else by
+  its path. A test alters every leaf of the schema in turn, and a flag that can be left unset
+  both ways, and finds a change each time, so nothing an apply would alter can go unlisted. A
+  password is said to have changed, never what to.
+- **A field** is checked when it is left, not before. What the router refuses is shown at the
+  field whose path it is at or beneath, and is dropped when that field is edited; what has no
+  field is listed at the top of its tab, and what is another page's, or another tab's, above
+  the page (the router reports a clash between two WANs or two LANs at the later one). Something
+  the page itself finds wrong in what was typed is not in the draft, so Apply changes is held
+  until it is put right.
+- **The countdown** is the change's revert time against the router's uptime, counted on in the
+  browser between the router's words; a browser whose clock is wrong counts the same. The
+  banner is a group, not a status, so that it is not read out every second.
+- **Leaving the page asks first** only while the draft has changes that were not sent: a tab
+  that a change left behind follows its own link to the router without being asked.
+- **The lease time and the subnet size are choices** (four lease times, or Other with the
+  seconds; a /16 to a /30 with what each holds). A WAN's port may be one that is in use
+  elsewhere, and the list says where; a LAN's ticks offer its own ports and the free ones. A
+  new WAN or LAN is named once, in a small dialog. A DHCP server switched on for the first
+  time is proposed the 100th to the 200th address of a subnet that has them.
+- **A reservation matched by client identifier** has a MAC as well: the router wants one on
+  every reservation and matches by the identifier whenever there is one. Such a row shows the
+  identifier, says its MAC beneath, and can only be removed.
+- **IPv6 switched off on a LAN** also clears whether it advertises and its number in a
+  delegation, which the router accepts only on a LAN that carries IPv6; on brings back what
+  the router's config has.
+- **The dashboard moved into a shell** that every page behind the login sits in. The shell
+  listens to the router once and provides what it hears (`LIVE`), the config store (`CONFIG`),
+  the banners every page needs, the save bar and the apply dialog.
+- **The browser run** boots with `openfeo.confirm_secs=40` and proves the return by address:
+  the page says where the router went, the lab re-homes the LAN host, and the test logs in at
+  `https://192.168.2.1` and confirms there. The client's own test returns by address too, with
+  the same token; the return by name is part 2a's scenario, by the Rust client. No test
+  against a real router meets an apply that is not answered: on the lab's machine the answer
+  got out every time, so that path is proven against a scripted socket and a scripted router.
+
+**For part 3**
+
+- A page behind the login is a child route of the shell (`routes.ts`, `PAGES`) and injects
+  `LIVE` and `CONFIG`; it listens to nothing itself. A settings page is also named in the
+  shell's `settings`, which is where the save bar shows.
+- A settings page provides `pageFields()` as `FIELDS` and is made of `parts/SettingField.vue`
+  (a table's cell: `parts/SettingCell.vue`), each given the router's own path for its field
+  (`wans[0].vlan`, `lans[0].dhcp.static[2].ip`): that path is how a violation finds its field,
+  how a field is known to have been left, and how a renumbering's leftovers are marked. The
+  page's model says what is wrong with a field as typed, keyed by the same paths, and which
+  paths the page has a field for; `parts/RefusedList.vue` shows the rest. Every edit goes
+  through `store.edit`.
+- A new page's settings want names in `model/changes.ts`; until they have them they are listed
+  by path, which is correct and ugly. A new string field in the config must be classified in
+  `model/renumber.ts` or its test fails.
+- Once the firewall page exists, removing a LAN need not be refused for the forwards and rules
+  that point into it (`model/lan.ts`, `blockers`), and "May reach" becomes a field there.
+- `@openfeo/ui` now has the form's components: `OfoFormSection`, `OfoAdvanced`, `OfoChoice`,
+  `OfoChoiceGroup`, `OfoToggle`, `OfoSelect`, `OfoTabs`, `OfoSaveBar`, `OfoDialog`,
+  `OfoChangeList`; `OfoInput` takes a placeholder, a small size and digits only.
+
+**Known limits**
+
+- The countdown is up to a second coarse, and a browser clock that is stepped in the middle of
+  a window misleads it until the router's state next arrives. The counters carry the router's
+  clock every second and are not used for it.
+- What was typed for a WAN's type, its IPv6 or a LAN's DHCP server and then switched away from
+  is kept by the page, so it is lost when the person goes to another page and back.
+- A line of help carries an address in the text face (`Was 192.168.1.100.`), as the approved
+  mockup had it, where the design system sets what a machine reads in mono.
+- A tab reached by address that asks for a revert at an address the pending change gave the
+  router is not told where the router went back to: it never knew the address before.

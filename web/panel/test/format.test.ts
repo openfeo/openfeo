@@ -3,7 +3,7 @@
 
 import { expect, test } from 'vitest'
 
-import { clock, duration, portSpeed, rate, since } from '../src/model/format'
+import { clock, countdown, duration, durationWords, hourMinute, portSpeed, rate, since } from '../src/model/format'
 
 test('rates step by a thousand and keep one decimal', () => {
   expect(rate(941_200_000)).toEqual({ value: '941.2', unit: 'Mbit/s' })
@@ -64,4 +64,36 @@ test('a port says its speed, a dash without a cable, and up when the driver does
   expect(portSpeed({ carrier: true, speedMbps: 2500 })).toBe('2.5G')
   expect(portSpeed({ carrier: true, speedMbps: 10_000 })).toBe('10G')
   expect(portSpeed({ carrier: true, speedMbps: 25_000 })).toBe('25G')
+})
+
+test('a length of time in words is the largest unit that divides it', () => {
+  expect(durationWords(120)).toBe('2 minutes')
+  expect(durationWords(60)).toBe('1 minute')
+  expect(durationWords(40)).toBe('40 seconds')
+  expect(durationWords(90)).toBe('90 seconds')
+  expect(durationWords(43200)).toBe('12 hours')
+  expect(durationWords(86400)).toBe('1 day')
+  expect(durationWords(604800)).toBe('1 week')
+  expect(durationWords(3600)).toBe('1 hour')
+  expect(durationWords(1)).toBe('1 second')
+  expect(durationWords(1209600)).toBe('2 weeks')
+  expect(durationWords(172800)).toBe('2 days')
+  expect(durationWords(0)).toBe('0 seconds')
+})
+
+test('the time left is minutes and seconds, and never less than none', () => {
+  expect(countdown(107_000)).toBe('1:47')
+  expect(countdown(5_000)).toBe('0:05')
+  expect(countdown(60_000)).toBe('1:00')
+  expect(countdown(600_000)).toBe('10:00')
+  // A part of a second is still time left.
+  expect(countdown(400)).toBe('0:01')
+  expect(countdown(0)).toBe('0:00')
+  expect(countdown(-30_000)).toBe('0:00')
+  expect(countdown(Number.NaN)).toBe('0:00')
+})
+
+test('a time of day is hours and minutes', () => {
+  expect(hourMinute(new Date(2026, 10, 10, 22, 41, 59))).toBe('22:41')
+  expect(hourMinute(new Date(2026, 10, 10, 9, 5, 0))).toBe('09:05')
 })

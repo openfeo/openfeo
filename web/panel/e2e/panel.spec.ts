@@ -8,22 +8,13 @@
 
 import { mkdirSync } from 'node:fs'
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test } from '@playwright/test'
 
 import { ask } from '../../scripts/labctl.mjs'
+import { SHOTS, shots, watch } from './support'
 
 const PASSWORD = process.env.OPENFEO_PASSWORD ?? ''
 const FINGERPRINT = process.env.OPENFEO_FINGERPRINT ?? ''
-const SHOTS = process.env.OPENFEO_SHOTS ?? 'e2e-out/shots'
-
-/** A screenshot of the page as it stands, in both themes: the panel follows the system until told. */
-async function shots(page: Page, name: string): Promise<void> {
-  for (const theme of ['dark', 'light'] as const) {
-    await page.emulateMedia({ colorScheme: theme })
-    await page.screenshot({ path: `${SHOTS}/${name}-${theme}.png`, fullPage: true })
-  }
-  await page.emulateMedia({ colorScheme: 'dark' })
-}
 
 test('from the first visit to a cut WAN, without a reload', async ({ page, baseURL }) => {
   test.setTimeout(300_000)
@@ -32,25 +23,8 @@ test('from the first visit to a cut WAN, without a reload', async ({ page, baseU
   mkdirSync(SHOTS, { recursive: true })
   const router = new URL(baseURL ?? '').host
 
-  // Whatever goes wrong on the page is a failure, whichever step it happens in: an error on
-  // the console (the content security policy reports there), an uncaught exception, or
-  // anything asked of a host that is not the router.
-  const problems: string[] = []
-  page.on('console', (message) => {
-    // A refused login is the router saying no, which the browser also notes on the console.
-    const refusedLogin = message.location().url.endsWith('/api/login') && /status of (401|429)/.test(message.text())
-    if (message.type() === 'error' && !refusedLogin) {
-      problems.push(`console: ${message.text()}`)
-    }
-  })
-  page.on('pageerror', (error) => problems.push(`uncaught: ${error.message}`))
-  const elsewhere = (url: string) => {
-    if (new URL(url).host !== router) {
-      problems.push(`asked of another host: ${url}`)
-    }
-  }
-  page.on('request', (request) => elsewhere(request.url()))
-  page.on('websocket', (socket) => elsewhere(socket.url()))
+  // Whatever goes wrong on the page is a failure, whichever step it happens in.
+  const { problems } = watch(page, [router])
 
   // 1. The first visit: a router with no password says so, and shows whose router it is.
   await page.goto('/')
@@ -127,7 +101,7 @@ test('from the first visit to a cut WAN, without a reload', async ({ page, baseU
   await page.setViewportSize({ width: 800, height: 900 })
   await expect(page.locator('.ofo-nav__label').first()).toBeHidden()
   await expect(page.locator('.ofo-nav__item').first()).toBeVisible()
-  await page.screenshot({ path: `${SHOTS}/dashboard-narrow-dark.png`, fullPage: true })
+  await shots(page, 'dashboard-narrow')
   await page.setViewportSize({ width: 1280, height: 720 })
 
   // 7. The notices are one click from the gate, with no login.

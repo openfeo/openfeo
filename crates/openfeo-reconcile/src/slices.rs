@@ -7,7 +7,9 @@
 //! of config does ([`crate::effects`]) is worked out from the same slices, so the two cannot
 //! disagree.
 //!
-//! The DHCPv4 server's slice is its desired state, [`crate::dhcp::DesiredDhcpServer`].
+//! The DHCPv4 server's slice is its desired state, [`crate::dhcp::DesiredDhcpServer`]. A
+//! static WAN has no task and so no slice of that kind; [`static_wans`] is what a change of
+//! config compares for it.
 
 use std::collections::BTreeMap;
 use std::net::Ipv6Addr;
@@ -76,6 +78,21 @@ pub struct Dhcp6ClientSlice {
     pub pd_hint: u8,
 }
 
+/// Where a static WAN sits and what was typed for it (SPEC §7.2). No task is started from
+/// it: the appliers follow the config itself. It exists for [`crate::effects`] alone, which
+/// would otherwise say that replacing a static WAN's address or port interrupts nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticWanSlice {
+    /// The port.
+    pub port: String,
+    /// Its VLAN tag, or 0 for none.
+    pub vlan: u32,
+    /// The address and the size of the ISP's subnet, as typed.
+    pub address: String,
+    /// The gateway, as typed.
+    pub gateway: String,
+}
+
 fn none_if_empty(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
@@ -120,6 +137,30 @@ pub fn pppoe_clients(config: &Config) -> BTreeMap<String, PppoeSlice> {
                     password: pppoe.password.clone().into_bytes(),
                     service: none_if_empty(&pppoe.service),
                     ac: none_if_empty(&pppoe.ac),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Every WAN of kind static, by WAN name: what [`crate::effects`] compares, and nothing else
+/// reads. Its DNS servers and its priority are left out: changing them replaces no address.
+#[must_use]
+pub fn static_wans(config: &Config) -> BTreeMap<String, StaticWanSlice> {
+    config
+        .wans
+        .iter()
+        .filter_map(|wan| {
+            let Some(wan::Kind::Static(fixed)) = &wan.kind else {
+                return None;
+            };
+            Some((
+                wan.name.clone(),
+                StaticWanSlice {
+                    port: wan.port.clone(),
+                    vlan: wan.vlan,
+                    address: fixed.address.clone(),
+                    gateway: fixed.gateway.clone(),
                 },
             ))
         })

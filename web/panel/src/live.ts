@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-// What the dashboard watches (SPEC §8.4, §10): the router's state as it changes, its
-// counters each second, and its events as they happen. The router keeps no history, so the
-// last minute of the default WAN's rates is kept here, for the sparklines.
+// What the panel watches (SPEC §8.4, §10): the router's state as it changes, its counters
+// each second, and its events as they happen. The shell listens once and every page behind
+// the login reads from it. The router keeps no history, so the last minute of the default
+// WAN's rates is kept here, for the sparklines; and it says its uptime only when its state
+// changes, so the clock that counts on from there is kept here too.
 
 import { rates as ratesOf, type Connection, type Counters, type Event, type LinkRate, type State, type Subscription } from '@openfeo/client'
-import { ref, type Ref } from 'vue'
+import { computed, ref, type ComputedRef, type InjectionKey, type Ref } from 'vue'
 
 import { defaultWan } from './model/dashboard'
 import type { PanelRouter } from './session'
@@ -29,7 +31,15 @@ export interface LiveData {
   connection: Ref<Connection>
   /** When the connection was lost, while it is. */
   lostAt: Ref<Date | null>
-  /** Start listening (when the page mounts). */
+  /** The browser's clock, moving on each second while listening: what "today" is, and what a countdown ticks by. */
+  now: Ref<Date>
+  /**
+   * How long the router has been up by now, in milliseconds: what it last said, and the time
+   * since it said it. The router's own clock, which a pending change and an event are stamped
+   * with; `undefined` until the router has said.
+   */
+  sinceBootMs: ComputedRef<number | undefined>
+  /** Start listening (when the shell mounts). */
   start(): void
   /** Stop (when it unmounts). */
   stop(): void
@@ -43,7 +53,17 @@ export function useLive(router: PanelRouter): LiveData {
   const events = ref<Event[]>([])
   const connection = ref<Connection>(router.connection)
   const lostAt = ref<Date | null>(null)
+  const now = ref(new Date())
+  /** The browser's clock when the state last arrived. */
+  let stateAt = now.value.getTime()
+  // The time since the state arrived is never taken to be negative: a browser clock that was
+  // set back holds the uptime where it was until the router speaks again.
+  const sinceBootMs = computed(() => {
+    const system = state.value?.system
+    return system === undefined ? undefined : Number(system.uptimeSecs) * 1000 + Math.max(0, now.value.getTime() - stateAt)
+  })
 
+  let ticking: ReturnType<typeof setInterval> | undefined
   let previous: Counters | undefined
   let subscriptions: Subscription[] = []
   let eventsSubscription: Subscription | undefined
@@ -109,11 +129,19 @@ export function useLive(router: PanelRouter): LiveData {
     events,
     connection,
     lostAt,
+    now,
+    sinceBootMs,
     start: () => {
       connection.value = router.connection
       unhear = router.onConnection(heard)
+      now.value = new Date()
+      ticking = setInterval(() => {
+        now.value = new Date()
+      }, 1_000)
       subscriptions = [
         router.subscribe('state', (pushed) => {
+          now.value = new Date()
+          stateAt = now.value.getTime()
           state.value = pushed
         }),
         router.subscribe('counters', sampled),
@@ -121,6 +149,8 @@ export function useLive(router: PanelRouter): LiveData {
       listenToEvents()
     },
     stop: () => {
+      clearInterval(ticking)
+      ticking = undefined
       unhear?.()
       unhear = undefined
       for (const subscription of subscriptions) {
@@ -132,3 +162,5 @@ export function useLive(router: PanelRouter): LiveData {
     },
   }
 }
+
+export const LIVE: InjectionKey<LiveData> = Symbol('what the router is doing')

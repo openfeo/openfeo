@@ -44,8 +44,37 @@ export function duration(secs: number): string {
   return `${seconds}s`
 }
 
+const WORDS: [secs: number, unit: string][] = [
+  [604_800, 'week'],
+  [86_400, 'day'],
+  [3_600, 'hour'],
+  [60, 'minute'],
+]
+
+/**
+ * A length of time in words, for a sentence: the largest of weeks, days, hours and minutes
+ * that divides it, and seconds when none does. `2 minutes`, `12 hours`, `90 seconds`.
+ */
+export function durationWords(secs: number): string {
+  const whole = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0
+  const [size, unit] = WORDS.find(([each]) => whole >= each && whole % each === 0) ?? [1, 'second']
+  const count = whole / size
+  return `${count} ${unit}${count === 1 ? '' : 's'}`
+}
+
+/** The time left on a countdown, as minutes and seconds: `1:47`, `0:05`. A part of a second counts; less than none is none. */
+export function countdown(ms: number): string {
+  const secs = Number.isFinite(ms) && ms > 0 ? Math.ceil(ms / 1000) : 0
+  return `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+}
+
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 const two = (n: number) => String(n).padStart(2, '0')
+
+/** A time of day to the minute, in the reader's own zone: `22:41`. */
+export function hourMinute(at: Date): string {
+  return `${two(at.getHours())}:${two(at.getMinutes())}`
+}
 
 /** A date and a time to the minute, in the reader's own zone: `7 Nov 09:14`. */
 export function since(unixMs: bigint): string {
