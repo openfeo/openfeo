@@ -20,7 +20,7 @@ import { THEME_KEY } from '@openfeo/ui'
 import { flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import { useConfig, type ConfigStore } from '../src/config'
+import { useConfig, type ConfigStore, type Review } from '../src/config'
 import { useLive } from '../src/live'
 import { TOKEN_KEY } from '../src/session'
 import type { FakeRouter } from './fake-router'
@@ -590,11 +590,12 @@ test("setting a LAN's address carries what follows it and keeps what does not fi
   ])
   expect(store.draft.value!.lans[0]!.dhcp!.range).toEqual(['192.168.2.100', '192.168.2.200'])
 
-  // An address that is not one yet is set as typed and carries nothing.
+  // An address that is not one yet is set as typed and carries nothing; what an earlier move
+  // left without a place is still without one.
   store.setLanAddress('lan0', '192.168.5')
   expect(store.draft.value!.lans[0]!.ipv4).toBe('192.168.5')
   expect(store.draft.value!.lans[0]!.dhcp!.static[0]!.ip).toBe('192.168.2.10')
-  expect(store.unfit.value).toEqual([])
+  expect(store.unfit.value).toHaveLength(2)
   // A LAN that is not there is nobody's.
   store.setLanAddress('nothing', '192.168.9.1/24')
   expect(store.draft.value!.lans).toHaveLength(1)
@@ -775,6 +776,158 @@ test('a confirm or a revert the router refuses says so in its words', async () =
   router.revertAnswer = { answered: false }
   await store.revert()
   expect(store.notice.value).toBeNull()
+})
+
+test('nothing is left when the session ends while the router is being asked', async () => {
+  // Each of the four asks waits on the router. Whichever is in flight when the session ends
+  // must leave nothing behind when its answer comes: the draft may hold a typed password.
+  const asks: [name: 'validate' | 'apply' | 'confirm' | 'revert', prepare: (router: FakeRouter) => void, ask: (store: ConfigStore, review: Review) => Promise<unknown>][] = [
+    [
+      'validate',
+      (router) => {
+        router.validation = { violations: [{ $typeName: 'openfeo.v1.ConfigViolation', path: 'wans[0]', code: 'x', message: 'refused' }], effects: [], caller: undefined }
+      },
+      (store) => store.review(),
+    ],
+    ['apply', (router) => (router.applyAnswer = { answered: true, tag: 't2' }), (store, review) => store.apply(review, false)],
+    ['apply', (router) => (router.applyAnswer = { answered: false }), (store, review) => store.apply(review, false)],
+    ['apply', (router) => (router.applyAnswer = new RouterError(ErrorCode.FAILED_PRECONDITION, 'stale')), (store, review) => store.apply(review, false)],
+    ['confirm', (router) => (router.confirmRefusal = new RouterError(ErrorCode.INTERNAL, 'not written')), (store) => store.confirm()],
+    ['revert', (router) => (router.revertAnswer = new RouterError(ErrorCode.UNAVAILABLE, 'the router did not answer')), (store) => store.revert()],
+  ]
+  for (const [name, prepare, ask] of asks) {
+    const { router, store } = await started(pppoeConfig())
+    store.edit(typePassword)
+    // A change that moves the caller, so that an apply would have something to say.
+    router.validation = {
+      violations: [],
+      effects: [],
+      caller: { $typeName: 'openfeo.v1.Caller', connectionDrops: true, lanChanges: true, lan: 'lan0', routerAfter: '192.168.2.1' },
+    }
+    const review = (await store.review())!
+    prepare(router)
+    const letGo = router.holdCall(name)
+    const asked = ask(store, review)
+    await flushPromises()
+    expect(store.busy.value, name).toBe(true)
+    router.endSession('lapsed')
+    await flushPromises()
+    letGo()
+    await asked
+    await flushPromises()
+    expect(store.base.value, name).toBeNull()
+    expect(store.draft.value, name).toBeNull()
+    expect(store.notice.value, name).toBeNull()
+    expect(store.violations.value, name).toEqual([])
+    expect(store.awaiting.value, name).toBe(false)
+    expect(store.busy.value, name).toBe(false)
+  }
+})
+
+test('a read that is answered after the session ended brings nothing back', async () => {
+  const { router, store } = await started()
+  const letGo = router.holdCall('config')
+  router.push('events', event('config.applied', { mode: 'immediate' }))
+  await flushPromises()
+  router.endSession('revoked')
+  letGo()
+  await flushPromises()
+  expect(store.base.value).toBeNull()
+  expect(store.draft.value).toBeNull()
+})
+
+test('a read that brings what the draft already is leaves the draft alone', async () => {
+  // The pages keep what is half typed beside the draft, and start afresh when the draft is
+  // another one: a read that changes nothing must not look like another draft.
+  const { router, store } = await started()
+  const before = store.draft.value
+  router.push('events', event('config.applied', { mode: 'immediate' }))
+  await flushPromises()
+  expect(router.calls.config).toBe(2)
+  expect(store.draft.value).toBe(before)
+  // One that brings another config still replaces it.
+  router.configNow = { config: reserved(), tag: 't2', confirmSecs: 120 }
+  router.push('events', event('config.confirmed', {}, new Date(NOW.getTime() + 1)))
+  await flushPromises()
+  expect(store.draft.value).not.toBe(before)
+  expect(store.draft.value!.lans[0]!.dhcp!.static).toHaveLength(2)
+  expect(store.changes.value).toEqual([])
+})
+
+test('what had no place is still marked after a move that gives it none', async () => {
+  const { store } = await started()
+  const ends = [
+    { path: 'lans[0].dhcp.range[0]', value: '192.168.1.100' },
+    { path: 'lans[0].dhcp.range[1]', value: '192.168.1.200' },
+  ]
+  store.setLanAddress('lan0', '192.168.2.1/26')
+  expect(store.unfit.value).toEqual(ends)
+  // The same address again is no move at all.
+  store.setLanAddress('lan0', '192.168.2.1/26')
+  expect(store.unfit.value).toEqual(ends)
+  // The router moves within the same small subnet: the pool's ends still have no place in it.
+  store.setLanAddress('lan0', '192.168.2.2/26')
+  expect(store.unfit.value).toEqual(ends)
+  // One of them put right by hand is no longer the renumbering's to report.
+  store.edit((draft) => (draft.lans[0]!.dhcp!.range[0] = '192.168.2.10'))
+  store.setLanAddress('lan0', '192.168.2.3/26')
+  expect(store.unfit.value).toEqual([ends[1]])
+  // A subnet that has room for what was left over stops marking it.
+  store.setLanAddress('lan0', '192.168.1.1/24')
+  expect(store.unfit.value).toEqual([])
+})
+
+test('a second ask while one is under way is not sent', async () => {
+  const { router, store } = await started()
+  store.edit(reserve)
+  const review = (await store.review())!
+  let letGo = router.holdCall('apply')
+  const first = store.apply(review, false)
+  const second = store.apply(review, false)
+  await flushPromises()
+  letGo()
+  await Promise.all([first, second])
+  expect(router.calls.apply).toHaveLength(1)
+
+  letGo = router.holdCall('confirm')
+  const confirms = [store.confirm(), store.confirm(), store.revert()]
+  await flushPromises()
+  letGo()
+  await Promise.all(confirms)
+  expect(router.calls.confirm).toBe(1)
+  expect(router.calls.revert).toBe(0)
+
+  letGo = router.holdCall('validate')
+  const validated = router.calls.validate.length
+  const reviews = [store.review(), store.review()]
+  await flushPromises()
+  letGo()
+  expect((await Promise.all(reviews)).filter((found) => found !== null)).toHaveLength(1)
+  expect(router.calls.validate).toHaveLength(validated + 1)
+})
+
+test('an apply that awaits the router says so', async () => {
+  const { router, store } = await started()
+  expect(store.awaiting.value).toBe(false)
+  const review = await moving(store, router)
+  router.applyAnswer = { answered: false }
+  router.configUnreachable = true
+  await store.apply(review, false)
+  await flushPromises()
+  expect(store.awaiting.value).toBe(true)
+  router.setConnection('reconnecting')
+  router.configUnreachable = false
+  router.configNow = { config: clone(ConfigSchema, store.draft.value!), tag: 't2', confirmSecs: 120 }
+  router.setConnection('open')
+  router.push('state', pendingState(20))
+  await flushPromises()
+  expect(store.awaiting.value).toBe(false)
+  // An answered apply never awaited anything.
+  const other = await started()
+  other.store.edit(reserve)
+  other.router.applyAnswer = { answered: true, tag: 't2' }
+  await other.store.apply((await other.store.review())!, false)
+  expect(other.store.awaiting.value).toBe(false)
 })
 
 test('a router that restarted with a change pending is known by its clock', async () => {

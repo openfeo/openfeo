@@ -9,7 +9,7 @@ import { flushPromises, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import type { FakeRouter } from './fake-router'
-import { NOW, routerConfig, state } from './fixtures'
+import { event, NOW, routerConfig, state } from './fixtures'
 import { fieldLabelled, panelAt, signedIn, unmountAll } from './mounting'
 
 async function page(path = '/lan', config: Config = routerConfig(), prepare: (router: FakeRouter) => void = () => undefined) {
@@ -138,6 +138,18 @@ test("changing the router's address carries the pool and the reservations, and e
   await type(network(), 'Router address', '192.168.4')
   expect(fieldLabelled(network(), 'Router address').find('[role="alert"]').text()).toBe('Not an IPv4 address.')
   expect(store().draft.value!.lans[0]!.ipv4).toBe('192.168.4.1/23')
+})
+
+test('an address that is half typed outlives a read of the config', async () => {
+  // A config event, or the socket opening again, makes the panel read the config. With no
+  // changes in the draft, that used to count as another draft and wipe the field.
+  const { wrapper, router, store } = await page()
+  await box(wrapper, 'Router address').setValue('192.168.9')
+  router.push('events', event('config.applied', { mode: 'immediate' }))
+  await flushPromises()
+  expect(router.calls.config).toBe(2)
+  expect(valueOf(wrapper, 'Router address')).toBe('192.168.9')
+  expect(store().changes.value).toEqual([])
 })
 
 test('an address with no place in the new subnet is marked at its field', async () => {

@@ -18,6 +18,8 @@ import { computed, effectScope, ref, shallowRef, watch, type ComputedRef, type E
 
 import type { LiveData } from './live'
 import { changes as changesOf, type Change } from './model/changes'
+import { isHost, parse4, parseCidr4 } from './model/ip'
+import { stillUnfit } from './model/lan'
 import { renumber, type Unfit } from './model/renumber'
 import type { PanelRouter } from './session'
 
@@ -66,9 +68,15 @@ export interface ConfigStore {
   notice: Ref<Notice | null>
   /** A review, an apply, a confirm or a revert is under way. */
   busy: Ref<boolean>
+  /** An apply had no answer, and the router has not yet said whether it took it. */
+  awaiting: ComputedRef<boolean>
   /** Change the draft. Does nothing on a router that takes no changes. */
   edit(change: (draft: Config) => void): void
-  /** Set a LAN's address and, when the old and the new are both valid, carry what lay in its subnet along. */
+  /**
+   * Set a LAN's address and, when the old and the new are both valid, carry what lay in its
+   * subnet along. `unfit` is then what this move could not place, and before it whatever an
+   * earlier move could not place that is still where it was left and still has no place.
+   */
   setLanAddress(lan: string, ipv4: string): void
   /** The message of a violation at `path` or beneath it. */
   problemAt(path: string): string | undefined
@@ -174,6 +182,11 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
 
   /** The tag of `base`. */
   let tag = ''
+  /**
+   * Which session this is, counted up each time one ends. An ask that was in flight when the
+   * session ended finds another number when its answer comes, and leaves nothing behind.
+   */
+  let session = 0
   let mine: Mine | null = null
   let watched: Watched | null = null
   /** The change whose going back was said with no reason, for the event that may yet give one. */
@@ -204,13 +217,14 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       do {
         again = false
         let view: ConfigView
+        const asked = session
         try {
           view = await router.config()
         } catch {
           // Not reachable, or no longer logged in: read again when the socket next opens.
           break
         }
-        if (scope === undefined) {
+        if (scope === undefined || asked !== session) {
           break
         }
         took(view)
@@ -238,7 +252,11 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       settleUnanswered()
     } else {
       if (first || !changed) {
-        draft.value = clone(ConfigSchema, view.config)
+        // A draft that already is what was read stays the object it is: the pages keep what
+        // is half typed beside it, and start afresh only when the draft is another one.
+        if (draft.value === null || !equals(ConfigSchema, draft.value, view.config)) {
+          draft.value = clone(ConfigSchema, view.config)
+        }
       } else if (another && notice.value?.kind !== 'refused') {
         // (A refusal that is already up says it in the router's own words.)
         notice.value = { kind: 'changed-elsewhere' }
@@ -432,6 +450,7 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
 
   /** The session is over: the draft may hold a typed password, and goes with everything remembered of it. */
   function forget(): void {
+    session += 1
     base.value = null
     draft.value = null
     tag = ''
@@ -463,15 +482,26 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
     pending,
     notice,
     busy,
+    awaiting: computed(() => awaited.value !== null),
     edit,
     setLanAddress: (name, ipv4) => {
       edit((config) => {
         const lan = config.lans.find((each) => each.name === name)
-        if (lan !== undefined) {
-          const from = lan.ipv4
-          lan.ipv4 = ipv4
-          unfit.value = renumber(config, from, ipv4)
+        if (lan === undefined || lan.ipv4 === ipv4) {
+          return
         }
+        const from = lan.ipv4
+        lan.ipv4 = ipv4
+        const left = renumber(config, from, ipv4)
+        // What an earlier move left without a place is still reported while its field holds
+        // it and this LAN's subnet has no room for it either.
+        const subnet = parseCidr4(ipv4)
+        const fits = (value: string) => {
+          const address = parse4(value)
+          return subnet !== null && address !== null && isHost(subnet, address)
+        }
+        const before = unfit.value.filter((old) => !left.some((now) => now.path === old.path) && stillUnfit(config, old) && !fits(old.value))
+        unfit.value = [...before, ...left]
       })
     },
     problemAt: (path) => violations.value.find((violation) => violation.path === path || violation.path.startsWith(`${path}.`) || violation.path.startsWith(`${path}[`))?.message,
@@ -481,35 +511,46 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
       unfit.value = []
     },
     review: async () => {
-      if (draft.value === null) {
+      if (draft.value === null || busy.value) {
         return null
       }
       busy.value = true
+      const asked = session
       try {
         // A copy, and the tag as it is now: what the router is asked about is what an apply sends.
         const reviewed = clone(ConfigSchema, draft.value)
         const from = tag
         const listed = changes.value
         const answer = await router.validate(reviewed)
+        if (asked !== session) {
+          return null
+        }
         violations.value = answer.violations
         return answer.violations.length > 0 ? null : { changes: listed, effects: answer.effects, caller: answer.caller, config: reviewed, tag: from }
       } catch (error) {
-        refused(error)
+        if (asked === session) {
+          refused(error)
+        }
         return null
       } finally {
         busy.value = false
       }
     },
     apply: async (review, immediate) => {
-      if (draft.value === null) {
+      if (draft.value === null || busy.value) {
         return
       }
       busy.value = true
+      const asked = session
       // What was reviewed, against the config it was reviewed against.
       const sent = clone(ConfigSchema, review.config)
       const fromTag = review.tag
       try {
         const applied = await router.apply(sent, fromTag, { immediate })
+        if (asked !== session) {
+          // The session ended while the router was being asked: what was sent is not kept.
+          return
+        }
         const remembered: Mine = {
           sent,
           fromTag,
@@ -548,29 +589,43 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
         }
       } catch (error) {
         // The router's own words; what it has now is read again, and the draft stays.
-        refused(error)
-        void read()
+        if (asked === session) {
+          refused(error)
+          void read()
+        }
       } finally {
         busy.value = false
       }
     },
     confirm: async () => {
+      if (busy.value) {
+        return
+      }
       busy.value = true
+      const asked = session
       try {
         await router.confirm()
       } catch (error) {
-        refused(error)
+        if (asked === session) {
+          refused(error)
+        }
       } finally {
         busy.value = false
       }
     },
     revert: async () => {
+      if (busy.value) {
+        return
+      }
       busy.value = true
+      const asked = session
       try {
         // Answered or not, the state says what became of it.
         await router.revert()
       } catch (error) {
-        refused(error)
+        if (asked === session) {
+          refused(error)
+        }
       } finally {
         busy.value = false
       }
