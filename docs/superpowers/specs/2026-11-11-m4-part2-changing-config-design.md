@@ -667,7 +667,12 @@ from the design above.
   under it: there is no merge, and what the other session changed shows in the draft as a
   change back, in the bar's count and in the dialog. An apply sends the config and the tag
   that the dialog was shown for, so a config changed from elsewhere while the dialog is open
-  is refused as stale and not overwritten unseen.
+  is refused as stale and not overwritten unseen. A read that brings what the draft already
+  is leaves the draft the object it is, so that what is half typed on a page outlives it.
+  Whatever the store was asking of the router when the session ended (a read, a review, an
+  apply, a confirm, a revert) leaves nothing behind when its answer comes, and none of the
+  four asks is sent while another is under way. `awaiting` says that an apply had no answer
+  and the router has not yet said whether it took it; the bar offers no other apply meanwhile.
 - **What became of a pending change is read, not guessed.** A `config.confirmed` or
   `config.reverted` event stamped no earlier than the change decides; with none yet, a tag
   other than the one read while it was pending, or a router that has been up for less time
@@ -683,6 +688,13 @@ from the design above.
   setting of a page this part does not have. A rule's target moves as an address, as a range
   (whole or not at all) or as a block. Which fields hold such addresses is one table over every
   string field of the config (`model/renumber.ts`), and a test holds the table to the schema.
+  Two LANs can be in one subnet for a moment, half way through being swapped, and an address
+  there does not say whose it is: a LAN's own pool and reservations follow that LAN alone
+  (`renumber` is told which LAN is moving), and anything else stays with the other LAN when it
+  points into that LAN in the config the draft was read from and still holds what that LAN's
+  moves have made of it; a field is the same field in both configs by the names above it (the
+  LAN's, the forward's, the rule's, the record's). What one move could not place stays marked
+  through the next, until the LAN whose move left it has room for it or it is changed by hand.
 - **A change is counted per setting, as the dialog lists it** (`model/changes.ts`): one for
   each setting of a WAN or LAN that differs, named as its page names it; one for a pool; one
   for a LAN's reservations together; one for a WAN or LAN added or removed; one for each
@@ -695,7 +707,12 @@ from the design above.
   field is listed at the top of its tab, and what is another page's, or another tab's, above
   the page (the router reports a clash between two WANs or two LANs at the later one). Something
   the page itself finds wrong in what was typed is not in the draft, so Apply changes is held
-  until it is put right.
+  until it is put right. After a LAN's address or size is taken, the fields of that LAN that a
+  move carries count as left, so a pool whose start was carried past its end is said at once.
+  When a reservation, a WAN or a LAN is removed, what was said of it and of the items after
+  it is dropped: it is kept by path, and their paths now name other items. Unticking a port
+  drops what was said of the ports for the same reason, and what was typed for a WAN or a LAN
+  that is removed, which the page keeps under its name, goes with it.
 - **The countdown** is the change's revert time against the router's uptime, counted on in the
   browser between the router's words; a browser whose clock is wrong counts the same. The
   banner is a group, not a status, so that it is not read out every second.
@@ -720,7 +737,8 @@ from the design above.
   `https://192.168.2.1` and confirms there. The client's own test returns by address too, with
   the same token; the return by name is part 2a's scenario, by the Rust client. No test
   against a real router meets an apply that is not answered: on the lab's machine the answer
-  got out every time, so that path is proven against a scripted socket and a scripted router.
+  got out every time, so that path is proven against a scripted socket and a scripted router
+  (#117).
 
 **For part 3**
 
@@ -733,7 +751,8 @@ from the design above.
   how a field is known to have been left, and how a renumbering's leftovers are marked. The
   page's model says what is wrong with a field as typed, keyed by the same paths, and which
   paths the page has a field for; `parts/RefusedList.vue` shows the rest. Every edit goes
-  through `store.edit`.
+  through `store.edit`, and a page that removes an item of a list calls `forgetFrom`
+  (`fields.ts`) for it.
 - A new page's settings want names in `model/changes.ts`; until they have them they are listed
   by path, which is correct and ugly. A new string field in the config must be classified in
   `model/renumber.ts` or its test fails.
@@ -747,10 +766,15 @@ from the design above.
 
 - The countdown is up to a second coarse, and a browser clock that is stepped in the middle of
   a window misleads it until the router's state next arrives. The counters carry the router's
-  clock every second and are not used for it.
+  clock every second and are not used for it (#119).
 - What was typed for a WAN's type, its IPv6 or a LAN's DHCP server and then switched away from
-  is kept by the page, so it is lost when the person goes to another page and back.
+  is kept by the page, so it is lost when the person goes to another page and back (#121).
 - A line of help carries an address in the text face (`Was 192.168.1.100.`), as the approved
-  mockup had it, where the design system sets what a machine reads in mono.
+  mockup had it, where the design system sets what a machine reads in mono (#122).
+- In a subnet that two LANs share, an address in a list of plain addresses (the servers a
+  LAN hands out, the upstream resolvers) is known by its place in that list, so one added or
+  removed before it in the same draft makes it another: it then follows the LAN that is
+  moving, which may not be its own. The dialog lists what a move carried; an address wrongly
+  left is not in it.
 - A tab reached by address that asks for a revert at an address the pending change gave the
   router is not told where the router went back to: it never knew the address before.

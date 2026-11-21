@@ -6,6 +6,7 @@
 //! order; and a file the router refuses still yields its hash, so a typo elsewhere in the
 //! config does not leave the panel for whoever is on the LAN to claim.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -19,7 +20,7 @@ use crate::state::ConfigProblem;
 use crate::{Admin, Config, PortMap, file};
 
 /// What a config file's text gives up about the admin password without being valid.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Salvage {
     /// The file is TOML and carries this non-empty hash.
     Hash(String),
@@ -27,6 +28,18 @@ pub enum Salvage {
     NoHash,
     /// The file is not TOML: nothing can be read from it.
     Unreadable,
+}
+
+/// Which of the three it is, and never the hash: a hash reaches no `Debug` output, of this
+/// or of what holds it.
+impl fmt::Debug for Salvage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Hash(_) => "Hash(<redacted>)",
+            Self::NoHash => "NoHash",
+            Self::Unreadable => "Unreadable",
+        })
+    }
 }
 
 /// How the running config came to be, as the API needs to know it.
@@ -206,5 +219,15 @@ mod tests {
             Salvage::NoHash
         );
         assert_eq!(salvage_password_hash("= ="), Salvage::Unreadable);
+    }
+
+    /// What a refused file still says about the password is the hash itself: its `Debug`,
+    /// and that of anything that holds it (the boot's decision), prints none.
+    #[test]
+    fn the_debug_of_a_salvaged_hash_prints_none() {
+        let text = format!("{:?}", Salvage::Hash(HASH.to_owned()));
+        assert_eq!(text, "Hash(<redacted>)");
+        assert_eq!(format!("{:?}", Salvage::NoHash), "NoHash");
+        assert_eq!(format!("{:?}", Salvage::Unreadable), "Unreadable");
     }
 }

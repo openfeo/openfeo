@@ -315,3 +315,29 @@ test('while a change is pending the bar says to settle it first', async () => {
   await flushPromises()
   expect(bar(wrapper).findAll('button').map((each) => each.text())).toEqual(['Discard', 'Apply changes'])
 })
+
+test('while an apply awaits the router the bar says so and offers no other', async () => {
+  // An apply that had no answer: until the router says whether it took it, another would be
+  // asked of a router that may be moving, and its refusal would take the place of the notice.
+  const { wrapper, router, store } = await changed((fake) => {
+    fake.applyAnswer = { answered: false }
+  })
+  await review(wrapper)
+  router.configUnreachable = true
+  await button(dialog(wrapper), 'Apply changes')?.trigger('click')
+  await flushPromises()
+  expect(router.calls.apply).toHaveLength(1)
+  expect(bar(wrapper).text()).toContain('1 change not applied yet')
+  expect(bar(wrapper).text()).toContain('Waiting to hear from the router what became of the change that was sent.')
+  expect(bar(wrapper).findAll('button').map((each) => each.text())).toEqual(['Discard'])
+
+  // Found again as it was: the change was not taken, and it can be applied again.
+  router.setConnection('reconnecting')
+  router.configUnreachable = false
+  router.setConnection('open')
+  router.push('state', state())
+  await flushPromises()
+  expect(store().awaiting.value).toBe(false)
+  expect(bar(wrapper).text()).not.toContain('Waiting to hear')
+  expect(bar(wrapper).findAll('button').map((each) => each.text())).toEqual(['Discard', 'Apply changes'])
+})
