@@ -11,6 +11,13 @@
 // same distance from the new subnet's start. One with no such place is left as it was and
 // reported, for the person to put right.
 //
+// Two LANs can be in one subnet for a moment: half way through swapping two, or while one is
+// given the subnet another is about to leave. An address there does not say which LAN it
+// belongs to, so two things do. A LAN's own pool and reservations follow that LAN and no
+// other. Everything else follows the LAN it pointed into as the router has it, wherever
+// earlier moves of this draft have carried it since; what the router's config does not
+// place in any LAN (typed in this draft) follows whichever LAN leaves first, as it always did.
+//
 // Which fields hold such addresses is said once, in STRING_FIELDS, for every string field
 // the config has: the walk below carries what it says to carry and a test holds the list to
 // the schema, so a field added later is classified or the test fails.
@@ -27,11 +34,13 @@ export interface Unfit {
 
 /**
  * Every string field of the config, by its path without indices: `carried` holds IPv4
- * addresses that follow a renumbered LAN, `target` a firewall rule's target (an address, an
- * `a-b` range or a block), and `left` is never touched. A LAN's own `ipv4` is left: the edit
- * that renumbers it sets it.
+ * addresses that follow a renumbered LAN, `own` holds a LAN's own (its pool, its
+ * reservations), which follow that LAN alone, `target` a firewall rule's target (an address,
+ * an `a-b` range or a block), and `left` is never touched. A LAN's own `ipv4` is left: the
+ * edit that renumbers it sets it. The servers a LAN hands out are `carried` and not `own`:
+ * one that sits on another LAN follows that LAN.
  */
-export const STRING_FIELDS: Record<string, 'carried' | 'target' | 'left'> = {
+export const STRING_FIELDS: Record<string, 'carried' | 'own' | 'target' | 'left'> = {
   'system.hostname': 'left',
   'system.domain': 'left',
   'system.timezone': 'left',
@@ -58,9 +67,9 @@ export const STRING_FIELDS: Record<string, 'carried' | 'target' | 'left'> = {
   'lans.ipv4': 'left',
   'lans.reaches': 'left',
   'lans.ipv6': 'left',
-  'lans.dhcp.range': 'carried',
+  'lans.dhcp.range': 'own',
   'lans.dhcp.static.mac': 'left',
-  'lans.dhcp.static.ip': 'carried',
+  'lans.dhcp.static.ip': 'own',
   'lans.dhcp.static.hostname': 'left',
   'lans.dhcp.static.client_id': 'left',
   'lans.dhcp.dns': 'carried',
@@ -204,23 +213,80 @@ function retarget(text: string, from: Cidr4, to: Cidr4): string | null | undefin
   return placed === null ? null : format4(placed)
 }
 
+/** Whether two subnets have an address in common. */
+function overlap(one: Cidr4, other: Cidr4): boolean {
+  return contains(one, network(other)) || contains(other, network(one))
+}
+
+/** The address a field's text starts with: the address itself, a range's first, a block's. */
+function first(text: string): number | null {
+  return parse4(text.split(/[-/]/)[0] ?? '')
+}
+
+/**
+ * Whose a field is when the subnet a LAN is leaving holds another LAN too: for each field of
+ * `base` (the config the draft was read from), by its path, whether what it holds there
+ * points into a LAN other than `owner`. Such a field belongs to that LAN and stays. `null`
+ * when no other LAN shares the subnet, or there is nothing to tell by: then every address in
+ * the subnet follows.
+ *
+ * A field is known by its path, so a row added or removed above it in this draft is taken
+ * for its neighbour: in a subnet two LANs share, and nowhere else.
+ */
+function anothers(config: Config, before: Cidr4, owner: string | undefined, base: Config | undefined): ((path: string) => boolean) | null {
+  if (owner === undefined || base === undefined) {
+    return null
+  }
+  const shared = config.lans.some((lan) => {
+    const subnet = lan.name === owner ? null : parseCidr4(lan.ipv4)
+    return subnet !== null && overlap(subnet, before)
+  })
+  if (!shared) {
+    return null
+  }
+  const others = base.lans.flatMap((lan) => {
+    const subnet = lan.name === owner ? null : parseCidr4(lan.ipv4)
+    return subnet === null ? [] : [subnet]
+  })
+  const home = parseCidr4(base.lans.find((lan) => lan.name === owner)?.ipv4 ?? '')
+  const theirs = new Set<string>()
+  strings(ConfigSchema, base as unknown as Record<string, unknown>, '', '', (key, path, value) => {
+    const kind = STRING_FIELDS[key]
+    const address = kind === 'carried' || kind === 'target' ? first(value) : null
+    if (address !== null && !(home !== null && contains(home, address)) && others.some((subnet) => contains(subnet, address))) {
+      theirs.add(path)
+    }
+  })
+  return (path) => theirs.has(path)
+}
+
 /**
  * Carry every IPv4 address that lay in `from`'s subnet along to `to`'s (both as a LAN's
  * `ipv4`: the router's address and the subnet's size), in place. What had no place in the new
  * subnet is left as it was and handed back. When either is not a valid address, or the two
  * are the same, nothing is touched.
+ *
+ * With `owner`, the name of the LAN that is moving, a pool and a reservation follow only when
+ * they are that LAN's own. With `base` as well, the config the draft was read from, a field
+ * that points into another LAN there stays when that LAN shares the subnet being left.
+ * Without them every address in the subnet follows.
  */
-export function renumber(config: Config, from: string, to: string): Unfit[] {
+export function renumber(config: Config, from: string, to: string, owner?: string, base?: Config): Unfit[] {
   const before = parseCidr4(from)
   const after = parseCidr4(to)
   if (before === null || after === null || (before.address === after.address && before.prefix === after.prefix)) {
     return []
   }
+  const own = owner === undefined ? null : `lans[${config.lans.findIndex((lan) => lan.name === owner)}].`
+  const theirs = anothers(config, before, owner, base)
   const unfit: Unfit[] = []
   strings(ConfigSchema, config as unknown as Record<string, unknown>, '', '', (key, path, value, set) => {
     const kind = STRING_FIELDS[key]
     let next: string | null | undefined
-    if (kind === 'carried') {
+    if (kind === 'own' ? own !== null && !path.startsWith(own) : theirs?.(path) === true) {
+      return
+    }
+    if (kind === 'carried' || kind === 'own') {
       const address = parse4(value)
       if (address !== null && contains(before, address)) {
         const placed = place(address, before, after)

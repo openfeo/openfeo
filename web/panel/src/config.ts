@@ -492,7 +492,7 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
         }
         const from = lan.ipv4
         lan.ipv4 = ipv4
-        const left = renumber(config, from, ipv4)
+        const left = renumber(config, from, ipv4, name, base.value ?? undefined)
         // What an earlier move left without a place is still reported while its field holds
         // it and this LAN's subnet has no room for it either.
         const subnet = parseCidr4(ipv4)

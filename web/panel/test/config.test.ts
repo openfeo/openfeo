@@ -570,6 +570,28 @@ test("another session's revert is said, with no draft to keep", async () => {
   expect(store.changes.value).toEqual([])
 })
 
+test('two LANs swap their subnets, and each keeps its own', async () => {
+  // The store says which LAN is moving and what the router has, so that half way through,
+  // with both in one subnet, a pool or a forward is not carried by the wrong one's move.
+  const config = labConfig()
+  config.lans.push(
+    ...create(ConfigSchema, {
+      lans: [{ name: 'guest', ports: ['p1'], ipv4: '192.168.3.1/24', dhcp: { range: ['192.168.3.100', '192.168.3.200'], dns: ['192.168.1.53'] } }],
+    }).lans,
+  )
+  const { store } = await started(config)
+  store.setLanAddress('lan0', '192.168.3.1/24')
+  store.setLanAddress('guest', '192.168.1.1/24')
+  const [lan0, guest] = store.draft.value!.lans
+  expect(lan0!.dhcp!.range).toEqual(['192.168.3.100', '192.168.3.200'])
+  expect(lan0!.dhcp!.static[0]!.ip).toBe('192.168.3.10')
+  expect(guest!.dhcp!.range).toEqual(['192.168.1.100', '192.168.1.200'])
+  // What pointed into lan0 still does: the forward, and the server guest hands out.
+  expect(store.draft.value!.firewall!.portForwards[0]!.to).toBe('192.168.3.2')
+  expect(guest!.dhcp!.dns).toEqual(['192.168.3.53'])
+  expect(store.unfit.value).toEqual([])
+})
+
 test("setting a LAN's address carries what follows it and keeps what does not fit", async () => {
   const { store } = await started()
   store.setLanAddress('lan0', '192.168.2.1/24')
