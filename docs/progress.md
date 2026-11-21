@@ -348,16 +348,19 @@ and follow-ups that the reviews of #101 and #103 left, the ten that a person can
 broke one of the repository's own rules; the other twenty are filed as #104 to #123. No wire type
 prints a secret in `Debug`: the seven messages that carry a password, a token or a hash have theirs
 written by hand, so neither they nor a config, a World or a request that holds one can put a secret
-into a log line or an error, and a test holds the list of such fields to the proto files. In the
+into a log line or an error; the build gives no derived `Debug` to any message with a field that is
+a secret by its name, so one added later does not compile until its own is written. Two hand-written
+types that held the admin's hash and a PAP request's password no longer print them either. In the
 panel's store, an ask that is answered after the session ended leaves nothing behind (an apply used
 to put back what it had sent, a typed password included); a read that brings what the draft already
 is no longer wipes a field that is half typed; what a renumbering could not place stays marked across
 the next one; no ask is sent a second time by a double press; and the bar offers no other apply while
 one awaits the router's word. Swapping two LANs' subnets no longer scrambles them: a LAN's own pool
 and reservations follow that LAN alone, and in a subnet that two LANs share for a moment anything
-else follows the LAN it points into as the router has it. A pool that a move left the wrong way
+else stays with the LAN it points into as the router has it. A pool that a move left the wrong way
 round is said at once, and what was said of a reservation, a WAN or a LAN goes with it when it is
-removed, together with what was said of those after it, whose places changed.
+removed, together with what was said of those after it, whose places changed, and with what was
+typed for it and kept under its name.
 
 ## Tooling and process
 

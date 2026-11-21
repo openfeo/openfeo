@@ -690,9 +690,11 @@ from the design above.
   string field of the config (`model/renumber.ts`), and a test holds the table to the schema.
   Two LANs can be in one subnet for a moment, half way through being swapped, and an address
   there does not say whose it is: a LAN's own pool and reservations follow that LAN alone
-  (`renumber` is told which LAN is moving), and anything else there follows the LAN it points
-  into in the config the draft was read from. What one move could not place stays marked
-  through the next, until it has a place or is changed by hand.
+  (`renumber` is told which LAN is moving), and anything else stays with the other LAN when it
+  points into that LAN in the config the draft was read from and still holds what that LAN's
+  moves have made of it; a field is the same field in both configs by the names above it (the
+  LAN's, the forward's, the rule's, the record's). What one move could not place stays marked
+  through the next, until the LAN whose move left it has room for it or it is changed by hand.
 - **A change is counted per setting, as the dialog lists it** (`model/changes.ts`): one for
   each setting of a WAN or LAN that differs, named as its page names it; one for a pool; one
   for a LAN's reservations together; one for a WAN or LAN added or removed; one for each
@@ -708,7 +710,9 @@ from the design above.
   until it is put right. After a LAN's address or size is taken, the fields of that LAN that a
   move carries count as left, so a pool whose start was carried past its end is said at once.
   When a reservation, a WAN or a LAN is removed, what was said of it and of the items after
-  it is dropped: it is kept by path, and their paths now name other items.
+  it is dropped: it is kept by path, and their paths now name other items. Unticking a port
+  drops what was said of the ports for the same reason, and what was typed for a WAN or a LAN
+  that is removed, which the page keeps under its name, goes with it.
 - **The countdown** is the change's revert time against the router's uptime, counted on in the
   browser between the router's words; a browser whose clock is wrong counts the same. The
   banner is a group, not a status, so that it is not read out every second.
@@ -767,8 +771,10 @@ from the design above.
   is kept by the page, so it is lost when the person goes to another page and back (#121).
 - A line of help carries an address in the text face (`Was 192.168.1.100.`), as the approved
   mockup had it, where the design system sets what a machine reads in mono (#122).
-- In a subnet that two LANs share, a field is known by its path in the config the draft was
-  read from, so a row added or removed above it in the same draft is taken for its neighbour
-  and may follow the wrong LAN. The dialog lists every address a move carries.
+- In a subnet that two LANs share, an address in a list of plain addresses (the servers a
+  LAN hands out, the upstream resolvers) is known by its place in that list, so one added or
+  removed before it in the same draft makes it another: it then follows the LAN that is
+  moving, which may not be its own. The dialog lists what a move carried; an address wrongly
+  left is not in it.
 - A tab reached by address that asks for a revert at an address the pending change gave the
   router is not told where the router went back to: it never knew the address before.
