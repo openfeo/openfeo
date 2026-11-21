@@ -19,7 +19,7 @@ import { computed, inject, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { CONFIG } from '../config'
-import { FIELDS, listText, numberText, pageFields, parseList, toNumber, under } from '../fields'
+import { FIELDS, forgetFrom, listText, numberText, pageFields, parseList, toNumber, under } from '../fields'
 import { LIVE } from '../live'
 import { address4, cidr4 } from '../model/check'
 import { durationWords } from '../model/format'
@@ -159,6 +159,22 @@ const addressProblem = computed(() => {
   return typed === undefined ? null : typed.includes('/') ? cidr4(typed) : address4(typed)
 })
 
+/**
+ * The LAN's address or size was taken, and the addresses of this LAN that follow it may have
+ * moved. Their fields count as left: what the move made of them is said at once, and not
+ * first when Apply changes is pressed. A pool whose start was carried past its end is the
+ * case that matters: each end has a place, and together they are no pool.
+ */
+function leaveCarried(): void {
+  const rows = lan.value?.dhcp?.static
+  if (rows === undefined) {
+    return
+  }
+  for (const field of ['dhcp.range', 'dhcp.range[1]', 'dhcp.dns', 'dhcp.ntp', ...rows.map((_, row) => `dhcp.static[${row}].ip`)]) {
+    fields.left.add(`${at.value}.${field}`)
+  }
+}
+
 /** The address field was left: an address (alone, or with its size) is taken, and what lay in the subnet follows. */
 function leaveAddress(): void {
   const typed = fields.typed.get(`${at.value}.ipv4`)
@@ -169,6 +185,9 @@ function leaveAddress(): void {
   if (whole === '' || parseCidr4(whole) !== null) {
     store.setLanAddress(lan.value.name, whole)
     fields.typed.delete(`${at.value}.ipv4`)
+    if (whole !== '') {
+      leaveCarried()
+    }
   }
 }
 
@@ -184,6 +203,7 @@ function setSize(size: string): void {
   } else {
     store.setLanAddress(lan.value.name, `${address}/${size}`)
     fields.typed.delete(`${at.value}.ipv4`)
+    leaveCarried()
   }
 }
 
@@ -257,6 +277,11 @@ function lease(at: number, edit: (lease: StaticLease) => void): void {
     }
   })
 }
+/** Take a reservation away, and with it what was said of the rows whose places change. */
+function removeLease(row: number): void {
+  change((shown) => shown.dhcp?.static.splice(row, 1))
+  forgetFrom(fields, store, `${at.value}.dhcp.static`, row)
+}
 /** What the router said of a reservation as a whole, or of its identifier: said under its name. */
 function rowProblem(row: number): string | undefined {
   const path = `${at.value}.dhcp.static[${row}]`
@@ -292,7 +317,10 @@ function add(name: string): void {
 /** What still points at this LAN: it cannot go until the pages that edit those are here. */
 const inTheWay = computed(() => (lan.value === undefined || store.draft.value === null ? [] : blockers(store.draft.value, lan.value)))
 function remove(): void {
-  store.edit((draft) => draft.lans.splice(index.value, 1))
+  const gone = index.value
+  store.edit((draft) => draft.lans.splice(gone, 1))
+  // The LANs after it each have another place now: what was said of them by place goes too.
+  forgetFrom(fields, store, 'lans', gone)
   const first = lans.value[0]
   void routes.replace(first === undefined ? PAGES.lan : `${PAGES.lan}/${first.name}`)
 }
@@ -508,7 +536,7 @@ function remove(): void {
                     @update="(text) => lease(n, (each) => (each.ip = text))"
                   />
                   <td>
-                    <OfoButton size="sm" variant="ghost" :disabled="!editable" @click="change((shown) => shown.dhcp?.static.splice(n, 1))">Remove</OfoButton>
+                    <OfoButton size="sm" variant="ghost" :disabled="!editable" @click="removeLease(n)">Remove</OfoButton>
                   </td>
                 </tr>
               </tbody>

@@ -20,7 +20,7 @@ import { computed, inject, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { CONFIG } from '../config'
-import { FIELDS, listText, numberText, pageFields, parseList, toNumber, under } from '../fields'
+import { FIELDS, forgetFrom, listText, numberText, pageFields, parseList, toNumber, under } from '../fields'
 import { LIVE } from '../live'
 import { ipv6On, newWan, portOptions, setIpv6, setType, typeOf, WAN_FIELDS, wanProblems, type WanType } from '../model/wan'
 import NameDialog from '../parts/NameDialog.vue'
@@ -148,7 +148,10 @@ function add(name: string): void {
   show(name)
 }
 function remove(): void {
-  store.edit((draft) => draft.wans.splice(index.value, 1))
+  const gone = index.value
+  store.edit((draft) => draft.wans.splice(gone, 1))
+  // The WANs after it each have another place now: what was said of them by place goes too.
+  forgetFrom(fields, store, 'wans', gone)
   const first = wans.value[0]
   void routes.replace(first === undefined ? PAGES.wan : `${PAGES.wan}/${first.name}`)
 }

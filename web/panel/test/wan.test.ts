@@ -302,6 +302,26 @@ test('what the router refuses on a WAN that is not shown is said above the page'
   expect(above()).toBeUndefined()
 })
 
+test('removing a WAN takes with it what was said of the WANs whose places change', async () => {
+  const { wrapper, router, store } = await page('/wan', twoWans())
+  router.validation = {
+    violations: [{ $typeName: 'openfeo.v1.ConfigViolation', path: 'wans[1].port', code: 'port_used_twice', message: '"p2" is already assigned' }],
+    effects: [],
+    caller: undefined,
+  }
+  expect(await store().review()).toBeNull()
+  await flushPromises()
+  expect(tabs(wrapper)[1]?.find('.ofo-pill').text()).toBe('problem')
+  // wan0 goes: wan1 is the first WAN now, and what was said of a second is said of none.
+  await wrapper.findAll('button').find((button) => button.text() === 'Remove wan0')?.trigger('click')
+  await flushPromises()
+  expect(tabs(wrapper).map((tab) => tab.text())).toEqual(['wan1'])
+  expect(wrapper.find('.refused').exists()).toBe(false)
+  expect(wrapper.find('[role="tabpanel"] .ofo-field--error').exists()).toBe(false)
+  expect(tabs(wrapper)[0]?.find('.ofo-pill').exists()).toBe(false)
+  expect(store().violations.value).toEqual([])
+})
+
 test('advanced opens for a field that is set', async () => {
   const closed = await page()
   const groups = () => closed.wrapper.findAll('details.ofo-adv')

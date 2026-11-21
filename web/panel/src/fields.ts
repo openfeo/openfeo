@@ -8,6 +8,9 @@
 
 import { reactive, type InjectionKey } from 'vue'
 
+import type { ConfigStore } from './config'
+import { fromItem } from './model/path'
+
 export { under } from './model/path'
 
 export interface PageFields {
@@ -23,6 +26,29 @@ export function pageFields(): PageFields {
   return { left: reactive(new Set<string>()), typed: reactive(new Map<string, string>()) }
 }
 
+/**
+ * The item at `at` of the list at `list` (`lans`, `lans[0].dhcp.static`) was removed. What
+ * the router refused, what had no place, which fields were left and what was typed in them
+ * are all kept by a path, and a path names an item by its place: every item after the one
+ * that went now has another. So what was said of the item removed and of those after it is
+ * dropped, rather than said of their neighbours; the router says again what still holds when
+ * it is next asked.
+ */
+export function forgetFrom(fields: PageFields, store: ConfigStore, list: string, at: number): void {
+  const gone = (path: string) => fromItem(path, list, at)
+  store.violations.value = store.violations.value.filter((violation) => !gone(violation.path))
+  store.unfit.value = store.unfit.value.filter((unfit) => !gone(unfit.path))
+  for (const path of [...fields.left]) {
+    if (gone(path)) {
+      fields.left.delete(path)
+    }
+  }
+  for (const path of [...fields.typed.keys()]) {
+    if (gone(path)) {
+      fields.typed.delete(path)
+    }
+  }
+}
 
 /** A list as it is typed, separated by commas, into the list it means. */
 export function parseList(text: string): string[] {

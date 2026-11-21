@@ -185,6 +185,30 @@ test('an address with no place in the new subnet is marked at its field', async 
   expect(wrapper.find('[role="tabpanel"] [role="alert"]').exists()).toBe(false)
 })
 
+test('a pool that a move left the wrong way round says so at once', async () => {
+  // Into the upper half of the subnet: the pool's start is carried up past its end, which
+  // has a place where it is. No field of the pool was touched, and it is said all the same.
+  const config = routerConfig()
+  config.lans[0]!.dhcp!.range = ['192.168.1.100', '192.168.1.200']
+  const { wrapper } = await page('/lan', config)
+  expect(tabs(wrapper)[0]?.find('.ofo-pill').exists()).toBe(false)
+  await type(wrapper, 'Router address', '192.168.1.129/25')
+  expect(valueOf(wrapper, 'Pool start')).toBe('192.168.1.228')
+  expect(valueOf(wrapper, 'Pool end')).toBe('192.168.1.200')
+  expect(fieldLabelled(wrapper, 'Pool start').find('[role="alert"]').text()).toBe('The pool starts after it ends.')
+  expect(tabs(wrapper)[0]?.find('.ofo-pill').text()).toBe('problem')
+
+  // The same by the size alone.
+  const high = routerConfig()
+  high.lans[0]!.ipv4 = '192.168.1.250/24'
+  high.lans[0]!.dhcp!.range = ['192.168.1.100', '192.168.1.200']
+  unmountAll()
+  const other = await page('/lan', high)
+  await fieldLabelled(other.wrapper, 'Subnet size').find('select').setValue('25')
+  expect(valueOf(other.wrapper, 'Pool start')).toBe('192.168.1.228')
+  expect(fieldLabelled(other.wrapper, 'Pool start').find('[role="alert"]').text()).toBe('The pool starts after it ends.')
+})
+
 test('the subnet size says the range it gives', async () => {
   const { wrapper, store } = await page()
   const size = () => fieldLabelled(wrapper, 'Subnet size')
@@ -270,6 +294,49 @@ test('a reservation is added, edited and removed in place', async () => {
   // All three are one change.
   expect(store().changes.value).toEqual([{ subject: 'lan0', what: 'reservations', before: '', after: '1 added, 1 removed, 1 changed' }])
   expect(store().draft.value!.lans[0]!.dhcp!.static.map((lease) => lease.hostname)).toEqual(['nas', 'camera'])
+})
+
+test('removing a reservation takes with it what was said of the rows whose places change', async () => {
+  // What the router refused is kept by the row's number. With a row gone, the rows after it
+  // each have another number, and what was said of row 2 must not be said of what was row 3.
+  const config = routerConfig()
+  config.lans[0]!.dhcp!.static.push(
+    ...create(ConfigSchema, {
+      lans: [
+        {
+          dhcp: {
+            static: [
+              { mac: '52:54:00:fe:10:12', ip: '192.168.1.12', hostname: 'tv' },
+              { mac: '52:54:00:fe:10:13', ip: '192.168.1.13', hostname: 'desk' },
+            ],
+          },
+        },
+      ],
+    }).lans[0]!.dhcp!.static,
+  )
+  const { wrapper, router, store } = await page('/lan', config)
+  router.validation = {
+    violations: [
+      { $typeName: 'openfeo.v1.ConfigViolation', path: 'lans[0].dhcp.static[0].ip', code: 'pool', message: 'inside the pool' },
+      { $typeName: 'openfeo.v1.ConfigViolation', path: 'lans[0].dhcp.static[2].ip', code: 'twice', message: 'reserved twice' },
+    ],
+    effects: [],
+    caller: undefined,
+  }
+  expect(await store().review()).toBeNull()
+  await flushPromises()
+  const said = () => rows(wrapper).map((row) => row.find('[role="alert"]').exists() && row.find('[role="alert"]').text())
+  expect(said()).toEqual(['inside the pool', false, 'reserved twice', false])
+
+  await rows(wrapper)[1]?.findAll('button').find((button) => button.text() === 'Remove')?.trigger('click')
+  // The row before the one that went keeps what was said of it; no row after it says anything.
+  expect(cells(wrapper).map((row) => row[0])).toEqual(['nas', 'tv', 'desk'])
+  expect(said()).toEqual(['inside the pool', false, false])
+  expect(store().violations.value.map((violation) => violation.path)).toEqual(['lans[0].dhcp.static[0].ip'])
+
+  await rows(wrapper)[0]?.findAll('button').find((button) => button.text() === 'Remove')?.trigger('click')
+  expect(said()).toEqual([false, false])
+  expect(tabs(wrapper)[0]?.find('.ofo-pill').exists()).toBe(false)
 })
 
 test('a reservation by client identifier is shown, kept, and can only be removed', async () => {
@@ -458,6 +525,43 @@ test('Add LAN asks for a name and adds an empty LAN; Remove takes one away', asy
   expect(routes.currentRoute.value.path).toBe('/lan/lan0')
   expect(store().changes.value).toEqual([])
   expect(errors).toEqual([])
+})
+
+test('removing a LAN takes with it what was said of the LANs whose places change', async () => {
+  // No forward points into lan0 here, so it can go; iot is then the first LAN.
+  const config = routerConfig()
+  config.firewall!.portForwards = []
+  const { wrapper, router, store } = await page('/lan/iot', config)
+  // Half an address typed on iot and left there, and a refusal at iot's pool.
+  await type(wrapper, 'Router address', '192.168.20')
+  expect(fieldLabelled(wrapper, 'Router address').find('[role="alert"]').text()).toBe('Not an IPv4 address.')
+  router.validation = {
+    violations: [{ $typeName: 'openfeo.v1.ConfigViolation', path: 'lans[1].dhcp.range', code: 'pool', message: 'the pool is not in the subnet' }],
+    effects: [],
+    caller: undefined,
+  }
+  expect(await store().review()).toBeNull()
+  await flushPromises()
+
+  await tabs(wrapper)[0]?.trigger('click')
+  await flushPromises()
+  await wrapper.findAll('button').find((button) => button.text() === 'Remove lan0')?.trigger('click')
+  await flushPromises()
+  expect(tabs(wrapper).map((tab) => tab.text())).toEqual(['iot 3 clients'])
+  // Nothing is said of a LAN 1 that is no longer there, above the page or on a tab.
+  expect(wrapper.find('.refused').exists()).toBe(false)
+  expect(store().violations.value).toEqual([])
+  expect(tabs(wrapper)[0]?.find('.ofo-pill').exists()).toBe(false)
+  expect(valueOf(wrapper, 'Router address')).toBe('192.168.20.1')
+
+  // And a LAN added now, which is LAN 1, does not start with what was typed for another.
+  await wrapper.find('.ofo-pagehead__actions button').trigger('click')
+  await wrapper.find('.ofo-dialog input').setValue('guest')
+  await wrapper.findAll('.ofo-dialog__foot button')[1]?.trigger('click')
+  await flushPromises()
+  expect(valueOf(wrapper, 'Router address')).toBe('')
+  expect(fieldLabelled(wrapper, 'Router address').find('[role="alert"]').exists()).toBe(false)
+  expect(tabs(wrapper)[1]?.find('.ofo-pill').exists()).toBe(false)
 })
 
 test('what the LAN may reach is a line, not a field', async () => {
