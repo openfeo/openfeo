@@ -20,26 +20,17 @@ use sha2::{Digest as _, Sha256};
 use crate::api::{Auth, ChangePasswordRequest, LoginRequest, Session, SetInitialPasswordRequest};
 use crate::{Admin, Config, PppoeWan, wan};
 
-/// Every field of the wire that holds a secret, as `(message, field)`. `build.rs` derives no
-/// `Debug` for these messages; the impls below print the field as [`hidden`] has it.
-pub const SECRET_FIELDS: &[(&str, &str)] = &[
-    ("Admin", "password_hash"),
-    ("PppoeWan", "password"),
-    ("Auth", "token"),
-    ("Session", "token"),
-    ("LoginRequest", "password"),
-    ("SetInitialPasswordRequest", "password"),
-    ("ChangePasswordRequest", "old_password"),
-    ("ChangePasswordRequest", "new_password"),
-];
-
 /// A secret as `Debug` shows it: that there is one, or that there is none, and never which.
 fn hidden(secret: &str) -> &'static str {
     if secret.is_empty() { "" } else { "<redacted>" }
 }
 
-// Each impl takes its message apart by name, so that a field added to the message later
-// does not compile until it is printed here, or hidden.
+// Which messages these are is not a list kept here: `build.rs` reads the proto files'
+// descriptors and derives no `Debug` for any message with a field that is a secret by its
+// name. Such a message does not compile inside another until its `Debug` is written, so a
+// secret added to the wire later lands in this file. Each impl takes its message apart by
+// name, so that a field added to one of these messages does not compile either until it is
+// printed here, or hidden.
 
 impl fmt::Debug for Admin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -297,51 +288,29 @@ mod tests {
         assert!(!none.contains("redacted"), "{none}");
     }
 
-    /// Every field of the wire that is a secret by its name belongs to a message whose
-    /// `Debug` is written by hand above. A field added later fails here until it is.
+    // `SECRET_FIELDS`: what `build.rs` found in the descriptors, and gave no derived `Debug`.
+    include!(concat!(env!("OUT_DIR"), "/secret_fields.rs"));
+
+    /// The build found these fields to be secrets by their names, and no others: each is in
+    /// a message whose `Debug` is written by hand above and tried in
+    /// `no_wire_type_prints_a_secret`. A secret added to the wire shows here as a new line,
+    /// after its message has been given a `Debug` that hides it (it does not compile inside
+    /// another message before), and is added to that test with it.
     #[test]
-    fn a_field_that_holds_a_secret_is_named_here() {
-        const PROTOS: &[&str] = &[
-            include_str!("../../../proto/openfeo/v1/config.proto"),
-            include_str!("../../../proto/openfeo/v1/state.proto"),
-            include_str!("../../../proto/openfeo/v1/events.proto"),
-            include_str!("../../../proto/openfeo/v1/api.proto"),
-        ];
-        let mut found = Vec::new();
-        for proto in PROTOS {
-            let mut message = String::new();
-            for line in proto.lines() {
-                let line = line.trim();
-                if let Some(name) = line.strip_prefix("message ") {
-                    message = name.trim_end_matches('{').trim().to_owned();
-                    continue;
-                }
-                let mut words = line.split_whitespace();
-                let (Some(kind), Some(field)) = (words.next(), words.next()) else {
-                    continue;
-                };
-                let kind = if kind == "optional" || kind == "repeated" {
-                    let Some(next) = words.next() else { continue };
-                    (field, next)
-                } else {
-                    (kind, field)
-                };
-                let (kind, field) = kind;
-                let secret = ["password", "token", "secret", "hash", "key"]
-                    .iter()
-                    .any(|word| field.contains(word));
-                if matches!(kind, "string" | "bytes") && secret {
-                    found.push((message.clone(), field.to_owned()));
-                }
-            }
-        }
-        found.sort();
-        let mut named: Vec<(String, String)> = SECRET_FIELDS
-            .iter()
-            .map(|(message, field)| ((*message).to_owned(), (*field).to_owned()))
-            .collect();
-        named.sort();
-        assert_eq!(found, named);
+    fn the_fields_that_are_secrets_by_name_are_these() {
+        assert_eq!(
+            SECRET_FIELDS,
+            [
+                ("Admin", "password_hash"),
+                ("Auth", "token"),
+                ("ChangePasswordRequest", "new_password"),
+                ("ChangePasswordRequest", "old_password"),
+                ("LoginRequest", "password"),
+                ("PppoeWan", "password"),
+                ("Session", "token"),
+                ("SetInitialPasswordRequest", "password"),
+            ]
+        );
     }
 
     fn password(config: &Config, index: usize) -> &str {

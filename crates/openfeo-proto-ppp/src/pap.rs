@@ -22,7 +22,7 @@ pub const RETRY: Timestamp = 3 * MS;
 pub const MAX_TRIES: u32 = 10;
 
 /// A PAP packet's content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Message {
     Request {
         peer_id: Vec<u8>,
@@ -31,6 +31,25 @@ pub enum Message {
     /// The server's message, bytes as sent (shown lossily, never round-tripped as text).
     Ack(Vec<u8>),
     Nak(Vec<u8>),
+}
+
+/// A request shows who asks and never the password, as text or as bytes; what the server
+/// answers is shown as it came.
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request {
+                peer_id,
+                password: _,
+            } => f
+                .debug_struct("Request")
+                .field("peer_id", &String::from_utf8_lossy(peer_id))
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Ack(message) => f.debug_tuple("Ack").field(message).finish(),
+            Self::Nak(message) => f.debug_tuple("Nak").field(message).finish(),
+        }
+    }
 }
 
 /// A length-prefixed field and what follows it.
@@ -379,5 +398,25 @@ mod tests {
         assert!(text.contains("openfeo@isp.example"), "{text}");
         assert!(!text.contains("example-secret"), "{text}");
         assert!(!text.contains("14"), "not even the length: {text}");
+    }
+
+    /// A decoded or built Authenticate-Request holds the password: its `Debug` prints the
+    /// peer's name and not the password, as text or as bytes.
+    #[test]
+    fn debug_of_a_request_never_shows_the_password() {
+        let request = Message::Request {
+            peer_id: b"openfeo@isp.example".to_vec(),
+            password: b"example-secret".to_vec(),
+        };
+        let text = format!("{request:?}");
+        assert!(text.contains("openfeo@isp.example"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("example-secret"), "{text}");
+        assert!(!text.contains("101, 120, 97"), "{text}");
+        // What the server says is not a secret, and is shown as before.
+        assert_eq!(
+            format!("{:?}", Message::Ack(b"ok".to_vec())),
+            "Ack([111, 107])"
+        );
     }
 }
