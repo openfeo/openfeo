@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | parts 1 and 2 of 5, 2026-11-19 | #68, #81, #101, #103 |
+| M4 API and panel | parts 1 and 2 of 5, 2026-11-19 | #68, #81, #101, #103; follow-up #124 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -342,6 +342,22 @@ counting it the moment `dig` returns (#64); the `netlink` suite waits up to five
 kernel-generated link-local, which the kernel announces only once duplicate address detection
 completes, up to two seconds after the port comes up, so the stable-privacy scenario no longer fails
 on a loaded host. The six minors left are filed as #60 to #63, #65 and #66.
+
+**2026-11-21, [#124](https://github.com/openfeo/openfeo/pull/124), M4 part 2 minors.** Of the minors
+and follow-ups that the reviews of #101 and #103 left, the ten that a person can meet today or that
+broke one of the repository's own rules; the other twenty are filed as #104 to #123. No wire type
+prints a secret in `Debug`: the seven messages that carry a password, a token or a hash have theirs
+written by hand, so neither they nor a config, a World or a request that holds one can put a secret
+into a log line or an error, and a test holds the list of such fields to the proto files. In the
+panel's store, an ask that is answered after the session ended leaves nothing behind (an apply used
+to put back what it had sent, a typed password included); a read that brings what the draft already
+is no longer wipes a field that is half typed; what a renumbering could not place stays marked across
+the next one; no ask is sent a second time by a double press; and the bar offers no other apply while
+one awaits the router's word. Swapping two LANs' subnets no longer scrambles them: a LAN's own pool
+and reservations follow that LAN alone, and in a subnet that two LANs share for a moment anything
+else follows the LAN it points into as the router has it. A pool that a move left the wrong way
+round is said at once, and what was said of a reservation, a WAN or a LAN goes with it when it is
+removed, together with what was said of those after it, whose places changed.
 
 ## Tooling and process
 
