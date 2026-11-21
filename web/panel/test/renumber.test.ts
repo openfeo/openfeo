@@ -263,6 +263,43 @@ test('two LANs swap their subnets, and what pointed into each still does', () =>
   expect(again.lans[1]!.dhcp!.ntp).toEqual(['192.168.3.1'])
 })
 
+test('in a shared subnet a field is known by the names above it, not by its place', () => {
+  // A LAN between the two is removed in the same draft, so guest is the third LAN as the
+  // router has it and the second in the draft. The server it hands out is its own.
+  const base = twoLans()
+  base.lans.splice(1, 0, ...create(ConfigSchema, { lans: [{ name: 'mid', ports: ['p4'], ipv4: '192.168.2.1/24', dhcp: { dns: ['192.168.1.53'] } }] }).lans)
+  base.lans[2]!.dhcp!.dns = ['192.168.3.53']
+  const config = clone(ConfigSchema, base)
+  config.lans.splice(1, 1)
+  const [lan0, guest] = [config.lans[0]!, config.lans[1]!]
+  lan0.ipv4 = '192.168.3.1/24'
+  expect(renumber(config, '192.168.1.1/24', '192.168.3.1/24', 'lan0', base)).toEqual([])
+  guest.ipv4 = '192.168.1.1/24'
+  expect(renumber(config, '192.168.3.1/24', '192.168.1.1/24', 'guest', base)).toEqual([])
+  // Its own server went with it. By place, it would have been taken for the server that
+  // the removed LAN handed out, which sat on lan0, and left behind.
+  expect(guest.dhcp!.dns).toEqual(['192.168.1.53'])
+  expect(config.firewall!.portForwards[0]!.to).toBe('192.168.3.2')
+})
+
+test('in a shared subnet a field that was pointed elsewhere by hand is no longer the other LAN\'s', () => {
+  // As the router has it, guest hands out a server on lan0. In this draft it hands out its
+  // own router. What the router's config says of the field is not what the field holds, so
+  // it is not lan0's to keep: it follows guest.
+  const base = twoLans()
+  const config = twoLans()
+  const [lan0, guest] = [config.lans[0]!, config.lans[1]!]
+  guest.dhcp!.dns = ['192.168.3.1']
+  lan0.ipv4 = '192.168.3.1/24'
+  renumber(config, '192.168.1.1/24', '192.168.3.1/24', 'lan0', base)
+  expect(guest.dhcp!.dns).toEqual(['192.168.3.1'])
+  guest.ipv4 = '192.168.1.1/24'
+  expect(renumber(config, '192.168.3.1/24', '192.168.1.1/24', 'guest', base)).toEqual([])
+  expect(guest.dhcp!.dns).toEqual(['192.168.1.1'])
+  // And the forward into lan0, which holds what lan0's move made of it, stayed with lan0.
+  expect(config.firewall!.portForwards[0]!.to).toBe('192.168.3.2')
+})
+
 test('moving there and back changes nothing', () => {
   const config = labConfig()
   const before = clone(ConfigSchema, config)

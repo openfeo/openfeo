@@ -161,6 +161,8 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
   const confirmSecs = ref(120)
   const violations = ref<ConfigViolation[]>([])
   const unfit = ref<Unfit[]>([])
+  /** Which LAN's move left each of `unfit` without a place, by its path. Read only for a path that is in `unfit`. */
+  const leftBy = new Map<string, string>()
   const notice = ref<Notice | null>(null)
   const busy = ref(false)
   const changes = computed(() => (base.value === null || draft.value === null ? [] : changesOf(base.value, draft.value)))
@@ -494,13 +496,17 @@ export function useConfig(router: PanelRouter, live: LiveData, host: () => strin
         lan.ipv4 = ipv4
         const left = renumber(config, from, ipv4, name, base.value ?? undefined)
         // What an earlier move left without a place is still reported while its field holds
-        // it and this LAN's subnet has no room for it either.
+        // it. What this LAN's own earlier move left is no longer, once this LAN's subnet has
+        // room for it; another LAN's move says nothing about it.
         const subnet = parseCidr4(ipv4)
-        const fits = (value: string) => {
-          const address = parse4(value)
-          return subnet !== null && address !== null && isHost(subnet, address)
+        const fits = (old: Unfit) => {
+          const address = parse4(old.value)
+          return leftBy.get(old.path) === name && subnet !== null && address !== null && isHost(subnet, address)
         }
-        const before = unfit.value.filter((old) => !left.some((now) => now.path === old.path) && stillUnfit(config, old) && !fits(old.value))
+        const before = unfit.value.filter((old) => !left.some((now) => now.path === old.path) && stillUnfit(config, old) && !fits(old))
+        for (const now of left) {
+          leftBy.set(now.path, name)
+        }
         unfit.value = [...before, ...left]
       })
     },

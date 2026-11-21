@@ -592,6 +592,23 @@ test('two LANs swap their subnets, and each keeps its own', async () => {
   expect(store.unfit.value).toEqual([])
 })
 
+test("a mark is not cleared by another LAN's move", async () => {
+  // Two LANs of unequal size swap. lan0's pool end has no place in the smaller subnet; that
+  // guest then moves into a subnet the address would fit in says nothing about lan0.
+  const config = labConfig()
+  config.lans.push(...create(ConfigSchema, { lans: [{ name: 'guest', ports: ['p1'], ipv4: '192.168.3.1/25', dhcp: { range: ['192.168.3.10', '192.168.3.100'] } }] }).lans)
+  const { store } = await started(config)
+  const end = [{ path: 'lans[0].dhcp.range[1]', value: '192.168.1.200' }]
+  store.setLanAddress('lan0', '192.168.3.1/25')
+  expect(store.unfit.value).toEqual(end)
+  store.setLanAddress('guest', '192.168.1.1/24')
+  expect(store.draft.value!.lans[0]!.dhcp!.range).toEqual(['192.168.3.100', '192.168.1.200'])
+  expect(store.unfit.value).toEqual(end)
+  // lan0's own next move, into a subnet with room for it, is what clears it.
+  store.setLanAddress('lan0', '192.168.0.1/22')
+  expect(store.unfit.value).toEqual([])
+})
+
 test("setting a LAN's address carries what follows it and keeps what does not fit", async () => {
   const { store } = await started()
   store.setLanAddress('lan0', '192.168.2.1/24')
