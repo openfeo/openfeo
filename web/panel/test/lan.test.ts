@@ -564,6 +564,41 @@ test('removing a LAN takes with it what was said of the LANs whose places change
   expect(tabs(wrapper)[1]?.find('.ofo-pill').exists()).toBe(false)
 })
 
+test('what was typed for a LAN that was removed does not come back under its name', async () => {
+  // The DHCP server of a LAN whose server was switched off is kept under the LAN's name,
+  // as it was typed. It goes when the LAN does: a LAN added under that name has, when its
+  // server is switched on, what the router has for a LAN of that name and nothing typed.
+  const { wrapper, store } = await page('/lan/iot')
+  await type(wrapper, 'Pool end', '192.168.20.140')
+  await section(wrapper, 'DHCP').find('.ofo-toggle input').setValue(false)
+  await wrapper.findAll('button').find((button) => button.text() === 'Remove iot')?.trigger('click')
+  await flushPromises()
+
+  await wrapper.find('.ofo-pagehead__actions button').trigger('click')
+  await wrapper.find('.ofo-dialog input').setValue('iot')
+  await wrapper.findAll('.ofo-dialog__foot button')[1]?.trigger('click')
+  await flushPromises()
+  await type(wrapper, 'Router address', '192.168.20.1')
+  await section(wrapper, 'DHCP').find('.ofo-toggle input').setValue(true)
+  expect(store().draft.value!.lans[1]!.dhcp!.range).toEqual(['192.168.20.100', '192.168.20.149'])
+})
+
+test('unticking a port takes with it what was said of the ports', async () => {
+  // A refusal at a port is kept by the port's place in the list, and the list has changed.
+  const { wrapper, router, store } = await page()
+  router.validation = {
+    violations: [{ $typeName: 'openfeo.v1.ConfigViolation', path: 'lans[0].ports[1]', code: 'port', message: 'no such port' }],
+    effects: [],
+    caller: undefined,
+  }
+  expect(await store().review()).toBeNull()
+  await flushPromises()
+  expect(wrapper.find('[role="tabpanel"] .refused').findAll('li').map((item) => item.text())).toEqual(['lans[0].ports[1]: no such port'])
+  await section(wrapper, 'Network').findAll('.ofo-choice')[0]?.find('input').setValue(false)
+  expect(wrapper.find('[role="tabpanel"] .refused').exists()).toBe(false)
+  expect(tabs(wrapper)[0]?.find('.ofo-pill').exists()).toBe(false)
+})
+
 test('what the LAN may reach is a line, not a field', async () => {
   const config = routerConfig()
   config.lans[0]!.reaches = []

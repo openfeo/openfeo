@@ -322,6 +322,31 @@ test('removing a WAN takes with it what was said of the WANs whose places change
   expect(store().violations.value).toEqual([])
 })
 
+test('a WAN added under the name of one that was removed starts from nothing', async () => {
+  // What was typed for a type that was switched away from is kept under the WAN's name, a
+  // typed password with it. It goes when the WAN does.
+  const { wrapper, store } = await page('/wan/wan1', twoWans())
+  const choose = async (at: number) => {
+    await wrapper.findAll('.ofo-choice')[at]?.find('input').setValue(true)
+  }
+  await choose(1)
+  await type(wrapper, 'Username', 'second@isp.example')
+  await type(wrapper, 'Password', 'a-typed-secret')
+  await choose(2)
+  await wrapper.findAll('button').find((button) => button.text() === 'Remove wan1')?.trigger('click')
+  await flushPromises()
+
+  await wrapper.find('.ofo-pagehead__actions button').trigger('click')
+  await wrapper.find('.ofo-dialog input').setValue('wan1')
+  await wrapper.findAll('.ofo-dialog__foot button')[1]?.trigger('click')
+  await flushPromises()
+  await choose(1)
+  expect((input(wrapper, 'Username').element as HTMLInputElement).value).toBe('')
+  const account = store().draft.value!.wans[1]!.kind
+  expect(account.case === 'pppoe' && account.value.password).toBe('')
+  expect(wrapper.html()).not.toContain('a-typed-secret')
+})
+
 test('advanced opens for a field that is set', async () => {
   const closed = await page()
   const groups = () => closed.wrapper.findAll('details.ofo-adv')

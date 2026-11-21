@@ -61,7 +61,7 @@ provide(FIELDS, fields)
 
 /** The DHCP server of a LAN whose server has since been switched off. */
 const keptDhcp = new Map<string, LanDhcp>()
-// A draft that is another one (discarded, applied, read again) starts clean.
+// A draft that is another one (discarded, applied, read again with something new in it) starts clean.
 watch(
   () => store.draft.value,
   (now, before) => {
@@ -222,6 +222,8 @@ function tick(port: string, ticked: boolean): void {
   change((shown) => {
     shown.ports = ticked ? [...shown.ports.filter((member) => member !== port), port] : shown.ports.filter((member) => member !== port)
   })
+  // What the router refused at a port is kept by the port's place in the list, which is another list now.
+  store.violations.value = store.violations.value.filter((violation) => !under(violation.path, `${at.value}.ports`))
 }
 const reach = computed(() => (lan.value === undefined || lan.value.reaches.length === 0 ? 'wan' : lan.value.reaches.join(', ')))
 
@@ -318,9 +320,14 @@ function add(name: string): void {
 const inTheWay = computed(() => (lan.value === undefined || store.draft.value === null ? [] : blockers(store.draft.value, lan.value)))
 function remove(): void {
   const gone = index.value
+  const name = lan.value?.name
   store.edit((draft) => draft.lans.splice(gone, 1))
   // The LANs after it each have another place now: what was said of them by place goes too.
   forgetFrom(fields, store, 'lans', gone)
+  // And the DHCP server kept under its name: a LAN added under the same name starts from nothing.
+  if (name !== undefined) {
+    keptDhcp.delete(name)
+  }
   const first = lans.value[0]
   void routes.replace(first === undefined ? PAGES.lan : `${PAGES.lan}/${first.name}`)
 }
