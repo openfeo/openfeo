@@ -169,6 +169,137 @@ test('another LAN, the WAN side and every IPv6 address are left alone', () => {
   expect(config.lans[1]?.ipv6).toBe('2001:db8:1:3::1/64')
 })
 
+/** The lab's config with a second LAN, `guest`, that has a pool, a reservation, a rule and a record of its own, and hands out a DNS server that sits on lan0. */
+function twoLans(): Config {
+  const config = labConfig()
+  const more = create(ConfigSchema, {
+    lans: [
+      {
+        name: 'guest',
+        ports: ['p1'],
+        ipv4: '192.168.3.1/24',
+        dhcp: { range: ['192.168.3.100', '192.168.3.200'], static: [{ mac: '02:00:00:aa:03:10', ip: '192.168.3.10', hostname: 'tv' }], dns: ['192.168.1.53'], ntp: ['192.168.3.1'] },
+      },
+    ],
+    firewall: { rules: [{ name: 'cameras', from: 'wan', to: '192.168.3.64/26', proto: 'tcp', ports: ['554'] }] },
+    dns: { records: [{ name: 'tv', address: '192.168.3.10' }] },
+  })
+  config.lans.push(...more.lans)
+  config.firewall!.rules = more.firewall!.rules
+  config.dns = more.dns
+  return config
+}
+
+test("a LAN's own pool follows only its own move", () => {
+  const config = twoLans()
+  const [lan0, guest] = [config.lans[0]!, config.lans[1]!]
+  // lan0 is given a subnet that guest is in: for a moment the two are in one, as they are
+  // half way through being swapped.
+  lan0.ipv4 = '192.168.3.1/24'
+  expect(renumber(config, '192.168.1.1/24', '192.168.3.1/24', 'lan0')).toEqual([])
+  expect(lan0.dhcp!.range).toEqual(['192.168.3.100', '192.168.3.200'])
+  expect(lan0.dhcp!.static[0]!.ip).toBe('192.168.3.10')
+  // Guest's own are where they were, and the server it hands out, which sits on lan0, followed lan0.
+  expect(guest.dhcp!.range).toEqual(['192.168.3.100', '192.168.3.200'])
+  expect(guest.dhcp!.static[0]!.ip).toBe('192.168.3.10')
+  expect(guest.dhcp!.dns).toEqual(['192.168.3.53'])
+
+  // Guest moves out: its own pool and reservation go with it, and lan0's, which now lie in
+  // the subnet guest is leaving, stay.
+  guest.ipv4 = '192.168.1.1/24'
+  expect(renumber(config, '192.168.3.1/24', '192.168.1.1/24', 'guest')).toEqual([])
+  expect(guest.dhcp!.range).toEqual(['192.168.1.100', '192.168.1.200'])
+  expect(guest.dhcp!.static[0]!.ip).toBe('192.168.1.10')
+  expect(lan0.dhcp!.range).toEqual(['192.168.3.100', '192.168.3.200'])
+  expect(lan0.dhcp!.static[0]!.ip).toBe('192.168.3.10')
+  // Without an owner every address of the subnet is carried, as before.
+  const plain = twoLans()
+  plain.lans[0]!.ipv4 = '192.168.3.1/24'
+  renumber(plain, '192.168.1.1/24', '192.168.3.1/24')
+  plain.lans[1]!.ipv4 = '192.168.1.1/24'
+  renumber(plain, '192.168.3.1/24', '192.168.1.1/24')
+  expect(plain.lans[0]!.dhcp!.range).toEqual(['192.168.1.100', '192.168.1.200'])
+})
+
+test('two LANs swap their subnets, and what pointed into each still does', () => {
+  // Half way through, both LANs are in one subnet, and an address there says nothing of
+  // which LAN it belongs to. What tells them apart is the config the draft was read from:
+  // the LAN a field points into there is the one it belongs to, wherever an earlier move of
+  // this draft has carried it since.
+  const base = twoLans()
+  const config = twoLans()
+  const [lan0, guest] = [config.lans[0]!, config.lans[1]!]
+  lan0.ipv4 = '192.168.3.1/24'
+  expect(renumber(config, '192.168.1.1/24', '192.168.3.1/24', 'lan0', base)).toEqual([])
+  guest.ipv4 = '192.168.1.1/24'
+  expect(renumber(config, '192.168.3.1/24', '192.168.1.1/24', 'guest', base)).toEqual([])
+
+  // lan0 and all that pointed into it are in 192.168.3.0/24.
+  expect(lan0.dhcp!.range).toEqual(['192.168.3.100', '192.168.3.200'])
+  expect(lan0.dhcp!.static[0]!.ip).toBe('192.168.3.10')
+  expect(config.firewall!.portForwards[0]!.to).toBe('192.168.3.2')
+  expect(guest.dhcp!.dns).toEqual(['192.168.3.53'])
+  // Guest and all that pointed into it are in 192.168.1.0/24: its rule, its record, and its
+  // own router handed out as the time server.
+  expect(guest.dhcp!.range).toEqual(['192.168.1.100', '192.168.1.200'])
+  expect(guest.dhcp!.static[0]!.ip).toBe('192.168.1.10')
+  expect(config.firewall!.rules[0]!.to).toBe('192.168.1.64/26')
+  expect(config.dns!.records[0]!.address).toBe('192.168.1.10')
+  expect(guest.dhcp!.ntp).toEqual(['192.168.1.1'])
+
+  // The LAN that arrived moves on while the other stays: what came with it goes with it,
+  // and what was the resident's is left.
+  const again = twoLans()
+  again.lans[0]!.ipv4 = '192.168.3.1/24'
+  renumber(again, '192.168.1.1/24', '192.168.3.1/24', 'lan0', base)
+  again.lans[0]!.ipv4 = '192.168.5.1/24'
+  expect(renumber(again, '192.168.3.1/24', '192.168.5.1/24', 'lan0', base)).toEqual([])
+  expect(again.lans[0]!.dhcp!.range).toEqual(['192.168.5.100', '192.168.5.200'])
+  expect(again.firewall!.portForwards[0]!.to).toBe('192.168.5.2')
+  expect(again.lans[1]!.dhcp!.dns).toEqual(['192.168.5.53'])
+  expect(again.lans[1]!.dhcp!.range).toEqual(['192.168.3.100', '192.168.3.200'])
+  expect(again.firewall!.rules[0]!.to).toBe('192.168.3.64/26')
+  expect(again.dns!.records[0]!.address).toBe('192.168.3.10')
+  expect(again.lans[1]!.dhcp!.ntp).toEqual(['192.168.3.1'])
+})
+
+test('in a shared subnet a field is known by the names above it, not by its place', () => {
+  // A LAN between the two is removed in the same draft, so guest is the third LAN as the
+  // router has it and the second in the draft. The server it hands out is its own.
+  const base = twoLans()
+  base.lans.splice(1, 0, ...create(ConfigSchema, { lans: [{ name: 'mid', ports: ['p4'], ipv4: '192.168.2.1/24', dhcp: { dns: ['192.168.1.53'] } }] }).lans)
+  base.lans[2]!.dhcp!.dns = ['192.168.3.53']
+  const config = clone(ConfigSchema, base)
+  config.lans.splice(1, 1)
+  const [lan0, guest] = [config.lans[0]!, config.lans[1]!]
+  lan0.ipv4 = '192.168.3.1/24'
+  expect(renumber(config, '192.168.1.1/24', '192.168.3.1/24', 'lan0', base)).toEqual([])
+  guest.ipv4 = '192.168.1.1/24'
+  expect(renumber(config, '192.168.3.1/24', '192.168.1.1/24', 'guest', base)).toEqual([])
+  // Its own server went with it. By place, it would have been taken for the server that
+  // the removed LAN handed out, which sat on lan0, and left behind.
+  expect(guest.dhcp!.dns).toEqual(['192.168.1.53'])
+  expect(config.firewall!.portForwards[0]!.to).toBe('192.168.3.2')
+})
+
+test('in a shared subnet a field that was pointed elsewhere by hand is no longer the other LAN\'s', () => {
+  // As the router has it, guest hands out a server on lan0. In this draft it hands out its
+  // own router. What the router's config says of the field is not what the field holds, so
+  // it is not lan0's to keep: it follows guest.
+  const base = twoLans()
+  const config = twoLans()
+  const [lan0, guest] = [config.lans[0]!, config.lans[1]!]
+  guest.dhcp!.dns = ['192.168.3.1']
+  lan0.ipv4 = '192.168.3.1/24'
+  renumber(config, '192.168.1.1/24', '192.168.3.1/24', 'lan0', base)
+  expect(guest.dhcp!.dns).toEqual(['192.168.3.1'])
+  guest.ipv4 = '192.168.1.1/24'
+  expect(renumber(config, '192.168.3.1/24', '192.168.1.1/24', 'guest', base)).toEqual([])
+  expect(guest.dhcp!.dns).toEqual(['192.168.1.1'])
+  // And the forward into lan0, which holds what lan0's move made of it, stayed with lan0.
+  expect(config.firewall!.portForwards[0]!.to).toBe('192.168.3.2')
+})
+
 test('moving there and back changes nothing', () => {
   const config = labConfig()
   const before = clone(ConfigSchema, config)
@@ -217,18 +348,10 @@ test('every string field of the config is classified', () => {
   // The ones that are carried, and the one that is a rule's target.
   const of = (kind: string) => Object.keys(STRING_FIELDS).filter((path) => STRING_FIELDS[path] === kind).sort()
   expect(of('carried')).toEqual(
-    [
-      'dns.records.address',
-      'dns.upstreams',
-      'firewall.port_forwards.to',
-      'lans.dhcp.dns',
-      'lans.dhcp.ntp',
-      'lans.dhcp.range',
-      'lans.dhcp.static.ip',
-      'system.ntp_servers',
-      'wans.static.dns',
-    ].sort(),
+    ['dns.records.address', 'dns.upstreams', 'firewall.port_forwards.to', 'lans.dhcp.dns', 'lans.dhcp.ntp', 'system.ntp_servers', 'wans.static.dns'].sort(),
   )
+  // A LAN's own: they follow that LAN and no other.
+  expect(of('own')).toEqual(['lans.dhcp.range', 'lans.dhcp.static.ip'])
   expect(of('target')).toEqual(['firewall.rules.to'])
   expect(STRING_FIELDS['lans.ipv4']).toBe('left')
 })

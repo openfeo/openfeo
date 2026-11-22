@@ -20,7 +20,7 @@ import { computed, inject, provide, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { CONFIG } from '../config'
-import { FIELDS, listText, numberText, pageFields, parseList, toNumber, under } from '../fields'
+import { FIELDS, forgetFrom, listText, numberText, pageFields, parseList, toNumber, under } from '../fields'
 import { LIVE } from '../live'
 import { ipv6On, newWan, portOptions, setIpv6, setType, typeOf, WAN_FIELDS, wanProblems, type WanType } from '../model/wan'
 import NameDialog from '../parts/NameDialog.vue'
@@ -40,8 +40,9 @@ provide(FIELDS, fields)
 /** What was typed for a type, or for IPv6, that has since been switched away from. */
 const keptTypes = new Map<string, Wan['kind']>()
 const keptV6 = new Map<string, Ipv6Wan>()
-// A draft that is another one (discarded, applied, read again) starts clean: nothing kept
-// from the one before, a typed password least of all, and no field counted as left.
+// A draft that is another one (discarded, applied, read again with something new in it)
+// starts clean: nothing kept from the one before, a typed password least of all, and no
+// field counted as left.
 watch(
   () => store.draft.value,
   (now, before) => {
@@ -148,7 +149,21 @@ function add(name: string): void {
   show(name)
 }
 function remove(): void {
-  store.edit((draft) => draft.wans.splice(index.value, 1))
+  const gone = index.value
+  const name = wan.value?.name
+  store.edit((draft) => draft.wans.splice(gone, 1))
+  // The WANs after it each have another place now: what was said of them by place goes too.
+  forgetFrom(fields, store, 'wans', gone)
+  // And what was typed for it, kept under its name, a password with it: a WAN added under
+  // the same name starts from nothing.
+  if (name !== undefined) {
+    for (const kept of [...keptTypes.keys()]) {
+      if (kept.startsWith(`${name}:`)) {
+        keptTypes.delete(kept)
+      }
+    }
+    keptV6.delete(name)
+  }
   const first = wans.value[0]
   void routes.replace(first === undefined ? PAGES.wan : `${PAGES.wan}/${first.name}`)
 }

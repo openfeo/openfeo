@@ -85,7 +85,17 @@ function setTheme(chosen: Theme): void {
 // What the settings pages have changed is applied from here, whichever of them is shown:
 // the bar beneath the page counts it, and one dialog says what an apply does before it is sent.
 const settings = computed(() => at(PAGES.wan) || at(PAGES.lan))
-const held = computed(() => (config.pending.value === undefined ? undefined : 'Confirm or revert the change that is waiting first.'))
+/**
+ * Why another apply is not offered just now: one is waiting to be confirmed, or one was sent
+ * and the router has not yet said whether it took it (another would be asked of a router
+ * that may be moving, and its refusal would take the place of the notice that says so).
+ */
+const held = computed(() => {
+  if (config.pending.value !== undefined) {
+    return 'Confirm or revert the change that is waiting first.'
+  }
+  return config.awaiting.value ? 'Waiting to hear from the router what became of the change that was sent.' : undefined
+})
 /** What the router made of the draft, while the dialog that shows it is open. */
 const reviewed = ref<Review | null>(null)
 

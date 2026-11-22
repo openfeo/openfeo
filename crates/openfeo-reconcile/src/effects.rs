@@ -6,8 +6,9 @@
 //! worked out from the same slices the task managers compare ([`crate::slices`],
 //! [`crate::dhcp::servers_of`]), so what the router says a change will interrupt is what it
 //! then interrupts. A static WAN has no task; its address, gateway, port and tag are compared
-//! too, since replacing any of them drops what was running over it. A change that touches no slice (a priority, a firewall rule, a DNS
-//! record) has no effects: it takes hold without restarting anything.
+//! too, since replacing any of them drops what was running over it. A change that touches no
+//! slice (a priority, a firewall rule, a DNS record) has no effects: it takes hold without
+//! restarting anything.
 
 use std::collections::BTreeSet;
 
