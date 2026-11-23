@@ -22,7 +22,7 @@ use openfeo_net::dhcp4::DriverError;
 use openfeo_net::dhcp4_server::{ServerDriver, ServerDriverConfig};
 use openfeo_proto_dhcp4::identity::{from_hex, hex};
 use openfeo_proto_dhcp4::server::Timestamp;
-use openfeo_proto_dhcp4::{LeaseRecord, ServerEvent};
+use openfeo_proto_dhcp4::{Joined, LeaseRecord, ServerEvent};
 use openfeo_reconcile::bridge_name;
 use openfeo_reconcile::dhcp::{DesiredDhcpServer, server_config, servers};
 use openfeo_runtime::Publisher;
@@ -288,6 +288,7 @@ fn record_from(
         hostname: (!lease.hostname.is_empty()).then(|| lease.hostname.clone()),
         granted_at: now.saturating_sub(unix_now.saturating_sub(lease.granted_unix)),
         expires_at: now + (lease.expires_unix - unix_now),
+        joined: Joined::Unix(lease.granted_unix),
     })
 }
 
@@ -596,6 +597,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at: 43_200,
+            joined: Joined::At(0),
         };
         for event in [
             ServerEvent::Granted(record.clone()),
@@ -642,6 +644,7 @@ mod tests {
             hostname: Some("nas".into()),
             granted_at: 100,
             expires_at: 43_300,
+            joined: Joined::At(100),
         }];
         let file = file_from_records("lan0", &records, 200, 1_800_000_200);
         assert_eq!(file.lan, "lan0");
@@ -661,6 +664,8 @@ mod tests {
             vec![LeaseRecord {
                 granted_at: 0,
                 expires_at: 43_100,
+                // Read back, it is from before this server's clock began.
+                joined: Joined::Unix(1_800_000_100),
                 ..records[0].clone()
             }]
         );
@@ -764,6 +769,7 @@ mod tests {
             hostname: None,
             granted_at: 55,
             expires_at: 175,
+            joined: Joined::At(55),
         };
         let own = file_from_records("lan0", &[granted], 60, NOW_UNIX + 10);
         let saved = file_with(own, &aside, 60, NOW_UNIX + 10);
@@ -861,6 +867,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at: 43_200,
+            joined: Joined::At(0),
         };
         let own = file_from_records("lan0", &[live], 0, NOW_UNIX);
         let saved = file_with(own, &aside, 0, NOW_UNIX);
@@ -987,6 +994,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at: 43_200,
+            joined: Joined::At(0),
         };
         assert_eq!(
             event_line(
@@ -1086,6 +1094,7 @@ mod tests {
                 hostname: None,
                 granted_at: 0,
                 expires_at: 300,
+                joined: Joined::At(0),
             },
             LeaseRecord {
                 address: ip("192.168.1.10"),
@@ -1094,6 +1103,7 @@ mod tests {
                 hostname: Some("nas".into()),
                 granted_at: 0,
                 expires_at: 500,
+                joined: Joined::At(0),
             },
         ];
         let facts = facts_from(&records, 100, 1_800_000_000);
