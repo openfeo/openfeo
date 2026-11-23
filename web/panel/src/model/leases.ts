@@ -125,12 +125,19 @@ export function reserved(lease: Lease, base: Config | null, draft: Config | null
  * Reserve: the lease's MAC always gets its address, under the name it gave when it gave one.
  * It joins the draft's other changes, in that LAN's reservations. Nothing is added unless
  * {@link reserved} says the reservation is on offer, so a second press adds nothing.
+ *
+ * The router keeps a reservation's name to one device a LAN. A name another reservation
+ * there already has is left out (two devices of one make give the same name, and one that
+ * replaces another gives its predecessor's): the address is what was asked for, and a name
+ * can be given on LAN & DHCP.
  */
 export function reserve(draft: Config, base: Config | null, lease: Lease): void {
   if (reserved(lease, base, draft) !== 'no') {
     return
   }
-  lanOf(draft, lease.lan)?.dhcp?.static.push(create(StaticLeaseSchema, { mac: lease.mac, ip: lease.address, hostname: lease.hostname }))
+  const held = lanOf(draft, lease.lan)?.dhcp?.static
+  const taken = held?.some((each) => each.hostname !== '' && each.hostname.toLowerCase() === lease.hostname.toLowerCase()) ?? false
+  held?.push(create(StaticLeaseSchema, { mac: lease.mac, ip: lease.address, hostname: taken ? '' : lease.hostname }))
 }
 
 /** A lease as a table shows it: every cell as text, with what the page hangs on the row. */

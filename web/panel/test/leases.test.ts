@@ -193,6 +193,46 @@ test('Reserve puts a reservation among the changes, and the row says so', async 
   expect(rowOf(wrapper, '192.168.1.143').find('button').text()).toBe('Reserve')
 })
 
+test('what the router refuses is said on the page, so that Apply changes never looks dead', async () => {
+  // The draft is the whole config: what the router finds wrong with it may be this page's
+  // doing or another's, and either way a person who pressed Apply here is told here.
+  const { wrapper, router } = await page()
+  await rowOf(wrapper, '192.168.1.143').find('button').trigger('click')
+  router.validation = {
+    violations: [
+      { $typeName: 'openfeo.v1.ConfigViolation', path: 'lans[0].dhcp.static[2].hostname', code: 'duplicate_hostname', message: 'another reservation has this name' },
+      { $typeName: 'openfeo.v1.ConfigViolation', path: 'wans[0].port', code: 'port', message: 'no such port' },
+    ],
+    effects: [],
+    caller: undefined,
+  }
+  expect(wrapper.find('.refused').exists()).toBe(false)
+  await wrapper.find('.ofo-savebar').findAll('button').find((button) => button.text() === 'Apply changes')?.trigger('click')
+  await flushPromises()
+  expect(wrapper.find('[role="alertdialog"]').exists()).toBe(false)
+  expect(wrapper.find('.refused').findAll('li').map((item) => item.text())).toEqual([
+    'lans[0].dhcp.static[2].hostname: another reservation has this name',
+    'wans[0].port: no such port',
+  ])
+})
+
+test('a device whose name another reservation on its LAN already has is reserved without the name', async () => {
+  // The router keeps a reservation's name to one device a LAN: two plugs of one make give
+  // the same name, and a device that replaces another gives its predecessor's.
+  const table = leases([
+    ['192.168.1.143', 'printer', 125],
+    ['192.168.1.144', 'NAS', 60],
+  ])
+  const { wrapper, store } = await page(table)
+  await rowOf(wrapper, '192.168.1.143').find('button').trigger('click')
+  await rowOf(wrapper, '192.168.1.144').find('button').trigger('click')
+  const added = store().draft.value?.lans[0]?.dhcp?.static.slice(2)
+  expect(added?.map((each) => [each.ip, each.hostname])).toEqual([
+    ['192.168.1.143', ''],
+    ['192.168.1.144', ''],
+  ])
+})
+
 test('a reservation the router has reads Reserved, and one that cannot be made is not offered', async () => {
   const table = leases([
     ['192.168.1.10', 'nas', 60, { mac: '52:54:00:fe:10:10' }],

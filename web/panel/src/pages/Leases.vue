@@ -8,6 +8,7 @@ import { computed, inject, ref, watch } from 'vue'
 import { CONFIG } from '../config'
 import { LIVE } from '../live'
 import { leaseKey, leaseRows, matches, newestFirst, perLan, reserve, reserved } from '../model/leases'
+import RefusedList from '../parts/RefusedList.vue'
 
 // The Leases page (SPEC §8.4): every device that took an address from the router, newest
 // first, so that the one just plugged in is at the top with its address. It is a view of what
@@ -110,6 +111,9 @@ function keep(key: string): void {
   <div class="page">
     <OfoPageHeader title="Leases" sub="Devices that took an address from the router, newest first." />
     <OfoBanner v-if="store.readOnly.value" class="readonly" tone="info">{{ store.readOnly.value }}</OfoBanner>
+    <!-- The page has no field to show a refusal at, so every one is listed: whatever the router
+         found wrong with the draft, a person who pressed Apply changes here is told here. -->
+    <RefusedList :violations="store.violations.value" />
 
     <div v-if="table === null" class="leases__waiting">
       <OfoSkeleton :width="40" />

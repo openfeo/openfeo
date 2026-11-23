@@ -177,6 +177,18 @@ test('Reserve puts the MAC, the address and the name into that LAN’s reservati
   expect(draft.lans[0]?.dhcp?.static.at(-1)?.hostname).toBe('')
 })
 
+test('a name another reservation on the LAN has is left out, whatever its case', () => {
+  const base = config()
+  const draft = clone(ConfigSchema, base)
+  // `nas` is the router's own reservation on lan0.
+  reserve(draft, base, lease('192.168.1.143', 1, { hostname: 'NAS' }))
+  expect(draft.lans[0]?.dhcp?.static.at(-1)?.hostname).toBe('')
+  // A name that is free is kept; then it is taken.
+  reserve(draft, base, lease('192.168.1.144', 1, { hostname: 'plug' }))
+  reserve(draft, base, lease('192.168.1.145', 1, { hostname: 'plug' }))
+  expect(draft.lans[0]?.dhcp?.static.slice(-2).map((each) => each.hostname)).toEqual(['plug', ''])
+})
+
 test('reserving twice adds one', () => {
   const base = config()
   const draft = clone(ConfigSchema, base)
