@@ -11,6 +11,7 @@ import globe from 'lucide-static/icons/globe.svg?raw'
 import info from 'lucide-static/icons/info.svg?raw'
 import layoutDashboard from 'lucide-static/icons/layout-dashboard.svg?raw'
 import logOut from 'lucide-static/icons/log-out.svg?raw'
+import monitorSmartphone from 'lucide-static/icons/monitor-smartphone.svg?raw'
 import moon from 'lucide-static/icons/moon.svg?raw'
 import network from 'lucide-static/icons/network.svg?raw'
 import sun from 'lucide-static/icons/sun.svg?raw'
@@ -28,6 +29,7 @@ export const ICONS = {
   info: shapes(info),
   'layout-dashboard': shapes(layoutDashboard),
   'log-out': shapes(logOut),
+  'monitor-smartphone': shapes(monitorSmartphone),
   moon: shapes(moon),
   network: shapes(network),
   sun: shapes(sun),

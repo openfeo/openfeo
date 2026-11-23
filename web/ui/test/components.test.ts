@@ -8,7 +8,9 @@ import {
   OfoBanner,
   OfoButton,
   OfoCard,
+  OfoChart,
   OfoDataTable,
+  OfoEmpty,
   OfoField,
   OfoIcon,
   OfoInput,
@@ -16,6 +18,7 @@ import {
   OfoNav,
   OfoPageHeader,
   OfoPortStrip,
+  OfoSegmented,
   OfoShell,
   OfoSkeleton,
   OfoStatTile,
@@ -351,4 +354,143 @@ test('the wordmark offers both files and lets the stylesheet pick', () => {
   expect(mark.findAll('img')[0]?.attributes('src')).toContain('openfeo-mark')
   expect(mark.findAll('img')[1]?.attributes('src')).toContain('openfeo-mark-light')
   expect(mark.findAll('img')[0]?.attributes('height')).toBe('20')
+})
+
+test('a stat tile with a sparkline and a foot shows both, the line above', () => {
+  const down = mount(OfoStatTile, {
+    props: { label: 'Download', value: '412.6', unit: 'Mbit/s', spark: [1, 2, 3], series: 1, foot: 'peak 918.2 Mbit/s in the last hour' },
+  })
+  expect(down.find('svg.ofo-stat__spark').exists()).toBe(true)
+  expect(down.find('.ofo-stat__foot').text()).toBe('peak 918.2 Mbit/s in the last hour')
+  expect(down.element.lastElementChild?.className).toBe('ofo-stat__foot')
+})
+
+test('a table keys its rows and classes them as it is told', () => {
+  const table = mount(OfoDataTable, {
+    props: {
+      columns: [{ key: 'address', label: 'Address', mono: true }],
+      rows: [
+        { id: 'a', address: '192.168.1.143', fresh: 'yes' },
+        { id: 'b', address: '192.168.1.142', fresh: '' },
+      ],
+      rowKey: 'id',
+      rowClass: (row: Record<string, string>) => (row.fresh === 'yes' ? 'ofo-table__row--new' : undefined),
+    },
+  })
+  const rows = table.findAll('tbody tr')
+  expect(rows[0]?.classes()).toEqual(['ofo-table__row--new'])
+  expect(rows[1]?.classes()).toEqual([])
+})
+
+test('a segmented choice is a group of buttons with the chosen one pressed, and a count where given', async () => {
+  const choice = mount(OfoSegmented, {
+    props: {
+      label: 'LAN',
+      modelValue: 'all',
+      options: [
+        { value: 'all', label: 'All LANs' },
+        { value: 'lan0', label: 'lan0', count: 11 },
+        { value: 'iot', label: 'iot', count: 0 },
+      ],
+    },
+  })
+  expect(choice.classes()).toEqual(['ofo-seg'])
+  expect(choice.attributes('role')).toBe('group')
+  expect(choice.attributes('aria-label')).toBe('LAN')
+  const buttons = choice.findAll('button')
+  expect(buttons.map((button) => button.attributes('aria-pressed'))).toEqual(['true', 'false', 'false'])
+  expect(buttons.every((button) => button.attributes('type') === 'button')).toBe(true)
+  expect(buttons[0]?.find('.ofo-tabs__count').exists()).toBe(false)
+  expect(buttons[1]?.find('.ofo-tabs__count').text()).toBe('11')
+  expect(buttons[2]?.find('.ofo-tabs__count').text()).toBe('0')
+  await buttons[1]?.trigger('click')
+  expect(choice.emitted('update:modelValue')).toEqual([['lan0']])
+  await choice.setProps({ modelValue: 'lan0' })
+  expect(choice.findAll('button').map((button) => button.attributes('aria-pressed'))).toEqual(['false', 'true', 'false'])
+})
+
+test('an empty state has the lattice, what is missing, one line, and its action', () => {
+  const empty = mount(OfoEmpty, {
+    props: { title: 'No leases yet', text: 'A device appears here when it takes an address.' },
+    slots: { default: '<button class="ofo-btn">Add</button>' },
+  })
+  expect(empty.classes()).toEqual(['ofo-empty'])
+  const art = empty.find('svg.ofo-empty__art')
+  expect(art.attributes('aria-hidden')).toBe('true')
+  expect(art.findAll('circle.fe')).toHaveLength(5)
+  expect(art.findAll('circle.o')).toHaveLength(4)
+  expect(empty.find('.ofo-empty__title').text()).toBe('No leases yet')
+  expect(empty.find('.ofo-empty__text').text()).toBe('A device appears here when it takes an address.')
+  expect(empty.find('button.ofo-btn').exists()).toBe(true)
+  const bare = mount(OfoEmpty, { props: { title: 'Nothing' } })
+  expect(bare.find('.ofo-empty__text').exists()).toBe(false)
+})
+
+test('a chart is a picture with a name, a legend of what is now, a grid, and its marks', () => {
+  const chart = mount(OfoChart, {
+    props: {
+      title: 'wan0',
+      label: 'Download and upload on wan0 over the last hour',
+      runs: [
+        [
+          { at: 0, rx: 100, tx: 10 },
+          { at: 1800, rx: 400, tx: 40 },
+        ],
+        [{ at: 3000, rx: 918.2, tx: 104 }, { at: 3600, rx: 412.6, tx: 38.2 }],
+      ],
+      from: 0,
+      to: 3600,
+      unit: 'Mbit/s',
+      now: { rx: '412.6', tx: '38.2' },
+      marks: [{ at: 2900, label: 'reconnected 14:12' }],
+      ticks: [
+        { at: 0, label: '13:20' },
+        { at: 1800, label: '13:50' },
+      ],
+    },
+    slots: { range: '<div class="ofo-seg">range</div>' },
+  })
+  expect(chart.classes()).toEqual(['ofo-chart'])
+  expect(chart.find('.ofo-chart__head h2').text()).toBe('wan0')
+  expect(chart.find('.ofo-chart__head .ofo-seg').text()).toBe('range')
+  expect(chart.find('.ofo-chart__key--rx').text()).toBe('Download 412.6 Mbit/s')
+  expect(chart.find('.ofo-chart__key--rx b').text()).toBe('412.6')
+  expect(chart.find('.ofo-chart__key--tx').text()).toBe('Upload 38.2 Mbit/s')
+  const svg = chart.find('.ofo-chart__plot svg')
+  expect(svg.attributes('role')).toBe('img')
+  expect(svg.attributes('aria-label')).toBe('Download and upload on wan0 over the last hour')
+  expect(svg.attributes('viewBox')).toBe('0 0 720 220')
+  expect(svg.findAll('g.grid line')).toHaveLength(5)
+  // The scale's top is the round value above the largest point, and each level is said.
+  expect(svg.findAll('g.axis text.ofo-chart__level').map((text) => text.text())).toEqual(['0', '250', '500', '750', '1000'])
+  expect(svg.findAll('g.axis text.ofo-chart__tick').map((text) => text.text())).toEqual(['13:20', '13:50'])
+  expect(svg.find('path.line.rx').attributes('d')).toMatch(/^M0 [\d.]+ L336 [\d.]+ M560 [\d.]+ L672 [\d.]+$/)
+  expect(svg.find('path.line.tx').attributes('d')).toMatch(/^M0 /)
+  expect(svg.find('path.area.rx').attributes('d')).toMatch(/Z$/)
+  const events = svg.findAll('g.event')
+  expect(events).toHaveLength(1)
+  expect(events[0]?.find('text').text()).toBe('reconnected 14:12')
+  expect(events[0]?.find('line').attributes('x1')).toBe(events[0]?.find('line').attributes('x2'))
+  expect(chart.find('.ofo-chart__note').exists()).toBe(false)
+  expect(chart.html()).not.toMatch(/style=/)
+})
+
+test('a chart with nothing to draw still has its scale, and says what it was told to', () => {
+  const chart = mount(OfoChart, {
+    props: {
+      title: 'wan1',
+      label: 'Download and upload on wan1 over the last five minutes',
+      runs: [],
+      from: 0,
+      to: 300,
+      unit: 'bit/s',
+      now: { rx: '–', tx: '–' },
+      note: 'The last hour could not be read from the router.',
+    },
+  })
+  expect(chart.find('.ofo-chart__note').text()).toBe('The last hour could not be read from the router.')
+  expect(chart.findAll('g.grid line')).toHaveLength(5)
+  expect(chart.find('path.line.rx').attributes('d')).toBe('')
+  expect(chart.findAll('g.event')).toHaveLength(0)
+  expect(chart.find('.ofo-chart__key--rx').text()).toBe('Download – bit/s')
 })
