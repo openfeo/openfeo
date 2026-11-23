@@ -404,9 +404,21 @@ mod dhcp4_server_leases_tests {
                 hostname: "nas".into(),
                 granted_unix: 1_800_000_000,
                 expires_unix: 1_800_043_200,
+                joined_unix: 1_799_990_000,
             }],
         };
         let text = render_dhcp4_server_leases(&leases).unwrap();
+        // A file written before the joined time was kept has no such line, and still reads.
+        let older = text
+            .lines()
+            .filter(|line| !line.starts_with("joined_unix"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(older, text, "{text}");
+        assert_eq!(
+            parse_dhcp4_server_leases(&older).unwrap().leases[0].joined_unix,
+            0
+        );
         assert!(text.contains("[[leases]]"), "{text}");
         assert_eq!(parse_dhcp4_server_leases(&text).unwrap(), leases);
         assert!(

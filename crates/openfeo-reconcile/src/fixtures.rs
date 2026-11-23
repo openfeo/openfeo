@@ -107,12 +107,14 @@ pub fn lease_facts() -> BTreeMap<String, Vec<LeaseFact>> {
                 mac: MacAddr([0x52, 0x54, 0x00, 0xfe, 0x10, 0x10]),
                 hostname: Some("nas".to_owned()),
                 expires_unix: 1_800_000_000,
+                joined_unix: 1_799_900_000,
             },
             LeaseFact {
                 address: Ipv4Addr::new(192, 168, 1, 120),
                 mac: MacAddr([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
                 hostname: Some("pc".to_owned()),
                 expires_unix: 1_800_000_000,
+                joined_unix: 1_799_990_000,
             },
         ],
     )])

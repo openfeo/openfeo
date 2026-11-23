@@ -144,7 +144,8 @@ async fn run(
             aside.len()
         );
     }
-    publish_facts(lan, &driver, publisher);
+    let mut wall = Wall::default();
+    publish_facts(lan, &driver, publisher, &mut wall);
     let mut last_save: Option<Instant> = None;
     let mut save_at: Option<Instant> = None;
     let mut noisy = Throttle::new(NOISY_WINDOW);
@@ -169,7 +170,7 @@ async fn run(
                         info!("{line}");
                     }
                     if changes_leases(&event) {
-                        publish_facts(lan, &driver, publisher);
+                        publish_facts(lan, &driver, publisher, &mut wall);
                         if save_at.is_none() {
                             save_at = Some(next_save(last_save, Instant::now()));
                         }
@@ -189,7 +190,7 @@ async fn run(
                     // The bridge was recreated: the sockets are bound to the old index. A save
                     // still owed is written first; the restart reads it back.
                     if save_at.is_some() {
-                        save_leases(&path, lan, &driver, &aside).await;
+                        save_leases(&path, lan, &driver, &aside, &mut wall).await;
                     }
                     return Err(format!(
                         "dhcp4 server {lan}: {bridge} changed index {ifindex} -> {index}; restarting"
@@ -198,7 +199,7 @@ async fn run(
                 }
             }
             () = sleep_until(save_at) => {
-                save_leases(&path, lan, &driver, &aside).await;
+                save_leases(&path, lan, &driver, &aside, &mut wall).await;
                 last_save = Some(Instant::now());
                 save_at = None;
             }
@@ -207,7 +208,7 @@ async fn run(
                 // file, and the file tells time by the wall clock. One written before the
                 // clock was stepped (SNTP's first answer) would have every lease read as long
                 // expired; written now, the times in it are a moment old.
-                save_leases(&path, lan, &driver, &aside).await;
+                save_leases(&path, lan, &driver, &aside, &mut wall).await;
                 info!("{}", stopped_line(lan));
                 return Ok(());
             }
@@ -288,8 +289,50 @@ fn record_from(
         hostname: (!lease.hostname.is_empty()).then(|| lease.hostname.clone()),
         granted_at: now.saturating_sub(unix_now.saturating_sub(lease.granted_unix)),
         expires_at: now + (lease.expires_unix - unix_now),
-        joined: Joined::Unix(lease.granted_unix),
+        // A file from before the joined time was kept has none: its last renewal stands in.
+        joined: Joined::Unix(if lease.joined_unix == 0 {
+            lease.granted_unix
+        } else {
+            lease.joined_unix
+        }),
     })
+}
+
+/// A joined time on the wall clock: as written when a lease file gave it, stamped now when the
+/// device joined while this server ran. Stamping at the moment of use is what makes a device
+/// that joined before the clock was set right once it is. `now` and `unix_now` are the same
+/// instant.
+#[must_use]
+pub fn joined_unix(joined: Joined, now: Timestamp, unix_now: u64) -> u64 {
+    match joined {
+        Joined::Unix(unix) => unix,
+        Joined::At(at) => unix_now.saturating_sub(now.saturating_sub(at)),
+    }
+}
+
+/// The wall clock's lead over the driver's clock, held still while the two keep step. The
+/// driver's clock counts whole seconds rounded up and the wall clock whole seconds rounded
+/// down, read a moment apart, so their difference wobbles by a second; a time stamped from it
+/// (a lease's expiry, when its device joined) would wobble with it, and a renewal would seem
+/// to move a joined time. A lead within a second of the last one used is taken to be that one.
+/// A larger difference is the wall clock stepped (SNTP's first answer), which is followed.
+#[derive(Debug, Default)]
+pub struct Wall {
+    lead: Option<u64>,
+}
+
+impl Wall {
+    /// The wall clock at the driver's `now`, where `unix_now` is the wall clock read at that
+    /// instant.
+    pub fn unix(&mut self, now: Timestamp, unix_now: u64) -> u64 {
+        let lead = unix_now.saturating_sub(now);
+        let held = match self.lead {
+            Some(held) if held.abs_diff(lead) <= 1 => held,
+            _ => lead,
+        };
+        self.lead = Some(held);
+        held + now
+    }
 }
 
 /// The core's records as the file, with wall-clock times.
@@ -311,6 +354,7 @@ pub fn file_from_records(
                 hostname: record.hostname.clone().unwrap_or_default(),
                 granted_unix: unix_now.saturating_sub(now.saturating_sub(record.granted_at)),
                 expires_unix: unix_now + record.expires_at.saturating_sub(now),
+                joined_unix: joined_unix(record.joined, now, unix_now),
             })
             .collect(),
     }
@@ -326,6 +370,7 @@ pub fn facts_from(records: &[LeaseRecord], now: Timestamp, unix_now: u64) -> Vec
             mac: MacAddr(record.mac),
             hostname: record.hostname.clone(),
             expires_unix: unix_now + record.expires_at.saturating_sub(now),
+            joined_unix: joined_unix(record.joined, now, unix_now),
         })
         .collect();
     facts.sort_by_key(|fact| fact.address);
@@ -399,6 +444,13 @@ pub fn file_with(
             Dhcp4ServerLease {
                 granted_unix: expires_unix.saturating_sub(length),
                 expires_unix,
+                // When its device joined does not move with them: as the file had it, its
+                // granted time standing in where the file is from before that was kept.
+                joined_unix: if entry.lease.joined_unix == 0 {
+                    entry.lease.granted_unix
+                } else {
+                    entry.lease.joined_unix
+                },
                 ..entry.lease.clone()
             }
         })
@@ -451,8 +503,15 @@ fn read_leases(
     }
 }
 
-async fn save_leases(path: &Path, lan: &str, driver: &ServerDriver, aside: &[Aside]) {
-    let (now, now_unix) = (driver.now(), unix_now());
+async fn save_leases(
+    path: &Path,
+    lan: &str,
+    driver: &ServerDriver,
+    aside: &[Aside],
+    wall: &mut Wall,
+) {
+    let now = driver.now();
+    let now_unix = wall.unix(now, unix_now());
     let own = file_from_records(lan, &driver.leases(), now, now_unix);
     let leases = file_with(own, aside, now, now_unix);
     let result = match file::render_dhcp4_server_leases(&leases) {
@@ -472,8 +531,9 @@ async fn save_leases(path: &Path, lan: &str, driver: &ServerDriver, aside: &[Asi
     }
 }
 
-fn publish_facts(lan: &str, driver: &ServerDriver, publisher: &Publisher) {
-    let facts = facts_from(&driver.leases(), driver.now(), unix_now());
+fn publish_facts(lan: &str, driver: &ServerDriver, publisher: &Publisher, wall: &mut Wall) {
+    let now = driver.now();
+    let facts = facts_from(&driver.leases(), now, wall.unix(now, unix_now()));
     publisher.update(|world| {
         Arc::make_mut(&mut world.leases).insert(lan.to_owned(), facts);
     });
@@ -657,6 +717,7 @@ mod tests {
                 hostname: "nas".into(),
                 granted_unix: 1_800_000_100,
                 expires_unix: 1_800_043_300,
+                joined_unix: 1_800_000_100,
             }
         );
         assert_eq!(
@@ -727,6 +788,7 @@ mod tests {
             address: address.into(),
             granted_unix: NOW_UNIX - 100,
             expires_unix,
+            joined_unix: NOW_UNIX - 5_000,
             ..Default::default()
         }
     }
@@ -1084,6 +1146,126 @@ mod tests {
         );
     }
 
+    /// A record that joined at `joined`, granted at 0 and expiring at 43 200 on the driver's clock.
+    fn joined_record(joined: Joined) -> LeaseRecord {
+        LeaseRecord {
+            address: ip("192.168.1.120"),
+            mac: MAC_A,
+            client_id: None,
+            hostname: None,
+            granted_at: 0,
+            expires_at: 43_200,
+            joined,
+        }
+    }
+
+    /// A file from before the joined time was kept has none: its granted time, the last
+    /// renewal, stands in.
+    #[test]
+    fn a_file_without_a_joined_time_reads_its_granted_time() {
+        let file = Dhcp4ServerLeases {
+            lan: "lan0".into(),
+            leases: vec![Dhcp4ServerLease {
+                mac: "02:00:00:00:00:0a".into(),
+                address: "192.168.1.120".into(),
+                granted_unix: 1_800_000_000,
+                expires_unix: 1_800_043_200,
+                ..Default::default()
+            }],
+        };
+        let (records, dropped) = records_from_file(&file, "lan0", 0, 1_800_000_100);
+        assert_eq!(dropped, Vec::<String>::new());
+        assert_eq!(records[0].joined, Joined::Unix(1_800_000_000));
+    }
+
+    /// What a file gave is written back as it was, whatever the wall clock says now: on a
+    /// box with no clock of its own the file is read while the clock is still the build's.
+    #[test]
+    fn the_joined_time_goes_to_the_file_and_back_as_written() {
+        let record = joined_record(Joined::Unix(1_799_990_000));
+        for unix_now in [1_800_000_000, 1_700_000_000] {
+            let file = file_from_records("lan0", std::slice::from_ref(&record), 100, unix_now);
+            assert_eq!(file.leases[0].joined_unix, 1_799_990_000, "at {unix_now}");
+            let (back, _) = records_from_file(&file, "lan0", 100, unix_now);
+            assert_eq!(back[0].joined, Joined::Unix(1_799_990_000), "at {unix_now}");
+        }
+    }
+
+    /// A device that joined while this server ran is stamped when it is written or published,
+    /// so one that joined before SNTP's first answer is right once the clock is.
+    #[test]
+    fn a_lease_joined_before_the_clock_was_set_is_right_once_it_is() {
+        let records = [joined_record(Joined::At(5))];
+        for (unix_now, joined) in [
+            (1_700_000_000, 1_699_999_905),
+            (1_800_000_000, 1_799_999_905),
+        ] {
+            assert_eq!(facts_from(&records, 100, unix_now)[0].joined_unix, joined);
+            assert_eq!(
+                file_from_records("lan0", &records, 100, unix_now).leases[0].joined_unix,
+                joined
+            );
+        }
+        assert_eq!(
+            joined_unix(Joined::At(500), 100, 50),
+            50,
+            "never ahead of now"
+        );
+    }
+
+    /// The two clocks are read a moment apart and rounded opposite ways. Without this a stamp
+    /// would move by a second from one publication to the next, and a renewal would seem to
+    /// move a joined time.
+    #[test]
+    fn the_wall_clock_is_held_still_within_a_second_and_follows_a_step() {
+        let mut wall = Wall::default();
+        assert_eq!(wall.unix(10, 1_010), 1_010);
+        assert_eq!(
+            wall.unix(11, 1_012),
+            1_011,
+            "a second ahead is the same lead"
+        );
+        assert_eq!(
+            wall.unix(12, 1_011),
+            1_012,
+            "a second behind is the same lead"
+        );
+        assert_eq!(wall.unix(13, 5_013), 5_013, "a step is followed");
+        assert_eq!(wall.unix(14, 5_014), 5_014);
+        assert_eq!(wall.unix(15, 1_015), 1_015, "and one back");
+    }
+
+    #[test]
+    fn an_entry_set_aside_keeps_its_joined_time() {
+        let with = |address: &str, joined_unix| Dhcp4ServerLease {
+            joined_unix,
+            ..entry("02:00:00:00:00:0a", address, NOW_UNIX + 9_000)
+        };
+        let aside = [
+            Aside {
+                lease: with("192.168.1.100", 1_790_000_000),
+                expires_at: 9_050,
+            },
+            // From a file written before the joined time was kept.
+            Aside {
+                lease: with("192.168.1.101", 0),
+                expires_at: 9_050,
+            },
+        ];
+        let own = Dhcp4ServerLeases {
+            lan: "lan0".into(),
+            leases: Vec::new(),
+        };
+        // A minute on, and the wall clock stepped a year ahead meanwhile.
+        let file = file_with(own, &aside, 110, NOW_UNIX + 31_536_000);
+        assert_eq!(file.leases[0].joined_unix, 1_790_000_000);
+        assert_eq!(
+            file.leases[1].joined_unix,
+            NOW_UNIX - 100,
+            "its granted time as the file had it, not as it is moved along with the expiry"
+        );
+    }
+
     #[test]
     fn facts_carry_wall_clock_expiry_sorted_by_address() {
         let records = vec![
@@ -1113,10 +1295,12 @@ mod tests {
                 address: ip("192.168.1.10"),
                 mac: MacAddr(MAC_A),
                 hostname: Some("nas".into()),
-                expires_unix: 1_800_000_400
+                expires_unix: 1_800_000_400,
+                joined_unix: 1_799_999_900,
             }
         );
         assert_eq!(facts[1].expires_unix, 1_800_000_200);
+        assert_eq!(facts[1].joined_unix, 1_799_999_900);
         assert_eq!(
             server_lease_path("lan0").to_str(),
             Some("/state/leases/dhcp4-server-lan0.toml")

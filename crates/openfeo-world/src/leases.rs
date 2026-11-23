@@ -18,4 +18,7 @@ pub struct LeaseFact {
     pub hostname: Option<String>,
     /// Wall-clock expiry, seconds since the Unix epoch.
     pub expires_unix: u64,
+    /// When the device first took this address, on the wall clock (SPEC §7.6): a renewal
+    /// does not move it.
+    pub joined_unix: u64,
 }

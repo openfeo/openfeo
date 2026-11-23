@@ -328,6 +328,10 @@ message Dhcp4ServerLease {
   string hostname = 4;
   uint64 granted_unix = 5;
   uint64 expires_unix = 6;
+  // When the device first took this address (wall clock, seconds since the Unix epoch): kept
+  // across renewals (SPEC §7.6). 0 in a file written before it was kept: `granted_unix`
+  // stands in.
+  uint64 joined_unix = 7;
 }
 
 // A LAN's lease database.
