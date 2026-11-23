@@ -29,6 +29,10 @@ withDefaults(
             <slot :name="`cell-${column.key}`" :row="row" :value="row[column.key] ?? ''">{{ row[column.key] }}</slot>
           </td>
         </tr>
+        <!-- What a filter that found nothing says, in the table and not in place of it (EmptyState.md). -->
+        <tr v-if="rows.length === 0 && $slots.empty">
+          <td :colspan="columns.length"><slot name="empty" /></td>
+        </tr>
       </tbody>
     </table>
   </div>

@@ -382,6 +382,23 @@ test('a table keys its rows and classes them as it is told', () => {
   expect(rows[1]?.classes()).toEqual([])
 })
 
+test('a table with no rows says what its `empty` slot says, across every column', () => {
+  const columns = [
+    { key: 'address', label: 'Address' },
+    { key: 'name', label: 'Name' },
+  ]
+  const none = mount(OfoDataTable, { props: { columns, rows: [] }, slots: { empty: 'No leases match <code>zzz</code>' } })
+  const cell = none.find('tbody tr td')
+  expect(none.findAll('tbody tr')).toHaveLength(1)
+  expect(cell.attributes('colspan')).toBe('2')
+  expect(cell.text()).toBe('No leases match zzz')
+  // With rows, or with nothing to say, there is no such row.
+  expect(mount(OfoDataTable, { props: { columns, rows: [] } }).findAll('tbody tr')).toHaveLength(0)
+  const some = mount(OfoDataTable, { props: { columns, rows: [{ address: 'a', name: 'b' }] }, slots: { empty: 'nothing' } })
+  expect(some.findAll('tbody tr')).toHaveLength(1)
+  expect(some.text()).not.toContain('nothing')
+})
+
 test('a segmented choice is a group of buttons with the chosen one pressed, and a count where given', async () => {
   const choice = mount(OfoSegmented, {
     props: {

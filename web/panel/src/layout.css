@@ -142,6 +142,34 @@ body {
   white-space: nowrap;
 }
 
+/* The Leases page: what narrows the table, in a row above it. */
+.leases__tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.leases__filter {
+  width: 280px;
+  max-width: 100%;
+}
+
+.leases__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.leases__help,
+.leases__cut {
+  margin: var(--space-4) 0 0;
+  max-width: 80ch;
+  font-size: 13px;
+  line-height: 20px;
+}
+
 /* The link from a card's head to the page that has the rest. */
 .dash__more {
   font-size: 13px;

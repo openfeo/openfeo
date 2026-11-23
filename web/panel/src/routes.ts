@@ -13,6 +13,7 @@ import ConfigUnreadable from './pages/ConfigUnreadable.vue'
 import Dashboard from './pages/Dashboard.vue'
 import FirstPassword from './pages/FirstPassword.vue'
 import Lan from './pages/Lan.vue'
+import Leases from './pages/Leases.vue'
 import Login from './pages/Login.vue'
 import Wan from './pages/Wan.vue'
 import type { PanelSession, Screen } from './session'
@@ -51,6 +52,7 @@ export function panelRoutes(session: PanelSession, history: RouterHistory = crea
           // The WAN or LAN shown is in the address, so a reload and a link come back to it.
           { path: 'wan/:name?', component: Wan },
           { path: 'lan/:name?', component: Lan },
+          { path: 'leases', component: Leases },
         ],
       },
       { path: PATHS.login, component: Login },

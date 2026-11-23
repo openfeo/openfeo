@@ -311,7 +311,7 @@ test('the sidebar marks the dashboard', async () => {
   const { wrapper } = await loaded()
   const items = wrapper.findAll('.ofo-nav__item')
   expect(items[0]?.text()).toBe('Dashboard')
-  expect(items.map((item) => item.attributes('aria-current'))).toEqual(['page', undefined, undefined])
+  expect(items.map((item) => item.attributes('aria-current'))).toEqual(['page', undefined, undefined, undefined])
 })
 
 test('a router that has seen nothing happen says so', async () => {
