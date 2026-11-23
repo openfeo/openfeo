@@ -329,15 +329,22 @@ mark where the WAN came back; the rate tiles say the hour's peak, the highest te
 average; and a card lists the five newest leases. **Leases** is a page of its own under
 Network: every LAN's leases, newest first, filtered by name, address or MAC, a row that arrives
 marked for a minute, and Reserve on a row, which puts the reservation among the changes the
-save bar counts. Proven by 1100 unit tests on the Rust side and 503 on the web side, and
-by three new `m4` scenarios (38 in all) and two extended: a lease listed with its joined time,
+save bar counts. Proven by 1101 unit tests on the Rust side and 506 on the web side, and
+by three new `m4` scenarios (38 in all) and three extended: a lease listed with its joined time,
 which stays to the second when its client asks again and when the LAN's server restarts and
 reads it back from the file; traffic that passed with no socket open found in the history
 afterwards, a sample a second; the client's calls under Node, with a device that joins pushed
 to a subscriber; and Playwright's Chromium, started twenty seconds after the router, finding
 the chart already drawn into that time, a device that joins appearing without a reload, the
 reservation made from the Leases page applied and confirmed, and the mark where the ISP was
-cut and came back. Slices 3b (the settings pages) and 3c (the views) follow.
+cut and came back. The whole-branch review found two things the tests had not asked, fixed in
+the same pull request. Lease facts were stamped on the wall clock once and not again when it
+stepped, so on a router whose clock starts at the build's the lease table was empty after its
+first time sync until the next lease on that LAN: they are now stamped again at a step and the
+file rewritten, and the scenario that steps the clock a year finds the lease still listed, a
+few minutes old. And the Leases page said nothing when the router refused the draft, so Apply
+changes looked dead: it lists every refusal, and a new reservation leaves out a name another
+on its LAN already has. Slices 3b (the settings pages) and 3c (the views) follow.
 
 ## Follow-ups
 
