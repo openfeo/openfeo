@@ -223,6 +223,21 @@ test('the tiles show the default WAN, the leases and the tracked connections', (
   expect(tiles(none, live)[2]).toEqual({ label: 'Clients', value: '0' })
 })
 
+test('the rate tiles say the hour’s peak beneath, with its own unit', () => {
+  const live = {
+    rate: rateOf('ppp-wan0', 412_600_000, 38_200),
+    history: { rx: [1, 2, 3], tx: [3, 2, 1] },
+    peak: { rx: 918_200_000, tx: 104_000_000 },
+  }
+  const [down, up] = tiles(state(), live)
+  expect(down).toEqual({ label: 'Download', value: '412.6', unit: 'Mbit/s', spark: [1, 2, 3], series: 1, foot: 'peak 918.2 Mbit/s in the last hour' })
+  // The rate of the moment and the hour's peak need not share a unit.
+  expect(up).toEqual({ label: 'Upload', value: '38.2', unit: 'kbit/s', spark: [3, 2, 1], series: 2, foot: 'peak 104.0 Mbit/s in the last hour' })
+  // The peak stands while the rate of the moment is not known (the socket is away).
+  const [away] = tiles(state(), { history: { rx: [], tx: [] }, peak: { rx: 918_200_000, tx: 0 } })
+  expect(away).toEqual({ label: 'Download', value: '—', spark: [], series: 1, foot: 'peak 918.2 Mbit/s in the last hour' })
+})
+
 test('a port says what it is for, in words', () => {
   expect(ports(state())).toEqual([
     { name: 'p0', speed: '2.5G', wan: true, up: true, title: 'p0 · 52:54:00:12:34:00 · WAN wan0, VLAN 911' },
