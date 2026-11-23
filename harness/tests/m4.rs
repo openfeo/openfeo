@@ -175,6 +175,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "a_lease_is_listed_and_keeps_its_joined_time",
         run: a_lease_is_listed_and_keeps_its_joined_time,
     },
+    Scenario {
+        name: "an_hour_of_counters_is_kept_with_nobody_watching",
+        run: an_hour_of_counters_is_kept_with_nobody_watching,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -2586,5 +2590,65 @@ fn a_lease_is_listed_and_keeps_its_joined_time(lab: &mut Lab) -> anyhow::Result<
         "after the server restarted: {restored:?}, joined {} before",
         lease.joined_unix
     );
+    no_task_failed(lab)
+}
+
+/// SPEC §10 (M4 part 3a): the router reads its counters every second whether or not anyone
+/// is subscribed, and keeps the last hour of each link's bytes. Traffic that passed while no
+/// socket was open is in the history asked for afterwards, a sample a second; a link the
+/// router has none of is left out; and a request that names no link is refused.
+fn an_hour_of_counters_is_kept_with_nobody_watching(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let _server = isp_http_target(lab)?;
+    // No socket is open and nothing is subscribed while the LAN fetches from the ISP.
+    for _ in 0..5 {
+        let body = lanclient::http_get(
+            &lab.lan0,
+            "203.0.113.1:8080".parse()?,
+            "/",
+            Duration::from_secs(5),
+        )?;
+        ensure!(body == ISP_HTTP_BODY, "unexpected body {body:?}");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let mut ws = api.ws_with(&token)?;
+    let links = ws
+        .history(&["p0", "nope"])?
+        .map_err(|error| anyhow::anyhow!("the history was refused: {error:?}"))?;
+    ensure!(
+        links.len() == 1 && links[0].name == "p0",
+        "only the link the router has: {:?}",
+        links.iter().map(|link| &link.name).collect::<Vec<_>>()
+    );
+    let p0 = &links[0];
+    ensure!(
+        p0.monotonic_ms.len() >= 5
+            && p0.rx_bytes.len() == p0.monotonic_ms.len()
+            && p0.tx_bytes.len() == p0.monotonic_ms.len(),
+        "{} samples of p0, with {} and {} byte counts",
+        p0.monotonic_ms.len(),
+        p0.rx_bytes.len(),
+        p0.tx_bytes.len()
+    );
+    for pair in p0.monotonic_ms.windows(2) {
+        let apart = pair[1].saturating_sub(pair[0]);
+        ensure!(
+            (800..=2_500).contains(&apart),
+            "samples {apart} ms apart: {:?}",
+            p0.monotonic_ms
+        );
+    }
+    ensure!(
+        p0.rx_bytes.is_sorted() && p0.tx_bytes.is_sorted(),
+        "a counter fell: {p0:?}"
+    );
+    // The five fetches lie within the last eight samples or so, read while nobody watched.
+    let recent = &p0.rx_bytes[p0.rx_bytes.len().saturating_sub(10)..];
+    let grew = recent[recent.len() - 1] - recent[0];
+    ensure!(
+        grew >= 5 * ISP_HTTP_BODY.len() as u64,
+        "five bodies were fetched and p0 received {grew} bytes in that time: {recent:?}"
+    );
+    refused(ws.history(&[])?, ErrorCode::InvalidArgument)?;
     no_task_failed(lab)
 }

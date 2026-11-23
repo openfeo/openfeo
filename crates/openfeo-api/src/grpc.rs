@@ -13,11 +13,11 @@ use futures::Stream;
 use openfeo_config::api::{
     ApplyConfigRequest, ApplyConfigResponse, ChangePasswordRequest, ChangePasswordResponse,
     ConfirmConfigRequest, ConfirmConfigResponse, ErrorCode, GetConfigRequest, GetConfigResponse,
-    GetLeasesRequest, GetLeasesResponse, GetStateRequest, GetStateResponse, LoginRequest,
-    LoginResponse, LogoutRequest, LogoutResponse, RevertConfigRequest, RevertConfigResponse,
-    ServerMsg, SetInitialPasswordRequest, SetInitialPasswordResponse, SubscribeRequest,
-    SubscribeResponse, ValidateConfigRequest, ValidateConfigResponse, server_msg,
-    subscribe_response, telemetry,
+    GetHistoryRequest, GetHistoryResponse, GetLeasesRequest, GetLeasesResponse, GetStateRequest,
+    GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse,
+    RevertConfigRequest, RevertConfigResponse, ServerMsg, SetInitialPasswordRequest,
+    SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse, ValidateConfigRequest,
+    ValidateConfigResponse, server_msg, subscribe_response, telemetry,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -334,6 +334,18 @@ impl StateService for Grpc {
         Ok(Response::new(GetLeasesResponse {
             leases: Some(self.shared.leases()),
         }))
+    }
+
+    async fn get_history(
+        &self,
+        request: Request<GetHistoryRequest>,
+    ) -> Result<Response<GetHistoryResponse>, Status> {
+        token(&self.shared, &request)?;
+        let links = self
+            .shared
+            .history(&request.get_ref().links)
+            .map_err(|error| status(&error))?;
+        Ok(Response::new(GetHistoryResponse { links }))
     }
 
     async fn subscribe(
@@ -921,6 +933,40 @@ mod tests {
             second.body,
             Some(subscribe_response::Body::Leases(table)) if table.leases.len() == 2
         ));
+    }
+
+    #[tokio::test]
+    async fn the_history_over_grpc_needs_a_session_and_a_link() {
+        use openfeo_config::api::GetHistoryRequest;
+        let (api, token) = crate::testing::TestApi::with_password(PASSWORD).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut state = StateServiceClient::new(api.channel().await);
+        let ask = |links: &[&str]| GetHistoryRequest {
+            links: links.iter().map(|link| (*link).to_owned()).collect(),
+        };
+        let refused = state
+            .get_history(with_token(ask(&["p0"]), ""))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+        let none = state
+            .get_history(with_token(ask(&[]), &token))
+            .await
+            .unwrap_err();
+        assert_eq!(none.code(), tonic::Code::InvalidArgument);
+        let answer = state
+            .get_history(with_token(ask(&["p0"]), &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(answer.links[0].name, "p0");
+        assert!(
+            answer.links[0]
+                .monotonic_ms
+                .last()
+                .is_some_and(|ms| *ms > 0),
+            "a sample, read on the boot clock"
+        );
     }
 
     #[tokio::test]

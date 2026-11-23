@@ -15,6 +15,9 @@ pub const MAX_SOCKETS: usize = 16;
 pub const MAX_SUBSCRIPTIONS: usize = 16;
 /// Events queued for one socket before the oldest is dropped.
 pub const EVENT_QUEUE: usize = 256;
+/// The most links one `GetHistory` names. An hour of one link is up to about 90 KiB on the
+/// wire, so an hour of each of eight fits a frame.
+pub const MAX_HISTORY_LINKS: usize = 8;
 /// Recent events kept for a subscriber's backlog.
 pub const EVENT_BACKLOG: usize = 256;
 /// The server pings an open socket this often.

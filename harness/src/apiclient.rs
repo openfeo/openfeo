@@ -27,12 +27,12 @@ use openfeo_api::pb::state_service_client::StateServiceClient;
 use openfeo_config::Config;
 use openfeo_config::api::{
     ApplyConfigRequest, Auth, ClientMsg, ConfirmConfigRequest, Error, GetConfigRequest,
-    GetConfigResponse, GetLeasesRequest, GetStateRequest, Request, RevertConfigRequest, ServerMsg,
-    Subscribe, ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response,
-    server_msg, telemetry,
+    GetConfigResponse, GetHistoryRequest, GetLeasesRequest, GetStateRequest, Request,
+    RevertConfigRequest, ServerMsg, Subscribe, ValidateConfigRequest, ValidateConfigResponse,
+    client_msg, request, response, server_msg, telemetry,
 };
 use openfeo_config::events::Event;
-use openfeo_config::state::{Counters, Leases, State};
+use openfeo_config::state::{Counters, Leases, LinkHistory, State};
 use prost::Message as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -781,6 +781,23 @@ impl Ws {
             },
             other => bail!("not a response: {other:?}"),
         }
+    }
+
+    /// Ask for the last hour of `links`' byte counters (`GetHistory`): the links the router
+    /// has samples of, or its refusal.
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes, or it is neither.
+    pub fn history(&mut self, links: &[&str]) -> Result<Result<Vec<LinkHistory>, Error>> {
+        let ask = GetHistoryRequest {
+            links: links.iter().map(|link| (*link).to_owned()).collect(),
+        };
+        Ok(match self.answered(request::Body::GetHistory(ask))? {
+            Ok(response::Body::GetHistory(answer)) => Ok(answer.links),
+            Ok(other) => bail!("not the history: {other:?}"),
+            Err(error) => Err(error),
+        })
     }
 
     /// The next `leases` push that satisfies `wanted`.

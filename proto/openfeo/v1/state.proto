@@ -221,7 +221,8 @@ message Leases {
 }
 
 // Interface and connection counters at one moment (SPEC §10). The router computes no rates: a
-// client takes two of these and their times.
+// client takes two of these and their times. They are read once a second whether or not
+// anyone listens, and the last hour of each link's byte counters is kept (`LinkHistory`).
 message Counters {
   // When they were read, on the clock that counts from the kernel's boot.
   uint64 monotonic_ms = 1;
@@ -238,4 +239,16 @@ message LinkCounters {
   uint64 tx_packets = 5;
   uint64 rx_errors = 6;
   uint64 tx_errors = 7;
+}
+
+// The byte counters of one link over the last hour, as they were read (SPEC §10): what
+// `GetHistory` answers. A link that did not exist for a while has no samples for that while,
+// and a reader sees the gap in the times.
+message LinkHistory {
+  string name = 1;
+  // When each sample was read, on the clock of `Counters.monotonic_ms`; oldest first.
+  repeated uint64 monotonic_ms = 2;
+  // One per sample.
+  repeated uint64 rx_bytes = 3;
+  repeated uint64 tx_bytes = 4;
 }

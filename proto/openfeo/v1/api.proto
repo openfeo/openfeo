@@ -63,6 +63,7 @@ message Request {
     ConfirmConfigRequest confirm_config = 7;
     RevertConfigRequest revert_config = 8;
     GetLeasesRequest get_leases = 9;
+    GetHistoryRequest get_history = 10;
   }
 }
 
@@ -78,6 +79,7 @@ message Response {
     ConfirmConfigResponse confirm_config = 7;
     RevertConfigResponse revert_config = 8;
     GetLeasesResponse get_leases = 9;
+    GetHistoryResponse get_history = 10;
   }
 }
 
@@ -171,6 +173,17 @@ message GetLeasesResponse {
   Leases leases = 1;
 }
 
+// The last hour of some links' byte counters (SPEC §8.3, §10).
+message GetHistoryRequest {
+  // Kernel names, as `WanState.interface` gives them. At least one and at most eight.
+  repeated string links = 1;
+}
+
+message GetHistoryResponse {
+  // One for each link asked for that the router has samples of, in the order asked.
+  repeated LinkHistory links = 1;
+}
+
 message SubscribeRequest {
   repeated string topics = 1;
   // For `events`: send this many recent events first.
@@ -189,6 +202,7 @@ message SubscribeResponse {
 service StateService {
   rpc GetState(GetStateRequest) returns (GetStateResponse);
   rpc GetLeases(GetLeasesRequest) returns (GetLeasesResponse);
+  rpc GetHistory(GetHistoryRequest) returns (GetHistoryResponse);
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 }
 

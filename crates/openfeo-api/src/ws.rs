@@ -18,8 +18,9 @@ use axum::response::{IntoResponse, Response};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{Sink, SinkExt as _, StreamExt as _};
 use openfeo_config::api::{
-    ChangePasswordResponse, ConfirmConfigResponse, ErrorCode, GetLeasesResponse, GetStateResponse,
-    LogoutResponse, Request, RevertConfigResponse, ServerMsg, request, response,
+    ChangePasswordResponse, ConfirmConfigResponse, ErrorCode, GetHistoryResponse,
+    GetLeasesResponse, GetStateResponse, LogoutResponse, Request, RevertConfigResponse, ServerMsg,
+    request, response,
 };
 use prost::Message as _;
 use tokio::sync::broadcast;
@@ -148,6 +149,9 @@ pub(crate) async fn perform(
         }),
         Some(request::Body::GetLeases(_)) => response::Body::GetLeases(GetLeasesResponse {
             leases: Some(shared.leases()),
+        }),
+        Some(request::Body::GetHistory(ask)) => response::Body::GetHistory(GetHistoryResponse {
+            links: shared.history(&ask.links)?,
         }),
         Some(request::Body::Logout(_)) => {
             shared.logout(token);
@@ -655,6 +659,53 @@ pub(crate) mod tests {
             panic!("not the leases: {reply:?}");
         };
         assert_eq!(answer.leases.map(|table| table.leases.len()), Some(2));
+    }
+
+    /// SPEC §8.3, §10: the hour is there for whoever asks, without having subscribed to
+    /// anything; and a request names at least one link and at most eight.
+    #[tokio::test]
+    async fn the_history_is_answered_and_its_request_is_bounded() {
+        use openfeo_config::api::GetHistoryRequest;
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        // The test API's source has one link; give it two reads.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let ask = |links: &[&str]| {
+            request::Body::GetHistory(GetHistoryRequest {
+                links: links.iter().map(|link| (*link).to_owned()).collect(),
+            })
+        };
+        let server_msg::Body::Response(reply) = ws.ask(ask(&["p0", "nope"])).await else {
+            panic!("not a response");
+        };
+        let Some(response::Body::GetHistory(answer)) = reply.body else {
+            panic!("not the history: {reply:?}");
+        };
+        assert_eq!(
+            answer.links.len(),
+            1,
+            "only the link the router has samples of"
+        );
+        let p0 = &answer.links[0];
+        assert_eq!(p0.name, "p0");
+        assert!(p0.monotonic_ms.len() >= 2, "{p0:?}");
+        assert!(p0.monotonic_ms.is_sorted(), "oldest first");
+        assert_eq!(
+            p0.rx_bytes, p0.monotonic_ms,
+            "the test source's bytes are its clock"
+        );
+        assert_eq!(p0.tx_bytes.len(), p0.monotonic_ms.len());
+        for links in [&[][..], &["a", "b", "c", "d", "e", "f", "g", "h", "i"][..]] {
+            let server_msg::Body::Error(error) = ws.ask(ask(links)).await else {
+                panic!("{} links were answered", links.len());
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{links:?}");
+        }
+        let server_msg::Body::Response(_) =
+            ws.ask(ask(&["a", "b", "c", "d", "e", "f", "g", "h"])).await
+        else {
+            panic!("eight links were refused");
+        };
     }
 
     /// Subscribing to `state` marks the World as seen. A lease that changed in that World,
