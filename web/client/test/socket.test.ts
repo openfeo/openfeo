@@ -8,6 +8,8 @@ import {
   CountersSchema,
   ErrorCode,
   EventSchema,
+  LeasesSchema,
+  LinkHistorySchema,
   memoryTokenStore,
   Router,
   RouterError,
@@ -15,6 +17,7 @@ import {
   type Connection,
   type Counters,
   type Event,
+  type Leases,
   type SessionEnd,
   type State,
 } from '../src/index.js'
@@ -232,6 +235,62 @@ test('state and counters pushes reach every listener of their topic', () => {
   expect(states.map((pushed) => pushed.generation)).toEqual([3n])
   expect(more.map((pushed) => pushed.generation)).toEqual([3n])
   expect(counters.map((pushed) => pushed.monotonicMs)).toEqual([5n])
+})
+
+test('the lease table is a topic of its own, pushed whole', () => {
+  const { router, socket } = setup()
+  const tables: Leases[] = []
+  const subscription = router.subscribe('leases', (pushed) => tables.push(pushed))
+  socket().accept()
+  expect(socket().kinds()).toEqual(['auth', 'subscribe'])
+  const frame = socket().last()
+  expect(frame.body.case === 'subscribe' && frame.body.value.topic).toBe('leases')
+  const table = create(LeasesSchema, {
+    timeUnix: 1_800_000_000n,
+    leases: [{ lan: 'lan0', address: '192.168.1.143', mac: '02:00:00:3a:11:9e', hostname: 'plug-kitchen', joinedUnix: 1_799_999_880n }],
+  })
+  socket().receive({ id: 0, body: { case: 'telemetry', value: { topic: 'leases', body: { case: 'leases', value: table } } } })
+  expect(tables.map((pushed) => [pushed.timeUnix, pushed.leases[0]?.hostname])).toEqual([[1_800_000_000n, 'plug-kitchen']])
+  subscription.close()
+  const gone = socket().last()
+  expect(gone.body.case === 'unsubscribe' && gone.body.value.topic).toBe('leases')
+})
+
+test('the leases are asked for by a call, and so is the last hour of some links', async () => {
+  const { router, socket } = setup()
+  const asked = router.leases()
+  socket().accept()
+  const first = socket().last()
+  expect(first.body.case === 'request' && first.body.value.body.case).toBe('getLeases')
+  socket().receive({
+    id: socket().last().id,
+    body: { case: 'response', value: { body: { case: 'getLeases', value: { leases: { timeUnix: 5n, leases: [{ address: '192.168.1.143' }] } } } } },
+  })
+  expect((await asked).leases.map((lease) => lease.address)).toEqual(['192.168.1.143'])
+
+  const hour = router.history(['ppp-wan0', 'p1'])
+  const request = socket().last()
+  expect(request.body.case === 'request' && request.body.value.body.case === 'getHistory' && request.body.value.body.value.links).toEqual([
+    'ppp-wan0',
+    'p1',
+  ])
+  const link = create(LinkHistorySchema, { name: 'ppp-wan0', monotonicMs: [1_000n], rxBytes: [10n], txBytes: [1n] })
+  socket().receive({ id: request.id, body: { case: 'response', value: { body: { case: 'getHistory', value: { links: [link] } } } } })
+  expect((await hour).map((found) => found.name)).toEqual(['ppp-wan0'])
+})
+
+test('an answer of another kind to a call for the leases or the history is an error, not a guess', async () => {
+  const { router, socket } = setup()
+  const leases = router.leases()
+  socket().accept()
+  socket().receive({ id: socket().last().id, body: { case: 'response', value: { body: { case: 'getState', value: {} } } } })
+  expect((await refusal(leases)).code).toBe(ErrorCode.INTERNAL)
+  const empty = router.leases()
+  socket().receive({ id: socket().last().id, body: { case: 'response', value: { body: { case: 'getLeases', value: {} } } } })
+  expect((await refusal(empty)).code).toBe(ErrorCode.INTERNAL)
+  const hour = router.history(['p0'])
+  socket().receive({ id: socket().last().id, body: { case: 'response', value: { body: { case: 'getState', value: {} } } } })
+  expect((await refusal(hour)).code).toBe(ErrorCode.INTERNAL)
 })
 
 test('a listener that throws does not stop the others or the socket, and its error is reported', () => {

@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Andrew Newton
 
 // How a test running inside the lab asks the lab for something only the harness can do: take
-// a port's carrier away, give it back, move the LAN host to another subnet. The harness names
+// a port's carrier away, give it back, move the LAN host to another subnet, have a device
+// join the LAN. The harness names
 // a directory in OPENFEO_LAB_CTL; a request is a file `<n>.req` holding a verb and what it
 // takes, numbered from 1, and its answer is `<n>.ack`: `ok`, or `error: <why>`. The other end
 // is `LabCtl` in harness/src/web.rs, and the verbs are `lab_verb`'s in harness/tests/m4.rs.
@@ -17,9 +18,10 @@ let asked = 0
 
 /**
  * Ask the lab to do `verb` and wait until it has. The verbs: `wan-down` and `wan-up` (the WAN
- * port's carrier), `lan-down` and `lan-up` (the LAN port's), and `lan-to <cidr> <gateway>`
- * (the LAN host gives up its IPv4 address and takes `<cidr>`, with `<gateway>` as its default
- * route: what a person does to follow a router that moved).
+ * port's carrier), `lan-down` and `lan-up` (the LAN port's), `lan-to <cidr> <gateway>` (the
+ * LAN host gives up its IPv4 address and takes `<cidr>`, with `<gateway>` as its default
+ * route: what a person does to follow a router that moved), and `join <hostname>` (a device
+ * takes a lease on the LAN under that name; the LAN host's own address is left alone).
  *
  * @param {string} verb
  * @returns {Promise<void>}

@@ -1114,9 +1114,10 @@ fn a_harness_build_takes_one_extra_host_name(lab: &mut Lab) -> anyhow::Result<()
 }
 
 /// What a test inside the lab may ask of it (`web/scripts/labctl.mjs`): the WAN port's carrier
-/// and the LAN port's, taken away and given back as the link-flap scenarios do, and the LAN
+/// and the LAN port's, taken away and given back as the link-flap scenarios do, the LAN
 /// host moved to another subnet (`lan-to <cidr> <gateway>`: [`rehome`]), as a person follows a
-/// router whose address they changed.
+/// router whose address they changed, and a device that joins the LAN (`join <hostname>`:
+/// [`join`]).
 fn lab_verb(lab: &Lab, qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
     let words: Vec<&str> = verb.split_whitespace().collect();
     match words.as_slice() {
@@ -1125,13 +1126,33 @@ fn lab_verb(lab: &Lab, qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
         ["lan-down"] => qmp.set_link("p2", false),
         ["lan-up"] => qmp.set_link("p2", true),
         ["lan-to", cidr, gateway] => rehome(lab, cidr, gateway),
+        ["join", hostname] => join(lab, hostname),
         _ => anyhow::bail!("no such verb: {verb}"),
     }
 }
 
+/// A device joins `lan0`: the harness's own DHCP client takes a lease there under `hostname`.
+/// Unlike udhcpc's script it puts no address on the interface, so whatever else runs in the
+/// namespace (a browser, Node) keeps the address it had.
+fn join(lab: &Lab, hostname: &str) -> anyhow::Result<()> {
+    let events = lanclient::dhcp_client(
+        env!("CARGO_BIN_EXE_openfeo-harness"),
+        &lab.lan0,
+        "lan0",
+        &["--hostname", hostname],
+        Duration::from_secs(15),
+    )?;
+    ensure!(
+        events.iter().any(|event| event["event"] == "bound"),
+        "{hostname} was given no lease: {events:?}"
+    );
+    Ok(())
+}
+
 /// `@openfeo/client`'s own tests (SPEC §11), run by Node inside the LAN namespace against the
-/// booted router: the first password, login, state, counters and rates, a WAN that goes and
-/// comes, a LAN link that goes silent and returns, and a session ended from elsewhere.
+/// booted router: the first password, login, state, counters and rates, the history that was
+/// kept before anyone asked, a device that joins and is pushed in the lease table, a WAN that
+/// goes and comes, a LAN link that goes silent and returns, and a session ended from elsewhere.
 /// Skipped, with the reason, on a machine without Node or the workspace's packages.
 fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
     web::node_ready()?;

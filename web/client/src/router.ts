@@ -16,7 +16,7 @@ import {
 } from './gen/openfeo/v1/api_pb.js'
 import type { Config } from './gen/openfeo/v1/config_pb.js'
 import type { Event } from './gen/openfeo/v1/events_pb.js'
-import type { ConfigEffect, ConfigViolation, Counters, State } from './gen/openfeo/v1/state_pb.js'
+import type { ConfigEffect, ConfigViolation, Counters, Leases, LinkHistory, State } from './gen/openfeo/v1/state_pb.js'
 import { call, type Http } from './http.js'
 import type { RouterOptions, Timers, WebSocketLike } from './options.js'
 import { Link, type Ask, type Connection, type SessionEnd, type Subscription } from './socket.js'
@@ -166,6 +166,33 @@ export class Router {
     return reply.body.value.state
   }
 
+  /**
+   * Every LAN's DHCPv4 leases, with the router's clock: ages are counted against that, not
+   * against this machine's. At most 4096, the newest by when they joined; `truncated` says
+   * when there were more.
+   */
+  async leases(): Promise<Leases> {
+    const reply = await this.#link.request({ case: 'getLeases', value: {} })
+    if (reply.body.case !== 'getLeases' || reply.body.value.leases === undefined) {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered without the leases')
+    }
+    return reply.body.value.leases
+  }
+
+  /**
+   * The last hour of some links' byte counters, a sample a second, for the links the router
+   * has samples of, in the order asked. `links` are kernel names, as a WAN's `interface` in
+   * the state gives them: at least one and at most eight (`INVALID_ARGUMENT` otherwise).
+   * `samplesOf` and `ratesOver` make rates of an answer.
+   */
+  async history(links: string[]): Promise<LinkHistory[]> {
+    const reply = await this.#link.request({ case: 'getHistory', value: { links } })
+    if (reply.body.case !== 'getHistory') {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered a call for the history with something else')
+    }
+    return reply.body.value.links
+  }
+
   /** The running config without its secrets, the tag an apply must name, and the router's default window. */
   async config(): Promise<ConfigView> {
     const reply = await this.#link.request({ case: 'getConfig', value: {} })
@@ -239,20 +266,24 @@ export class Router {
 
   /**
    * Listen to a topic until the subscription is closed: `state` is the whole state now and
-   * after every change, `counters` a sample each second, `events` each event as it happens
-   * (with the last `backlog` first; `onLost` when the router had to drop some).
+   * after every change, `leases` the whole lease table now and whenever a lease in it
+   * changes, `counters` a sample each second, `events` each event as it happens (with the
+   * last `backlog` first; `onLost` when the router had to drop some).
    */
   subscribe(topic: 'state', onPush: (state: State) => void): Subscription
+  subscribe(topic: 'leases', onPush: (leases: Leases) => void): Subscription
   subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
   subscribe(topic: 'events', onPush: (event: Event) => void, options?: { backlog?: number; onLost?: () => void }): Subscription
   subscribe(
-    topic: 'state' | 'counters' | 'events',
-    onPush: ((state: State) => void) | ((counters: Counters) => void) | ((event: Event) => void),
+    topic: 'state' | 'leases' | 'counters' | 'events',
+    onPush: ((state: State) => void) | ((leases: Leases) => void) | ((counters: Counters) => void) | ((event: Event) => void),
     options: { backlog?: number; onLost?: () => void } = {},
   ): Subscription {
     switch (topic) {
       case 'state':
         return this.#link.subscribeState(onPush as (state: State) => void)
+      case 'leases':
+        return this.#link.subscribeLeases(onPush as (leases: Leases) => void)
       case 'counters':
         return this.#link.subscribeCounters(onPush as (counters: Counters) => void)
       case 'events':

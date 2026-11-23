@@ -116,6 +116,21 @@ test('a dropped socket is replaced, authenticated and subscribed again, and the 
   expect(ends).toEqual([])
 })
 
+test('the leases are subscribed again on the new socket', () => {
+  const { router, socket, timers } = setup()
+  const tables: bigint[] = []
+  router.subscribe('leases', (table) => tables.push(table.timeUnix))
+  socket().accept()
+  socket().drop(1006)
+  timers.advance(500)
+  socket().accept()
+  expect(socket().kinds()).toEqual(['auth', 'subscribe'])
+  const frame = socket().last()
+  expect(frame.body.case === 'subscribe' && frame.body.value.topic).toBe('leases')
+  socket().receive({ id: 0, body: { case: 'telemetry', value: { topic: 'leases', body: { case: 'leases', value: { timeUnix: 7n } } } } })
+  expect(tables).toEqual([7n])
+})
+
 test('what was waiting when the socket dropped is rejected UNAVAILABLE and not sent again', async () => {
   const { router, socket, timers } = setup()
   router.subscribe('state', () => undefined)

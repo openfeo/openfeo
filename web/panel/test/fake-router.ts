@@ -10,6 +10,7 @@ import {
   create,
   ErrorCode,
   GetStatusResponseSchema,
+  LeasesSchema,
   RouterError,
   SessionSchema,
   type Applied,
@@ -19,6 +20,8 @@ import {
   type Counters,
   type Event,
   type GetStatusResponse,
+  type Leases,
+  type LinkHistory,
   type Reverted,
   type Session,
   type SessionEnd,
@@ -29,10 +32,11 @@ import {
 
 import type { PanelRouter } from '../src/session'
 
-type Listener = ((state: State) => void) | ((counters: Counters) => void) | ((event: Event) => void)
+type Listener = ((state: State) => void) | ((leases: Leases) => void) | ((counters: Counters) => void) | ((event: Event) => void)
+type Topic = 'state' | 'leases' | 'counters' | 'events'
 
 interface Listening {
-  topic: 'state' | 'counters' | 'events'
+  topic: Topic
   onPush: Listener
   backlog: number
   onLost: (() => void) | undefined
@@ -70,6 +74,10 @@ export class FakeRouter implements PanelRouter {
   configNow: ConfigView = { config: create(ConfigSchema, {}), tag: 't0', confirmSecs: 120 }
   /** While set, `config` fails as a router that cannot be reached. */
   configUnreachable = false
+  /** What `leases` answers. */
+  leasesNow: Leases = create(LeasesSchema, {})
+  /** What `history` answers for the links it is asked of, or the refusal it throws. */
+  historyNow: LinkHistory[] | RouterError = []
   /** What `validate` answers. */
   validation: Validation = { violations: [], effects: [], caller: undefined }
   /** What `apply` answers, or the refusal it throws. */
@@ -87,6 +95,8 @@ export class FakeRouter implements PanelRouter {
     setInitialPassword: [] as string[],
     logout: 0,
     state: 0,
+    leases: 0,
+    history: [] as string[][],
     config: 0,
     validate: [] as Config[],
     apply: [] as { config: Config; tag: string; immediate: boolean }[],
@@ -140,6 +150,22 @@ export class FakeRouter implements PanelRouter {
       : Promise.resolve(this.stateNow)
   }
 
+  leases(): Promise<Leases> {
+    this.calls.leases += 1
+    return Promise.resolve(this.leasesNow)
+  }
+
+  async history(links: string[]): Promise<LinkHistory[]> {
+    this.calls.history.push([...links])
+    await this.#held.get('history')?.promise
+    if (this.historyNow instanceof RouterError) {
+      throw this.historyNow
+    }
+    // As the router does: only the links asked for, in the order asked.
+    const known = this.historyNow
+    return links.flatMap((link) => known.filter((history) => history.name === link))
+  }
+
   async config(): Promise<ConfigView> {
     this.calls.config += 1
     await this.#held.get('config')?.promise
@@ -183,9 +209,10 @@ export class FakeRouter implements PanelRouter {
   }
 
   subscribe(topic: 'state', onPush: (state: State) => void): Subscription
+  subscribe(topic: 'leases', onPush: (leases: Leases) => void): Subscription
   subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
   subscribe(topic: 'events', onPush: (event: Event) => void, options?: { backlog?: number; onLost?: () => void }): Subscription
-  subscribe(topic: 'state' | 'counters' | 'events', onPush: Listener, options: { backlog?: number; onLost?: () => void } = {}): Subscription {
+  subscribe(topic: Topic, onPush: Listener, options: { backlog?: number; onLost?: () => void } = {}): Subscription {
     // As the client does: with no session there is nothing to subscribe on, and it says so at once.
     if (!this.authenticated) {
       throw new RouterError(ErrorCode.UNAUTHENTICATED, 'not logged in')
@@ -212,16 +239,17 @@ export class FakeRouter implements PanelRouter {
   // What a test does to it.
 
   /** The open subscriptions to a topic. */
-  open(topic: 'state' | 'counters' | 'events'): Listening[] {
+  open(topic: Topic): Listening[] {
     return this.listening.filter((entry) => entry.topic === topic && !entry.closed)
   }
 
   push(topic: 'state', value: State): void
+  push(topic: 'leases', value: Leases): void
   push(topic: 'counters', value: Counters): void
   push(topic: 'events', value: Event): void
-  push(topic: 'state' | 'counters' | 'events', value: State | Counters | Event): void {
+  push(topic: Topic, value: State | Leases | Counters | Event): void {
     for (const entry of this.open(topic)) {
-      ;(entry.onPush as (value: State | Counters | Event) => void)(value)
+      ;(entry.onPush as (value: State | Leases | Counters | Event) => void)(value)
     }
   }
 
@@ -251,7 +279,7 @@ export class FakeRouter implements PanelRouter {
   }
 
   /** Make calls of one kind wait until the returned function is called. */
-  holdCall(name: 'config' | 'validate' | 'apply' | 'confirm' | 'revert'): () => void {
+  holdCall(name: 'config' | 'validate' | 'apply' | 'confirm' | 'revert' | 'history'): () => void {
     const gate = held<void>()
     this.#held.set(name, gate)
     return () => {
