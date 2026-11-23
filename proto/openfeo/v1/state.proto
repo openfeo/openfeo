@@ -198,6 +198,28 @@ message AddressState {
   bool deprecated = 5;
 }
 
+// One device holding an address from a LAN's DHCPv4 server (SPEC §7.6).
+message Lease {
+  string lan = 1;
+  string address = 2;
+  string mac = 3;
+  // The reservation's name, else the one the device gave; empty for none.
+  string hostname = 4;
+  // When the device first took this address (wall clock, seconds). A renewal does not move it.
+  uint64 joined_unix = 5;
+  uint64 expires_unix = 6;
+}
+
+// Every LAN's leases (SPEC §8.3): what `GetLeases` answers and the `leases` topic pushes.
+message Leases {
+  // The router's wall clock when this was built: ages are counted against it, not the reader's.
+  uint64 time_unix = 1;
+  // By LAN in config order, then by address.
+  repeated Lease leases = 2;
+  // More leases exist than are here; those that joined longest ago were left out.
+  bool truncated = 3;
+}
+
 // Interface and connection counters at one moment (SPEC §10). The router computes no rates: a
 // client takes two of these and their times.
 message Counters {
