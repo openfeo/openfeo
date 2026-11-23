@@ -15,7 +15,7 @@ use openfeo_config::api::{
     telemetry,
 };
 use openfeo_config::events::Event;
-use openfeo_config::state::{Counters, State};
+use openfeo_config::state::{Counters, Lease, Leases, State};
 use prost::Message as _;
 
 use crate::limits::{EVENT_BACKLOG, EVENT_QUEUE, MAX_FRAME, MAX_SUBSCRIPTIONS};
@@ -58,6 +58,8 @@ pub enum Out {
 pub enum Topic {
     /// The whole `State`, now and after every change; coalesced.
     State,
+    /// Every LAN's leases, now and whenever one changes; coalesced.
+    Leases,
     /// `Counters` once a second; coalesced.
     Counters,
     /// Events as they happen; queued.
@@ -70,6 +72,7 @@ impl Topic {
     pub fn parse(name: &str) -> Option<Topic> {
         match name {
             "state" => Some(Topic::State),
+            "leases" => Some(Topic::Leases),
             "counters" => Some(Topic::Counters),
             "events" => Some(Topic::Events),
             _ => None,
@@ -81,6 +84,7 @@ impl Topic {
     pub const fn as_str(self) -> &'static str {
         match self {
             Topic::State => "state",
+            Topic::Leases => "leases",
             Topic::Counters => "counters",
             Topic::Events => "events",
         }
@@ -95,6 +99,9 @@ pub struct Conn {
     topics: BTreeSet<Topic>,
     replies: VecDeque<ServerMsg>,
     state: Option<State>,
+    leases: Option<Leases>,
+    /// The leases of the last table taken, and whether it was cut: what the next is told from.
+    leases_taken: Option<(Vec<Lease>, bool)>,
     counters: Option<Counters>,
     events: VecDeque<Event>,
     lost: bool,
@@ -231,6 +238,10 @@ impl Conn {
                 self.topics.remove(&topic);
                 match topic {
                     Topic::State => self.state = None,
+                    Topic::Leases => {
+                        self.leases = None;
+                        self.leases_taken = None;
+                    }
                     Topic::Counters => self.counters = None,
                     Topic::Events => {
                         self.events.clear();
@@ -284,6 +295,25 @@ impl Conn {
         }
     }
 
+    /// The lease table; replaces one not yet sent. Dropped unless subscribed, and dropped
+    /// when its leases are those of the last table taken: every table carries the router's
+    /// clock, and the clock alone is no change.
+    pub fn push_leases(&mut self, leases: &Leases) {
+        if !self.wants(Topic::Leases) {
+            return;
+        }
+        let same = self
+            .leases_taken
+            .as_ref()
+            .is_some_and(|(taken, truncated)| {
+                *taken == leases.leases && *truncated == leases.truncated
+            });
+        if !same {
+            self.leases_taken = Some((leases.leases.clone(), leases.truncated));
+            self.leases = Some(leases.clone());
+        }
+    }
+
     /// The latest `Counters`; replaces one not yet sent. Dropped unless subscribed.
     pub fn push_counters(&mut self, counters: &Counters) {
         if self.wants(Topic::Counters) {
@@ -307,7 +337,7 @@ impl Conn {
     }
 
     /// What the writer sends next: replies first, then word of lost events, then the latest
-    /// state and counters, then events in order.
+    /// state, leases and counters, then events in order.
     pub fn next_out(&mut self) -> Option<ServerMsg> {
         if self.closed {
             return None;
@@ -332,6 +362,9 @@ impl Conn {
         };
         if let Some(state) = self.state.take() {
             return Some(telemetry(Topic::State, telemetry::Body::State(state)));
+        }
+        if let Some(leases) = self.leases.take() {
+            return Some(telemetry(Topic::Leases, telemetry::Body::Leases(leases)));
         }
         if let Some(counters) = self.counters.take() {
             return Some(telemetry(
@@ -594,6 +627,99 @@ mod tests {
             [Out::Close(1009)]
         );
         assert_eq!(authed().on_text(), [Out::Close(1003)]);
+    }
+
+    fn table(time_unix: u64, addresses: &[&str]) -> Leases {
+        Leases {
+            time_unix,
+            leases: addresses
+                .iter()
+                .map(|address| Lease {
+                    lan: "lan0".into(),
+                    address: (*address).into(),
+                    ..Lease::default()
+                })
+                .collect(),
+            truncated: false,
+        }
+    }
+
+    fn pushed_leases(message: &ServerMsg) -> Option<Leases> {
+        match &message.body {
+            Some(server_msg::Body::Telemetry(Telemetry {
+                topic,
+                body: Some(telemetry::Body::Leases(leases)),
+            })) if topic == "leases" => Some(leases.clone()),
+            _ => None,
+        }
+    }
+
+    /// SPEC §8.3: the whole table when subscribed and whenever a lease in it changes,
+    /// coalesced as `state` is. The router's clock moves on in every table built; that alone
+    /// is not a change.
+    #[test]
+    fn a_lease_table_is_coalesced_and_an_unchanged_one_is_not_sent_again() {
+        let mut conn = authed();
+        conn.push_leases(&table(1, &["192.168.1.100"]));
+        assert_eq!(conn.next_out(), None, "not subscribed: dropped");
+        assert_eq!(
+            conn.on_binary(&encode(&client(2, subscribe("leases", 0))), &mut Fake),
+            [Out::Send(ack(2))]
+        );
+        assert!(conn.wants(Topic::Leases));
+        conn.push_leases(&table(1, &["192.168.1.100"]));
+        conn.push_leases(&table(2, &["192.168.1.100", "192.168.1.101"]));
+        let sent = drain(&mut conn);
+        assert_eq!(sent.len(), 1, "the older one was replaced, not queued");
+        assert_eq!(
+            pushed_leases(&sent[0]),
+            Some(table(2, &["192.168.1.100", "192.168.1.101"]))
+        );
+        conn.push_leases(&table(9, &["192.168.1.100", "192.168.1.101"]));
+        assert_eq!(conn.next_out(), None, "the same leases at a later time");
+        let mut cut = table(10, &["192.168.1.100", "192.168.1.101"]);
+        cut.truncated = true;
+        conn.push_leases(&cut);
+        assert_eq!(drain(&mut conn).len(), 1, "that it was cut is a change");
+        // Leaving and coming back starts afresh: the table as it stands is sent again.
+        conn.push_leases(&table(11, &["192.168.1.102"]));
+        let out = conn.on_binary(
+            &encode(&client(
+                3,
+                Body::Unsubscribe(Unsubscribe {
+                    topic: "leases".into(),
+                }),
+            )),
+            &mut Fake,
+        );
+        assert_eq!(out, [Out::Send(ack(3))]);
+        assert_eq!(conn.next_out(), None, "the unsent table went");
+        assert_eq!(
+            conn.on_binary(&encode(&client(4, subscribe("leases", 0))), &mut Fake),
+            [Out::Send(ack(4))]
+        );
+        conn.push_leases(&table(12, &["192.168.1.102"]));
+        assert_eq!(
+            pushed_leases(&conn.next_out().expect("the table again")),
+            Some(table(12, &["192.168.1.102"]))
+        );
+    }
+
+    /// What the writer sends first when everything is waiting.
+    #[test]
+    fn the_leases_go_after_the_state_and_before_the_counters() {
+        let mut conn =
+            Conn::subscribed(&[Topic::State, Topic::Leases, Topic::Counters, Topic::Events]);
+        conn.push_event(&event(1));
+        conn.push_counters(&Counters::default());
+        conn.push_leases(&table(1, &["192.168.1.100"]));
+        conn.push_state(&State::default());
+        let sent = drain(&mut conn);
+        assert_eq!(sent.len(), 4);
+        assert!(pushed_generation(&sent[0]).is_some());
+        assert!(pushed_leases(&sent[1]).is_some());
+        assert_eq!(event_number(&sent[3]), Some(1));
+        assert_eq!(Topic::parse("leases").map(Topic::as_str), Some("leases"));
     }
 
     #[test]

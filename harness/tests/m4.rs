@@ -171,6 +171,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "leases_survive_a_restart_after_the_clock_stepped",
         run: leases_survive_a_restart_after_the_clock_stepped,
     },
+    Scenario {
+        name: "a_lease_is_listed_and_keeps_its_joined_time",
+        run: a_lease_is_listed_and_keeps_its_joined_time,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -2483,6 +2487,104 @@ fn leases_survive_a_restart_after_the_clock_stepped(lab: &mut Lab) -> anyhow::Re
         udhcpc_env(&again, "ip")? == ip,
         "after the restart the client was given {:?}, not {ip}",
         udhcpc_env(&again, "ip")
+    );
+    no_task_failed(lab)
+}
+
+/// SPEC §7.6 and §8.3 (M4 part 3a): a device that takes a lease is in the lease table, pushed
+/// to a subscriber and answered to a call, with the name it gave and when it joined. Asking
+/// again for the address it holds moves the lease's end and not its joined time; and the
+/// joined time outlives a restart of the LAN's server, which reads it back from the lease
+/// file.
+fn a_lease_is_listed_and_keeps_its_joined_time(lab: &mut Lab) -> anyhow::Result<()> {
+    const NAMED: &[&str] = &["-x", "hostname:plug-kitchen"];
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    ws.subscribe("leases", 0)?;
+    let empty = ws.leases_where(SOON, |_| true)?;
+    ensure!(
+        empty.leases.is_empty() && !empty.truncated,
+        "a table before anyone took a lease: {empty:?}"
+    );
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    ensure!(
+        empty.time_unix.abs_diff(host_now) <= 30,
+        "the table's clock is {}, and the VM's clock chip follows this host's {host_now}",
+        empty.time_unix
+    );
+    let first = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, NAMED, UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&first, "ip")?.to_owned();
+    let table = ws.leases_where(SOON, |table| !table.leases.is_empty())?;
+    ensure!(table.leases.len() == 1, "one client, one lease: {table:?}");
+    let lease = table.leases[0].clone();
+    ensure!(
+        lease.lan == "lan0" && lease.address == ip && lease.hostname == "plug-kitchen",
+        "the lease udhcpc was given, with its name: {lease:?}"
+    );
+    ensure!(
+        re(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$").is_match(&lease.mac),
+        "a hardware address: {lease:?}"
+    );
+    ensure!(
+        lease.joined_unix.abs_diff(table.time_unix) <= 5 && lease.expires_unix > table.time_unix,
+        "joined just now and still running, by the table's own clock: {table:?}"
+    );
+    let asked = ws.leases()?;
+    ensure!(
+        asked.leases == table.leases,
+        "the call and the push disagree: {asked:?}"
+    );
+    // The same client asks afresh for the address it holds, as a device plugged in again
+    // does: the lease's end moves on, and when it joined does not.
+    std::thread::sleep(Duration::from_secs(2));
+    let again = lanclient::udhcpc(
+        &lab.lan0,
+        "lan0",
+        &lab.run_dir,
+        &["-r", &ip, "-x", "hostname:plug-kitchen"],
+        UDHCPC_TIMEOUT,
+    )?;
+    ensure!(
+        udhcpc_env(&again, "ip")? == ip,
+        "another address: {again:?}"
+    );
+    let renewed = ws.leases_where(SOON, |table| {
+        table
+            .leases
+            .first()
+            .is_some_and(|now| now.expires_unix > lease.expires_unix)
+    })?;
+    ensure!(
+        renewed.leases[0].joined_unix == lease.joined_unix,
+        "asking again moved the joined time from {} to {}",
+        lease.joined_unix,
+        renewed.leases[0].joined_unix
+    );
+    // A reservation for some other device restarts the LAN's server, which starts from the
+    // lease file: the joined time is in it.
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    lab.console()?.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: lan lan0 dhcp restored 1 leases"),
+        SOON,
+    )?;
+    let deadline = Instant::now() + SOON;
+    let restored = loop {
+        let table = ws.leases()?;
+        if let Some(found) = table.leases.first() {
+            break found.clone();
+        }
+        ensure!(Instant::now() < deadline, "no lease after the restart");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    ensure!(
+        restored.address == ip && restored.joined_unix == lease.joined_unix,
+        "after the server restarted: {restored:?}, joined {} before",
+        lease.joined_unix
     );
     no_task_failed(lab)
 }

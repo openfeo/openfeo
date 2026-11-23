@@ -27,12 +27,12 @@ use openfeo_api::pb::state_service_client::StateServiceClient;
 use openfeo_config::Config;
 use openfeo_config::api::{
     ApplyConfigRequest, Auth, ClientMsg, ConfirmConfigRequest, Error, GetConfigRequest,
-    GetConfigResponse, GetStateRequest, Request, RevertConfigRequest, ServerMsg, Subscribe,
-    ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response, server_msg,
-    telemetry,
+    GetConfigResponse, GetLeasesRequest, GetStateRequest, Request, RevertConfigRequest, ServerMsg,
+    Subscribe, ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response,
+    server_msg, telemetry,
 };
 use openfeo_config::events::Event;
-use openfeo_config::state::{Counters, State};
+use openfeo_config::state::{Counters, Leases, State};
 use prost::Message as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -760,6 +760,42 @@ impl Ws {
         self.until(timeout, "state", |message| match message.body {
             Some(server_msg::Body::Telemetry(push)) => match push.body {
                 Some(telemetry::Body::State(state)) if wanted(&state) => Some(state),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// Ask for the lease table over the socket (`GetLeases`).
+    ///
+    /// # Errors
+    ///
+    /// When no table comes back.
+    pub fn leases(&mut self) -> Result<Leases> {
+        match self.ask(request::Body::GetLeases(GetLeasesRequest {}))? {
+            server_msg::Body::Response(response) => match response.body {
+                Some(openfeo_config::api::response::Body::GetLeases(reply)) => {
+                    reply.leases.context("no table in the reply")
+                }
+                other => bail!("not the leases: {other:?}"),
+            },
+            other => bail!("not a response: {other:?}"),
+        }
+    }
+
+    /// The next `leases` push that satisfies `wanted`.
+    ///
+    /// # Errors
+    ///
+    /// When none arrives in time.
+    pub fn leases_where(
+        &mut self,
+        timeout: Duration,
+        wanted: impl Fn(&Leases) -> bool,
+    ) -> Result<Leases> {
+        self.until(timeout, "leases", |message| match message.body {
+            Some(server_msg::Body::Telemetry(push)) => match push.body {
+                Some(telemetry::Body::Leases(leases)) if wanted(&leases) => Some(leases),
                 _ => None,
             },
             _ => None,

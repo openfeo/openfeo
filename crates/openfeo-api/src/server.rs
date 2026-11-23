@@ -566,6 +566,14 @@ impl Shared {
         state(&self.world.borrow(), &system)
     }
 
+    /// Every LAN's leases now (SPEC §8.3), on the clock [`Self::state`] uses.
+    #[must_use]
+    pub fn leases(&self) -> openfeo_config::state::Leases {
+        let boot = boot_ms();
+        let now_unix_ms = self.wall_offset_ms(boot).saturating_add(boot);
+        openfeo_reconcile::leases::leases(&self.world.borrow(), now_unix_ms)
+    }
+
     /// The wall clock minus the boot clock, in milliseconds. The two are read a moment apart,
     /// so the difference jitters; it is held steady and moved only when the wall clock steps
     /// (SNTP), so that a time derived from it (when a WAN came up) is the same in every

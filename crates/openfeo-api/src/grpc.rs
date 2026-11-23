@@ -13,10 +13,11 @@ use futures::Stream;
 use openfeo_config::api::{
     ApplyConfigRequest, ApplyConfigResponse, ChangePasswordRequest, ChangePasswordResponse,
     ConfirmConfigRequest, ConfirmConfigResponse, ErrorCode, GetConfigRequest, GetConfigResponse,
-    GetStateRequest, GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse,
-    RevertConfigRequest, RevertConfigResponse, ServerMsg, SetInitialPasswordRequest,
-    SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse, ValidateConfigRequest,
-    ValidateConfigResponse, server_msg, subscribe_response, telemetry,
+    GetLeasesRequest, GetLeasesResponse, GetStateRequest, GetStateResponse, LoginRequest,
+    LoginResponse, LogoutRequest, LogoutResponse, RevertConfigRequest, RevertConfigResponse,
+    ServerMsg, SetInitialPasswordRequest, SetInitialPasswordResponse, SubscribeRequest,
+    SubscribeResponse, ValidateConfigRequest, ValidateConfigResponse, server_msg,
+    subscribe_response, telemetry,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -166,6 +167,7 @@ fn stream_item(message: ServerMsg) -> Option<Result<SubscribeResponse, Status>> 
         server_msg::Body::Telemetry(push) => match push.body? {
             telemetry::Body::State(state) => subscribe_response::Body::State(state),
             telemetry::Body::Counters(counters) => subscribe_response::Body::Counters(counters),
+            telemetry::Body::Leases(leases) => subscribe_response::Body::Leases(leases),
         },
         server_msg::Body::Error(error) => {
             return Some(Err(Status::data_loss(error.message)));
@@ -207,6 +209,7 @@ async fn feed(
     }
     world.borrow_and_update();
     conn.push_state(&shared.state());
+    conn.push_leases(&shared.leases());
     loop {
         while let Some(message) = conn.next_out() {
             let Some(item) = stream_item(message) else {
@@ -219,11 +222,12 @@ async fn feed(
         }
         tokio::select! {
             () = tx.closed() => return,
-            changed = world.changed(), if conn.wants(Topic::State) => {
+            changed = world.changed(), if conn.wants(Topic::State) || conn.wants(Topic::Leases) => {
                 if changed.is_err() {
                     return;
                 }
                 conn.push_state(&shared.state());
+                conn.push_leases(&shared.leases());
             }
             event = events.recv(), if conn.wants(Topic::Events) => match event {
                 Ok(event) => conn.push_event(&to_pb(&event)),
@@ -319,6 +323,16 @@ impl StateService for Grpc {
         token(&self.shared, &request)?;
         Ok(Response::new(GetStateResponse {
             state: Some(self.shared.state()),
+        }))
+    }
+
+    async fn get_leases(
+        &self,
+        request: Request<GetLeasesRequest>,
+    ) -> Result<Response<GetLeasesResponse>, Status> {
+        token(&self.shared, &request)?;
+        Ok(Response::new(GetLeasesResponse {
+            leases: Some(self.shared.leases()),
         }))
     }
 
@@ -854,6 +868,59 @@ mod tests {
             0,
             "and gives it back"
         );
+    }
+
+    #[tokio::test]
+    async fn leases_over_grpc_need_a_session_and_stream() {
+        use openfeo_config::api::GetLeasesRequest;
+        let (api, token) = crate::testing::TestApi::with_password(PASSWORD).await;
+        api.shared.publisher.update(|world| {
+            Arc::make_mut(&mut world.leases).insert(
+                "lan0".to_owned(),
+                vec![crate::ws::tests::lease_fact(143, "plug-kitchen")],
+            );
+        });
+        let mut state = StateServiceClient::new(api.channel().await);
+        let refused = state
+            .get_leases(with_token(GetLeasesRequest {}, ""))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+        let answer = state
+            .get_leases(with_token(GetLeasesRequest {}, &token))
+            .await
+            .unwrap()
+            .into_inner()
+            .leases
+            .unwrap();
+        assert_eq!(answer.leases[0].hostname, "plug-kitchen");
+        let mut stream = state
+            .subscribe(with_token(
+                SubscribeRequest {
+                    topics: vec!["leases".to_owned()],
+                    backlog: 0,
+                },
+                &token,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        let Some(subscribe_response::Body::Leases(table)) = first.body else {
+            panic!("not the leases: {first:?}");
+        };
+        assert_eq!(table.leases.len(), 1, "the table as it stands, first");
+        api.shared.publisher.update(|world| {
+            Arc::make_mut(&mut world.leases)
+                .entry("lan0".to_owned())
+                .or_default()
+                .push(crate::ws::tests::lease_fact(144, ""));
+        });
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            second.body,
+            Some(subscribe_response::Body::Leases(table)) if table.leases.len() == 2
+        ));
     }
 
     #[tokio::test]

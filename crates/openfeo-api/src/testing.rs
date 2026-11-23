@@ -478,6 +478,19 @@ impl Ws {
         }
     }
 
+    pub(crate) async fn next_leases(&mut self) -> openfeo_config::state::Leases {
+        use openfeo_config::api::{Telemetry, server_msg, telemetry};
+        loop {
+            if let Some(server_msg::Body::Telemetry(Telemetry {
+                body: Some(telemetry::Body::Leases(leases)),
+                ..
+            })) = self.msg().await.body
+            {
+                return leases;
+            }
+        }
+    }
+
     pub(crate) async fn next_counters(&mut self) -> openfeo_config::state::Counters {
         use openfeo_config::api::{Telemetry, server_msg, telemetry};
         loop {

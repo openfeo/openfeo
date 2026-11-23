@@ -42,7 +42,7 @@ message Auth {
 }
 
 message Subscribe {
-  // `state`, `counters` or `events`.
+  // `state`, `leases`, `counters` or `events`.
   string topic = 1;
   // For `events`: send this many recent events first.
   uint32 backlog = 2;
@@ -62,6 +62,7 @@ message Request {
     ApplyConfigRequest apply_config = 6;
     ConfirmConfigRequest confirm_config = 7;
     RevertConfigRequest revert_config = 8;
+    GetLeasesRequest get_leases = 9;
   }
 }
 
@@ -76,6 +77,7 @@ message Response {
     ApplyConfigResponse apply_config = 6;
     ConfirmConfigResponse confirm_config = 7;
     RevertConfigResponse revert_config = 8;
+    GetLeasesResponse get_leases = 9;
   }
 }
 
@@ -85,6 +87,7 @@ message Telemetry {
   oneof body {
     State state = 2;
     Counters counters = 3;
+    Leases leases = 4;
   }
 }
 
@@ -161,6 +164,13 @@ message GetStateResponse {
   State state = 1;
 }
 
+// Every LAN's DHCPv4 leases (SPEC §8.3). The topic `leases` pushes the same table.
+message GetLeasesRequest {}
+
+message GetLeasesResponse {
+  Leases leases = 1;
+}
+
 message SubscribeRequest {
   repeated string topics = 1;
   // For `events`: send this many recent events first.
@@ -172,11 +182,13 @@ message SubscribeResponse {
     State state = 1;
     Counters counters = 2;
     Event event = 3;
+    Leases leases = 4;
   }
 }
 
 service StateService {
   rpc GetState(GetStateRequest) returns (GetStateResponse);
+  rpc GetLeases(GetLeasesRequest) returns (GetLeasesResponse);
   rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
 }
 

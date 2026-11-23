@@ -56,12 +56,13 @@ pub mod api {
     pub use crate::generated::{
         ApplyConfigRequest, ApplyConfigResponse, Auth, Caller, ChangePasswordRequest,
         ChangePasswordResponse, ClientMsg, ConfirmConfigRequest, ConfirmConfigResponse, Error,
-        ErrorCode, GetConfigRequest, GetConfigResponse, GetStateRequest, GetStateResponse,
-        GetStatusResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Request,
-        Response, RevertConfigRequest, RevertConfigResponse, ServerMsg, Session,
-        SetInitialPasswordRequest, SetInitialPasswordResponse, Subscribe, SubscribeRequest,
-        SubscribeResponse, Telemetry, Unsubscribe, ValidateConfigRequest, ValidateConfigResponse,
-        client_msg, request, response, server_msg, subscribe_response, telemetry,
+        ErrorCode, GetConfigRequest, GetConfigResponse, GetLeasesRequest, GetLeasesResponse,
+        GetStateRequest, GetStateResponse, GetStatusResponse, LoginRequest, LoginResponse,
+        LogoutRequest, LogoutResponse, Request, Response, RevertConfigRequest,
+        RevertConfigResponse, ServerMsg, Session, SetInitialPasswordRequest,
+        SetInitialPasswordResponse, Subscribe, SubscribeRequest, SubscribeResponse, Telemetry,
+        Unsubscribe, ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response,
+        server_msg, subscribe_response, telemetry,
     };
 }
 
