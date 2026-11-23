@@ -236,8 +236,7 @@ mod tests {
         telemetry
             .history(&[link.to_owned()])
             .first()
-            .map(|history| history.monotonic_ms.clone())
-            .unwrap_or_default()
+            .map_or_default(|history| history.monotonic_ms.clone())
     }
 
     /// SPEC §10: read once a second, whether or not anyone is subscribed, so that a chart
