@@ -171,9 +171,7 @@ async fn run(
                     }
                     if changes_leases(&event) {
                         publish_facts(lan, &driver, publisher, &mut wall);
-                        if save_at.is_none() {
-                            save_at = Some(next_save(last_save, Instant::now()));
-                        }
+                        save_at = save_at.or_else(|| Some(next_save(last_save, Instant::now())));
                     }
                 }
             }
@@ -196,6 +194,15 @@ async fn run(
                         "dhcp4 server {lan}: {bridge} changed index {ifindex} -> {index}; restarting"
                     )
                     .into());
+                }
+                // The wall clock stepped (the time task says each sync in the World; SNTP's
+                // first answer on a box whose clock began at the build's is a step of months).
+                // Every time in the facts and in the file was stamped on the old clock: a
+                // lease would read as run out long ago, or as joined at the build's date. They
+                // are stamped again now, and the file is owed a write.
+                if wall.stepped(driver.now(), unix_now()) {
+                    publish_facts(lan, &driver, publisher, &mut wall);
+                    save_at = save_at.or_else(|| Some(next_save(last_save, Instant::now())));
                 }
             }
             () = sleep_until(save_at) => {
@@ -322,6 +329,14 @@ pub struct Wall {
 }
 
 impl Wall {
+    /// Whether the wall clock has stepped since a time was last stamped: what was stamped then
+    /// is of another clock now. Looking does not follow the step; the next stamp does.
+    #[must_use]
+    pub fn stepped(&self, now: Timestamp, unix_now: u64) -> bool {
+        self.lead
+            .is_some_and(|held| held.abs_diff(unix_now.saturating_sub(now)) > 1)
+    }
+
     /// The wall clock at the driver's `now`, where `unix_now` is the wall clock read at that
     /// instant.
     pub fn unix(&mut self, now: Timestamp, unix_now: u64) -> u64 {
@@ -1233,6 +1248,29 @@ mod tests {
         assert_eq!(wall.unix(13, 5_013), 5_013, "a step is followed");
         assert_eq!(wall.unix(14, 5_014), 5_014);
         assert_eq!(wall.unix(15, 1_015), 1_015, "and one back");
+    }
+
+    /// What was stamped before the wall clock stepped is of another clock: the server has to
+    /// know that it did, to stamp its facts again.
+    #[test]
+    fn a_step_of_the_wall_clock_is_noticed_and_a_wobble_is_not() {
+        let mut wall = Wall::default();
+        assert!(!wall.stepped(5, 1_005), "nothing has been stamped yet");
+        assert_eq!(wall.unix(10, 1_010), 1_010);
+        assert!(
+            !wall.stepped(11, 1_012),
+            "a second ahead is the two clocks' rounding"
+        );
+        assert!(!wall.stepped(12, 1_011), "and a second behind");
+        assert!(
+            wall.stepped(13, 31_537_013),
+            "SNTP's first answer, a year on"
+        );
+        assert!(wall.stepped(13, 1_011), "and a step back");
+        // Looking does not follow the step: the next stamp does, and then it is no step.
+        assert!(wall.stepped(13, 31_537_013));
+        assert_eq!(wall.unix(13, 31_537_013), 31_537_013);
+        assert!(!wall.stepped(14, 31_537_014));
     }
 
     #[test]

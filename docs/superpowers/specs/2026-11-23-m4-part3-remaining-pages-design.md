@@ -247,7 +247,9 @@ moved to another address.
 - A device that joins before the clock is set (the first seconds of a boot with no clock chip)
   must not be stamped for ever with the build's date: its joined time is right once the clock
   is. Expiry already has this problem and solves it by keeping its own clock and stamping at
-  publication.
+  publication. (Found when 3a was built: a stamp is only as right as its last publication, and
+  nothing published when the clock stepped. The server now stamps its facts again, and owes
+  the file a write, whenever the wall clock steps.)
 
 ### Leases on the wire
 

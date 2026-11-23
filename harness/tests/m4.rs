@@ -2488,6 +2488,38 @@ fn leases_survive_a_restart_after_the_clock_stepped(lab: &mut Lab) -> anyhow::Re
     // A session need not outlive a year.
     let token = api.login(PASSWORD)?;
     let mut ws = api.ws_with(&token)?;
+    // The lease table follows the clock (M4 part 3a): the device is still listed, running
+    // and joined a moment ago, by the table's own clock. Stamped once on the old clock, its
+    // lease would have run out a year ago and the table would be empty until the next lease.
+    let deadline = Instant::now() + SOON;
+    let table = loop {
+        let table = ws.leases()?;
+        if !table.leases.is_empty() {
+            break table;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "after the clock stepped the lease is not in the table: {table:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    ensure!(
+        table.time_unix.abs_diff(host_now + YEAR.unsigned_abs()) <= 120,
+        "the table's clock is {}, not a year on from {host_now}",
+        table.time_unix
+    );
+    let listed = &table.leases[0];
+    ensure!(
+        listed.address == ip
+            && listed.expires_unix > table.time_unix
+            && listed.joined_unix <= table.time_unix
+            && table.time_unix - listed.joined_unix <= 180,
+        "on the new clock the lease should be running and a few minutes old: {listed:?} at {}",
+        table.time_unix
+    );
     let view = ws.config()?;
     let config = view.config.context("no config")?;
     let mut cur = Cursor::default();
