@@ -157,12 +157,13 @@ export class FakeRouter implements PanelRouter {
 
   async history(links: string[]): Promise<LinkHistory[]> {
     this.calls.history.push([...links])
+    // What the router held when it was asked, however long the answer then takes.
+    const known = this.historyNow
     await this.#held.get('history')?.promise
-    if (this.historyNow instanceof RouterError) {
-      throw this.historyNow
+    if (known instanceof RouterError) {
+      throw known
     }
     // As the router does: only the links asked for, in the order asked.
-    const known = this.historyNow
     return links.flatMap((link) => known.filter((history) => history.name === link))
   }
 

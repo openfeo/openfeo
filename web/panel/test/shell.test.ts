@@ -86,17 +86,17 @@ test('a refused config is said on every page', async () => {
 
 test('the router is listened to once, whichever page is shown', async () => {
   const { router, routes } = await panelAt('/')
-  const open = () => [router.open('state').length, router.open('counters').length, router.open('events').length]
-  expect(open()).toEqual([1, 1, 1])
+  const open = () => (['state', 'leases', 'counters', 'events'] as const).map((topic) => router.open(topic).length)
+  expect(open()).toEqual([1, 1, 1, 1])
   await routes.push('/wan')
   await flushPromises()
   await routes.push('/lan/lan0')
   await flushPromises()
   await routes.push('/')
   await flushPromises()
-  expect(open()).toEqual([1, 1, 1])
+  expect(open()).toEqual([1, 1, 1, 1])
   // And none was closed and opened again on the way.
-  expect(router.listening).toHaveLength(3)
+  expect(router.listening).toHaveLength(4)
 })
 
 test('an address of no page goes to the dashboard', async () => {

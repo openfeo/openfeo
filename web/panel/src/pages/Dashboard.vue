@@ -40,8 +40,10 @@ const ADDRESS_COLUMNS = [
   { key: 'address', label: 'Address', mono: true },
   { key: 'from', label: 'From' },
 ]
+/** How many events the dashboard lists; the shell keeps as many as the router does, for the charts' marks. */
+const RECENT = 8
 const happened = computed(() =>
-  live.events.value.map((event) => ({
+  live.events.value.slice(0, RECENT).map((event) => ({
     at: when(event, state.value?.system?.timeSynced === true, now.value, sinceBootMs.value),
     parts: sentence(event),
   })),
