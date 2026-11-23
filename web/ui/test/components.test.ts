@@ -492,6 +492,54 @@ test('a chart is a picture with a name, a legend of what is now, a grid, and its
   expect(chart.html()).not.toMatch(/style=/)
 })
 
+test('a mark near the right edge is labelled to its left, so that the label stays in the picture', () => {
+  const chart = mount(OfoChart, {
+    props: {
+      title: 'wan0',
+      label: 'Download and upload on wan0 over the last hour',
+      runs: [],
+      from: 0,
+      to: 3600,
+      unit: 'bit/s',
+      now: { rx: '0.0', tx: '0.0' },
+      marks: [
+        { at: 600, label: 'up 13:30' },
+        { at: 3540, label: 'reconnected 14:19' },
+      ],
+    },
+  })
+  const [early, late] = chart.findAll('g.event')
+  const place = (event: typeof early) => ({ line: Number(event?.find('line').attributes('x1')), text: Number(event?.find('text').attributes('x')), anchor: event?.find('text').attributes('text-anchor') })
+  expect(place(early).text).toBeGreaterThan(place(early).line)
+  expect(place(early).anchor).toBe('start')
+  expect(place(late).text).toBeLessThan(place(late).line)
+  expect(place(late).anchor).toBe('end')
+})
+
+test('marks close together have their labels one under another, not one over another', () => {
+  const marked = (marks: { at: number; label: string }[]) =>
+    mount(OfoChart, {
+      props: { title: 'wan0', label: 'wan0 over the last hour', runs: [], from: 0, to: 3600, unit: 'bit/s', now: { rx: '0.0', tx: '0.0' }, marks },
+    })
+      .findAll('g.event text')
+      .map((text) => Number(text.attributes('y')))
+  // A minute apart in an hour is a few pixels: the second label takes the next line down.
+  const [first, second, third] = marked([
+    { at: 3480, label: 'up 13:18' },
+    { at: 3540, label: 'reconnected 13:19' },
+    { at: 3570, label: 'reconnected 13:19' },
+  ])
+  expect(second).toBeGreaterThan(first ?? 0)
+  expect(third).toBeGreaterThan(second ?? 0)
+  // Far apart, they share the top line.
+  const [early, late] = marked([
+    { at: 600, label: 'up 13:30' },
+    { at: 3000, label: 'reconnected 14:10' },
+  ])
+  expect(late).toBe(early)
+  expect(early).toBe(first)
+})
+
 test('a chart with nothing to draw still has its scale, and says what it was told to', () => {
   const chart = mount(OfoChart, {
     props: {

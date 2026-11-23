@@ -179,6 +179,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "an_hour_of_counters_is_kept_with_nobody_watching",
         run: an_hour_of_counters_is_kept_with_nobody_watching,
     },
+    Scenario {
+        name: "the_panel_shows_the_hour_and_the_leases_in_a_browser",
+        run: the_panel_shows_the_hour_and_the_leases_in_a_browser,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -2672,4 +2676,75 @@ fn an_hour_of_counters_is_kept_with_nobody_watching(lab: &mut Lab) -> anyhow::Re
     );
     refused(ws.history(&[])?, ErrorCode::InvalidArgument)?;
     no_task_failed(lab)
+}
+
+/// Status and leases in a real browser (SPEC §7.6, §8.4, §10, M4 part 3a;
+/// `web/panel/e2e/leases.spec.ts`): the router runs for a while before the browser is started,
+/// and the dashboard's chart is drawn back into that time; a device that joins (the lab's
+/// `join` verb) appears in Newest leases without a reload; on the Leases page it is reserved,
+/// the change applied and confirmed; and the chart marks where the WAN came back. The config
+/// the router ends up with has the reservation. Skipped as the other browser scenarios are.
+fn the_panel_shows_the_hour_and_the_leases_in_a_browser(lab: &mut Lab) -> anyhow::Result<()> {
+    const WINDOW: u32 = 40;
+    web::ready()?;
+    boot(lab, &format!("openfeo.confirm_secs={WINDOW}"))?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    web::settle(&lab.lan0, "lan0")?;
+    // Nobody looks for a while. What the chart then draws of this time is what the router
+    // kept of it, read with no subscriber.
+    std::thread::sleep(Duration::from_secs(20));
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "leases.spec",
+        ])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e-leases"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright-leases.log"),
+        Duration::from_secs(360),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+    let confirmed = lab.console()?.count(&re(r"openfeo: config: confirmed"));
+    ensure!(
+        confirmed == 1,
+        "the change was confirmed {confirmed} times on the console, not once"
+    );
+    no_task_failed(lab)?;
+    password_never_logged(lab)?;
+    // What the router ended up with: the device that joined, reserved at the address it took.
+    let api = api(lab)?;
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let config = ws.config()?.config.context("no config")?;
+    let reserved: Vec<(&str, &str)> = config
+        .lans
+        .first()
+        .and_then(|lan| lan.dhcp.as_ref())
+        .into_iter()
+        .flat_map(|dhcp| &dhcp.r#static)
+        .map(|lease| (lease.hostname.as_str(), lease.ip.as_str()))
+        .collect();
+    let table = ws.leases()?;
+    let lease = table
+        .leases
+        .iter()
+        .find(|lease| lease.hostname == "plug-kitchen")
+        .with_context(|| format!("no lease named plug-kitchen in {table:?}"))?;
+    ensure!(
+        reserved.contains(&("plug-kitchen", lease.address.as_str())),
+        "the reservations are {reserved:?}, and the lease is {lease:?}"
+    );
+    Ok(())
 }

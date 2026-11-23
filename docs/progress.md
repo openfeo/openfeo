@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | parts 1 and 2 of 5, 2026-11-19 | #68, #81, #101, #103; follow-up #124 |
+| M4 API and panel | parts 1 and 2 of 5, and 3a, 2026-11-23 | #68, #81, #101, #103, #128; follow-up #124 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -306,6 +306,38 @@ written into the design: the countdown is a second coarse and trusts the browser
 between the router's words, what was typed for a type that was switched away from is kept only
 while its page is open, and no test against a real router meets an apply that is not answered.
 Part 3 is the remaining pages.
+
+**2026-11-23, [#128](https://github.com/openfeo/openfeo/pull/128), part 3a: status and leases.**
+The first of part 3's three slices, each with its router work and its web work (the design is
+`docs/superpowers/specs/2026-11-23-m4-part3-remaining-pages-design.md`): what the panel's owner
+opens it for, which is finding the address of a device just plugged in and seeing whether the
+line is up and has been full. A lease now records when its device first took the address it
+holds, its joined time: a renewal keeps it, and so does a device that asks again for what it
+still holds; a lease taken again after it ran out, or on another address, has joined anew. It
+is in the lease file (a file from before reads its last renewal), in the published fact, and in
+a lease table the API serves as `GetLeases` and as the topic `leases`, pushed whole when a lease
+in it changes; the table holds at most 4096, the newest, and carries the router's clock so that
+ages are counted against that and not the reader's. The counters are now read every second
+whether or not anyone is subscribed, and the last hour of each link's bytes is kept in memory
+and served by `GetHistory`; the router still computes no rates (SPEC §10 changes by that
+sentence). `@openfeo/client` gains the two calls, the topic, and functions from a link's
+history to its rates over time by the rule the live samples are read by, with no rate across
+a gap. `@openfeo/ui` gains a chart, a segmented choice and an empty state from the design
+system's guidelines. The dashboard draws each WAN's download and upload over the last five
+minutes or the last hour, back to before the page was opened, with a gap drawn as a gap and a
+mark where the WAN came back; the rate tiles say the hour's peak, the highest ten-second
+average; and a card lists the five newest leases. **Leases** is a page of its own under
+Network: every LAN's leases, newest first, filtered by name, address or MAC, a row that arrives
+marked for a minute, and Reserve on a row, which puts the reservation among the changes the
+save bar counts. Proven by 1100 unit tests on the Rust side and 503 on the web side, and
+by three new `m4` scenarios (38 in all) and two extended: a lease listed with its joined time,
+which stays to the second when its client asks again and when the LAN's server restarts and
+reads it back from the file; traffic that passed with no socket open found in the history
+afterwards, a sample a second; the client's calls under Node, with a device that joins pushed
+to a subscriber; and Playwright's Chromium, started twenty seconds after the router, finding
+the chart already drawn into that time, a device that joins appearing without a reload, the
+reservation made from the Leases page applied and confirmed, and the mark where the ISP was
+cut and came back. Slices 3b (the settings pages) and 3c (the views) follow.
 
 ## Follow-ups
 

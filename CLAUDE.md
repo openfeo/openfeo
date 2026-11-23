@@ -126,10 +126,17 @@ lease was taken (`Lab::start_sntp`), so the router steps its clock at its next p
 scenarios (M4 part 2b) change config from the web side: `@openfeo/client`'s config calls under Node
 (`web/client/itest/config.test.ts`) and the panel in Chromium (`web/panel/e2e/config.spec.ts`: a change confirmed,
 one reverted by hand, one left to run out, a LAN added and removed with no going back, and `lan0`'s subnet moved from
-under the browser and confirmed at the router's new address after a second login there). Each of the four web
-scenarios names its own test or spec file (`lab.test`, `config.test`, `panel.spec`, `config.spec`), since one process
-numbers its requests to the lab from 1. A lab verb may carry arguments: `lan-to <cidr> <gateway>` re-homes the LAN
-host as `rehome` does, for a test that follows a router it moved. The browser run that changes config boots with
+under the browser and confirmed at the router's new address after a second login there). Three more (M4 part 3a) are
+for status and leases: a lease that is listed in the lease table and keeps its joined time when its client asks again
+and when the LAN's server restarts; an hour of counters kept while nobody is subscribed; and the panel in Chromium
+(`web/panel/e2e/leases.spec.ts`), which waits 20 s after the router is up before it starts the browser, so that the
+chart has a past to draw, and goes from there to a device that joins, a reservation made from the Leases page and
+confirmed, and the mark where the WAN came back. Each of the five web
+scenarios names its own test or spec file (`lab.test`, `config.test`, `panel.spec`, `config.spec`, `leases.spec`),
+since one process numbers its requests to the lab from 1. A lab verb may carry arguments: `lan-to <cidr> <gateway>`
+re-homes the LAN host as `rehome` does, for a test that follows a router it moved, and `join <hostname>` has a device
+take a lease on `lan0` under that name (the harness's own DHCP client, which puts no address on the interface, so the
+browser or Node in that namespace keeps its own). A browser run that changes config boots with
 `openfeo.confirm_secs=40`, because the panel always uses the router's own window: long enough to re-home the LAN host
 and log in again, short enough to wait out once. A screenshot is taken with the window made as tall as the page, so
 that what sticks to the window's edges is where a person would see it. `FILTER` picks scenarios by name across every suite, not a

@@ -74,7 +74,7 @@ test('a change confirmed, reverted, run out, made for good, and one that moves t
   await page.getByRole('button', { name: 'Set password' }).click()
   await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
   await expect(page.locator('.ofo-nav__group')).toHaveText('Network')
-  await expect(page.locator('.ofo-nav__item .ofo-nav__label')).toHaveText(['Dashboard', 'WAN', 'LAN & DHCP'])
+  await expect(page.locator('.ofo-nav__item .ofo-nav__label')).toHaveText(['Dashboard', 'WAN', 'LAN & DHCP', 'Leases'])
 
   // 2. Edit, apply, confirm.
   await page.getByRole('link', { name: 'LAN & DHCP' }).click()

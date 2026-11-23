@@ -60,7 +60,30 @@ const placed = <T extends { at: number }>(things: T[] | undefined) =>
     const x = across(thing.at, props.from, props.to, width.value)
     return x === undefined ? [] : [{ ...thing, x }]
   })
-const events = computed(() => placed(props.marks))
+/** About how wide a mark's label is drawn: its letters at the stylesheet's 11px. */
+const LABEL_LETTER = 6.5
+/** The lines a mark's label may take, and how far apart they are. */
+const LABEL_LINES = 4
+const LABEL_LINE = 13
+// A mark's label reads away from the nearer edge: one late in the range would otherwise run
+// out of the picture. Marks close together (a WAN that came back twice in a minute, seen
+// over an hour) would write over each other, so a label takes the first line down from the
+// top that is free where it would sit.
+const events = computed(() => {
+  const lines: { from: number; to: number }[][] = Array.from({ length: LABEL_LINES }, () => [])
+  return placed(props.marks)
+    .sort((a, b) => a.x - b.x)
+    .map((mark) => {
+      const late = mark.x > edge.value * (2 / 3)
+      const wide = mark.label.length * LABEL_LETTER
+      const from = late ? mark.x - 4 - wide : mark.x + 4
+      const span = { from, to: from + wide }
+      const free = lines.findIndex((line) => line.every((taken) => span.to < taken.from || span.from > taken.to))
+      const line = free === -1 ? LABEL_LINES - 1 : free
+      lines[line]?.push(span)
+      return { ...mark, late, textX: late ? mark.x - 4 : mark.x + 4, textY: TOP + 10 + line * LABEL_LINE }
+    })
+})
 const along = computed(() => placed(props.ticks))
 </script>
 
@@ -89,7 +112,7 @@ const along = computed(() => placed(props.ticks))
         <path class="line tx" :d="path('tx')" />
         <g v-for="event in events" :key="event.at" class="event">
           <line :x1="event.x" :x2="event.x" :y1="TOP" :y2="BOTTOM" />
-          <text :x="event.x + 4" :y="TOP + 10">{{ event.label }}</text>
+          <text :x="event.textX" :y="event.textY" :text-anchor="event.late ? 'end' : 'start'">{{ event.label }}</text>
         </g>
       </svg>
     </div>
