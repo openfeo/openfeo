@@ -1,29 +1,79 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 <!-- Copyright (C) 2026 Andrew Newton -->
 <script setup lang="ts">
-import { OfoCard, OfoDataTable, OfoInterfaceCard, OfoPageHeader, OfoPortStrip, OfoSkeleton, OfoStatTile } from '@openfeo/ui'
-import { computed, inject } from 'vue'
+import { OfoCard, OfoChart, OfoDataTable, OfoInterfaceCard, OfoPageHeader, OfoPortStrip, OfoSegmented, OfoSkeleton, OfoStatTile } from '@openfeo/ui'
+import { computed, inject, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 
 import { LIVE } from '../live'
+import { drawn, marks, OPENING, peak, rangeOf, RANGES, ticks, type Range } from '../model/chart'
 import { addresses, cards, defaultWan, headline, ports, tiles } from '../model/dashboard'
 import { sentence, when } from '../model/events'
+import { leaseRows, newestFirst } from '../model/leases'
+import { PAGES } from '../routes'
 
 // The dashboard (SPEC §8.4): read-only and live. What it says and how it says it is
 // model/; this arranges it. What it shows is what the shell hears from the router.
 const live = inject(LIVE)!
 const { state, now, sinceBootMs } = live
 
+/**
+ * The right edge of every chart, on the router's boot clock: its uptime by now, or the newest
+ * sample where that is later (the uptime is said in whole seconds).
+ */
+const edgeMs = computed(() => Math.max(sinceBootMs.value ?? 0, ...[...live.samples.value.values()].map((kept) => kept.at(-1)?.atMs ?? 0)))
+
 const stats = computed(() => {
   if (state.value === null) {
     return null
   }
   const wan = defaultWan(state.value)
+  const kept = wan === undefined ? undefined : live.samples.value.get(wan.interface)
   return tiles(state.value, {
     rate: wan === undefined ? undefined : live.rates.value?.get(wan.interface),
     history: live.history.value,
+    peak: kept === undefined ? undefined : peak(kept, edgeMs.value),
     conntrack: live.conntrack.value ?? undefined,
   })
 })
+
+// One range for the page: every WAN's chart is read against the same stretch of time.
+const range = ref<Range>(OPENING)
+const RANGE_CHOICES = RANGES.map(({ value, label }) => ({ value, label }))
+function choose(chosen: string): void {
+  range.value = rangeOf(chosen as Range).value
+}
+const charts = computed(() =>
+  state.value === null
+    ? null
+    : state.value.wans.map((wan) => ({
+        title: wan.name,
+        label: `Download and upload on ${wan.name} over ${rangeOf(range.value).words}`,
+        // A WAN with no interface just now (PPPoE between sessions) has nothing kept: its plot is empty.
+        ...drawn(live.samples.value.get(wan.interface) ?? [], range.value, edgeMs.value, live.rates.value?.get(wan.interface)),
+        marks: marks(live.events.value, wan.name, range.value, edgeMs.value, sinceBootMs.value, now.value),
+        ticks: ticks(range.value, edgeMs.value, sinceBootMs.value, now.value),
+        note: live.historyFailed.value ? 'The last hour could not be read from the router. The line starts from when this page was opened.' : undefined,
+      })),
+)
+
+/** How many of the newest leases the dashboard lists; the Leases page has them all. */
+const NEWEST = 5
+const LEASE_COLUMNS = [
+  { key: 'joined', label: 'Joined' },
+  { key: 'address', label: 'Address', mono: true },
+  { key: 'name', label: 'Name' },
+  { key: 'mac', label: 'MAC', mono: true },
+  { key: 'lan', label: 'LAN' },
+]
+const leased = computed(() => live.leases.value?.leases.length ?? 0)
+const newest = computed(() =>
+  live.leases.value === null
+    ? null
+    : // A device that joined under a minute ago is marked: it is the one just plugged in.
+      leaseRows(newestFirst(live.leases.value.leases).slice(0, NEWEST), live.routerClock.value, now.value, (_, ago) => ago !== undefined && ago < 60),
+)
+const marked = (row: Record<string, string>) => (row.fresh === 'yes' ? 'ofo-table__row--new' : undefined)
 const interfaces = computed(() => (state.value === null ? null : cards(state.value, live.rates.value)))
 const strip = computed(() => (state.value === null ? null : ports(state.value)))
 const held = computed(() =>
@@ -66,6 +116,18 @@ const happened = computed(() =>
       </template>
     </div>
 
+    <template v-if="charts">
+      <OfoChart v-for="chart in charts" :key="chart.title" v-bind="chart">
+        <template #range>
+          <OfoSegmented label="Range" :options="RANGE_CHOICES" :model-value="range" @update:model-value="choose" />
+        </template>
+      </OfoChart>
+    </template>
+    <div v-else class="ofo-chart dash__waiting">
+      <OfoSkeleton :width="40" />
+      <OfoSkeleton size="lg" :width="80" />
+    </div>
+
     <div class="ofo-grid ofo-grid--3">
       <template v-if="interfaces">
         <OfoInterfaceCard v-for="card in interfaces" :key="card.role + card.name" v-bind="card" />
@@ -79,6 +141,29 @@ const happened = computed(() =>
         </div>
       </template>
     </div>
+
+    <OfoCard title="Newest leases">
+      <template #actions>
+        <RouterLink v-if="leased > 0" class="dash__more" :to="PAGES.leases">{{ leased === 1 ? '1 lease' : `All ${leased} leases` }}</RouterLink>
+      </template>
+      <OfoDataTable v-if="newest && newest.length > 0" class="dash__leases" :columns="LEASE_COLUMNS" :rows="newest" row-key="key" :row-class="marked">
+        <template #cell-joined="{ row, value }">
+          <span :title="row.joinedAt">{{ value }}</span>
+        </template>
+        <template #cell-name="{ row, value }">
+          <span :class="{ 'ofo-muted': row.named === '' }">{{ value }}</span>
+        </template>
+        <template #cell-mac="{ value }">
+          <span class="ofo-muted">{{ value }}</span>
+        </template>
+      </OfoDataTable>
+      <p v-else-if="newest" class="ofo-muted said__line">No device has taken an address yet.</p>
+      <div v-else class="dash__waiting">
+        <OfoSkeleton :width="80" />
+        <OfoSkeleton :width="60" />
+        <OfoSkeleton :width="80" />
+      </div>
+    </OfoCard>
 
     <OfoCard title="Ports">
       <template v-if="strip">

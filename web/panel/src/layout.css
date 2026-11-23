@@ -142,6 +142,11 @@ body {
   white-space: nowrap;
 }
 
+/* The link from a card's head to the page that has the rest. */
+.dash__more {
+  font-size: 13px;
+}
+
 /* What is said above every page behind the login: one banner under another, then the page. */
 .said {
   display: flex;

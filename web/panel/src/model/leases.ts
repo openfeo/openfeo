@@ -7,6 +7,8 @@
 
 import { create, StaticLeaseSchema, type Config, type Lan, type Lease } from '@openfeo/client'
 
+import { clock, DASH } from './format'
+
 /** An IPv4 address as a number, so that `.9` comes before `.10`; one that does not parse sorts last. */
 function numeric(address: string): number {
   const parts = address.split('.').map(Number)
@@ -129,4 +131,58 @@ export function reserve(draft: Config, base: Config | null, lease: Lease): void 
     return
   }
   lanOf(draft, lease.lan)?.dhcp?.static.push(create(StaticLeaseSchema, { mac: lease.mac, ip: lease.address, hostname: lease.hostname }))
+}
+
+/** A lease as a table shows it: every cell as text, with what the page hangs on the row. */
+export interface LeaseRow extends Record<string, string> {
+  /** What tells the row from every other ({@link leaseKey}). */
+  key: string
+  /** How long ago it joined, and the exact time for the cell's title. */
+  joined: string
+  joinedAt: string
+  address: string
+  /** The name the device gave or its reservation has, or "none given". */
+  name: string
+  /** 'yes' when it has a name: "none given" is the page's word, said more quietly. */
+  named: string
+  mac: string
+  lan: string
+  /** How long until it expires, and the exact time for the cell's title. */
+  expires: string
+  expiresAt: string
+  /** 'yes' for a row to be marked as new. */
+  fresh: string
+}
+
+/**
+ * The rows of a lease table, in the order given. Ages are counted against `routerClock`, the
+ * router's own wall clock in seconds as it is by now, never against the browser's; the exact
+ * times are for a cell's title, on the browser's clock and in its zone, counted back or on
+ * from `now` by the router's measure. Until the router has said what time it is there is no
+ * age to say. `fresh` says which rows are marked as new, given how long ago each joined.
+ */
+export function leaseRows(
+  leases: readonly Lease[],
+  routerClock: number | undefined,
+  now: Date,
+  fresh: (lease: Lease, joinedSecsAgo: number | undefined) => boolean,
+): LeaseRow[] {
+  const exact = (secsFromNow: number) => clock(BigInt(Math.round(now.getTime() + secsFromNow * 1000)), now)
+  return leases.map((lease) => {
+    const joinedSecsAgo = routerClock === undefined ? undefined : routerClock - Number(lease.joinedUnix)
+    const left = routerClock === undefined ? undefined : Number(lease.expiresUnix) - routerClock
+    return {
+      key: leaseKey(lease),
+      joined: joinedSecsAgo === undefined ? DASH : ago(joinedSecsAgo),
+      joinedAt: joinedSecsAgo === undefined ? '' : exact(-Math.max(0, joinedSecsAgo)),
+      address: lease.address,
+      name: lease.hostname === '' ? 'none given' : lease.hostname,
+      named: lease.hostname === '' ? '' : 'yes',
+      mac: lease.mac,
+      lan: lease.lan,
+      expires: left === undefined ? DASH : until(left),
+      expiresAt: left === undefined ? '' : exact(left),
+      fresh: fresh(lease, joinedSecsAgo) ? 'yes' : '',
+    }
+  })
 }

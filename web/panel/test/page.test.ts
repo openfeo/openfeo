@@ -1,13 +1,52 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-import { create, StateSchema } from '@openfeo/client'
+import { create, ErrorCode, LeasesSchema, LinkHistorySchema, RouterError, StateSchema, type Leases, type LinkHistory } from '@openfeo/client'
 import { THEME_KEY } from '@openfeo/ui'
 import { flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
-import { counters, event, NOW, state } from './fixtures'
-import { panelAt, unmountAll } from './mounting'
+import { counters, event, NOW, state, UPTIME_SECS } from './fixtures'
+import { panelAt, signedIn, unmountAll } from './mounting'
+
+const UPTIME_MS = UPTIME_SECS * 1000
+const NOW_UNIX = Math.floor(NOW.getTime() / 1000)
+
+/** The lease table at NOW by the router's clock: each lease by its address, its name and how long ago it joined. */
+function leases(rows: [address: string, hostname: string, joinedSecsAgo: number, lan?: string][]): Leases {
+  return create(LeasesSchema, {
+    timeUnix: BigInt(NOW_UNIX),
+    leases: rows.map(([address, hostname, ago, lan]) => ({
+      lan: lan ?? 'lan0',
+      address,
+      mac: `02:00:00:00:00:${address.split('.').at(-1)?.padStart(2, '0').slice(-2) ?? '00'}`,
+      hostname,
+      joinedUnix: BigInt(NOW_UNIX - ago),
+      expiresUnix: BigInt(NOW_UNIX - ago + 43_200),
+    })),
+  })
+}
+
+/** What the router kept of a link: a sample a second for the `secs` seconds up to its uptime at NOW, at 8 Mbit/s down and 0.8 up. */
+function kept(name: string, secs: number): LinkHistory {
+  const seconds = Array.from({ length: secs + 1 }, (_, n) => UPTIME_SECS - secs + n)
+  return create(LinkHistorySchema, {
+    name,
+    monotonicMs: seconds.map((second) => BigInt(second) * 1_000n),
+    rxBytes: seconds.map((second) => BigInt(second) * 1_000_000n),
+    txBytes: seconds.map((second) => BigInt(second) * 100_000n),
+  })
+}
+
+/** The fixture's state with a second WAN, on a plain port. */
+function twoWans() {
+  const two = state()
+  const first = two.wans[0]
+  if (first !== undefined) {
+    two.wans.push({ ...first, name: 'wan1', interface: 'p1', default4: false, default6: false })
+  }
+  return two
+}
 
 // The dashboard as it is reached: in the shell, at /. What the shell itself holds (the
 // sidebar, the top bar, what is said above every page) is shell.test.ts's; the tests here
@@ -25,6 +64,7 @@ async function loaded() {
   router.push('events', event('wan.wan0.down', { reason: 'keepalive lost' }, new Date(2026, 10, 7, 21, 3, 19)))
   router.push('events', event('wan.wan0.up', {}, new Date(2026, 10, 7, 21, 3, 22)))
   router.push('events', event('lan.lan0.lease.granted', { address: '192.168.1.23', host: 'pixel-8' }, new Date(2026, 10, 10, 19, 42, 7)))
+  router.push('leases', leases([['192.168.1.23', 'pixel-8', 23]]))
   await flushPromises()
   return made
 }
@@ -57,8 +97,10 @@ test('before the first state there are skeletons and no numbers', async () => {
   expect(wrapper.findAll('.ofo-stat')).toHaveLength(4)
   expect(wrapper.findAll('.ofo-iface')).toHaveLength(3)
   expect(wrapper.find('.ofo-pagehead__sub').exists()).toBe(false)
-  // The frames are there already, so nothing jumps when the state arrives.
-  expect(wrapper.findAll('.ofo-card__title').map((title) => title.text())).toEqual(['Ports', 'Addresses', 'Recent events'])
+  // The frames are there already, so nothing jumps when the state arrives: a chart's among them.
+  expect(wrapper.findAll('.ofo-card__title').map((title) => title.text())).toEqual(['Newest leases', 'Ports', 'Addresses', 'Recent events'])
+  expect(wrapper.findAll('.ofo-chart')).toHaveLength(1)
+  expect(wrapper.find('.ofo-chart svg').exists()).toBe(false)
   // The router's name is known before login, so the top bar has it at once.
   expect(wrapper.find('.ofo-topbar__host').text()).toBe('openfeo.home.arpa')
 })
@@ -107,6 +149,162 @@ test('with the fixture state it shows the headline, four tiles, three cards, fou
   expect(events[0]?.findAll('code').map((code) => code.text())).toEqual(['lan0', '192.168.1.23', 'pixel-8'])
   // Nothing leads onward until the Logs page exists.
   expect(wrapper.find('.dash__events a').exists()).toBe(false)
+})
+
+test('a chart for each WAN, in config order, drawn back to before the page was opened', async () => {
+  const router = signedIn()
+  router.historyNow = [kept('ppp-wan0', 600), kept('p1', 600)]
+  const { wrapper } = await panelAt('/', router)
+  router.push('state', twoWans())
+  await flushPromises()
+  // From the top: the tiles, the charts, the interface cards.
+  const blocks = wrapper.findAll('.dash > *').map((block) => block.classes().find((name) => ['ofo-grid', 'ofo-chart', 'ofo-card'].includes(name)))
+  expect(blocks.slice(1, 5)).toEqual(['ofo-grid', 'ofo-chart', 'ofo-chart', 'ofo-grid'])
+  const charts = wrapper.findAll('.ofo-chart')
+  expect(charts.map((chart) => chart.find('h2').text())).toEqual(['wan0', 'wan1'])
+  expect(charts[0]?.find('svg').attributes('aria-label')).toBe('Download and upload on wan0 over the last hour')
+  // Ten minutes of the hour were kept by the router before this page asked: they are drawn.
+  expect(charts[0]?.find('path.line.rx').attributes('d')).toMatch(/^M[\d.]+ [\d.]+ L/)
+  expect(charts[1]?.find('path.line.rx').attributes('d')).toMatch(/^M/)
+  // The unit is said once, in the legend; what is now is not known until two live samples are in.
+  expect(charts[0]?.find('.ofo-chart__key--rx').text()).toBe('Download — Mbit/s')
+  expect(charts[0]?.findAll('.ofo-chart__tick').map((tick) => tick.text())).toEqual(['18:50', '19:00', '19:10', '19:20', '19:30', '19:40'])
+  const rx = (second: number) => BigInt(UPTIME_SECS + second) * 1_000_000n
+  router.push('counters', counters(BigInt(UPTIME_MS + 1_000), [['ppp-wan0', rx(1), 0n]]))
+  router.push('counters', counters(BigInt(UPTIME_MS + 2_000), [['ppp-wan0', rx(2), 0n]]))
+  await flushPromises()
+  expect(wrapper.findAll('.ofo-chart')[0]?.find('.ofo-chart__key--rx').text()).toBe('Download 8.0 Mbit/s')
+  expect(wrapper.find('.ofo-chart__note').exists()).toBe(false)
+})
+
+test('the range is one choice for every chart, and the hour is where it opens', async () => {
+  const router = signedIn()
+  router.historyNow = [kept('ppp-wan0', 600), kept('p1', 600)]
+  const { wrapper } = await panelAt('/', router)
+  router.push('state', twoWans())
+  await flushPromises()
+  const pressed = () => wrapper.findAll('.ofo-chart .ofo-seg').map((choice) => choice.findAll('button').map((button) => button.attributes('aria-pressed')))
+  expect(wrapper.findAll('.ofo-chart .ofo-seg button').map((button) => button.text())).toEqual(['5 min', '1 h', '5 min', '1 h'])
+  expect(wrapper.find('.ofo-chart .ofo-seg').attributes('aria-label')).toBe('Range')
+  expect(pressed()).toEqual([
+    ['false', 'true'],
+    ['false', 'true'],
+  ])
+  await wrapper.findAll('.ofo-chart')[1]?.findAll('.ofo-seg button')[0]?.trigger('click')
+  expect(pressed()).toEqual([
+    ['true', 'false'],
+    ['true', 'false'],
+  ])
+  expect(wrapper.findAll('.ofo-chart svg').map((svg) => svg.attributes('aria-label'))).toEqual([
+    'Download and upload on wan0 over the last five minutes',
+    'Download and upload on wan1 over the last five minutes',
+  ])
+  expect(wrapper.findAll('.ofo-chart')[0]?.findAll('.ofo-chart__tick').map((tick) => tick.text())).toEqual(['19:38', '19:39', '19:40', '19:41', '19:42'])
+})
+
+test('the tiles say the hour’s peak, and their lines are filled from what the router kept', async () => {
+  const router = signedIn()
+  router.historyNow = [kept('ppp-wan0', 600)]
+  const { wrapper } = await panelAt('/', router)
+  router.push('state', state())
+  await flushPromises()
+  const tiles = wrapper.findAll('.ofo-stat')
+  expect(tiles[0]?.find('.ofo-stat__foot').text()).toBe('peak 8.0 Mbit/s in the last hour')
+  expect(tiles[1]?.find('.ofo-stat__foot').text()).toBe('peak 800.0 kbit/s in the last hour')
+  // Sixty points already, before a single live sample.
+  expect(tiles[0]?.find('svg.ofo-stat__spark path').attributes('d')?.split('L')).toHaveLength(60)
+})
+
+test('a WAN with nothing kept has an empty chart and dashes, and a history that could not be read is said', async () => {
+  const router = signedIn()
+  router.historyNow = new RouterError(ErrorCode.UNAVAILABLE, 'the connection to the router was lost')
+  const { wrapper } = await panelAt('/', router)
+  router.push('state', state())
+  await flushPromises()
+  const chart = wrapper.find('.ofo-chart')
+  expect(chart.find('.ofo-chart__note').text()).toBe('The last hour could not be read from the router. The line starts from when this page was opened.')
+  expect(chart.find('path.line.rx').attributes('d')).toBe('')
+  expect(chart.find('.ofo-chart__key--rx').text()).toBe('Download — bit/s')
+  expect(chart.findAll('g.grid line')).toHaveLength(5)
+})
+
+test('a chart marks where its WAN came back', async () => {
+  const router = signedIn()
+  router.historyNow = [kept('ppp-wan0', 600)]
+  const { wrapper } = await panelAt('/', router)
+  router.push('state', state())
+  router.push('events', event('wan.wan0.down', { reason: 'keepalive lost' }, new Date(NOW.getTime() - 12 * 60_000)))
+  router.push('events', event('wan.wan0.up', {}, new Date(NOW.getTime() - 10 * 60_000)))
+  await flushPromises()
+  expect(wrapper.findAll('.ofo-chart g.event text').map((text) => text.text())).toEqual(['reconnected 19:32'])
+})
+
+test('the newest five leases, newest first, and a link to them all', async () => {
+  const { wrapper, router } = await dashboard()
+  router.push('state', state())
+  // Before the table has come the card waits.
+  await flushPromises()
+  const card = () => wrapper.findAll('.ofo-card').find((each) => each.find('.ofo-card__title').text() === 'Newest leases')
+  expect(card()?.find('.ofo-skel').exists()).toBe(true)
+  router.push(
+    'leases',
+    leases([
+      ['192.168.1.131', 'laptop', 2 * 86_400 + 60],
+      ['192.168.1.143', 'plug-kitchen', 125],
+      ['192.168.20.107', '', 41 * 60, 'iot'],
+      ['192.168.1.142', 'phone', 5 * 3_600 + 9],
+      ['192.168.20.101', 'camera-porch', 3 * 86_400, 'iot'],
+      ['192.168.1.120', 'printer', 6 * 86_400],
+      ['192.168.1.10', 'nas', 9 * 86_400],
+    ]),
+  )
+  await flushPromises()
+  expect(card()?.find('.ofo-skel').exists()).toBe(false)
+  expect(card()?.findAll('thead th').map((th) => th.text())).toEqual(['Joined', 'Address', 'Name', 'MAC', 'LAN'])
+  const rows = card()?.findAll('tbody tr') ?? []
+  expect(rows.map((row) => row.findAll('td').map((cell) => cell.text()))).toEqual([
+    ['2 min ago', '192.168.1.143', 'plug-kitchen', '02:00:00:00:00:43', 'lan0'],
+    ['41 min ago', '192.168.20.107', 'none given', '02:00:00:00:00:07', 'iot'],
+    ['5 h ago', '192.168.1.142', 'phone', '02:00:00:00:00:42', 'lan0'],
+    ['2 d ago', '192.168.1.131', 'laptop', '02:00:00:00:00:31', 'lan0'],
+    ['3 d ago', '192.168.20.101', 'camera-porch', '02:00:00:00:00:01', 'iot'],
+  ])
+  // The exact time is the cell's title, in the browser's zone; machine values are in mono.
+  expect(rows[0]?.find('td span').attributes('title')).toBe('19:40:25')
+  expect(rows[3]?.find('td span').attributes('title')).toBe('8 Nov 19:41')
+  expect(rows[0]?.findAll('td')[1]?.classes()).toContain('ofo-mono')
+  expect(rows[1]?.findAll('td')[2]?.find('.ofo-muted').text()).toBe('none given')
+  const all = card()?.find('.ofo-card__head a')
+  expect(all?.text()).toBe('All 7 leases')
+  expect(all?.attributes('href')).toBe('/leases')
+})
+
+test('a row that has just joined is marked, for a minute', async () => {
+  const { wrapper, router } = await dashboard()
+  router.push('state', state())
+  router.push('leases', leases([['192.168.1.143', 'plug-kitchen', 20], ['192.168.1.142', 'phone', 7_200]]))
+  await flushPromises()
+  const marked = () => wrapper.findAll('.dash__leases tbody tr').map((row) => row.classes().includes('ofo-table__row--new'))
+  expect(marked()).toEqual([true, false])
+  expect(wrapper.find('.dash__leases tbody tr td').text()).toBe('just now')
+  // The router's clock is carried on by the browser's between two tables.
+  await vi.advanceTimersByTimeAsync(45_000)
+  expect(marked()).toEqual([false, false])
+  expect(wrapper.find('.dash__leases tbody tr td').text()).toBe('1 min ago')
+})
+
+test('with no lease yet the card says so, and one lease is not "all 1 leases"', async () => {
+  const { wrapper, router } = await dashboard()
+  router.push('state', state())
+  router.push('leases', leases([]))
+  await flushPromises()
+  const card = () => wrapper.findAll('.ofo-card').find((each) => each.find('.ofo-card__title').text() === 'Newest leases')
+  expect(card()?.text()).toContain('No device has taken an address yet.')
+  expect(card()?.find('table').exists()).toBe(false)
+  expect(card()?.find('a').exists()).toBe(false)
+  router.push('leases', leases([['192.168.1.143', 'plug-kitchen', 20]]))
+  await flushPromises()
+  expect(card()?.find('.ofo-card__head a').text()).toBe('1 lease')
 })
 
 test('the sidebar marks the dashboard', async () => {

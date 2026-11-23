@@ -26,7 +26,7 @@ export const PATHS: Record<Screen, string> = {
 }
 
 /** The pages behind the login, each by the address it starts at. */
-export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan' } as const
+export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan', leases: '/leases' } as const
 
 /** The gates: a screen that is one of these has exactly one address. */
 const GATES = new Set<string>([PATHS.login, PATHS['first-password'], PATHS['config-unreadable']])

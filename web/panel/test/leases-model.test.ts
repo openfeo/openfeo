@@ -4,8 +4,8 @@
 import { clone, ConfigSchema, create, LeaseSchema, type Config, type Lease } from '@openfeo/client'
 import { expect, test } from 'vitest'
 
-import { ago, leaseKey, matches, newestFirst, perLan, reserve, reserved, until } from '../src/model/leases'
-import { labConfig } from './fixtures'
+import { ago, leaseKey, leaseRows, matches, newestFirst, perLan, reserve, reserved, until } from '../src/model/leases'
+import { labConfig, NOW } from './fixtures'
 
 function lease(address: string, joined: number, more: Partial<Pick<Lease, 'lan' | 'mac' | 'hostname'>> = {}): Lease {
   return create(LeaseSchema, {
@@ -188,4 +188,30 @@ test('reserving twice adds one', () => {
   reserve(draft, base, lease('192.168.1.143', 1, { lan: 'quiet' }))
   reserve(draft, base, lease('192.168.1.10', 1, { mac: '02:00:00:00:00:77' }))
   expect(draft.lans[0]?.dhcp?.static).toHaveLength(2)
+})
+
+test('a row says its ages on the router’s clock and its exact times on the browser’s', () => {
+  // The router's clock is a year behind the browser's: the ages do not notice, and the exact
+  // times are counted back from the browser's now by the router's own measure.
+  const routerClock = Math.floor(NOW.getTime() / 1000) - 31_536_000
+  const plug = lease('192.168.1.143', routerClock - 125, { hostname: 'plug-kitchen', mac: '02:00:00:3A:11:9E' })
+  const unnamed = lease('192.168.20.107', routerClock - 2 * 86_400 - 60, { lan: 'iot' })
+  const rows = leaseRows([plug, unnamed], routerClock, NOW, (_, joinedSecsAgo) => joinedSecsAgo !== undefined && joinedSecsAgo < 180)
+  expect(rows[0]).toEqual({
+    key: 'lan0 02:00:00:3a:11:9e 192.168.1.143',
+    joined: '2 min ago',
+    joinedAt: '19:40:25',
+    address: '192.168.1.143',
+    name: 'plug-kitchen',
+    named: 'yes',
+    mac: '02:00:00:3A:11:9E',
+    lan: 'lan0',
+    expires: 'in 11 h 57 min',
+    expiresAt: '11 Nov 07:40',
+    fresh: 'yes',
+  })
+  expect(rows[1]).toMatchObject({ joined: '2 d ago', joinedAt: '8 Nov 19:41', name: 'none given', named: '', lan: 'iot', fresh: '' })
+  // Until the router has said what time it is, there is no age to say.
+  const waiting = leaseRows([plug], undefined, NOW, () => true)
+  expect(waiting[0]).toMatchObject({ joined: '—', joinedAt: '', expires: '—', expiresAt: '', fresh: 'yes' })
 })
