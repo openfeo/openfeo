@@ -184,6 +184,7 @@ pub(crate) async fn perform(
             shared.revert_config(Why::Asked).await?;
             response::Body::RevertConfig(RevertConfigResponse {})
         }
+        Some(request::Body::Reboot(_)) => response::Body::Reboot(shared.reboot(at.peer)),
         None => {
             return Err(ApiError::new(
                 ErrorCode::InvalidArgument,
@@ -665,6 +666,25 @@ pub(crate) mod tests {
             panic!("not the leases: {reply:?}");
         };
         assert_eq!(answer.leases.map(|table| table.leases.len()), Some(2));
+    }
+
+    /// SPEC §8.3 (M4 part 3b): a restart is asked of the router, and answered at once.
+    #[tokio::test]
+    async fn a_restart_is_asked_of_the_router_and_answered() {
+        use openfeo_config::api::RebootRequest;
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        assert_eq!(api.restarts(), 0);
+        let server_msg::Body::Response(reply) =
+            ws.ask(request::Body::Reboot(RebootRequest {})).await
+        else {
+            panic!("not a response");
+        };
+        assert!(
+            matches!(reply.body, Some(response::Body::Reboot(_))),
+            "{reply:?}"
+        );
+        assert_eq!(api.restarts(), 1);
     }
 
     /// SPEC §8.3, §10: the hour is there for whoever asks, without having subscribed to

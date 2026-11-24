@@ -55,6 +55,13 @@ pub struct Listen {
     pub admit: Admit,
 }
 
+/// How the API has the router restart (SPEC §6.3). `restart` returns at once; the router stops
+/// what has a goodbye to say and asks PID 1 in its own time. Asking twice is asking once.
+pub trait Restarter: Send + Sync {
+    /// Begin a restart of the router.
+    fn restart(&self);
+}
+
 /// What the API needs from the router.
 pub struct ApiDeps {
     /// The World.
@@ -87,6 +94,8 @@ pub struct ApiDeps {
     /// [`keeper::DEFAULT_WINDOW_SECS`], unless a harness build was told a shorter one
     /// (`openfeo.confirm_secs=`).
     pub confirm_secs: u32,
+    /// How a restart is asked of the router.
+    pub restarter: Arc<dyn Restarter>,
 }
 
 /// Bind and serve the API until a listener fails.
@@ -99,18 +108,20 @@ pub async fn run(deps: ApiDeps) -> Result<(), TaskError> {
 }
 
 /// Every route on the HTTPS listener, before the guard closes over them: the plain HTTP
-/// calls, the WebSocket, and the two gRPC services under their own paths.
+/// calls, the WebSocket, and the gRPC services under their own paths.
 pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::Shared>> {
     use tonic::server::NamedService;
 
     use pb::auth_service_server::AuthServiceServer;
     use pb::config_service_server::ConfigServiceServer;
     use pb::state_service_server::StateServiceServer;
+    use pb::system_service_server::SystemServiceServer;
 
     let grpc = grpc::Grpc::new(shared.clone());
     let auth = AuthServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
     let config = ConfigServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
-    let state = StateServiceServer::new(grpc).max_decoding_message_size(limits::MAX_BODY);
+    let state = StateServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
+    let system = SystemServiceServer::new(grpc).max_decoding_message_size(limits::MAX_BODY);
     http::routes()
         .route("/ws", axum::routing::get(ws::upgrade))
         .route_service(
@@ -124,6 +135,10 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
         .route_service(
             &format!("/{}/{{*call}}", ConfigServiceServer::<grpc::Grpc>::NAME),
             config,
+        )
+        .route_service(
+            &format!("/{}/{{*call}}", SystemServiceServer::<grpc::Grpc>::NAME),
+            system,
         )
 }
 

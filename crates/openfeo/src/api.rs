@@ -152,6 +152,15 @@ impl CounterSource for RouterCounters {
     }
 }
 
+/// Stands where the router's restart will: asked, it says so and does nothing.
+struct NotYet;
+
+impl openfeo_api::Restarter for NotYet {
+    fn restart(&self) {
+        warn!("restart: asked, and nothing here does it yet");
+    }
+}
+
 /// What the API is told once, at boot.
 #[derive(Debug, Clone)]
 pub struct Boot {
@@ -207,6 +216,7 @@ pub fn spawn(
                 limits: Limits::default(),
                 extra_host,
                 confirm_secs: confirm_secs.unwrap_or(openfeo_api::keeper::DEFAULT_WINDOW_SECS),
+                restarter: Arc::new(NotYet),
             })
             .await
         }

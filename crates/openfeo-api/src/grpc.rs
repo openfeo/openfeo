@@ -14,10 +14,10 @@ use openfeo_config::api::{
     ApplyConfigRequest, ApplyConfigResponse, ChangePasswordRequest, ChangePasswordResponse,
     ConfirmConfigRequest, ConfirmConfigResponse, ErrorCode, GetConfigRequest, GetConfigResponse,
     GetHistoryRequest, GetHistoryResponse, GetLeasesRequest, GetLeasesResponse, GetStateRequest,
-    GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse,
-    RevertConfigRequest, RevertConfigResponse, ServerMsg, SetInitialPasswordRequest,
-    SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse, ValidateConfigRequest,
-    ValidateConfigResponse, server_msg, subscribe_response, telemetry,
+    GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, RebootRequest,
+    RebootResponse, RevertConfigRequest, RevertConfigResponse, ServerMsg,
+    SetInitialPasswordRequest, SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse,
+    ValidateConfigRequest, ValidateConfigResponse, server_msg, subscribe_response, telemetry,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -31,6 +31,7 @@ use crate::limits::EVENT_BACKLOG;
 use crate::pb::auth_service_server::AuthService;
 use crate::pb::config_service_server::ConfigService;
 use crate::pb::state_service_server::StateService;
+use crate::pb::system_service_server::SystemService;
 use crate::server::{ApiError, Shared};
 use crate::ws::Slot;
 
@@ -309,6 +310,17 @@ impl ConfigService for Grpc {
             .await
             .map_err(|error| status(&error))?;
         Ok(Response::new(RevertConfigResponse {}))
+    }
+}
+
+#[tonic::async_trait]
+impl SystemService for Grpc {
+    async fn reboot(
+        &self,
+        request: Request<RebootRequest>,
+    ) -> Result<Response<RebootResponse>, Status> {
+        token(&self.shared, &request)?;
+        Ok(Response::new(self.shared.reboot(from(&request)?)))
     }
 }
 
@@ -880,6 +892,26 @@ mod tests {
             0,
             "and gives it back"
         );
+    }
+
+    /// SPEC §8.3 (M4 part 3b): `SystemService.Reboot` needs a session like every other call.
+    #[tokio::test]
+    async fn a_restart_over_grpc_needs_a_session() {
+        use crate::pb::system_service_client::SystemServiceClient;
+        use openfeo_config::api::RebootRequest;
+        let (api, token) = crate::testing::TestApi::with_password(PASSWORD).await;
+        let mut system = SystemServiceClient::new(api.channel().await);
+        let refused = system
+            .reboot(with_token(RebootRequest {}, ""))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+        assert_eq!(api.restarts(), 0, "a stranger restarts nothing");
+        system
+            .reboot(with_token(RebootRequest {}, &token))
+            .await
+            .unwrap();
+        assert_eq!(api.restarts(), 1);
     }
 
     #[tokio::test]
