@@ -9,6 +9,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use openfeo_api::telemetry::CounterSource;
 use openfeo_api::{ApiDeps, Limits, Listen};
@@ -21,7 +22,7 @@ use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{Publisher, Supervisor};
 use openfeo_world::health::HealthView;
 use tokio::sync::watch;
-use tracing::debug;
+use tracing::{info, warn};
 
 use crate::router::CONFIG_PATH;
 use crate::version::build_epoch;
@@ -43,6 +44,33 @@ type StatsFuture<'a> = Pin<Box<dyn Future<Output = Option<Vec<LinkStats>>> + Sen
 type StatsSource = Box<dyn Fn() -> StatsFuture<'static> + Send + Sync>;
 type SysctlSource = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+/// A change in whether the counters can be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// A read failed after one that worked, or as the first.
+    Began,
+    /// A read worked after one that failed.
+    Ended,
+}
+
+/// Whether the last read of the counters failed. They are read every second for as long as
+/// the router is up, so a failure is said when it begins and when it ends: a line for each
+/// second of it would bury everything else in the log.
+#[derive(Debug, Default)]
+struct Failing(AtomicBool);
+
+impl Failing {
+    /// What there is to say of a read that `failed` or did not: nothing when the one before
+    /// it went the same way.
+    fn turned(&self, failed: bool) -> Option<Turn> {
+        (self.0.swap(failed, Ordering::Relaxed) != failed).then_some(if failed {
+            Turn::Began
+        } else {
+            Turn::Ended
+        })
+    }
+}
+
 /// The router's counters: every link's from one netlink dump, and conntrack's count and limit.
 pub struct RouterCounters {
     stats: StatsSource,
@@ -52,14 +80,28 @@ pub struct RouterCounters {
 impl RouterCounters {
     /// Counters read through `nl` and `/proc/sys`.
     pub fn new(nl: Netlink) -> Self {
+        let failing = Arc::new(Failing::default());
         Self::with(
             move || {
                 let nl = nl.clone();
+                let failing = failing.clone();
                 Box::pin(async move {
-                    nl.link_stats()
-                        .await
-                        .map_err(|err| debug!("counters: {err}"))
-                        .ok()
+                    match nl.link_stats().await {
+                        Ok(links) => {
+                            if failing.turned(false) == Some(Turn::Ended) {
+                                info!("counters: read again");
+                            }
+                            Some(links)
+                        }
+                        Err(err) => {
+                            if failing.turned(true) == Some(Turn::Began) {
+                                warn!(
+                                    "counters: cannot be read, until this log says they are again: {err}"
+                                );
+                            }
+                            None
+                        }
+                    }
                 })
             },
             |key| sysctl::read(key).ok(),
@@ -215,6 +257,24 @@ mod tests {
         assert_eq!((counters.conntrack, counters.conntrack_max), (0, 0));
         let failing = RouterCounters::with(|| Box::pin(async { None }), |_| None);
         assert_eq!(failing.read().await, None);
+    }
+
+    /// The counters are read every second for as long as the router is up: a read that fails
+    /// is said when the failing begins and when it ends, not each second of it.
+    #[test]
+    fn a_failing_read_is_said_when_it_begins_and_when_it_ends() {
+        let failing = Failing::default();
+        assert_eq!(failing.turned(false), None, "a read that works");
+        assert_eq!(failing.turned(true), Some(Turn::Began));
+        assert_eq!(failing.turned(true), None, "the second after");
+        assert_eq!(failing.turned(true), None, "and every one after that");
+        assert_eq!(failing.turned(false), Some(Turn::Ended));
+        assert_eq!(failing.turned(false), None, "a read that works again");
+        assert_eq!(
+            failing.turned(true),
+            Some(Turn::Began),
+            "it can begin again"
+        );
     }
 
     #[test]
