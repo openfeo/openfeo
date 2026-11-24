@@ -17,6 +17,7 @@ import FirstPassword from './pages/FirstPassword.vue'
 import Lan from './pages/Lan.vue'
 import Leases from './pages/Leases.vue'
 import Login from './pages/Login.vue'
+import System from './pages/System.vue'
 import Wan from './pages/Wan.vue'
 import type { PanelSession, Screen } from './session'
 import Shell from './Shell.vue'
@@ -29,7 +30,7 @@ export const PATHS: Record<Screen, string> = {
 }
 
 /** The pages behind the login, each by the address it starts at. */
-export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan', leases: '/leases', firewall: '/firewall', dns: '/dns' } as const
+export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan', leases: '/leases', firewall: '/firewall', dns: '/dns', system: '/system' } as const
 
 /** The gates: a screen that is one of these has exactly one address. */
 const GATES = new Set<string>([PATHS.login, PATHS['first-password'], PATHS['config-unreadable']])
@@ -57,6 +58,7 @@ export function panelRoutes(session: PanelSession, history: RouterHistory = crea
           { path: 'leases', component: Leases },
           { path: 'firewall', component: Firewall },
           { path: 'dns', component: Dns },
+          { path: 'system', component: System },
         ],
       },
       { path: PATHS.login, component: Login },

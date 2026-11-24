@@ -18,6 +18,8 @@ const props = defineProps<{
   host: string
   /** Its full name, to come back to. */
   name: string
+  /** The router's name now and after, when the change renames it. */
+  renamed?: { from: string; to: string } | undefined
   /** The window the router gives, in seconds. */
   confirmSecs: number
   /** The apply is under way. */
@@ -55,6 +57,16 @@ const moves = computed(() => {
       ><template v-if="moves.address">
         or <code class="ofo-mono">https://{{ moves.address }}</code></template
       >.
+    </OfoBanner>
+
+    <!-- The page was reached by a name that will stop answering; its socket goes on working. -->
+    <OfoBanner v-if="renamed" class="apply__renamed" tone="warn" title="This renames the router">
+      It will answer at <code class="ofo-mono">https://{{ renamed.to }}</code> and no longer at <code class="ofo-mono">https://{{ renamed.from }}</code
+      >, and its certificate is issued again, so the browser will ask about it once more. This page goes on working until it is closed or reloaded: confirm the change here, then open
+      the new name.<template v-if="review.caller?.routerAfter">
+        It is also at <code class="ofo-mono">https://{{ review.caller.routerAfter }}</code
+        >.</template
+      >
     </OfoBanner>
 
     <p v-if="immediate" class="ofo-dialog__text apply__window">Nothing will undo this change by itself.</p>

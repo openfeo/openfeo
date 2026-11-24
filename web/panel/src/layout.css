@@ -241,6 +241,20 @@ body {
   margin-top: var(--space-3);
 }
 
+/* The System page's About: a name beside each thing the router says of itself, the long
+   fingerprint breaking where it must. */
+.about {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+}
+
+.about dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 /* The Firewall page's grid: each tick stands under the name of its column, and what the
    router refused about a row's ticks is said beneath the table. */
 .reach th:not(:first-child),

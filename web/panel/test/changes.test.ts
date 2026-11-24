@@ -288,7 +288,7 @@ test('a DHCP server turned off says what goes with it', () => {
 })
 
 test('a difference no page shows is listed by its path', () => {
-  expect(after((d) => (d.system!.hostname = 'edge'))).toEqual([{ subject: 'system.hostname', what: '', before: 'openfeo', after: 'edge' }])
+  expect(after((d) => (d.system!.timezone = 'Europe/London'))).toEqual([{ subject: 'system.timezone', what: '', before: '', after: 'Europe/London' }])
   // A whole part of the config there, with nothing in it, against not there at all.
   const bare = labConfig()
   bare.firewall = undefined
@@ -357,6 +357,20 @@ test('what a LAN may reach is said in words', () => {
 
 test('whether the router answers ping is named', () => {
   expect(after((d) => (d.firewall!.wanPing = false))).toEqual([{ subject: 'The router', what: 'answers ping from the internet', before: 'yes', after: 'no' }])
+})
+
+// ---- The System page's settings, as it names them (M4 part 3b) ----
+
+test('the router’s name and its time servers are named', () => {
+  expect(after((d) => (d.system!.hostname = 'edge'))).toEqual([{ subject: 'The router', what: 'hostname', before: 'openfeo', after: 'edge' }])
+  expect(after((d) => (d.system!.domain = 'lan.example'))).toEqual([{ subject: 'The router', what: 'domain', before: 'home.arpa', after: 'lan.example' }])
+  expect(after((d) => (d.system!.ntpServers = ['0.pool.ntp.org', '203.0.113.1']))).toEqual([
+    { subject: 'The router', what: 'time servers', before: 'none', after: '0.pool.ntp.org, 203.0.113.1' },
+  ])
+  // A router with no system settings at all gains a name.
+  const bare = labConfig()
+  bare.system = undefined
+  expect(after((d) => (d.system = create(ConfigSchema, { system: { hostname: 'edge' } }).system), bare)).toEqual([{ subject: 'The router', what: 'hostname', before: 'none', after: 'edge' }])
 })
 
 // ---- The DNS page's settings, as it names them (M4 part 3b) ----

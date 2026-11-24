@@ -368,7 +368,18 @@ function ruleSettings(base: Rule, draft: Rule): Setting[] {
 }
 
 /** The fields of the config outside the WANs and the LANs that a page names: not listed by path. */
-const NAMED = ['firewall.port_forwards', 'firewall.rules', 'firewall.wan_ping', 'dns.upstreams', 'dns.use_wan_dns', 'dns.records', 'dns.rebind_allow']
+const NAMED = [
+  'firewall.port_forwards',
+  'firewall.rules',
+  'firewall.wan_ping',
+  'dns.upstreams',
+  'dns.use_wan_dns',
+  'dns.records',
+  'dns.rebind_allow',
+  'system.hostname',
+  'system.domain',
+  'system.ntp_servers',
+]
 
 function lanSettings(base: Lan, draft: Lan): Setting[] {
   const found: Setting[] = []
@@ -545,6 +556,13 @@ export function changes(base: Config, draft: Config): Change[] {
   const through: Setting[] = []
   differing(through, 'names let through', listed(base.dns?.rebindAllow), listed(draft.dns?.rebindAllow), 'rebind_allow')
   found.push(...through.map(({ what, before, after }) => ({ subject: 'DNS', what, before, after })))
+
+  // The router's own name and its time servers, as the System page has them.
+  const own: Setting[] = []
+  differing(own, 'hostname', base.system?.hostname ?? '', draft.system?.hostname ?? '', 'hostname')
+  differing(own, 'domain', base.system?.domain ?? '', draft.system?.domain ?? '', 'domain')
+  differing(own, 'time servers', listed(base.system?.ntpServers), listed(draft.system?.ntpServers), 'ntp_servers')
+  found.push(...own.map(({ what, before, after }) => ({ subject: 'The router', what, before, after })))
 
   // The rest of the config, leaf by leaf. The WANs and the LANs are done, and so is what a
   // page names above; the admin's hash is neither sent nor taken, so it is never a change.

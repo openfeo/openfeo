@@ -20,6 +20,7 @@ import { RouterView, useRoute, useRouter } from 'vue-router'
 import { CONFIG, useConfig, type Review } from './config'
 import { LIVE, useLive } from './live'
 import { clock, duration } from './model/format'
+import { renamedTo } from './model/system'
 import ApplyDialog from './parts/ApplyDialog.vue'
 import NoticeBanner from './parts/NoticeBanner.vue'
 import PendingBanner from './parts/PendingBanner.vue'
@@ -75,6 +76,8 @@ const nav = computed<NavEntry[]>(() => [
   { kind: 'item', label: 'Leases', icon: 'monitor-smartphone', to: PAGES.leases, current: at(PAGES.leases) },
   { kind: 'item', label: 'Firewall', icon: 'shield', to: PAGES.firewall, current: at(PAGES.firewall) },
   { kind: 'item', label: 'DNS', icon: 'text', to: PAGES.dns, current: at(PAGES.dns) },
+  { kind: 'group', label: 'Router' },
+  { kind: 'item', label: 'System', icon: 'settings', to: PAGES.system, current: at(PAGES.system) },
 ])
 
 // The theme is the one thing kept in local storage; where that is blocked, a choice lasts the page.
@@ -88,7 +91,7 @@ function setTheme(chosen: Theme): void {
 // What the settings pages have changed is applied from here, whichever of them is shown:
 // the bar beneath the page counts it, and one dialog says what an apply does before it is sent.
 // (Leases is one of them: Reserve on a row is a change like any other.)
-const settings = computed(() => [PAGES.wan, PAGES.lan, PAGES.leases, PAGES.firewall, PAGES.dns].some(at))
+const settings = computed(() => [PAGES.wan, PAGES.lan, PAGES.leases, PAGES.firewall, PAGES.dns, PAGES.system].some(at))
 /**
  * Why another apply is not offered just now: one is waiting to be confirmed, or one was sent
  * and the router has not yet said whether it took it (another would be asked of a router
@@ -191,6 +194,7 @@ const lostAtClock = computed(() => (lostAt.value === null ? '' : clock(BigInt(lo
       :review="reviewed"
       :host="session.status.value?.hostname ?? ''"
       :name="host"
+      :renamed="renamedTo(config.base.value, reviewed.config) ?? undefined"
       :confirm-secs="config.confirmSecs.value"
       :busy="config.busy.value"
       @apply="apply"
