@@ -4,7 +4,7 @@
 import { clone, ConfigSchema, create, LeaseSchema, type Config, type Lease } from '@openfeo/client'
 import { expect, test } from 'vitest'
 
-import { ago, leaseKey, leaseRows, matches, newestFirst, perLan, reserve, reserved, until } from '../src/model/leases'
+import { ago, justJoined, leaseKey, leaseRows, matches, newestFirst, perLan, reserve, reserved, until } from '../src/model/leases'
 import { labConfig, NOW } from './fixtures'
 
 function lease(address: string, joined: number, more: Partial<Pick<Lease, 'lan' | 'mac' | 'hostname'>> = {}): Lease {
@@ -87,6 +87,21 @@ test('a time ahead of the clock is just now', () => {
   expect(ago(-30)).toBe('just now')
   expect(ago(-86_400)).toBe('just now')
   expect(ago(Number.NaN)).toBe('just now')
+})
+
+test('a lease has just joined within a minute of the router’s clock, either side of it', () => {
+  expect(justJoined(0)).toBe(true)
+  expect(justJoined(59)).toBe(true)
+  expect(justJoined(60)).toBe(false)
+  // The stamp and the table's clock are each said to the second: a second ahead is still new.
+  expect(justJoined(-2)).toBe(true)
+  // A lease file written under a right clock and read while the clock is still the build's:
+  // every lease in it is months ahead, and none of them is a device just plugged in.
+  expect(justJoined(-60)).toBe(false)
+  expect(justJoined(-86_400)).toBe(false)
+  // Until the router has said what time it is.
+  expect(justJoined(undefined)).toBe(false)
+  expect(justJoined(Number.NaN)).toBe(false)
 })
 
 test('how long until, by its two largest units', () => {

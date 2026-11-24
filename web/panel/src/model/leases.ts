@@ -63,6 +63,16 @@ export function ago(secs: number): string {
   return `${Math.floor(secs / 86_400)} d ago`
 }
 
+/**
+ * Whether a lease that joined `secs` ago is the device just plugged in: within a minute of the
+ * router's clock, on either side of it. A second or two ahead is still new (the stamp and the
+ * clock are each said to the second); a lease far ahead of the clock was read from a file under
+ * a clock that is wrong, and is no newer than the rest.
+ */
+export function justJoined(secs: number | undefined): boolean {
+  return secs !== undefined && Math.abs(secs) < 60
+}
+
 /** How long until, given the seconds left, by its two largest units; "expired" with none left. */
 export function until(secs: number): string {
   if (!(secs > 0)) {

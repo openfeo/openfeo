@@ -124,6 +124,29 @@ test('the peak is the highest ten-second average of the hour, not the highest se
   expect(peak(samples(0, 5_000, () => 8 * MBIT), 5_000)).toBeUndefined()
 })
 
+test('ten seconds of which under half was read are not drawn, and are not the peak', () => {
+  // The line is away from 300 s to 338 s (a PPPoE session ended and another began) and comes
+  // back into a burst: the readings at 339 s and 340 s are all there is of their ten seconds.
+  const burst = (atMs: number) => (atMs > 338_000 && atMs <= 340_000 ? 800 * MBIT : 8 * MBIT)
+  const back = samples(0, 400_000, burst, (atMs) => atMs <= 300_000 || atMs >= 338_000)
+  // Two seconds at 800 are not ten seconds at 800.
+  expect(peak(back, 400_000)?.rx).toBeCloseTo(8 * MBIT, 0)
+  const hour = drawn(back, '1h', 400_000, undefined)
+  expect(hour.unit).toBe('Mbit/s')
+  expect(hour.runs.map((run) => [run[0]?.at, run.at(-1)?.at])).toEqual([
+    [10, 300],
+    [350, 400],
+  ])
+  // Each second of it is still in the five minutes, where a second is a second.
+  const second = drawn(back, '5m', 400_000, undefined)
+  expect(Math.max(...second.runs.flatMap((run) => run.map((point) => point.rx)))).toBeCloseTo(800, 6)
+  // Half of the ten seconds is enough: a line that came back at 334 s is drawn from 340 s.
+  const sooner = samples(0, 400_000, () => 8 * MBIT, (atMs) => atMs <= 300_000 || atMs >= 334_000)
+  expect(drawn(sooner, '1h', 400_000, undefined).runs.map((run) => run[0]?.at)).toEqual([10, 340])
+  // The hour's first seconds after a boot follow the same rule.
+  expect(peak(samples(7_000, 30_000, (atMs) => (atMs <= 10_000 ? 800 * MBIT : 8 * MBIT)), 30_000)?.rx).toBeCloseTo(8 * MBIT, 0)
+})
+
 const UPTIME_MS = UPTIME_SECS * 1000
 const at = (minutesAgo: number) => new Date(NOW.getTime() - minutesAgo * 60_000)
 

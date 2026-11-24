@@ -226,12 +226,13 @@ test('an hour is kept and no more, and a WAN that is gone is forgotten', async (
   live.stop()
 })
 
-test('a WAN with no interface is not asked about, and nine WANs are asked about in two calls', async () => {
+test('a WAN whose interface has no name is not asked about, and nine WANs are asked about in two calls', async () => {
   const { router, live } = started()
   const many = state()
   const first = many.wans[0]
   if (first !== undefined) {
-    // (A PPPoE WAN between sessions has no interface to name.)
+    // (The router names an interface for every WAN, a PPPoE WAN's between sessions too; an
+    // empty name is no link to ask about.)
     many.wans = [
       ...Array.from({ length: 9 }, (_, n) => ({ ...first, name: `wan${n}`, interface: `p${n}` })),
       { ...first, name: 'wan9', interface: '' },

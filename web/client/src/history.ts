@@ -77,12 +77,13 @@ export function ratesOver(samples: readonly LinkSample[]): RatePoint[] {
 }
 
 /**
- * The mean of the points in each bucket that has any, placed at the bucket's end. Buckets are
- * `bucketMs` long and aligned to its multiples, each holding the points after its start up to
- * and at its end; one with no point is absent. With no length to a bucket the points come back
- * as they are.
+ * The mean of the points in each bucket that has at least `least` of them, placed at the
+ * bucket's end. Buckets are `bucketMs` long and aligned to its multiples, each holding the
+ * points after its start up to and at its end; one with fewer points is absent, since the
+ * mean of a second or two is not the mean of the bucket (a link that had just come back, or
+ * the first seconds after a boot). With no length to a bucket the points come back as they are.
  */
-export function averaged(points: readonly RatePoint[], bucketMs: number): RatePoint[] {
+export function averaged(points: readonly RatePoint[], bucketMs: number, least = 1): RatePoint[] {
   if (!(bucketMs > 0)) {
     return [...points]
   }
@@ -96,6 +97,7 @@ export function averaged(points: readonly RatePoint[], bucketMs: number): RatePo
     buckets.set(end, bucket)
   }
   return [...buckets.entries()]
+    .filter(([, bucket]) => bucket.count >= least)
     .sort(([a], [b]) => a - b)
     .map(([atMs, bucket]) => ({ atMs, rxBitsPerSec: bucket.rx / bucket.count, txBitsPerSec: bucket.tx / bucket.count }))
 }

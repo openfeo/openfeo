@@ -100,8 +100,9 @@ pub struct Conn {
     replies: VecDeque<ServerMsg>,
     state: Option<State>,
     leases: Option<Leases>,
-    /// The leases of the last table taken, and whether it was cut: what the next is told from.
-    leases_taken: Option<(Vec<Lease>, bool)>,
+    /// The leases of the last table pushed, sent yet or not, and whether it was cut: what
+    /// the next is told from.
+    leases_pushed: Option<(Vec<Lease>, bool)>,
     counters: Option<Counters>,
     events: VecDeque<Event>,
     lost: bool,
@@ -240,7 +241,7 @@ impl Conn {
                     Topic::State => self.state = None,
                     Topic::Leases => {
                         self.leases = None;
-                        self.leases_taken = None;
+                        self.leases_pushed = None;
                     }
                     Topic::Counters => self.counters = None,
                     Topic::Events => {
@@ -296,20 +297,20 @@ impl Conn {
     }
 
     /// The lease table; replaces one not yet sent. Dropped unless subscribed, and dropped
-    /// when its leases are those of the last table taken: every table carries the router's
+    /// when its leases are those of the last table pushed: every table carries the router's
     /// clock, and the clock alone is no change.
     pub fn push_leases(&mut self, leases: &Leases) {
         if !self.wants(Topic::Leases) {
             return;
         }
         let same = self
-            .leases_taken
+            .leases_pushed
             .as_ref()
-            .is_some_and(|(taken, truncated)| {
-                *taken == leases.leases && *truncated == leases.truncated
+            .is_some_and(|(pushed, truncated)| {
+                *pushed == leases.leases && *truncated == leases.truncated
             });
         if !same {
-            self.leases_taken = Some((leases.leases.clone(), leases.truncated));
+            self.leases_pushed = Some((leases.leases.clone(), leases.truncated));
             self.leases = Some(leases.clone());
         }
     }

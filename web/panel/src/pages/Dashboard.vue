@@ -9,7 +9,7 @@ import { LIVE } from '../live'
 import { drawn, marks, OPENING, peak, rangeOf, RANGES, ticks, type Range } from '../model/chart'
 import { addresses, cards, defaultWan, headline, ports, tiles } from '../model/dashboard'
 import { sentence, when } from '../model/events'
-import { leaseRows, newestFirst } from '../model/leases'
+import { justJoined, leaseRows, newestFirst } from '../model/leases'
 import { PAGES } from '../routes'
 
 // The dashboard (SPEC §8.4): read-only and live. What it says and how it says it is
@@ -49,7 +49,8 @@ const charts = computed(() =>
     : state.value.wans.map((wan) => ({
         title: wan.name,
         label: `Download and upload on ${wan.name} over ${rangeOf(range.value).words}`,
-        // A WAN with no interface just now (PPPoE between sessions) has nothing kept: its plot is empty.
+        // A WAN the router has kept nothing of (a PPPoE WAN with no session in the hour: its
+        // interface is named all the while, and is there only during one) has an empty plot.
         ...drawn(live.samples.value.get(wan.interface) ?? [], range.value, edgeMs.value, live.rates.value?.get(wan.interface)),
         marks: marks(live.events.value, wan.name, range.value, edgeMs.value, sinceBootMs.value, now.value),
         ticks: ticks(range.value, edgeMs.value, sinceBootMs.value, now.value),
@@ -71,7 +72,7 @@ const newest = computed(() =>
   live.leases.value === null
     ? null
     : // A device that joined under a minute ago is marked: it is the one just plugged in.
-      leaseRows(newestFirst(live.leases.value.leases).slice(0, NEWEST), live.routerClock.value, now.value, (_, ago) => ago !== undefined && ago < 60),
+      leaseRows(newestFirst(live.leases.value.leases).slice(0, NEWEST), live.routerClock.value, now.value, (_, ago) => justJoined(ago)),
 )
 const marked = (row: Record<string, string>) => (row.fresh === 'yes' ? 'ofo-table__row--new' : undefined)
 const interfaces = computed(() => (state.value === null ? null : cards(state.value, live.rates.value)))

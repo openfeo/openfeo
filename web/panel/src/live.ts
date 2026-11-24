@@ -115,7 +115,11 @@ export function useLive(router: PanelRouter): LiveData {
   let eventsSubscription: Subscription | undefined
   let unhear: (() => void) | undefined
 
-  /** The links the samples are kept of: each WAN's interface, where it has one (a PPPoE WAN between sessions has none). */
+  /**
+   * The links the samples are kept of: each WAN's interface. The router names one for every
+   * WAN, a PPPoE WAN's between sessions too, when the kernel has no such link and there is
+   * nothing to read of it; a name that is empty is no link to ask about.
+   */
   function wanted(): string[] {
     return [...new Set((state.value?.wans ?? []).map((wan) => wan.interface).filter((link) => link !== ''))]
   }
