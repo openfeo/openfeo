@@ -187,6 +187,22 @@ const SCENARIOS: &[Scenario] = &[
         name: "the_state_says_which_resolvers_are_in_use",
         run: the_state_says_which_resolvers_are_in_use,
     },
+    Scenario {
+        name: "a_restart_asked_over_the_api_stops_in_order_and_keeps_the_leases",
+        run: a_restart_asked_over_the_api_stops_in_order_and_keeps_the_leases,
+    },
+    Scenario {
+        name: "a_restart_ends_the_pppoe_session_first",
+        run: a_restart_ends_the_pppoe_session_first,
+    },
+    Scenario {
+        name: "a_restart_does_not_wait_for_a_concentrator_that_says_nothing",
+        run: a_restart_does_not_wait_for_a_concentrator_that_says_nothing,
+    },
+    Scenario {
+        name: "a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config",
+        run: a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -2823,5 +2839,231 @@ fn the_state_says_which_resolvers_are_in_use(lab: &mut Lab) -> anyhow::Result<()
     applied(&mut ws, &config, &tag, true, 0)?;
     ws.state_where(SOON, |state| resolvers_of(state) == [typed.clone()])
         .context("with the switch off the WAN's resolver is still in use")?;
+    no_task_failed(lab)
+}
+
+/// The API logs who asked for a restart.
+const RESTART_ASKED: &str = r"openfeo: system: restart asked from 192\.168\.1\.";
+/// PID 1 was asked to restart by the router process: the goodbyes are over.
+const REBOOT_REQUESTED: &str = r"openfeo-init: reboot requested by child";
+
+/// Ask for a restart over the socket and take a refusal for a failure of the scenario.
+fn restart_asked(ws: &mut Ws) -> anyhow::Result<()> {
+    ws.reboot()?
+        .map_err(|error| anyhow::anyhow!("the restart was refused: {error:?}"))
+}
+
+/// SPEC §6.3 (M4 part 3b): a restart asked over the API needs a session; it stops the LAN's
+/// DHCPv4 server first, so that a lease changed a moment before is in the file, and leaves the
+/// WAN's DHCPv4 client alone, so that the router comes back to the address it had. The router
+/// comes back with a smaller uptime, the same config and nobody logged in.
+fn a_restart_asked_over_the_api_stops_in_order_and_keeps_the_leases(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let refused = api.grpc_reboot(None)?;
+    ensure!(
+        refused
+            .as_ref()
+            .is_err_and(|status| status.code() == tonic::Code::Unauthenticated),
+        "a restart with no session: {refused:?}"
+    );
+    ensure!(
+        lab.console()?.count(&re(RESTART_ASKED)) == 0,
+        "a stranger's restart was taken"
+    );
+    // One device, joining twice under two names within a moment: the second is a change to its
+    // lease that the server has not yet written to its file (it writes once in five seconds).
+    join(lab, "early")?;
+    join(lab, "late")?;
+    let mut ws = api.ws_with(&token)?;
+    let deadline = Instant::now() + SOON;
+    let lease = loop {
+        let table = ws.leases()?;
+        if let Some(lease) = table.leases.iter().find(|lease| lease.hostname == "late") {
+            break lease.clone();
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the lease is not there: {table:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let before = ws.request_state()?;
+    let uptime = before
+        .system
+        .as_ref()
+        .map_or(0, |system| system.uptime_secs);
+    let wan_address = before.wans.first().map(|wan| wan.ipv4.clone());
+    let tag = ws.config()?.tag;
+    let listening = lab.console()?.count(&re(LISTENING));
+
+    let mut cur = Cursor::default();
+    restart_asked(&mut ws)?;
+    let console = lab.console()?;
+    console.wait_for(&mut cur, &re(RESTART_ASKED), SOON)?;
+    let asked = cur;
+    console
+        .wait_for(&mut cur, &re(LAN0_DHCP_STOPPED), SOON)
+        .context("the LAN's DHCP server was not stopped before the restart")?;
+    console
+        .wait_for(&mut cur, &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    wait_listening_again(lab, listening)?;
+    let console = lab.console()?;
+    ensure!(
+        console.count_since(&asked, &re(WAN0_DHCP_STOPPED)) == 0,
+        "the WAN's DHCP client was stopped for the restart: its lease is released"
+    );
+    console
+        .wait_for(&mut cur, &re(INIT_REBOOT), SOON)
+        .context("the router did not come back asking for the address it had")?;
+
+    ensure!(
+        api.get("/api/state", Some(&token))?.status == 401,
+        "a session outlived the restart"
+    );
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    // The state as it stands, and then every change, until the WAN has its address again.
+    ws.subscribe("state", 0)?;
+    let after = ws
+        .state_where(BOOT_TIMEOUT, |state| {
+            state.wans.first().map(|wan| wan.ipv4.clone()) == wan_address
+        })
+        .context("the WAN did not come back to the address it had")?;
+    let uptime_after = after
+        .system
+        .as_ref()
+        .map_or(u64::MAX, |system| system.uptime_secs);
+    ensure!(
+        uptime_after < uptime,
+        "the uptime did not start again: {uptime} s before, {uptime_after} s after"
+    );
+    ensure!(
+        ws.config()?.tag == tag,
+        "the config changed across the restart"
+    );
+    let table = ws.leases()?;
+    let kept = table
+        .leases
+        .iter()
+        .find(|kept| kept.mac == lease.mac)
+        .with_context(|| format!("the lease did not survive the restart: {table:?}"))?;
+    ensure!(
+        (
+            kept.hostname.as_str(),
+            kept.address.as_str(),
+            kept.joined_unix
+        ) == ("late", lease.address.as_str(), lease.joined_unix),
+        "the lease came back as {kept:?}, and was {lease:?}"
+    );
+    no_task_failed(lab)
+}
+
+/// SPEC §6.3, §7.2: before the router restarts, its PPPoE session is ended as the protocol
+/// asks, so the access concentrator knows at once and does not hold the account until its own
+/// echoes fail.
+fn a_restart_ends_the_pppoe_session_first(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_pppoe(lab)?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let listening = lab.console()?.count(&re(LISTENING));
+    let mut cur = Cursor::default();
+    lab.console()?.wait_for(&mut cur, &re(PPPOE_UP), SOON)?;
+    restart_asked(&mut ws)?;
+    let console = lab.console()?;
+    console.wait_for(&mut cur, &re(RESTART_ASKED), SOON)?;
+    console
+        .wait_for(&mut cur, &re(PPPOE_STOPPED), SOON)
+        .context("the PPPoE session was not ended before the restart")?;
+    console
+        .wait_for(&mut cur, &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    // The concentrator's side: our Terminate-Request reached its pppd.
+    pppd_log_shows(lab, "LCP terminated by peer")?;
+    wait_listening_again(lab, listening)?;
+    lab.console()?
+        .wait_for(&mut cur, &re(PPPOE_UP), BOOT_TIMEOUT)
+        .context("no session after the restart")?;
+    no_task_failed(lab)
+}
+
+/// SPEC §6.3: the goodbyes get 3 s and the restart goes ahead without them. A concentrator
+/// that answers nothing costs those seconds and nothing else.
+fn a_restart_does_not_wait_for_a_concentrator_that_says_nothing(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    boot_pppoe(lab)?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let listening = lab.console()?.count(&re(LISTENING));
+    // Killed, not stopped: nothing goes out, and the router's session still believes in it.
+    ensure!(lab.kill_pppoe_server(), "no access concentrator to kill");
+    let mut cur = Cursor::default();
+    restart_asked(&mut ws)?;
+    let answered = Instant::now();
+    let console = lab.console()?;
+    console.wait_for(&mut cur, &re(RESTART_ASKED), SOON)?;
+    console
+        .wait_for(
+            &mut cur,
+            &re(r"openfeo: task pppoe-wan0 did not stop in 3s; dropped"),
+            SOON,
+        )
+        .context("the session was not given up on")?;
+    console
+        .wait_for(&mut cur, &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    let took = answered.elapsed();
+    ensure!(
+        took <= Duration::from_secs(6),
+        "the restart waited {took:?} for a concentrator that was not there"
+    );
+    wait_listening_again(lab, listening)
+}
+
+/// SPEC §5.5, §6.3: a restart does not confirm a change that is waiting. The router comes back
+/// on the confirmed config, as after a power cut, and says the change was discarded.
+fn a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let ping = |config: &Config| {
+        config
+            .firewall
+            .as_ref()
+            .is_some_and(|firewall| firewall.wan_ping)
+    };
+    // A change that moves nothing, left unconfirmed.
+    let mut changed = config.clone();
+    changed
+        .firewall
+        .get_or_insert_with(Default::default)
+        .wan_ping = !ping(&config);
+    applied(&mut ws, &changed, &view.tag, false, 600)?;
+    let listening = lab.console()?.count(&re(LISTENING));
+    restart_asked(&mut ws)?;
+    lab.console()?
+        .wait_for(&mut Cursor::default(), &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    wait_listening_again(lab, listening)?;
+    lab.console()?
+        .wait_for(&mut Cursor::default(), &re(DISCARDED), SOON)?;
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let after = ws.config()?;
+    let running = after.config.context("no config")?;
+    ensure!(
+        after.tag == view.tag && ping(&running) == ping(&config),
+        "the router came back on the change it was never told to keep"
+    );
+    ws.subscribe("events", 16)?;
+    ws.event(SOON, "config.discarded")?;
     no_task_failed(lab)
 }

@@ -103,16 +103,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
 
     let health = HealthTracker::new();
     let supervisor = Supervisor::new(health.clone());
-    let ctl = CtlPipe::from_env();
-    if ctl.is_none() {
-        warn!("no control pipe (not supervised by PID 1); heartbeats go nowhere");
-    }
-    // Healthy until the first beat says otherwise; the API and the health events read this.
-    let (health_view_tx, health_view_rx) = watch::channel(HealthView {
-        healthy: true,
-        unhealthy: Vec::new(),
-    });
-    tokio::spawn(heartbeat::run(ctl, health.clone(), hung, health_view_tx));
+    let (health_view_rx, restarts, restart) = spawn_heartbeat(&health, hung);
 
     match kernel_decision(kconfig::read_running(), mode) {
         KernelDecision::Proceed(n) => info!("kernel: all {n} required options present"),
@@ -162,7 +153,12 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
         });
     }
     spawn_health_events(&supervisor, &publisher, &health_view_rx);
-    spawn_families(&supervisor, &publisher, &world_rx, ipv6_secret);
+    let goodbyes = spawn_families(&supervisor, &publisher, &world_rx, ipv6_secret);
+    tokio::spawn(crate::restart::run(
+        restart.asked,
+        move || goodbyes.say(),
+        restart.pid1,
+    ));
     crate::dns::spawn(&supervisor, &publisher, &world_rx);
     crate::ra::spawn(&supervisor, &publisher, &world_rx);
     crate::dhcp6_server::spawn(&supervisor, &publisher, &world_rx);
@@ -179,6 +175,7 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             extra_host: crate::panel_host::from_cmdline(cmdline),
             confirm_secs: crate::confirm_secs::from_cmdline(cmdline),
         },
+        restarts,
     );
     {
         let health = health.clone();
@@ -196,17 +193,60 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
     std::future::pending().await
 }
 
+/// What the restart task is started with once the families are up.
+struct RestartEnds {
+    /// Where the API's asks arrive.
+    asked: crate::restart::Asked,
+    /// Tells the heartbeat task, which owns the control pipe, to ask PID 1.
+    pid1: watch::Sender<bool>,
+}
+
+/// The heartbeat to PID 1 (SPEC §5.3), started before anything else can hang, and with it the
+/// ends of a restart asked through the API (SPEC §6.3): the API asks, the restart task says
+/// the goodbyes, and the heartbeat task, which owns the pipe, asks PID 1. Returns the
+/// heartbeat's view of health, what the API asks a restart with, and the restart task's ends.
+fn spawn_heartbeat(
+    health: &HealthTracker,
+    hung: Arc<AtomicBool>,
+) -> (
+    watch::Receiver<HealthView>,
+    crate::restart::Restarts,
+    RestartEnds,
+) {
+    let ctl = CtlPipe::from_env();
+    if ctl.is_none() {
+        warn!("no control pipe (not supervised by PID 1); heartbeats go nowhere");
+    }
+    // Healthy until the first beat says otherwise; the API and the health events read this.
+    let (health_view_tx, health_view_rx) = watch::channel(HealthView {
+        healthy: true,
+        unhealthy: Vec::new(),
+    });
+    let (restarts, asked) = crate::restart::channel();
+    let (pid1, restart_due) = watch::channel(false);
+    tokio::spawn(heartbeat::run(
+        ctl,
+        health.clone(),
+        hung,
+        health_view_tx,
+        restart_due,
+    ));
+    (health_view_rx, restarts, RestartEnds { asked, pid1 })
+}
+
 /// The tasks that exist once per WAN or LAN (SPEC §6.3): the DHCPv4 client, PPPoE, the two
-/// IPv6 clients of a WAN, and the DHCPv4 server of a LAN.
+/// IPv6 clients of a WAN, and the DHCPv4 server of a LAN. The two families with a goodbye to
+/// say before a restart can be halted; the others are never stopped for one, the DHCPv4 client
+/// above all, which would give its lease back.
 fn spawn_families(
     supervisor: &Supervisor,
     publisher: &Arc<Publisher>,
     world_rx: &openfeo_runtime::world::WorldRx,
     ipv6_secret: Option<[u8; 16]>,
-) {
+) -> crate::restart::Goodbyes {
     crate::family::spawn(crate::dhcp4::Dhcp4Clients, supervisor, publisher, world_rx);
     let secret = ipv6_secret.unwrap_or([0; 16]);
-    crate::family::spawn(
+    let pppoe = crate::family::spawn_haltable(
         crate::pppoe::PppoeClients { secret },
         supervisor,
         publisher,
@@ -219,12 +259,16 @@ fn spawn_families(
         world_rx,
     );
     crate::family::spawn(crate::dhcp6::Dhcp6Clients, supervisor, publisher, world_rx);
-    crate::family::spawn(
+    let dhcp4_servers = crate::family::spawn_haltable(
         crate::dhcp4_server::Dhcp4Servers,
         supervisor,
         publisher,
         world_rx,
     );
+    crate::restart::Goodbyes {
+        pppoe,
+        dhcp4_servers,
+    }
 }
 
 /// What `/state/identity/` holds for IPv6, loaded before the World exists.

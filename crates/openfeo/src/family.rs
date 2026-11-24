@@ -48,13 +48,6 @@ pub trait Family: Send + Sync + 'static {
 }
 
 /// Stops a family for good, for a restart of the router (SPEC §6.3).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the restart that halts a family is the next change"
-    )
-)]
 #[derive(Debug, Clone)]
 pub struct Halt {
     ask: mpsc::Sender<oneshot::Sender<()>>,
@@ -64,13 +57,6 @@ impl Halt {
     /// Have the manager stop every instance, each as any stop is (its goodbye, `STOP_GRACE` at
     /// most), start nothing after, and leave what they published in the World. Returns once
     /// they have stopped or been dropped. A manager that is not running has nothing to stop.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the restart that halts a family is the next change"
-        )
-    )]
     pub async fn halt(&self) {
         let (done, stopped) = oneshot::channel();
         if self.ask.send(done).await.is_ok() {
@@ -97,13 +83,6 @@ impl Halting {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the restart that halts a family is the next change"
-    )
-)]
 fn halting() -> (Halt, Arc<Halting>) {
     // One halt is ever asked in earnest; a few more may wait their turn to be told so.
     let (ask, asks) = mpsc::channel(4);
@@ -125,13 +104,6 @@ pub fn spawn<F: Family>(
 }
 
 /// As [`spawn`], and the family can be halted.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the restart that halts a family is the next change"
-    )
-)]
 pub fn spawn_haltable<F: Family>(
     family: F,
     supervisor: &Supervisor,

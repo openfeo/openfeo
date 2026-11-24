@@ -152,15 +152,6 @@ impl CounterSource for RouterCounters {
     }
 }
 
-/// Stands where the router's restart will: asked, it says so and does nothing.
-struct NotYet;
-
-impl openfeo_api::Restarter for NotYet {
-    fn restart(&self) {
-        warn!("restart: asked, and nothing here does it yet");
-    }
-}
-
 /// What the API is told once, at boot.
 #[derive(Debug, Clone)]
 pub struct Boot {
@@ -185,12 +176,14 @@ pub fn spawn(
     health: &watch::Receiver<HealthView>,
     nl: &Netlink,
     boot: Boot,
+    restarts: crate::restart::Restarts,
 ) {
     let (publisher, world, health) = (publisher.clone(), world.clone(), health.clone());
     let counters: Arc<dyn CounterSource> = Arc::new(RouterCounters::new(nl.clone()));
     supervisor.spawn("api", move || {
         let (publisher, world, health) = (publisher.clone(), world.clone(), health.clone());
         let counters = counters.clone();
+        let restarts = restarts.clone();
         let Boot {
             config_state,
             version,
@@ -216,7 +209,7 @@ pub fn spawn(
                 limits: Limits::default(),
                 extra_host,
                 confirm_secs: confirm_secs.unwrap_or(openfeo_api::keeper::DEFAULT_WINDOW_SECS),
-                restarter: Arc::new(NotYet),
+                restarter: Arc::new(restarts.clone()),
             })
             .await
         }

@@ -22,6 +22,7 @@ mod ipv6;
 mod panel_host;
 mod pppoe;
 mod ra;
+mod restart;
 mod router;
 mod state;
 mod time;

@@ -24,12 +24,13 @@ use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::TokioIo;
 use nix::sched::{CloneFlags, setns};
 use openfeo_api::pb::state_service_client::StateServiceClient;
+use openfeo_api::pb::system_service_client::SystemServiceClient;
 use openfeo_config::Config;
 use openfeo_config::api::{
     ApplyConfigRequest, Auth, ClientMsg, ConfirmConfigRequest, Error, GetConfigRequest,
-    GetConfigResponse, GetHistoryRequest, GetLeasesRequest, GetStateRequest, Request,
-    RevertConfigRequest, ServerMsg, Subscribe, ValidateConfigRequest, ValidateConfigResponse,
-    client_msg, request, response, server_msg, telemetry,
+    GetConfigResponse, GetHistoryRequest, GetLeasesRequest, GetStateRequest, RebootRequest,
+    Request, RevertConfigRequest, ServerMsg, Subscribe, ValidateConfigRequest,
+    ValidateConfigResponse, client_msg, request, response, server_msg, telemetry,
 };
 use openfeo_config::events::Event;
 use openfeo_config::state::{Counters, Leases, LinkHistory, State};
@@ -368,6 +369,25 @@ impl Api {
         Self::token_of(&reply, "log in")
     }
 
+    /// A gRPC channel to the router, over this client's own TLS.
+    async fn channel(&self) -> Result<tonic::transport::Channel> {
+        let this = self.clone();
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{}", self.host))?;
+        within(
+            "grpc connect",
+            endpoint.connect_with_connector(tower::service_fn(move |_: hyper::Uri| {
+                let this = this.clone();
+                async move {
+                    this.tls(b"h2")
+                        .await
+                        .map(TokioIo::new)
+                        .map_err(|err| std::io::Error::other(format!("{err:#}")))
+                }
+            })),
+        )
+        .await
+    }
+
     /// The state over gRPC.
     ///
     /// # Errors
@@ -375,22 +395,7 @@ impl Api {
     /// When the channel cannot be opened or the call is refused.
     pub fn grpc_state(&self, token: &str) -> Result<State> {
         self.inside(|| async move {
-            let this = self.clone();
-            let endpoint =
-                tonic::transport::Endpoint::from_shared(format!("http://{}", self.host))?;
-            let channel = within(
-                "grpc connect",
-                endpoint.connect_with_connector(tower::service_fn(move |_: hyper::Uri| {
-                    let this = this.clone();
-                    async move {
-                        this.tls(b"h2")
-                            .await
-                            .map(TokioIo::new)
-                            .map_err(|err| std::io::Error::other(format!("{err:#}")))
-                    }
-                })),
-            )
-            .await?;
+            let channel = self.channel().await?;
             let mut request = tonic::Request::new(GetStateRequest {});
             request
                 .metadata_mut()
@@ -401,6 +406,29 @@ impl Api {
             )
             .await?;
             reply.into_inner().state.context("no state in the reply")
+        })
+    }
+
+    /// `SystemService.Reboot` over gRPC, with a token or without: `Ok(Err(status))` is the
+    /// router's refusal.
+    ///
+    /// # Errors
+    ///
+    /// When the channel cannot be opened or nothing answers.
+    pub fn grpc_reboot(&self, token: Option<&str>) -> Result<Result<(), tonic::Status>> {
+        self.inside(|| async move {
+            let channel = self.channel().await?;
+            let mut request = tonic::Request::new(RebootRequest {});
+            if let Some(token) = token {
+                request
+                    .metadata_mut()
+                    .insert("authorization", format!("Bearer {token}").parse()?);
+            }
+            let answer =
+                tokio::time::timeout(STEP, SystemServiceClient::new(channel).reboot(request))
+                    .await
+                    .map_err(|_| anyhow!("Reboot: nothing within {} s", STEP.as_secs()))?;
+            Ok(answer.map(|_| ()))
         })
     }
 
@@ -780,6 +808,19 @@ impl Ws {
                 other => bail!("not the leases: {other:?}"),
             },
             other => bail!("not a response: {other:?}"),
+        }
+    }
+
+    /// Ask the router to restart (`Reboot`): its answer, which comes before it goes.
+    ///
+    /// # Errors
+    ///
+    /// When nothing answers.
+    pub fn reboot(&mut self) -> Result<Result<(), Error>> {
+        match self.answered(request::Body::Reboot(RebootRequest {}))? {
+            Ok(response::Body::Reboot(_)) => Ok(Ok(())),
+            Ok(other) => bail!("not the answer to a reboot: {other:?}"),
+            Err(error) => Ok(Err(error)),
         }
     }
 
