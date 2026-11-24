@@ -5,7 +5,20 @@
 // the router has it and the draft, each named as the page that edits it names it. The last
 // test holds it to the schema: no leaf of the config can differ and go unlisted.
 
-import { clone, ConfigSchema, create, ScalarType, WanSchema, type Config, type DescField, type DescMessage } from '@openfeo/client'
+import {
+  clone,
+  ConfigSchema,
+  create,
+  PortForwardSchema,
+  RuleSchema,
+  ScalarType,
+  WanSchema,
+  type Config,
+  type DescField,
+  type DescMessage,
+  type PortForward,
+  type Rule,
+} from '@openfeo/client'
 import { expect, test } from 'vitest'
 
 import { changes, type Change } from '../src/model/changes'
@@ -122,7 +135,7 @@ test('each setting of a LAN is one change; a pool is one and the reservations ar
     [(d) => (d.lans[0]!.ipv6 = '2001:db8:1:1::1/64'), { subject: 'lan0', what: 'routed /64', before: 'none', after: '2001:db8:1:1::1/64' }],
     [(d) => (d.lans[0]!.ra = false), { subject: 'lan0', what: 'router advertisements', before: 'on', after: 'off' }],
     [(d) => (d.lans[0]!.ipv6Index = 7), { subject: 'lan0', what: 'subnet number', before: 'none', after: '7' }],
-    [(d) => (d.lans[0]!.reaches = ['none']), { subject: 'lan0', what: 'may reach', before: 'wan', after: 'none' }],
+    [(d) => (d.lans[0]!.reaches = ['none']), { subject: 'lan0', what: 'may reach', before: 'the internet', after: 'nothing' }],
   ]
   for (const [edit, change] of table) {
     expect(after(edit), `${change.what} ${change.after}`).toEqual([change])
@@ -274,17 +287,75 @@ test('a DHCP server turned off says what goes with it', () => {
 })
 
 test('a difference no page shows is listed by its path', () => {
-  expect(after((d) => (d.firewall!.wanPing = false))).toEqual([{ subject: 'firewall.wan_ping', what: '', before: 'true', after: 'false' }])
-  expect(after((d) => (d.firewall!.portForwards[0]!.port = 2223))).toEqual([{ subject: 'firewall.port_forwards[0].port', what: '', before: '2222', after: '2223' }])
   expect(after((d) => (d.system!.hostname = 'edge'))).toEqual([{ subject: 'system.hostname', what: '', before: 'openfeo', after: 'edge' }])
-  // Something gone altogether: what it was, and that it is no more.
-  expect(after((d) => (d.firewall!.portForwards = []))).toEqual([
-    { subject: 'firewall.port_forwards[0].name', what: '', before: 'lan-http', after: 'none' },
-    { subject: 'firewall.port_forwards[0].proto', what: '', before: 'tcp', after: 'none' },
-    { subject: 'firewall.port_forwards[0].port', what: '', before: '2222', after: 'none' },
-    { subject: 'firewall.port_forwards[0].to', what: '', before: '192.168.1.2', after: 'none' },
-    { subject: 'firewall.port_forwards[0].to_port', what: '', before: '8080', after: 'none' },
+  // A whole part of the config there, with nothing in it, against not there at all.
+  const bare = labConfig()
+  bare.firewall = undefined
+  expect(after((d) => (d.firewall = create(ConfigSchema, { firewall: {} }).firewall), bare)).toEqual([{ subject: 'firewall', what: '', before: '', after: 'empty' }])
+})
+
+// ---- The Firewall page's settings, as it names them (M4 part 3b) ----
+
+test('a port forward added or removed is one change that says what it is', () => {
+  const forward = (init: Parameters<typeof create<typeof PortForwardSchema>>[1]) => create(PortForwardSchema, init)
+  expect(after((d) => d.firewall!.portForwards.push(forward({ name: 'nas-ssh', proto: 'tcp', port: 2222, to: '192.168.1.10', toPort: 22 })))).toEqual([
+    { subject: 'port forward nas-ssh', what: '', before: '', after: 'added: TCP 2222 to 192.168.1.10:22' },
   ])
+  // With no port of its own it leads to the same port; with an address, it says where it listens.
+  expect(after((d) => d.firewall!.portForwards.push(forward({ name: 'game', proto: 'udp', port: 27_015, to: '192.168.1.131', address: '198.51.100.2' })))).toEqual([
+    { subject: 'port forward game', what: '', before: '', after: 'added: UDP 27015 on 198.51.100.2 to 192.168.1.131' },
+  ])
+  expect(after((d) => (d.firewall!.portForwards = []))).toEqual([{ subject: 'port forward lan-http', what: '', before: 'TCP 2222 to 192.168.1.2:8080', after: 'removed' }])
+  // Renamed, it is another forward: the one that was is removed.
+  expect(after((d) => (d.firewall!.portForwards[0]!.name = 'web'))).toEqual([
+    { subject: 'port forward web', what: '', before: '', after: 'added: TCP 2222 to 192.168.1.2:8080' },
+    { subject: 'port forward lan-http', what: '', before: 'TCP 2222 to 192.168.1.2:8080', after: 'removed' },
+  ])
+  // A router with no firewall settings at all gains its first forward.
+  const bare = labConfig()
+  bare.firewall = undefined
+  expect(after((d) => (d.firewall = create(ConfigSchema, { firewall: { portForwards: [{ name: 'ssh', proto: 'tcp', port: 22, to: '192.168.1.2' }] } }).firewall), bare)).toEqual([
+    { subject: 'port forward ssh', what: '', before: '', after: 'added: TCP 22 to 192.168.1.2' },
+  ])
+})
+
+test('each field of a port forward is named as its column is', () => {
+  const edit = (change: (forward: PortForward) => void) => after((d) => change(d.firewall!.portForwards[0]!))
+  expect(edit((f) => (f.proto = 'udp'))).toEqual([{ subject: 'port forward lan-http', what: 'protocol', before: 'TCP', after: 'UDP' }])
+  expect(edit((f) => (f.port = 2223))).toEqual([{ subject: 'port forward lan-http', what: 'port', before: '2222', after: '2223' }])
+  expect(edit((f) => (f.to = '192.168.1.3'))).toEqual([{ subject: 'port forward lan-http', what: 'target', before: '192.168.1.2', after: '192.168.1.3' }])
+  expect(edit((f) => (f.toPort = 0))).toEqual([{ subject: 'port forward lan-http', what: 'target port', before: '8080', after: 'the same port' }])
+  expect(edit((f) => (f.address = '198.51.100.2'))).toEqual([{ subject: 'port forward lan-http', what: 'listens on', before: 'the WAN’s address', after: '198.51.100.2' }])
+})
+
+test('a rule is named, and so is each of its fields', () => {
+  const base = labConfig()
+  base.firewall!.rules = create(ConfigSchema, { firewall: { rules: [{ name: 'web6', from: 'wan', to: '2001:db8:1:1::10', proto: 'tcp', ports: ['80', '443'] }] } }).firewall!.rules
+  const edit = (change: (rule: Rule) => void) => after((d) => change(d.firewall!.rules[0]!), base)
+  expect(edit((r) => (r.from = 'lan0'))).toEqual([{ subject: 'rule web6', what: 'from', before: 'the internet', after: 'lan0' }])
+  expect(edit((r) => (r.to = '2001:db8:1:1::11'))).toEqual([{ subject: 'rule web6', what: 'target', before: '2001:db8:1:1::10', after: '2001:db8:1:1::11' }])
+  expect(edit((r) => (r.proto = 'udp'))).toEqual([{ subject: 'rule web6', what: 'protocol', before: 'TCP', after: 'UDP' }])
+  expect(edit((r) => (r.ports = ['443']))).toEqual([{ subject: 'rule web6', what: 'ports', before: '80, 443', after: '443' }])
+  expect(edit((r) => ((r.proto = 'icmp'), (r.ports = [])))).toEqual([
+    { subject: 'rule web6', what: 'protocol', before: 'TCP', after: 'ICMP' },
+    { subject: 'rule web6', what: 'ports', before: '80, 443', after: 'none' },
+  ])
+  expect(after((d) => (d.firewall!.rules = []), base)).toEqual([{ subject: 'rule web6', what: '', before: 'from the internet to 2001:db8:1:1::10, TCP 80, 443', after: 'removed' }])
+  expect(after((d) => d.firewall!.rules.push(create(RuleSchema, { name: 'cameras-to-nas', from: 'iot', to: '192.168.1.10', proto: 'any' })), base)).toEqual([
+    { subject: 'rule cameras-to-nas', what: '', before: '', after: 'added: from iot to 192.168.1.10, any protocol' },
+  ])
+})
+
+test('what a LAN may reach is said in words', () => {
+  const base = labConfig()
+  expect(after((d) => (d.lans[0]!.reaches = ['wan', 'iot']), base)).toEqual([{ subject: 'lan0', what: 'may reach', before: 'the internet', after: 'the internet, iot' }])
+  expect(after((d) => (d.lans[0]!.reaches = ['none']), base)).toEqual([{ subject: 'lan0', what: 'may reach', before: 'the internet', after: 'nothing' }])
+  // An empty list and one that says wan mean the same; the file differs, so it is listed.
+  expect(after((d) => (d.lans[0]!.reaches = ['wan']), base)).toEqual([{ subject: 'lans[0].reaches', what: '', before: '', after: 'wan' }])
+})
+
+test('whether the router answers ping is named', () => {
+  expect(after((d) => (d.firewall!.wanPing = false))).toEqual([{ subject: 'The router', what: 'answers ping from the internet', before: 'yes', after: 'no' }])
 })
 
 test('a flag that can be left unset is a change when it is spelt out, and when it is left unset again', () => {

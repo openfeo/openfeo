@@ -592,7 +592,7 @@ function remove(): void {
 
         <div class="page__foot">
           <OfoButton size="sm" variant="ghost" :disabled="!editable || inTheWay.length > 0" @click="remove">Remove {{ lan.name }}</OfoButton>
-          <span v-if="editable && inTheWay.length > 0" class="ofo-muted page__why">Cannot be removed yet: {{ inTheWay.join('; ') }}.</span>
+          <span v-if="editable && inTheWay.length > 0" class="ofo-muted page__why">Cannot be removed yet: {{ inTheWay.map((each) => each.text).join('; ') }}.</span>
         </div>
       </div>
     </template>

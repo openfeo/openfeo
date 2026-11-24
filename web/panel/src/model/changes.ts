@@ -2,14 +2,28 @@
 // Copyright (C) 2026 Andrew Newton
 
 // What applying a draft would alter (SPEC §8.4): every difference between the config as the
-// router has it and the draft, in the order the pages show it. A setting of a WAN or a LAN
-// is named as its page names it; a pool is one change and a LAN's reservations are one; an
-// address elsewhere that a renumbering carried is named by what it belongs to; and anything
-// else that differs, on a page this panel does not have yet or in a spelling no page writes,
-// is listed by its path. Nothing that differs goes unlisted, and a password is never shown:
-// only that it changed.
+// router has it and the draft, in the order the pages show it. A setting is named as its page
+// names it; a pool is one change and a LAN's reservations are one; a forward or a rule added
+// or removed is one; an address elsewhere that a renumbering carried is named by what it
+// belongs to; and anything else that differs, on a page this panel does not have yet or in a
+// spelling no page writes, is listed by its path. Nothing that differs goes unlisted, and a
+// password is never shown: only that it changed.
 
-import { ConfigSchema, LanSchema, toJson, WanSchema, type Config, type Lan, type LanDhcp, type StaticLease, type Wan } from '@openfeo/client'
+import {
+  ConfigSchema,
+  LanSchema,
+  PortForwardSchema,
+  RuleSchema,
+  toJson,
+  WanSchema,
+  type Config,
+  type Lan,
+  type LanDhcp,
+  type PortForward,
+  type Rule,
+  type StaticLease,
+  type Wan,
+} from '@openfeo/client'
 
 import { durationWords } from './format'
 
@@ -298,9 +312,61 @@ function offWords(dhcp: LanDhcp): string {
   return held > 0 ? `off; its ${count(held, 'reservation')} ${held === 1 ? 'goes' : 'go'}` : 'off'
 }
 
+/** What a LAN may reach, in words: an empty list is the internet alone, and `none` is nothing. */
 function reaches(lan: Lan): string {
-  return lan.reaches.length === 0 ? 'wan' : lan.reaches.join(', ')
+  const word = (name: string) => (name === 'wan' ? 'the internet' : name)
+  const may = lan.reaches.length === 0 ? ['wan'] : lan.reaches.filter((name) => name !== 'none')
+  return may.length === 0 ? 'nothing' : may.map(word).join(', ')
 }
+
+// ---- The firewall ----
+
+const PROTOCOLS: Record<string, string> = { tcp: 'TCP', udp: 'UDP', icmp: 'ICMP', any: 'any protocol' }
+
+function protocol(proto: string): string {
+  return PROTOCOLS[proto] ?? proto
+}
+
+function describeForward(forward: PortForward): string {
+  const on = forward.address === '' ? '' : ` on ${forward.address}`
+  const to = forward.toPort === 0 ? forward.to : `${forward.to}:${forward.toPort}`
+  return `${protocol(forward.proto)} ${forward.port}${on} to ${to === '' ? 'nowhere yet' : to}`
+}
+
+function forwardSettings(base: PortForward, draft: PortForward): Setting[] {
+  const found: Setting[] = []
+  const toPort = (forward: PortForward) => (forward.toPort === 0 ? 'the same port' : String(forward.toPort))
+  const listens = (forward: PortForward) => (forward.address === '' ? 'the WAN’s address' : forward.address)
+  differing(found, 'protocol', protocol(base.proto), protocol(draft.proto), 'proto')
+  differing(found, 'port', String(base.port), String(draft.port), 'port')
+  differing(found, 'target', base.to, draft.to, 'to')
+  differing(found, 'target port', toPort(base), toPort(draft), 'to_port')
+  differing(found, 'listens on', listens(base), listens(draft), 'address')
+  return found
+}
+
+function origin(from: string): string {
+  return from === 'wan' ? 'the internet' : from
+}
+
+function describeRule(rule: Rule): string {
+  const ports = rule.ports.length === 0 ? '' : ` ${rule.ports.join(', ')}`
+  return `from ${origin(rule.from)} to ${rule.to === '' ? 'nowhere yet' : rule.to}, ${protocol(rule.proto)}${ports}`
+}
+
+function ruleSettings(base: Rule, draft: Rule): Setting[] {
+  const found: Setting[] = []
+  // On its own a protocol is named as its choice is: "Any", not "any protocol".
+  const chosen = (proto: string) => (proto === 'any' ? 'Any' : protocol(proto))
+  differing(found, 'from', origin(base.from), origin(draft.from), 'from')
+  differing(found, 'target', base.to, draft.to, 'to')
+  differing(found, 'protocol', chosen(base.proto), chosen(draft.proto), 'proto')
+  differing(found, 'ports', base.ports.join(', '), draft.ports.join(', '), 'ports')
+  return found
+}
+
+/** The fields of the config outside the WANs and the LANs that a page names: not listed by path. */
+const NAMED = ['firewall.port_forwards', 'firewall.rules', 'firewall.wan_ping']
 
 function lanSettings(base: Lan, draft: Lan): Setting[] {
   const found: Setting[] = []
@@ -352,17 +418,28 @@ function lanSettings(base: Lan, draft: Lan): Setting[] {
 function named<T extends { name: string }>(
   base: T[],
   draft: T[],
-  kind: { word: string; list: string; describe: (item: T) => string; settings: (base: T, draft: T) => Setting[]; json: (item: T) => unknown; secret?: string },
+  kind: {
+    /** What an added or removed one is called beside its name: `WAN`. */
+    word: string
+    /** What a line about one is headed by, when that is more than its name: `port forward nas-ssh`. */
+    subject?: (item: T) => string
+    list: string
+    describe: (item: T) => string
+    settings: (base: T, draft: T) => Setting[]
+    json: (item: T) => unknown
+    secret?: string
+  },
   found: Change[],
 ): void {
+  const subject = kind.subject ?? ((item: T) => item.name)
   for (const [at, item] of draft.entries()) {
     const before = base.find((other) => other.name === item.name)
     if (before === undefined) {
-      found.push({ subject: item.name, what: kind.word, before: '', after: `added: ${kind.describe(item)}` })
+      found.push({ subject: subject(item), what: kind.word, before: '', after: `added: ${kind.describe(item)}` })
       continue
     }
     const settings = kind.settings(before, item)
-    found.push(...settings.map(({ what, before: was, after }) => ({ subject: item.name, what, before: was, after })))
+    found.push(...settings.map(({ what, before: was, after }) => ({ subject: subject(item), what, before: was, after })))
     // Whatever else differs between the two, in a field no setting above accounts for (a
     // spelling no page writes, a field a later schema adds), is listed by its path.
     const leaves: Leaf[] = []
@@ -377,15 +454,13 @@ function named<T extends { name: string }>(
   }
   for (const item of base) {
     if (!draft.some((other) => other.name === item.name)) {
-      found.push({ subject: item.name, what: kind.word, before: kind.describe(item), after: 'removed' })
+      found.push({ subject: subject(item), what: kind.word, before: kind.describe(item), after: 'removed' })
     }
   }
 }
 
 /** An address elsewhere in the config that a renumbering carries, by what it belongs to. */
 const ELSEWHERE: { field: string; what: string; subject: (config: Config, at: number) => string | undefined }[] = [
-  { field: 'firewall.port_forwards.to', what: 'target', subject: (config, at) => named1('port forward', config.firewall?.portForwards[at]?.name) },
-  { field: 'firewall.rules.to', what: 'target', subject: (config, at) => named1('rule', config.firewall?.rules[at]?.name) },
   { field: 'dns.records.address', what: 'address', subject: (config, at) => named1('DNS record', config.dns?.records[at]?.name) },
 ]
 
@@ -405,8 +480,34 @@ export function changes(base: Config, draft: Config): Change[] {
   )
   named(base.lans, draft.lans, { word: 'LAN', list: 'lans', describe: describeLan, settings: lanSettings, json: (lan) => toJson(LanSchema, lan, json) }, found)
 
-  // The rest of the config, leaf by leaf. The WANs and the LANs are done; the admin's hash is
-  // neither sent nor taken, so it is never a change.
+  // The firewall, as its page has it: the forwards, the rules, the router itself.
+  const [was, now] = [base.firewall, draft.firewall]
+  named(
+    was?.portForwards ?? [],
+    now?.portForwards ?? [],
+    {
+      word: '',
+      subject: (forward) => `port forward ${forward.name}`,
+      list: 'firewall.port_forwards',
+      describe: describeForward,
+      settings: forwardSettings,
+      json: (forward) => toJson(PortForwardSchema, forward, json),
+    },
+    found,
+  )
+  named(
+    was?.rules ?? [],
+    now?.rules ?? [],
+    { word: '', subject: (rule) => `rule ${rule.name}`, list: 'firewall.rules', describe: describeRule, settings: ruleSettings, json: (rule) => toJson(RuleSchema, rule, json) },
+    found,
+  )
+  const pings = (config: Config) => (config.firewall?.wanPing === true ? 'yes' : 'no')
+  if (pings(base) !== pings(draft)) {
+    found.push({ subject: 'The router', what: 'answers ping from the internet', before: pings(base), after: pings(draft) })
+  }
+
+  // The rest of the config, leaf by leaf. The WANs and the LANs are done, and so is what a
+  // page names above; the admin's hash is neither sent nor taken, so it is never a change.
   const rest = (config: Config): Record<string, unknown> => {
     const whole = toJson(ConfigSchema, config, json) as Record<string, unknown>
     return Object.fromEntries(Object.entries(whole).filter(([key]) => key !== 'wans' && key !== 'lans'))
@@ -415,7 +516,7 @@ export function changes(base: Config, draft: Config): Change[] {
   differ(rest(base), rest(draft), '', leaves)
   for (const leaf of leaves) {
     const field = fieldOf(leaf.path)
-    if (field === 'admin.password_hash' || field === 'admin') {
+    if (field === 'admin.password_hash' || field === 'admin' || NAMED.some((name) => field === name || field.startsWith(`${name}.`))) {
       continue
     }
     const elsewhere = ELSEWHERE.find((entry) => entry.field === field)
