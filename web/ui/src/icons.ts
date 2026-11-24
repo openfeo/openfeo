@@ -14,7 +14,10 @@ import logOut from 'lucide-static/icons/log-out.svg?raw'
 import monitorSmartphone from 'lucide-static/icons/monitor-smartphone.svg?raw'
 import moon from 'lucide-static/icons/moon.svg?raw'
 import network from 'lucide-static/icons/network.svg?raw'
+import settings from 'lucide-static/icons/settings.svg?raw'
+import shield from 'lucide-static/icons/shield.svg?raw'
 import sun from 'lucide-static/icons/sun.svg?raw'
+import text from 'lucide-static/icons/text.svg?raw'
 import triangleAlert from 'lucide-static/icons/triangle-alert.svg?raw'
 
 /** What is inside an SVG file's root element: its shapes, without the element's own attributes. */
@@ -32,7 +35,10 @@ export const ICONS = {
   'monitor-smartphone': shapes(monitorSmartphone),
   moon: shapes(moon),
   network: shapes(network),
+  settings: shapes(settings),
+  shield: shapes(shield),
   sun: shapes(sun),
+  text: shapes(text),
   'triangle-alert': shapes(triangleAlert),
 } as const
 

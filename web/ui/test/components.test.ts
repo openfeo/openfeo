@@ -332,6 +332,13 @@ test('the theme switch asks for the other theme and names what it will do', asyn
   expect(dark.classes()).toEqual(['ofo-btn', 'ofo-btn--sm', 'ofo-btn--ghost'])
 })
 
+test('the icons the settings pages are found by are there', () => {
+  for (const name of ['shield', 'text', 'settings'] as const) {
+    const icon = mount(OfoIcon, { props: { name } })
+    expect(icon.element.childElementCount, name).toBeGreaterThan(0)
+  }
+})
+
 test('an icon is drawn at the design system’s stroke and says nothing', () => {
   const icon = mount(OfoIcon, { props: { name: 'sun' } })
   expect(icon.element.tagName.toLowerCase()).toBe('svg')
