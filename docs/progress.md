@@ -415,9 +415,9 @@ test tells the change that touches no lease from the one after it by the state t
 them. Three comments say rightly that a PPPoE WAN's interface is named all the while and is there
 only during a session; the limit in `GetHistory`'s refusal comes from its constant; a field is named
 for what it holds; and `@openfeo/ui` no longer exports a function that only it uses. Of the other
-three, one needed nothing, and two wait: the lease table is built on every change of the World for
-sockets that follow only the state, and a new subscriber to the counters waits up to a second for
-its first sample.
+three, one needed nothing, and two are filed: the lease table is built on every change of the World
+for sockets that follow only the state (#130), and a new subscriber to the counters waits up to a
+second for its first sample (#131).
 
 ## Tooling and process
 
