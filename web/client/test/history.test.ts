@@ -84,3 +84,24 @@ test('buckets are aligned and averaged, and an empty one is absent', () => {
   // A bucket of no length is no bucket: the points come back as they are.
   expect(averaged(points, 0)).toEqual(points)
 })
+
+test('a bucket with fewer points than are asked for is absent', () => {
+  const point = (atMs: number, rx: number): RatePoint => ({ atMs, rxBitsPerSec: rx, txBitsPerSec: rx / 10 })
+  // 1 s to 10 s whole; of the next ten only 19 s and 20 s, a link that had just come back
+  // into a burst; then 21 s to 25 s.
+  const seconds = [...Array(25).keys()].map((n) => n + 1).filter((second) => second <= 10 || second >= 19)
+  const points = seconds.map((second) => point(second * 1_000, second === 19 || second === 20 ? 9_000 : 100))
+  // Two seconds are not the mean of ten: the bucket is left out, not passed off as one.
+  expect(averaged(points, 10_000, 5).map((bucket) => [bucket.atMs, bucket.rxBitsPerSec])).toEqual([
+    [10_000, 100],
+    [30_000, 100],
+  ])
+  // With no fewest asked for, every bucket that has a point is there.
+  expect(averaged(points, 10_000).map((bucket) => [bucket.atMs, bucket.rxBitsPerSec])).toEqual([
+    [10_000, 100],
+    [20_000, 9_000],
+    [30_000, 100],
+  ])
+  // The fewest is of the bucket's own points, whatever the others hold.
+  expect(averaged(points, 10_000, 6).map((bucket) => bucket.atMs)).toEqual([10_000])
+})

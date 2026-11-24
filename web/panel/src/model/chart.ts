@@ -29,20 +29,25 @@ export function rangeOf(range: Range): (typeof RANGES)[number] {
   return RANGES.find((each) => each.value === range) ?? HOUR
 }
 
+/** How often the router reads a link's counters (SPEC §10). */
+const READ_MS = 1_000
+
 /**
  * A link's rates as one view draws them, up to `toMs`: each second's, or the mean of each
- * bucket that is complete (the one still under way would rise and fall as it fills).
+ * bucket that is complete (the one still under way would rise and fall as it fills) and of
+ * which at least half was read: where the line had just come back, or the router had just
+ * booted, a second or two would otherwise stand for ten.
  */
 function points(samples: readonly LinkSample[], view: (typeof RANGES)[number], toMs: number): RatePoint[] {
   const fromMs = toMs - view.ms
   const rates = ratesOver(samples)
-  const shown = view.bucketMs > 1_000 ? averaged(rates, view.bucketMs) : rates
+  const shown = view.bucketMs > READ_MS ? averaged(rates, view.bucketMs, Math.ceil(view.bucketMs / READ_MS / 2)) : rates
   return shown.filter((point) => point.atMs > fromMs && point.atMs <= toMs)
 }
 
 /** Cut where two points are further apart than the view's points ever are: a gap is drawn as a gap. */
 function runsOf(shown: readonly RatePoint[], view: (typeof RANGES)[number]): RatePoint[][] {
-  const gapMs = view.bucketMs > 1_000 ? view.bucketMs * 1.5 : GAP_MS
+  const gapMs = view.bucketMs > READ_MS ? view.bucketMs * 1.5 : GAP_MS
   const runs: RatePoint[][] = []
   let before: RatePoint | undefined
   for (const point of shown) {
@@ -92,8 +97,8 @@ export function drawn(samples: readonly LinkSample[], range: Range, toMs: number
 /**
  * The hour's peak, in bits per second: the highest ten-second average of the hour that ends at
  * `toMs`, each way. It is the top of what the hour's chart draws, so the two cannot disagree;
- * a burst shorter than ten seconds reads lower than it was. Nothing when the hour has no
- * complete ten seconds.
+ * a burst shorter than ten seconds reads lower than it was, and ten seconds of which under
+ * half was read are not counted. Nothing when the hour has no such ten seconds.
  */
 export function peak(samples: readonly LinkSample[], toMs: number): { rx: number; tx: number } | undefined {
   const shown = points(samples, HOUR, toMs)
