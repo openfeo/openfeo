@@ -358,9 +358,9 @@ DHCPv4 client is left alone, so the router comes back to the address it had, and
 config that was waiting is not confirmed by it (SPEC §6.3 gains those sentences). A family
 manager learned to be halted for this: its instances are stopped as any stop is, nothing is
 started after, and nothing is withdrawn from the World. `/licences.txt` now covers the whole
-binary: the Rust crates' notices by `cargo about` (148 crates, against the list `cargo deny`
-applies), the C libraries' from the pinned sources, musl's and mimalloc's among them, then the
-npm packages' and the fonts' as before. The panel gains **Firewall** (a grid of which LAN may
+binary: the Rust crates' notices by `cargo about` (148 crates, mimalloc's among them, against
+the list `cargo deny` applies), the C libraries' from the pinned sources, with musl's kept beside
+them, then the npm packages' and the fonts' as before. The panel gains **Firewall** (a grid of which LAN may
 start connections to the internet and to each other LAN, port forwards and rules as tables
 edited in place, and whether the router answers ping), **DNS** (the owner's resolvers, whether
 the WAN's are used too, the resolvers in use now, local names, and under Advanced the names let
@@ -371,14 +371,21 @@ own, outside the draft: what is typed for a password is kept nowhere, and Restar
 and says what is lost. A LAN that a forward, a rule or another LAN's tick points into can now be
 removed once the draft has none of them, each named as a link to where it is removed; the apply
 dialog names every new setting as its page does, and says where the router will be found when a
-change renames it. Proven by 1124 unit tests on the Rust side and 605 on the web side, and by
+change renames it. Proven by 1124 unit tests on the Rust side and 607 on the web side, and by
 six new `m4` scenarios (44 in all): the resolvers in the state; a restart asked over the API
 that keeps a lease changed a moment before it, ends the PPPoE session first, does not wait for a
 concentrator that says nothing, and comes back on the confirmed config with a change left
 unconfirmed (three of the four fail with the goodbyes left out on purpose); and Playwright's
 Chromium adding a forward and a local name that a LAN host then looks up, changing the password,
-and restarting the router from the System page to end at the login screen. Slice 3c (the views:
-Routes, Ports, Logs) follows.
+and restarting the router from the System page to end at the login screen. The whole-branch
+review found two things the tests had not asked, fixed in the same pull request. The notices
+were written only on a machine whose cargo cache already held every crate in the lockfile, so
+the image would not have built on a fresh one, CI's among them: every crate is now fetched
+first, the script was run against an empty cache before and after, and a crate whose licence
+cannot be read stops the build where it used to be left out. And the wait a wrong current
+password earns stopped being said once the password was retyped, while the button stayed held:
+it is said for as long as the button is. libnftnl's label is the one its sources carry,
+GPL-2.0-or-later. Slice 3c (the views: Routes, Ports, Logs) follows.
 
 ## Follow-ups
 
