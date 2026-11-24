@@ -8,7 +8,7 @@ ADR-0002). Rust crate licences are checked by `cargo deny` (`deny.toml`).
 | Library | Version | Licence | Source |
 |---|---|---|---|
 | nftables (libnftables) | 1.1.7 | GPL-2.0-only | https://www.netfilter.org/projects/nftables/ |
-| libnftnl | 1.3.2 | GPL-2.0-only | https://www.netfilter.org/projects/libnftnl/ |
+| libnftnl | 1.3.2 | GPL-2.0-or-later | https://www.netfilter.org/projects/libnftnl/ |
 | libmnl | 1.0.5 | LGPL-2.1-or-later | https://www.netfilter.org/projects/libmnl/ |
 | jansson | 2.15.1 | MIT | https://github.com/akheron/jansson |
 

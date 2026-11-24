@@ -1,6 +1,6 @@
 [
   { "name": "nftables", "source": "nftables", "licence": "GPL-2.0-only", "file": "COPYING" },
-  { "name": "libnftnl", "source": "libnftnl", "licence": "GPL-2.0-only", "file": "COPYING" },
+  { "name": "libnftnl", "source": "libnftnl", "licence": "GPL-2.0-or-later", "file": "COPYING" },
   { "name": "libmnl", "source": "libmnl", "licence": "LGPL-2.1-or-later", "file": "COPYING" },
   { "name": "jansson", "source": "jansson", "licence": "MIT", "file": "LICENSE" },
   {

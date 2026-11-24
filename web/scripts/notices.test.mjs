@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Andrew Newton
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -223,3 +223,38 @@ test('every library the binary builds has an entry', () => {
     assert.ok(typeof entry.version === 'string' && entry.version !== '', `${entry.name} says which version its kept text is of`)
   }
 })
+
+// The pinned C sources, where `make nft-src` fetched them (the Makefile exports the place).
+const NFT_SRC = process.env.OPENFEO_NFT_SRC ?? ''
+
+test(
+  'a C library whose source files name one licence is labelled with it',
+  { skip: existsSync(NFT_SRC) ? false : 'the pinned C sources are not fetched (make nft-src, or run under make)' },
+  () => {
+    const scripts = new URL('.', import.meta.url)
+    const sources = readFileSync(new URL('../../nft/sources.txt', scripts), 'utf8')
+    const entries = JSON.parse(readFileSync(new URL('c-notices.json', scripts), 'utf8'))
+    const pinned = new Map(
+      sources
+        .split('\n')
+        .filter((line) => line !== '' && !line.startsWith('#'))
+        .map((line) => line.split(/\s+/).slice(0, 2)),
+    )
+    let checked = 0
+    for (const entry of entries.filter((each) => each.file !== undefined && each.within !== true)) {
+      const dir = join(NFT_SRC, `${entry.source}-${pinned.get(entry.source)}`, 'src')
+      const files = readdirSync(dir).filter((name) => name.endsWith('.c'))
+      const named = files
+        .map((name) => /SPDX-License-Identifier: ([A-Za-z0-9.+-]+)/.exec(readFileSync(join(dir, name), 'utf8'))?.[1])
+        .filter((licence) => licence !== undefined)
+      // Only where the sources speak, and with one voice: most of the files name a licence
+      // and every one that does names the same. A tree that says little, or two things, is
+      // labelled by what its project says of itself (docs/third-party.md).
+      if (named.length * 2 > files.length && named.every((licence) => licence === named[0])) {
+        assert.equal(entry.licence, named[0], `${entry.name}: its sources say ${named[0]}`)
+        checked += 1
+      }
+    }
+    assert.ok(checked > 0, 'no library names its licence in most of its source files: this test checks nothing')
+  },
+)
