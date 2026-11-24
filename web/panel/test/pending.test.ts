@@ -62,7 +62,7 @@ afterEach(() => {
 })
 
 test('a pending change is said on every page, with the time left', async () => {
-  for (const path of ['/', '/wan', '/lan', '/firewall']) {
+  for (const path of ['/', '/wan', '/lan', '/firewall', '/dns']) {
     const { wrapper, router } = await page(path)
     expect(waiting(wrapper).exists(), path).toBe(false)
     router.push('state', pendingState(13))

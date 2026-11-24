@@ -10,6 +10,7 @@ import {
   ConfigSchema,
   create,
   PortForwardSchema,
+  RecordSchema,
   RuleSchema,
   ScalarType,
   WanSchema,
@@ -225,7 +226,7 @@ test('what a renumbering carried elsewhere is listed by what it is', () => {
   expect(found.slice(3)).toEqual([
     { subject: 'port forward lan-http', what: 'target', before: '192.168.1.2', after: '192.168.2.2' },
     { subject: 'rule cameras', what: 'target', before: '192.168.1.64/26', after: '192.168.2.64/26' },
-    { subject: 'dns.upstreams', what: '', before: '192.168.1.53', after: '192.168.2.53' },
+    { subject: 'DNS', what: 'your own resolvers', before: '192.168.1.53', after: '192.168.2.53' },
     { subject: 'DNS record nas', what: 'address', before: '192.168.1.10', after: '192.168.2.10' },
   ])
 })
@@ -358,6 +359,38 @@ test('whether the router answers ping is named', () => {
   expect(after((d) => (d.firewall!.wanPing = false))).toEqual([{ subject: 'The router', what: 'answers ping from the internet', before: 'yes', after: 'no' }])
 })
 
+// ---- The DNS page's settings, as it names them (M4 part 3b) ----
+
+test('the DNS page’s settings are named as it names them', () => {
+  const base = labConfig()
+  base.dns = create(ConfigSchema, { dns: { upstreams: ['203.0.113.53'], records: [{ name: 'www', address: '192.168.1.10' }], rebindAllow: ['plex.direct'] } }).dns
+  expect(after((d) => (d.dns!.upstreams = ['9.9.9.9', '2001:db8::53']), base)).toEqual([{ subject: 'DNS', what: 'your own resolvers', before: '203.0.113.53', after: '9.9.9.9, 2001:db8::53' }])
+  expect(after((d) => (d.dns!.upstreams = []), base)).toEqual([{ subject: 'DNS', what: 'your own resolvers', before: '203.0.113.53', after: 'none' }])
+  expect(after((d) => (d.dns!.rebindAllow = []), base)).toEqual([{ subject: 'DNS', what: 'names let through', before: 'plex.direct', after: 'none' }])
+  expect(after((d) => (d.dns!.useWanDns = false), base)).toEqual([{ subject: 'DNS', what: 'the WAN’s resolvers too', before: 'not set', after: 'no' }])
+  // What no page edits is still listed, by its path.
+  expect(after((d) => (d.dns!.blocklists = ['ads']), base)).toEqual([{ subject: 'dns.blocklists', what: '', before: '', after: 'ads' }])
+})
+
+test('a local name is told from another by its name and its address’s family', () => {
+  const base = labConfig()
+  base.dns = create(ConfigSchema, { dns: { records: [{ name: 'www', address: '192.168.1.10' }, { name: 'www', address: '2001:db8:1:1::10' }] } }).dns
+  const record = (name: string, address: string) => create(RecordSchema, { name, address })
+  expect(after((d) => (d.dns!.records[1]!.address = '2001:db8:1:1::11'), base)).toEqual([{ subject: 'DNS record www', what: 'address', before: '2001:db8:1:1::10', after: '2001:db8:1:1::11' }])
+  expect(after((d) => d.dns!.records.push(record('media', '192.168.1.10')), base)).toEqual([{ subject: 'DNS record media', what: '', before: '', after: 'added: 192.168.1.10' }])
+  expect(after((d) => d.dns!.records.splice(0, 1), base)).toEqual([{ subject: 'DNS record www', what: '', before: '192.168.1.10', after: 'removed' }])
+  // Renamed, it is another name: the one that was is removed.
+  expect(after((d) => (d.dns!.records[0]!.name = 'web'), base)).toEqual([
+    { subject: 'DNS record web', what: '', before: '', after: 'added: 192.168.1.10' },
+    { subject: 'DNS record www', what: '', before: '192.168.1.10', after: 'removed' },
+  ])
+  // A router with no DNS settings gains its first name.
+  const bare = labConfig()
+  expect(after((d) => (d.dns = create(ConfigSchema, { dns: { records: [{ name: 'nas', address: '192.168.1.10' }] } }).dns), bare)).toEqual([
+    { subject: 'DNS record nas', what: '', before: '', after: 'added: 192.168.1.10' },
+  ])
+})
+
 test('a flag that can be left unset is a change when it is spelt out, and when it is left unset again', () => {
   // Unset, the forwarder also uses the WAN's resolvers; `false` spelt out stops that. JSON
   // leaves an unset flag out and writes `false` when it is spelt out: the two are not the
@@ -367,11 +400,12 @@ test('a flag that can be left unset is a change when it is spelt out, and when i
   }
   const unset = labConfig()
   flag(unset, undefined)
-  expect(after((d) => flag(d, false), unset)).toEqual([{ subject: 'dns.use_wan_dns', what: '', before: 'not set', after: 'false' }])
-  expect(after((d) => flag(d, true), unset)).toEqual([{ subject: 'dns.use_wan_dns', what: '', before: 'false', after: 'true' }])
+  expect(after((d) => flag(d, false), unset)).toEqual([{ subject: 'DNS', what: 'the WAN’s resolvers too', before: 'not set', after: 'no' }])
+  // Spelt out as yes it means what unset means, and is still another file.
+  expect(after((d) => flag(d, true), unset)).toEqual([{ subject: 'DNS', what: 'the WAN’s resolvers too', before: 'not set', after: 'yes' }])
   const spelt = labConfig()
   flag(spelt, false)
-  expect(after((d) => flag(d, undefined), spelt)).toEqual([{ subject: 'dns.use_wan_dns', what: '', before: 'false', after: 'not set' }])
+  expect(after((d) => flag(d, undefined), spelt)).toEqual([{ subject: 'DNS', what: 'the WAN’s resolvers too', before: 'no', after: 'not set' }])
   expect(after((d) => flag(d, false), spelt)).toEqual([])
 })
 

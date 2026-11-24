@@ -353,8 +353,8 @@ function remove(): void {
         </li>
       </ul>
       <p class="said__line">
-        They are set on other pages: a forward or a rule on <RouterLink :to="PAGES.firewall">Firewall</RouterLink>, a local name on DNS. Choose a subnet they fit in, or change them
-        there first.
+        They are set on other pages: a forward or a rule on <RouterLink :to="PAGES.firewall">Firewall</RouterLink>, a local name on
+        <RouterLink :to="PAGES.dns">DNS</RouterLink>. Choose a subnet they fit in, or change them there first.
       </p>
     </OfoBanner>
 

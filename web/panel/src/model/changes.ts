@@ -4,22 +4,24 @@
 // What applying a draft would alter (SPEC §8.4): every difference between the config as the
 // router has it and the draft, in the order the pages show it. A setting is named as its page
 // names it; a pool is one change and a LAN's reservations are one; a forward or a rule added
-// or removed is one; an address elsewhere that a renumbering carried is named by what it
-// belongs to; and anything else that differs, on a page this panel does not have yet or in a
-// spelling no page writes, is listed by its path. Nothing that differs goes unlisted, and a
+// or removed is one, and so is a local name; and anything else that differs, on a page this
+// panel does not have yet or in a spelling no page writes, is listed by its path. Nothing that differs goes unlisted, and a
 // password is never shown: only that it changed.
 
 import {
   ConfigSchema,
   LanSchema,
   PortForwardSchema,
+  RecordSchema,
   RuleSchema,
   toJson,
   WanSchema,
   type Config,
+  type Dns,
   type Lan,
   type LanDhcp,
   type PortForward,
+  type Record as DnsRecord,
   type Rule,
   type StaticLease,
   type Wan,
@@ -366,7 +368,7 @@ function ruleSettings(base: Rule, draft: Rule): Setting[] {
 }
 
 /** The fields of the config outside the WANs and the LANs that a page names: not listed by path. */
-const NAMED = ['firewall.port_forwards', 'firewall.rules', 'firewall.wan_ping']
+const NAMED = ['firewall.port_forwards', 'firewall.rules', 'firewall.wan_ping', 'dns.upstreams', 'dns.use_wan_dns', 'dns.records', 'dns.rebind_allow']
 
 function lanSettings(base: Lan, draft: Lan): Setting[] {
   const found: Setting[] = []
@@ -423,6 +425,8 @@ function named<T extends { name: string }>(
     word: string
     /** What a line about one is headed by, when that is more than its name: `port forward nas-ssh`. */
     subject?: (item: T) => string
+    /** What tells one from another, when that is more than its name: a local name and its address's family. */
+    key?: (item: T) => string
     list: string
     describe: (item: T) => string
     settings: (base: T, draft: T) => Setting[]
@@ -432,8 +436,9 @@ function named<T extends { name: string }>(
   found: Change[],
 ): void {
   const subject = kind.subject ?? ((item: T) => item.name)
+  const key = kind.key ?? ((item: T) => item.name)
   for (const [at, item] of draft.entries()) {
-    const before = base.find((other) => other.name === item.name)
+    const before = base.find((other) => key(other) === key(item))
     if (before === undefined) {
       found.push({ subject: subject(item), what: kind.word, before: '', after: `added: ${kind.describe(item)}` })
       continue
@@ -453,19 +458,28 @@ function named<T extends { name: string }>(
     }
   }
   for (const item of base) {
-    if (!draft.some((other) => other.name === item.name)) {
+    if (!draft.some((other) => key(other) === key(item))) {
       found.push({ subject: subject(item), what: kind.word, before: kind.describe(item), after: 'removed' })
     }
   }
 }
 
-/** An address elsewhere in the config that a renumbering carries, by what it belongs to. */
-const ELSEWHERE: { field: string; what: string; subject: (config: Config, at: number) => string | undefined }[] = [
-  { field: 'dns.records.address', what: 'address', subject: (config, at) => named1('DNS record', config.dns?.records[at]?.name) },
-]
+// ---- DNS ----
 
-function named1(kind: string, name: string | undefined): string | undefined {
-  return name === undefined || name === '' ? undefined : `${kind} ${name}`
+/** Whether the WAN's resolvers are used too, as the config says it: unsaid means yes, and is not the same file as yes. */
+function tooWords(dns: Dns | undefined): string {
+  return dns?.useWanDns === undefined ? 'not set' : dns.useWanDns ? 'yes' : 'no'
+}
+
+/** A local name is the same one when its name is and its address is of the same family. */
+function recordKey(record: DnsRecord): string {
+  return `${record.name.toLowerCase()} ${record.address.includes(':') ? 6 : 4}`
+}
+
+function recordSettings(base: DnsRecord, draft: DnsRecord): Setting[] {
+  const found: Setting[] = []
+  differing(found, 'address', base.address, draft.address, 'address')
+  return found
 }
 
 /** Everything applying `draft` over `base` would alter, in the order the pages show it. */
@@ -506,6 +520,32 @@ export function changes(base: Config, draft: Config): Change[] {
     found.push({ subject: 'The router', what: 'answers ping from the internet', before: pings(base), after: pings(draft) })
   }
 
+  // DNS, as its page has it: the resolvers, the local names, the names let through.
+  const dns: Setting[] = []
+  const listed = (values: readonly string[] | undefined) => (values ?? []).join(', ')
+  differing(dns, 'your own resolvers', listed(base.dns?.upstreams), listed(draft.dns?.upstreams), 'upstreams')
+  if (tooWords(base.dns) !== tooWords(draft.dns)) {
+    dns.push({ what: 'the WAN’s resolvers too', before: tooWords(base.dns), after: tooWords(draft.dns), covers: ['use_wan_dns'] })
+  }
+  found.push(...dns.map(({ what, before, after }) => ({ subject: 'DNS', what, before, after })))
+  named(
+    base.dns?.records ?? [],
+    draft.dns?.records ?? [],
+    {
+      word: '',
+      subject: (record) => `DNS record ${record.name}`,
+      key: recordKey,
+      list: 'dns.records',
+      describe: (record) => (record.address === '' ? 'no address yet' : record.address),
+      settings: recordSettings,
+      json: (record) => toJson(RecordSchema, record, json),
+    },
+    found,
+  )
+  const through: Setting[] = []
+  differing(through, 'names let through', listed(base.dns?.rebindAllow), listed(draft.dns?.rebindAllow), 'rebind_allow')
+  found.push(...through.map(({ what, before, after }) => ({ subject: 'DNS', what, before, after })))
+
   // The rest of the config, leaf by leaf. The WANs and the LANs are done, and so is what a
   // page names above; the admin's hash is neither sent nor taken, so it is never a change.
   const rest = (config: Config): Record<string, unknown> => {
@@ -519,10 +559,7 @@ export function changes(base: Config, draft: Config): Change[] {
     if (field === 'admin.password_hash' || field === 'admin' || NAMED.some((name) => field === name || field.startsWith(`${name}.`))) {
       continue
     }
-    const elsewhere = ELSEWHERE.find((entry) => entry.field === field)
-    const at = Number(/\[(\d+)\]/.exec(leaf.path)?.[1])
-    const subject = elsewhere !== undefined && leaf.before !== '' && leaf.after !== '' ? elsewhere.subject(draft, at) : undefined
-    found.push(elsewhere !== undefined && subject !== undefined ? { subject, what: elsewhere.what, before: leaf.before, after: leaf.after } : byPath(leaf, ''))
+    found.push(byPath(leaf, ''))
   }
   return found
 }

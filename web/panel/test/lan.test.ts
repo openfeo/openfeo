@@ -173,7 +173,10 @@ test('an address with no place in the new subnet is marked at its field', async 
   expect(above.findAll('li').map((item) => item.text())).toEqual(['dns.records[0].address: 192.168.1.200'])
   // Each is a setting of another page, and the banner says which.
   expect(above.find('.said__line').text()).toBe('They are set on other pages: a forward or a rule on Firewall, a local name on DNS. Choose a subnet they fit in, or change them there first.')
-  expect(above.findAll('.said__line a').map((link) => link.attributes('href'))).toContain('/firewall')
+  expect(above.findAll('.said__line a').map((link) => [link.text(), link.attributes('href')])).toEqual([
+    ['Firewall', '/firewall'],
+    ['DNS', '/dns'],
+  ])
   expect(tabs(wrapper)[0]?.find('.ofo-pill').text()).toBe('problem')
 
   // Put right by hand, the field says nothing more, and the tab has nothing to point at.
