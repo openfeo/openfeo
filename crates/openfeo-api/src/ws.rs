@@ -608,6 +608,9 @@ pub(crate) mod tests {
         use openfeo_config::api::GetLeasesRequest;
         let (api, token) = TestApi::with_password(PASSWORD).await;
         let mut ws = api.ws_with(&token).await;
+        // The state is followed too: it is sent for every change of the World, ahead of any
+        // table, which is how this tells below that a change has been dealt with.
+        ws.subscribe("state", 0).await;
         ws.subscribe("leases", 0).await;
         let first = ws.next_leases().await;
         assert_eq!(first.leases, Vec::new(), "the table as it stands");
@@ -636,10 +639,13 @@ pub(crate) mod tests {
             )
         );
         // A change of the World that touches no lease, then one that does: only the second
-        // is a table.
-        api.shared
-            .publisher
-            .update(|world| world.set_wan_cause("wan0", "nothing to do with leases"));
+        // is a table. The second is made once the state of the first has arrived: a table
+        // sent for the first would have been queued behind that state, and would be the next
+        // table to come, with its one lease.
+        api.shared.publisher.update(|world| {
+            Arc::make_mut(&mut world.dhcp4).remove("wan0");
+        });
+        while ws.next_state().await.wans[0].phase() != WanPhase::Connecting {}
         api.shared.publisher.update(|world| {
             Arc::make_mut(&mut world.leases)
                 .entry("lan0".to_owned())

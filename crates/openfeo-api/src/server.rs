@@ -594,7 +594,10 @@ impl Shared {
         if links.len() > crate::limits::MAX_HISTORY_LINKS {
             return Err(ApiError::new(
                 ErrorCode::InvalidArgument,
-                "at most 8 links in one call",
+                &format!(
+                    "at most {} links in one call",
+                    crate::limits::MAX_HISTORY_LINKS
+                ),
             ));
         }
         Ok(self.telemetry.history(links))
