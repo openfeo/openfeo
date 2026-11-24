@@ -36,7 +36,7 @@ const route = useRoute()
 const routes = useRouter()
 const live = useLive(router)
 provide(LIVE, live)
-const { state, lostAt, now, sinceBootMs } = live
+const { state, lostAt, restarting, now, sinceBootMs } = live
 
 const host = computed(() => {
   const status = session.status.value
@@ -142,6 +142,18 @@ async function apply(immediate: boolean): Promise<void> {
 
 const problem = computed(() => state.value?.system?.configProblem)
 const lostAtClock = computed(() => (lostAt.value === null ? '' : clock(BigInt(lostAt.value.getTime()), now.value)))
+/** How long a restart is given before the page says the router has not come back. */
+const RESTART_MS = 120_000
+/** What is said while the router restarts because this page asked it to. */
+const restartingWords = computed(() => {
+  const asked = restarting.value
+  if (asked === null) {
+    return null
+  }
+  return now.value.getTime() - asked.getTime() < RESTART_MS
+    ? 'The router is restarting. You log in again when it is back.'
+    : `The router was asked to restart at ${clock(BigInt(asked.getTime()), now.value)} and has not answered since.`
+})
 </script>
 
 <template>
@@ -154,8 +166,10 @@ const lostAtClock = computed(() => (lostAt.value === null ? '' : clock(BigInt(lo
       <OfoButton size="sm" variant="ghost" icon="log-out" @click="router.logout()">Log out</OfoButton>
     </template>
 
-    <div v-if="lostAt || problem || config.pending.value || config.notice.value" class="said">
-      <OfoBanner v-if="lostAt" tone="danger">The connection to the router was lost at {{ lostAtClock }}. Retrying.</OfoBanner>
+    <div v-if="restartingWords || lostAt || problem || config.pending.value || config.notice.value" class="said">
+      <!-- A restart that was asked for is not a connection lost: it is said as what it is. -->
+      <OfoBanner v-if="restartingWords" tone="info">{{ restartingWords }}</OfoBanner>
+      <OfoBanner v-else-if="lostAt" tone="danger">The connection to the router was lost at {{ lostAtClock }}. Retrying.</OfoBanner>
       <OfoBanner v-if="problem" tone="warn" title="config.toml was refused">
         <p class="said__line">{{ problem.reason }}</p>
         <ul v-if="problem.violations.length > 0" class="said__list">

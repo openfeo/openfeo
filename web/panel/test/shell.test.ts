@@ -7,6 +7,7 @@
 import { flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
+import { LIVE, type LiveData } from '../src/live'
 import { NOW, state } from './fixtures'
 import { panelAt, unmountAll } from './mounting'
 
@@ -110,4 +111,22 @@ test('an address of no page goes to the dashboard', async () => {
     expect(wrapper.find('h1').text(), path).toBe('Dashboard')
     unmountAll()
   }
+})
+
+test('a router that was asked to restart and stays away is said to be away', async () => {
+  const { wrapper, router, store } = await panelAt('/system')
+  router.push('state', state())
+  await flushPromises()
+  const said = () => wrapper.findAll('.said .ofo-banner').map((banner) => banner.text())
+  const live = (wrapper.findComponent({ name: 'Shell' }).vm.$ as unknown as { provides: Record<symbol, unknown> }).provides[LIVE as symbol] as LiveData
+  expect(store().pending.value).toBeUndefined()
+  live.restart()
+  router.setConnection('reconnecting')
+  await flushPromises()
+  expect(said()).toEqual(['The router is restarting. You log in again when it is back.'])
+  await vi.advanceTimersByTimeAsync(119_000)
+  expect(said()).toEqual(['The router is restarting. You log in again when it is back.'])
+  // Two minutes on it should have been back: the page says since when it has heard nothing.
+  await vi.advanceTimersByTimeAsync(2_000)
+  expect(said()).toEqual(['The router was asked to restart at 19:42:30 and has not answered since.'])
 })

@@ -4,12 +4,12 @@
 // The System page (SPEC §8.4), in the shell at /system: the router's name, its clock and time
 // servers, the password, restarting, and what it is running.
 
-import { type Config, type State } from '@openfeo/client'
+import { ErrorCode, RouterError, type Config, type State } from '@openfeo/client'
 import { flushPromises, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import type { FakeRouter } from './fake-router'
-import { NOW, routerConfig, state } from './fixtures'
+import { NOW, pendingState, routerConfig, state } from './fixtures'
 import { fieldLabelled, panelAt, signedIn, unmountAll } from './mounting'
 
 async function page(config: Config = routerConfig(), first: State | null = state(), prepare: (router: FakeRouter) => void = () => undefined) {
@@ -180,4 +180,285 @@ test('a config the router refused is shown and its settings cannot be changed', 
     expect((box(wrapper, label).element as HTMLInputElement).disabled, label).toBe(true)
   }
   expect(bar(wrapper).exists()).toBe(false)
+})
+
+// ---- The password: a call of its own, outside the draft ----
+
+const OLD = 'the password in use now'
+const NEW = 'a new password of length'
+const button = (wrapper: VueWrapper, text: string) => {
+  const found = wrapper.findAll('button').find((each) => each.text() === text)
+  if (found === undefined) {
+    throw new Error(`no button ${text}`)
+  }
+  return found
+}
+const disabled = (wrapper: VueWrapper, text: string) => (button(wrapper, text).element as HTMLButtonElement).disabled
+/** Fill the three fields in, leaving each as a person does. */
+async function fill(wrapper: VueWrapper, current: string, next: string, again: string = next) {
+  await type(wrapper, 'Current password', current)
+  await type(wrapper, 'New password', next)
+  await type(wrapper, 'New password again', again)
+}
+const typedIn = (wrapper: VueWrapper) => ['Current password', 'New password', 'New password again'].map((label) => (box(wrapper, label).element as HTMLInputElement).value)
+const alertAt = (wrapper: VueWrapper, label: string) => fieldLabelled(wrapper, label).find('[role="alert"]')
+
+test('the password is changed by a call of its own', async () => {
+  const { wrapper, router, store } = await page()
+  const password = section(wrapper, 'Password')
+  expect(password.find('.ofo-formsec__text').text()).toBe('Changing it takes effect at once and logs out every other session.')
+  expect(password.findAll('.ofo-field__label').map((label) => label.text())).toEqual(['Current password', 'New password', 'New password again'])
+  expect(password.findAll('input').map((input) => [input.attributes('type'), input.attributes('autocomplete')])).toEqual([
+    ['password', 'current-password'],
+    ['password', 'new-password'],
+    ['password', 'new-password'],
+  ])
+  expect(fieldLabelled(wrapper, 'New password').find('.ofo-field__help').text()).toBe('At least 12 characters.')
+  await fill(wrapper, OLD, NEW)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(router.calls.changePassword).toEqual([[OLD, NEW]])
+  // Done: the fields are empty and the page says what happened.
+  expect(typedIn(wrapper)).toEqual(['', '', ''])
+  expect(password.find('.changed').text()).toBe('The password was changed. Every other session was logged out.')
+  // It was never a change of config: nothing to apply.
+  expect(store().changes.value).toEqual([])
+  expect(bar(wrapper).exists()).toBe(false)
+})
+
+test('what is typed for a password is kept nowhere', async () => {
+  const { wrapper, routes, store } = await page()
+  await fill(wrapper, OLD, NEW, 'a second new password')
+  const kept = () =>
+    JSON.stringify([
+      store().draft.value,
+      store().base.value,
+      store().violations.value,
+      store().notice.value,
+      Object.entries(window.sessionStorage),
+      Object.entries(window.localStorage),
+    ])
+  for (const secret of [OLD, NEW, 'a second new password']) {
+    expect(kept(), secret).not.toContain(secret)
+  }
+  expect(store().changes.value).toEqual([])
+  // Leaving the page forgets them.
+  await routes.push('/dns')
+  await flushPromises()
+  await routes.push('/system')
+  await flushPromises()
+  expect(typedIn(wrapper)).toEqual(['', '', ''])
+})
+
+test('what the page knows of a new password is said when its field is left', async () => {
+  const { wrapper, router } = await page()
+  await box(wrapper, 'New password').setValue('short')
+  expect(alertAt(wrapper, 'New password').exists()).toBe(false)
+  await box(wrapper, 'New password').trigger('blur')
+  expect(alertAt(wrapper, 'New password').text()).toBe('12 characters or more.')
+  await type(wrapper, 'New password', NEW)
+  expect(alertAt(wrapper, 'New password').exists()).toBe(false)
+  await type(wrapper, 'New password again', 'another password entirely')
+  expect(alertAt(wrapper, 'New password again').text()).toBe('The two passwords differ.')
+  // Pressed as it is, nothing is asked of the router.
+  await type(wrapper, 'Current password', OLD)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(router.calls.changePassword).toEqual([])
+  // And pressed with nothing typed, each field that needs something says so.
+  unmountAll()
+  const empty = await page()
+  await button(empty.wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(empty.router.calls.changePassword).toEqual([])
+  expect(alertAt(empty.wrapper, 'New password').text()).toBe('12 characters or more.')
+})
+
+test('a wrong current password is said at its field, and the others are left as typed', async () => {
+  // Review Focus 4.
+  const { wrapper, router } = await page(routerConfig(), state(), (fake) => {
+    fake.changeRefusal = new RouterError(ErrorCode.INVALID_ARGUMENT, 'the old password is wrong')
+  })
+  await fill(wrapper, 'not the password', NEW)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(alertAt(wrapper, 'Current password').text()).toBe('That is not the current password.')
+  expect(typedIn(wrapper)).toEqual(['not the password', NEW, NEW])
+  expect(section(wrapper, 'Password').find('.changed').exists()).toBe(false)
+  // Typing the current password again takes what was said of it away.
+  router.changeRefusal = null
+  await type(wrapper, 'Current password', OLD)
+  expect(alertAt(wrapper, 'Current password').exists()).toBe(false)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(router.calls.changePassword).toEqual([
+    ['not the password', NEW],
+    [OLD, NEW],
+  ])
+  expect(section(wrapper, 'Password').find('.changed').exists()).toBe(true)
+})
+
+test('a wait is counted down at the field and the button is held for it', async () => {
+  const { wrapper, router } = await page(routerConfig(), state(), (fake) => {
+    fake.changeRefusal = new RouterError(ErrorCode.RESOURCE_EXHAUSTED, 'try again later', { retryAfterSecs: 4 })
+  })
+  await fill(wrapper, OLD, NEW)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(alertAt(wrapper, 'Current password').text()).toBe('Too many tries. Wait 4 s.')
+  expect(disabled(wrapper, 'Change password')).toBe(true)
+  await vi.advanceTimersByTimeAsync(2_000)
+  expect(alertAt(wrapper, 'Current password').text()).toBe('Too many tries. Wait 2 s.')
+  // Pressing does nothing while it counts.
+  await button(wrapper, 'Change password').trigger('click')
+  expect(router.calls.changePassword).toHaveLength(1)
+  await vi.advanceTimersByTimeAsync(2_000)
+  expect(disabled(wrapper, 'Change password')).toBe(false)
+  expect(alertAt(wrapper, 'Current password').exists()).toBe(false)
+  // A wrong password that earns a wait says both.
+  router.changeRefusal = new RouterError(ErrorCode.INVALID_ARGUMENT, 'the old password is wrong', { retryAfterSecs: 2 })
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(alertAt(wrapper, 'Current password').text()).toBe('That is not the current password. Wait 2 s.')
+  expect(disabled(wrapper, 'Change password')).toBe(true)
+})
+
+test('a double press sends one call', async () => {
+  const { wrapper, router } = await page()
+  await fill(wrapper, OLD, NEW)
+  const release = router.holdCall('changePassword')
+  await button(wrapper, 'Change password').trigger('click')
+  await button(wrapper, 'Change password').trigger('click')
+  expect(disabled(wrapper, 'Change password')).toBe(true)
+  release()
+  await flushPromises()
+  expect(router.calls.changePassword).toHaveLength(1)
+  expect(disabled(wrapper, 'Change password')).toBe(false)
+})
+
+test('while a change waits to be confirmed the password cannot be changed, and the page says why', async () => {
+  const { wrapper, router } = await page(routerConfig(), pendingState(13))
+  const password = section(wrapper, 'Password')
+  expect(password.find('.held').text()).toBe('A change of config is waiting to be confirmed. Confirm or revert it first.')
+  expect(disabled(wrapper, 'Change password')).toBe(true)
+  await fill(wrapper, OLD, NEW)
+  await button(wrapper, 'Change password').trigger('click')
+  expect(router.calls.changePassword).toEqual([])
+  // Once the change is settled, the button is offered again.
+  router.push('state', state())
+  await flushPromises()
+  expect(password.find('.held').exists()).toBe(false)
+  expect(disabled(wrapper, 'Change password')).toBe(false)
+  // A router that refuses for that reason all the same is given the same words.
+  router.changeRefusal = new RouterError(ErrorCode.FAILED_PRECONDITION, 'a change of config is pending; confirm or revert it before changing the password')
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(password.find('.failed').text()).toBe('A change of config is waiting to be confirmed. Confirm or revert it first.')
+})
+
+test('anything else the router says of a password change is said under the button', async () => {
+  const { wrapper } = await page(routerConfig(), state(), (fake) => {
+    fake.changeRefusal = new RouterError(ErrorCode.UNAVAILABLE, 'the router did not answer')
+  })
+  await fill(wrapper, OLD, NEW)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(section(wrapper, 'Password').find('.failed').text()).toBe('the router did not answer')
+  expect(typedIn(wrapper)).toEqual([OLD, NEW, NEW])
+})
+
+// ---- Restart: asked first, and a call of its own ----
+
+const dialog = (wrapper: VueWrapper) => wrapper.find('.ofo-dialog')
+const said = (wrapper: VueWrapper) => wrapper.findAll('.said .ofo-banner').map((banner) => banner.text())
+
+test('the dialog says what a restart loses', async () => {
+  // Review Focus 3.
+  const { wrapper, router, store } = await page()
+  const restart = section(wrapper, 'Restart')
+  expect(restart.find('.ofo-formsec__text').text()).toBe('Everything goes offline for about a minute. You log in again when it is back.')
+  expect(button(wrapper, 'Restart the router').classes()).toContain('ofo-btn--danger')
+  const lines = async () => {
+    await button(wrapper, 'Restart the router').trigger('click')
+    const found = dialog(wrapper)
+      .findAll('.ofo-dialog__text')
+      .map((line) => line.text())
+    await button(wrapper, 'Cancel').trigger('click')
+    return found
+  }
+  await button(wrapper, 'Restart the router').trigger('click')
+  expect(dialog(wrapper).find('.ofo-dialog__title').text()).toBe('Restart openfeo.home.arpa?')
+  expect(dialog(wrapper).attributes('role')).toBe('alertdialog')
+  expect(dialog(wrapper).findAll('button').map((each) => each.text())).toEqual(['Cancel', 'Restart'])
+  await button(wrapper, 'Cancel').trigger('click')
+  expect(dialog(wrapper).exists()).toBe(false)
+  // Nothing in hand.
+  expect(await lines()).toEqual(['Every device loses the internet for about a minute.'])
+  // A draft with one change, then with two.
+  store().edit((draft) => (draft.system!.hostname = 'edge'))
+  await flushPromises()
+  expect(await lines()).toEqual(['Every device loses the internet for about a minute.', '1 change that is not applied yet is lost.'])
+  store().edit((draft) => (draft.system!.domain = 'lan.example'))
+  await flushPromises()
+  expect(await lines()).toEqual(['Every device loses the internet for about a minute.', '2 changes that are not applied yet are lost.'])
+  // A change waiting to be confirmed, with the draft still in hand.
+  router.push('state', pendingState(13))
+  await flushPromises()
+  expect(await lines()).toEqual([
+    'Every device loses the internet for about a minute.',
+    'The change that is waiting to be confirmed goes back to how it was.',
+    '2 changes that are not applied yet are lost.',
+  ])
+  expect(router.calls.reboot).toBe(0)
+})
+
+test('Cancel asks nothing of the router', async () => {
+  const { wrapper, router } = await page()
+  await button(wrapper, 'Restart the router').trigger('click')
+  await button(wrapper, 'Cancel').trigger('click')
+  await flushPromises()
+  expect(router.calls.reboot).toBe(0)
+  expect(said(wrapper)).toEqual([])
+})
+
+test('after a restart the page waits and then asks for the password', async () => {
+  // Review Focus 5.
+  const { wrapper, router, routes } = await page()
+  await button(wrapper, 'Restart the router').trigger('click')
+  await button(wrapper, 'Restart').trigger('click')
+  await flushPromises()
+  expect(router.calls.reboot).toBe(1)
+  expect(dialog(wrapper).exists()).toBe(false)
+  expect(said(wrapper)).toEqual(['The router is restarting. You log in again when it is back.'])
+  // It cannot be asked twice.
+  expect(disabled(wrapper, 'Restart the router')).toBe(true)
+  // The socket goes with the router: the page says the same, not that the connection was lost.
+  router.setConnection('reconnecting')
+  await flushPromises()
+  expect(said(wrapper)).toEqual(['The router is restarting. You log in again when it is back.'])
+  // The router answers again and knows no session: the login screen.
+  router.endSession('lapsed')
+  await flushPromises()
+  expect(wrapper.find('h1').text()).toBe('Log in')
+  expect(routes.currentRoute.value.path).toBe('/login')
+})
+
+test('a restart the router refuses is said and nothing is marked', async () => {
+  const { wrapper, router } = await page(routerConfig(), state(), (fake) => {
+    fake.rebootRefusal = new RouterError(ErrorCode.UNAVAILABLE, 'the router did not answer')
+  })
+  await button(wrapper, 'Restart the router').trigger('click')
+  await button(wrapper, 'Restart').trigger('click')
+  await flushPromises()
+  expect(router.calls.reboot).toBe(1)
+  expect(dialog(wrapper).find('[role="alert"]').text()).toBe('the router did not answer')
+  expect(said(wrapper)).toEqual([])
+  // A double press while it is asked sends one call.
+  router.rebootRefusal = null
+  const release = router.holdCall('reboot')
+  await button(wrapper, 'Restart').trigger('click')
+  await button(wrapper, 'Restart').trigger('click')
+  release()
+  await flushPromises()
+  expect(router.calls.reboot).toBe(2)
 })
