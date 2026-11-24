@@ -40,9 +40,9 @@ pub mod pb {
 pub mod state {
     pub use crate::generated::{
         AddressOrigin, AddressState, ConfigEffect, ConfigEffectKind, ConfigProblem,
-        ConfigViolation, Counters, LanState, Lease, Leases, LinkCounters, LinkHistory,
-        PendingConfig, PortState, PortUse, PortUseKind, State, SystemState, WanKind, WanPhase,
-        WanState,
+        ConfigViolation, Counters, DnsResolver, DnsState, LanState, Lease, Leases, LinkCounters,
+        LinkHistory, PendingConfig, PortState, PortUse, PortUseKind, State, SystemState, WanKind,
+        WanPhase, WanState,
     };
 }
 

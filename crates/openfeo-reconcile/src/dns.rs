@@ -137,24 +137,15 @@ pub fn desired(world: &World) -> DesiredDns {
     }
     push_records(&mut local, &dns.records, &domain);
 
-    let mut upstreams: Vec<IpAddr> = Vec::new();
-    for upstream in dns.upstreams.iter().filter_map(|text| text.parse().ok()) {
-        push_unique(&mut upstreams, upstream);
-    }
-    let mut learned_from = None;
-    let mut wan_upstreams = Vec::new();
+    let Upstreams {
+        servers: upstreams,
+        learned_from,
+        from_wan: wan_upstreams,
+        ..
+    } = upstreams(world);
     let router_addrs = router_addrs(&listeners, world, &lan6);
     let mut wan_addrs: Vec<IpAddr> = Vec::new();
     if let Some(active) = active_wan(world) {
-        if dns.use_wan_dns.unwrap_or(true) {
-            wan_upstreams = wan_dns(world, active);
-            if !wan_upstreams.is_empty() {
-                learned_from = Some(active.name.clone());
-                for upstream in &wan_upstreams {
-                    push_unique(&mut upstreams, *upstream);
-                }
-            }
-        }
         // The WAN addresses are the router's too: a public name resolving to one is rebinding,
         // but they are not records of the router's name, so they are kept apart from the LAN
         // addresses.
@@ -224,6 +215,77 @@ pub fn forwarder_config(desired: &DesiredDns) -> Config {
             .collect(),
         cache_capacity: DEFAULT_CAPACITY,
     }
+}
+
+/// The forwarder's upstreams and where each came from.
+struct Upstreams {
+    /// In the order they are asked: the typed ones, then the active WAN's, each once.
+    servers: Vec<IpAddr>,
+    /// How many of `servers`, from the front, were typed into `[dns] upstreams`.
+    typed: usize,
+    /// The WAN whose servers were appended.
+    learned_from: Option<String>,
+    /// What that WAN learned or was given, before deduplication.
+    from_wan: Vec<IpAddr>,
+}
+
+/// The one place the forwarder's upstreams are worked out, for its settings and for the state.
+fn upstreams(world: &World) -> Upstreams {
+    let dns = world.config.dns.as_ref();
+    let mut servers: Vec<IpAddr> = Vec::new();
+    for upstream in dns
+        .into_iter()
+        .flat_map(|dns| &dns.upstreams)
+        .filter_map(|text| text.parse().ok())
+    {
+        push_unique(&mut servers, upstream);
+    }
+    let typed = servers.len();
+    let mut learned_from = None;
+    let mut from_wan = Vec::new();
+    if let Some(active) = active_wan(world)
+        && dns.and_then(|dns| dns.use_wan_dns).unwrap_or(true)
+    {
+        from_wan = wan_dns(world, active);
+        if !from_wan.is_empty() {
+            learned_from = Some(active.name.clone());
+            for upstream in &from_wan {
+                push_unique(&mut servers, *upstream);
+            }
+        }
+    }
+    Upstreams {
+        servers,
+        typed,
+        learned_from,
+        from_wan,
+    }
+}
+
+/// One upstream the forwarder asks, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolver {
+    pub address: IpAddr,
+    /// The WAN it was learned from; `None` for one typed into `[dns] upstreams`.
+    pub wan: Option<String>,
+}
+
+/// The forwarder's upstreams, in the order it asks them: exactly `desired(world).upstreams`.
+/// An address is a typed one when `[dns] upstreams` has it, whatever else also offers it.
+#[must_use]
+pub fn resolvers(world: &World) -> Vec<Resolver> {
+    let found = upstreams(world);
+    found
+        .servers
+        .iter()
+        .enumerate()
+        .map(|(place, address)| Resolver {
+            address: *address,
+            wan: (place >= found.typed)
+                .then(|| found.learned_from.clone())
+                .flatten(),
+        })
+        .collect()
 }
 
 /// The configured WAN with the lowest priority whose port the map knows.
@@ -903,5 +965,111 @@ mod tests {
             desired(&fixtures::dhcp_world_without_lease()).wan_addrs,
             Vec::<Ipv4Addr>::new()
         );
+    }
+
+    /// `wan0` holds a lease that gives two resolvers, behind its default route.
+    fn world_with_two_resolvers() -> World {
+        let mut world = fixtures::dhcp_world();
+        let mut fact = fixtures::dhcp_fact();
+        fact.dns = vec![
+            Ipv4Addr::new(203, 0, 113, 53),
+            Ipv4Addr::new(203, 0, 113, 54),
+        ];
+        world.dhcp4 = Arc::new(std::collections::BTreeMap::from([(
+            "wan0".to_owned(),
+            fact,
+        )]));
+        world
+    }
+
+    fn typed(world: &mut World, upstreams: &[&str], use_wan_dns: Option<bool>) {
+        Arc::make_mut(&mut world.config).dns = Some(Dns {
+            upstreams: upstreams.iter().map(|text| (*text).to_owned()).collect(),
+            use_wan_dns,
+            ..Default::default()
+        });
+    }
+
+    fn in_use(world: &World) -> Vec<(String, Option<String>)> {
+        resolvers(world)
+            .into_iter()
+            .map(|resolver| (resolver.address.to_string(), resolver.wan))
+            .collect()
+    }
+
+    fn of(address: &str, wan: Option<&str>) -> (String, Option<String>) {
+        (address.to_owned(), wan.map(str::to_owned))
+    }
+
+    #[test]
+    fn the_wans_resolvers_are_in_use_in_order_and_name_their_wan() {
+        assert_eq!(
+            in_use(&world_with_two_resolvers()),
+            [
+                of("203.0.113.53", Some("wan0")),
+                of("203.0.113.54", Some("wan0"))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_typed_resolver_comes_first_and_names_no_wan() {
+        let mut world = world_with_two_resolvers();
+        typed(&mut world, &["198.51.100.53"], None);
+        assert_eq!(
+            in_use(&world),
+            [
+                of("198.51.100.53", None),
+                of("203.0.113.53", Some("wan0")),
+                of("203.0.113.54", Some("wan0"))
+            ]
+        );
+    }
+
+    #[test]
+    fn with_the_switch_off_only_the_typed_are_in_use() {
+        let mut world = world_with_two_resolvers();
+        typed(&mut world, &["198.51.100.53"], Some(false));
+        assert_eq!(in_use(&world), [of("198.51.100.53", None)]);
+    }
+
+    #[test]
+    fn a_resolver_both_typed_and_learned_is_listed_once_as_typed() {
+        let mut world = world_with_two_resolvers();
+        typed(&mut world, &["203.0.113.54"], None);
+        assert_eq!(
+            in_use(&world),
+            [of("203.0.113.54", None), of("203.0.113.53", Some("wan0"))]
+        );
+    }
+
+    #[test]
+    fn a_wan_with_no_lease_gives_none() {
+        assert_eq!(in_use(&fixtures::dhcp_world_without_lease()), []);
+    }
+
+    /// The state shows what the forwarder uses, not a second opinion.
+    #[test]
+    fn the_list_is_what_the_forwarder_is_given() {
+        let mut both = world_with_two_resolvers();
+        typed(&mut both, &["198.51.100.53", "203.0.113.54"], None);
+        let mut off = world_with_two_resolvers();
+        typed(&mut off, &["198.51.100.53"], Some(false));
+        for world in [
+            world_with_two_resolvers(),
+            both,
+            off,
+            fixtures::dhcp_world_without_lease(),
+            fixtures::static_world(),
+            fixtures::pppoe_world(),
+            fixtures::ipv6_world(),
+            fixtures::pd_world(),
+        ] {
+            let addresses: Vec<IpAddr> = resolvers(&world)
+                .into_iter()
+                .map(|resolver| resolver.address)
+                .collect();
+            assert_eq!(addresses, desired(&world).upstreams);
+        }
     }
 }

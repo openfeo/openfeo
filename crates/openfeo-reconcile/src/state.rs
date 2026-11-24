@@ -11,8 +11,9 @@ use ipnet::IpNet;
 use openfeo_config::load::{DEFAULT_DOMAIN, DEFAULT_HOSTNAME};
 use openfeo_config::portname::parse_port_ref;
 use openfeo_config::state::{
-    AddressOrigin, AddressState, ConfigEffect, ConfigEffectKind, ConfigProblem, LanState,
-    PendingConfig, PortState, PortUse, PortUseKind, State, SystemState, WanKind, WanState,
+    AddressOrigin, AddressState, ConfigEffect, ConfigEffectKind, ConfigProblem, DnsResolver,
+    DnsState, LanState, PendingConfig, PortState, PortUse, PortUseKind, State, SystemState,
+    WanKind, WanState,
 };
 use openfeo_config::{Lan, Wan, wan::Kind};
 use openfeo_world::health::HealthView;
@@ -63,6 +64,21 @@ pub fn state(world: &World, system: &SystemFacts) -> State {
             .addresses
             .iter()
             .map(|addr| address_state(world, addr))
+            .collect(),
+        dns: Some(dns_state(world)),
+    }
+}
+
+/// The resolvers the forwarder is asking: the forwarder's own list (`reconcile::dns`), with
+/// where each came from.
+fn dns_state(world: &World) -> DnsState {
+    DnsState {
+        resolvers: crate::dns::resolvers(world)
+            .into_iter()
+            .map(|resolver| DnsResolver {
+                address: resolver.address.to_string(),
+                wan: resolver.wan.unwrap_or_default(),
+            })
             .collect(),
     }
 }
@@ -642,5 +658,27 @@ mod tests {
         let text = format!("{world:?}");
         assert!(text.contains("isp.example"), "the account is there: {text}");
         assert!(!text.contains("example-secret"), "{text}");
+    }
+
+    /// SPEC §8.3: which resolvers the forwarder is asking, and where each came from.
+    #[test]
+    fn the_state_says_which_resolvers_are_in_use() {
+        let mut world = fixtures::dhcp_world();
+        Arc::make_mut(&mut world.config).dns = Some(openfeo_config::Dns {
+            upstreams: vec!["198.51.100.53".into()],
+            ..Default::default()
+        });
+        let dns = state(&world, &system()).dns.unwrap();
+        let said: Vec<(&str, &str)> = dns
+            .resolvers
+            .iter()
+            .map(|resolver| (resolver.address.as_str(), resolver.wan.as_str()))
+            .collect();
+        assert_eq!(said, [("198.51.100.53", ""), ("203.0.113.1", "wan0")]);
+        assert_eq!(
+            state(&fixtures::dhcp_world_without_lease(), &system()).dns,
+            Some(openfeo_config::state::DnsState::default()),
+            "no resolver is an empty list, said"
+        );
     }
 }

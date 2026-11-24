@@ -183,6 +183,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "the_panel_shows_the_hour_and_the_leases_in_a_browser",
         run: the_panel_shows_the_hour_and_the_leases_in_a_browser,
     },
+    Scenario {
+        name: "the_state_says_which_resolvers_are_in_use",
+        run: the_state_says_which_resolvers_are_in_use,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -2779,4 +2783,45 @@ fn the_panel_shows_the_hour_and_the_leases_in_a_browser(lab: &mut Lab) -> anyhow
         "the reservations are {reserved:?}, and the lease is {lease:?}"
     );
     Ok(())
+}
+
+/// The resolvers the state names, in order, each with the WAN it came from.
+fn resolvers_of(state: &openfeo_config::state::State) -> Vec<(String, String)> {
+    state
+        .dns
+        .iter()
+        .flat_map(|dns| &dns.resolvers)
+        .map(|resolver| (resolver.address.clone(), resolver.wan.clone()))
+        .collect()
+}
+
+/// SPEC §8.3 (M4 part 3b): the state says which resolvers the forwarder is asking, in the
+/// order it asks, and where each came from: the WAN's lease, the ones the owner typed, and
+/// the switch that leaves the WAN's out.
+fn the_state_says_which_resolvers_are_in_use(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    ws.subscribe("state", 0)?;
+    let learned = ("203.0.113.1".to_owned(), "wan0".to_owned());
+    let typed = ("198.51.100.53".to_owned(), String::new());
+    // The lab's Kea gives one resolver with the lease.
+    ws.state_where(SOON, |state| resolvers_of(state) == [learned.clone()])
+        .context("the lease's resolver is not in the state")?;
+    let view = ws.config()?;
+    let mut config = view.config.context("no config")?;
+    let mut dns = config.dns.take().unwrap_or_default();
+    dns.upstreams = vec![typed.0.clone()];
+    config.dns = Some(dns);
+    let tag = applied(&mut ws, &config, &view.tag, true, 0)?;
+    ws.state_where(SOON, |state| {
+        resolvers_of(state) == [typed.clone(), learned.clone()]
+    })
+    .context("a typed resolver is not first, with no WAN to its name")?;
+    if let Some(dns) = config.dns.as_mut() {
+        dns.use_wan_dns = Some(false);
+    }
+    applied(&mut ws, &config, &tag, true, 0)?;
+    ws.state_where(SOON, |state| resolvers_of(state) == [typed.clone()])
+        .context("with the switch off the WAN's resolver is still in use")?;
+    no_task_failed(lab)
 }
