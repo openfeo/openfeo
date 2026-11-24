@@ -24,10 +24,14 @@ if [ "${have:-}" != "$want" ]; then
 fi
 
 cd "$(dirname "$0")/.."
-# Fetched as the build itself fetches them; from here on nothing is asked of the network.
-cargo fetch --locked --target x86_64-unknown-linux-musl
+# Every crate in the lockfile is fetched, not only this target's: `cargo about` reads the
+# whole of it before it leaves out what the binary does not link, and a machine that has built
+# nothing yet (CI's image job, a fresh clone) has none of them. From here on nothing is asked
+# of the network.
+cargo fetch --locked
 mkdir -p "$(dirname "$out")"
-cargo about generate --frozen -m crates/openfeo/Cargo.toml ${features:+--features "$features"} \
+# --fail: a crate whose licence cannot be read is a build that stops, not a notice left out.
+cargo about generate --frozen --fail -m crates/openfeo/Cargo.toml ${features:+--features "$features"} \
   -o "$out.new" about.hbs
 if [ ! -s "$out.new" ]; then
   echo "rust-notices: cargo about wrote nothing" >&2
