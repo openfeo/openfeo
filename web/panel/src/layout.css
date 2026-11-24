@@ -241,6 +241,18 @@ body {
   margin-top: var(--space-3);
 }
 
+/* A section whose table needs the page's whole width (a forward has six columns): its title
+   and its sentence stand above the table, not beside it. */
+.page__wide.ofo-formsec {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* A line about a table, beneath its Add button. */
+.page__note {
+  display: block;
+  margin: var(--space-3) 0 0;
+}
+
 /* The System page's About: a name beside each thing the router says of itself, the long
    fingerprint breaking where it must. */
 .about {

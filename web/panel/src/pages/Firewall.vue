@@ -194,11 +194,18 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
           </table>
         </div>
         <div v-if="reachSaid.length > 0" class="reach__said">
-          <p v-for="said in reachSaid" :key="said.lan" class="ofo-field__help ofo-field--error" role="alert">{{ said.lan }}: {{ said.message }}</p>
+          <p v-for="said in reachSaid" :key="said.lan" class="ofo-field--error page__none">
+            <span class="ofo-field__help" role="alert">{{ said.lan }}: {{ said.message }}</span>
+          </p>
         </div>
       </OfoFormSection>
 
-      <OfoFormSection title="Port forwards" text="A port on the router's internet address that leads to one device. It works from inside your network too." plain>
+      <OfoFormSection
+        class="page__wide"
+        title="Port forwards"
+        text="A port on the router's internet address that leads to one device. It works from inside your network too."
+        plain
+      >
         <div v-if="forwards.length > 0" class="ofo-table-wrap">
           <table class="ofo-table res fwd">
             <thead>
@@ -273,13 +280,14 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
         <div class="res__add">
           <OfoButton size="sm" :disabled="!editable" @click="change((firewall) => firewall.portForwards.push(newForward()))">Add forward</OfoButton>
         </div>
-        <p class="ofo-muted page__none">
+        <p class="ofo-field__help page__note">
           To port: leave empty for the same port.
           <template v-if="listens">Listens on: an address of your public block; empty for the WAN’s own.</template>
         </p>
       </OfoFormSection>
 
       <OfoFormSection
+        class="page__wide"
         title="Rules"
         text="A way in with no address translation: for a device's IPv6 address, for a LAN with public addresses, or from one LAN to one device on another."
         plain
@@ -333,7 +341,7 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
         <div class="res__add">
           <OfoButton size="sm" :disabled="!editable" @click="change((firewall) => firewall.rules.push(newRule()))">Add rule</OfoButton>
         </div>
-        <p class="ofo-muted page__none">
+        <p class="ofo-field__help page__note">
           To: one address, a range such as 192.168.1.10-192.168.1.20, or a block such as 192.168.1.0/28. Ports: one, several, or a range such as 1000-1010.
         </p>
       </OfoFormSection>

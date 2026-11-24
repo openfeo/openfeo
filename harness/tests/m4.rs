@@ -203,6 +203,10 @@ const SCENARIOS: &[Scenario] = &[
         name: "a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config",
         run: a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config,
     },
+    Scenario {
+        name: "the_panel_changes_the_settings_and_restarts_the_router",
+        run: the_panel_changes_the_settings_and_restarts_the_router,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -3078,4 +3082,131 @@ fn a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config(
     ws.subscribe("events", 16)?;
     ws.event(SOON, "config.discarded")?;
     no_task_failed(lab)
+}
+
+/// What the browser changes the lab's password to.
+const NEW_PASSWORD: &str = "lab-second-password";
+
+/// The settings pages (SPEC §8.4, §12; M4 part 3b) in Playwright's Chromium, inside the LAN
+/// namespace, against the booted router: a port forward is added on Firewall, applied and
+/// confirmed; a LAN that a forward points into cannot be removed until the forward is; a
+/// local name is added on DNS; the password is changed on System, the old one refused and
+/// the new one taken; and the router is restarted from there, the page waiting and ending at
+/// the login screen. Afterwards the router is asked what it ended up with: the forward and
+/// the name are in its config, a LAN host can look the name up, the new password logs in,
+/// and the console shows one restart that was asked for. Screenshots of the three pages and
+/// the restart's dialog join the others. Skipped as the other browser scenarios are.
+fn the_panel_changes_the_settings_and_restarts_the_router(lab: &mut Lab) -> anyhow::Result<()> {
+    const WINDOW: u32 = 40;
+    web::ready()?;
+    boot(lab, &format!("openfeo.confirm_secs={WINDOW}"))?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    web::settle(&lab.lan0, "lan0")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "settings.spec",
+        ])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e-settings"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_NEW_PASSWORD", NEW_PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright-settings.log"),
+        Duration::from_secs(480),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+
+    // One restart, asked for through the API, with its goodbyes; and the machine came up twice.
+    let console = lab.console()?;
+    for (line, times) in [
+        (RESTART_ASKED, 1),
+        (REBOOT_REQUESTED, 1),
+        (LAN0_DHCP_STOPPED, 1),
+        (r"Linux version \S+-openfeo", 2),
+        (r"openfeo: config: confirmed", 2),
+    ] {
+        let found = console.count(&re(line));
+        ensure!(
+            found == times,
+            "{line} is on the console {found} times, not {times}"
+        );
+    }
+    no_task_failed(lab)?;
+    password_never_logged(lab)?;
+    ensure!(
+        lab.console()?.count(&re(NEW_PASSWORD)) == 0,
+        "the new password is on the console"
+    );
+
+    settings_ended_up(lab)
+}
+
+/// What the router ended up with after the settings run, asked with the password the browser
+/// gave it: the forward and the local name, nothing of what was added and removed in one
+/// draft, and the name answered to a device on the LAN.
+fn settings_ended_up(lab: &Lab) -> anyhow::Result<()> {
+    let api = api(lab)?;
+    let token = api.login(NEW_PASSWORD)?;
+    let config = api.ws_with(&token)?.config()?.config.context("no config")?;
+    let forwards: Vec<(&str, u32, &str, u32)> = config
+        .firewall
+        .iter()
+        .flat_map(|firewall| &firewall.port_forwards)
+        .map(|forward| {
+            (
+                forward.name.as_str(),
+                forward.port,
+                forward.to.as_str(),
+                forward.to_port,
+            )
+        })
+        .collect();
+    ensure!(
+        forwards.contains(&("e2e-ssh", 2022, "192.168.1.50", 22)),
+        "the forwards are {forwards:?}"
+    );
+    ensure!(
+        !forwards.iter().any(|forward| forward.0 == "iot-cam")
+            && config.lans.iter().all(|lan| lan.name != "iot"),
+        "what was added and removed in one draft is in the config"
+    );
+    let names: Vec<(&str, &str)> = config
+        .dns
+        .iter()
+        .flat_map(|dns| &dns.records)
+        .map(|record| (record.name.as_str(), record.address.as_str()))
+        .collect();
+    ensure!(
+        names == [("printer", "192.168.1.50")],
+        "the local names are {names:?}"
+    );
+    // And a device on the LAN finds the name, under the router's domain.
+    let answer = lanclient::dig(
+        &lab.lan0,
+        std::net::Ipv4Addr::new(192, 168, 1, 1).into(),
+        "printer.home.arpa",
+        "A",
+        &[],
+        Duration::from_secs(6),
+    )?;
+    ensure!(
+        answer.status == "NOERROR"
+            && answer
+                .answers
+                .iter()
+                .any(|(_, _, rtype, data)| rtype == "A" && data == "192.168.1.50"),
+        "printer.home.arpa: {answer:?}"
+    );
+    Ok(())
 }

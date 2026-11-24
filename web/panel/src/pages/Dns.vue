@@ -134,7 +134,7 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
         <div class="ofo-span-2">
           <OfoToggle label="Also use the resolvers the WAN gives" :model-value="usesWan(dns)" :disabled="!editable" @update:model-value="setWan" />
         </div>
-        <p v-if="using !== null" class="dns__inuse ofo-muted ofo-span-2 page__none">
+        <p v-if="using !== null" class="dns__inuse ofo-field__help ofo-span-2 page__none">
           <template v-if="using.length === 0">In use now: none. Names outside your network cannot be looked up.</template>
           <template v-else>
             In use now:
@@ -186,7 +186,7 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
         <div class="res__add">
           <OfoButton size="sm" :disabled="!editable" @click="change((shown) => shown.records.push(newRecord()))">Add name</OfoButton>
         </div>
-        <p class="names__note ofo-muted page__none">
+        <p class="names__note ofo-field__help page__note">
           A name with no dot is under <span class="ofo-mono">{{ domain }}</span
           >: <span class="ofo-mono">{{ example }}</span> is <span class="ofo-mono">{{ example }}.{{ domain }}</span
           >. One name may have an IPv4 and an IPv6 address.

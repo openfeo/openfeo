@@ -294,11 +294,11 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
             @blur="leftAgain = true"
           />
         </OfoField>
-        <p v-if="pending" class="held ofo-muted ofo-span-2 page__none">{{ PENDING }}</p>
+        <p v-if="pending" class="held ofo-field__help ofo-span-2 page__none">{{ PENDING }}</p>
         <div class="ofo-span-2">
           <OfoButton :disabled="changing || wait > 0 || pending" @click="changePassword">Change password</OfoButton>
         </div>
-        <p v-if="failed" class="failed ofo-field--error ofo-field__help ofo-span-2" role="alert">{{ failed }}</p>
+        <p v-if="failed" class="failed ofo-field--error ofo-span-2 page__none"><span class="ofo-field__help" role="alert">{{ failed }}</span></p>
       </OfoFormSection>
 
       <OfoFormSection title="Restart" text="Everything goes offline for about a minute. You log in again when it is back.">
@@ -321,7 +321,7 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
 
     <OfoDialog v-if="asking" class="restart" :title="`Restart ${name}?`" @cancel="restartBusy || (asking = false)">
       <p v-for="line in loses" :key="line" class="ofo-dialog__text">{{ line }}</p>
-      <p v-if="restartFailed" class="ofo-field--error ofo-field__help" role="alert">{{ restartFailed }}</p>
+      <p v-if="restartFailed" class="ofo-field--error page__none"><span class="ofo-field__help" role="alert">{{ restartFailed }}</span></p>
       <template #foot>
         <OfoButton variant="ghost" autofocus :disabled="restartBusy" @click="asking = false">Cancel</OfoButton>
         <OfoButton variant="danger" :disabled="restartBusy" @click="restart">Restart</OfoButton>
