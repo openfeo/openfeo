@@ -12,22 +12,26 @@ import type { FakeRouter } from './fake-router'
 import { NOW, routerConfig, state } from './fixtures'
 import { panelAt, signedIn, unmountAll } from './mounting'
 
-const NOW_UNIX = Math.floor(NOW.getTime() / 1000)
+/**
+ * The router's clock when the browser's says NOW. It is a day behind, so that an age counted
+ * on the browser's clock would be a day out: the pages count on the router's.
+ */
+const ROUTER_UNIX = Math.floor(NOW.getTime() / 1000) - 86_400
 
 type Row = [address: string, hostname: string, joinedSecsAgo: number, more?: { lan?: string; mac?: string }]
 
-/** The lease table at NOW by the router's clock. */
+/** The lease table as the router has it when the browser's clock says NOW. */
 function leases(rows: Row[], truncated = false): Leases {
   return create(LeasesSchema, {
-    timeUnix: BigInt(NOW_UNIX),
+    timeUnix: BigInt(ROUTER_UNIX),
     truncated,
     leases: rows.map(([address, hostname, ago, more]) => ({
       lan: more?.lan ?? 'lan0',
       address,
       mac: more?.mac ?? `02:00:00:00:00:${address.split('.').at(-1)?.padStart(2, '0').slice(-2) ?? '00'}`,
       hostname,
-      joinedUnix: BigInt(NOW_UNIX - ago),
-      expiresUnix: BigInt(NOW_UNIX - ago + 43_200),
+      joinedUnix: BigInt(ROUTER_UNIX - ago),
+      expiresUnix: BigInt(ROUTER_UNIX - ago + 43_200),
     })),
   })
 }

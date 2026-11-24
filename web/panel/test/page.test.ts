@@ -10,19 +10,23 @@ import { counters, event, NOW, state, UPTIME_SECS } from './fixtures'
 import { panelAt, signedIn, unmountAll } from './mounting'
 
 const UPTIME_MS = UPTIME_SECS * 1000
-const NOW_UNIX = Math.floor(NOW.getTime() / 1000)
+/**
+ * The router's clock when the browser's says NOW. It is a day behind, so that an age counted
+ * on the browser's clock would be a day out: the pages count on the router's.
+ */
+const ROUTER_UNIX = Math.floor(NOW.getTime() / 1000) - 86_400
 
-/** The lease table at NOW by the router's clock: each lease by its address, its name and how long ago it joined. */
+/** The lease table as the router has it when the browser's clock says NOW: each lease by its address, its name and how long ago it joined. */
 function leases(rows: [address: string, hostname: string, joinedSecsAgo: number, lan?: string][]): Leases {
   return create(LeasesSchema, {
-    timeUnix: BigInt(NOW_UNIX),
+    timeUnix: BigInt(ROUTER_UNIX),
     leases: rows.map(([address, hostname, ago, lan]) => ({
       lan: lan ?? 'lan0',
       address,
       mac: `02:00:00:00:00:${address.split('.').at(-1)?.padStart(2, '0').slice(-2) ?? '00'}`,
       hostname,
-      joinedUnix: BigInt(NOW_UNIX - ago),
-      expiresUnix: BigInt(NOW_UNIX - ago + 43_200),
+      joinedUnix: BigInt(ROUTER_UNIX - ago),
+      expiresUnix: BigInt(ROUTER_UNIX - ago + 43_200),
     })),
   })
 }
@@ -291,6 +295,17 @@ test('a row that has just joined is marked, for a minute', async () => {
   await vi.advanceTimersByTimeAsync(45_000)
   expect(marked()).toEqual([false, false])
   expect(wrapper.find('.dash__leases tbody tr td').text()).toBe('1 min ago')
+})
+
+test('a row whose joined time is ahead of the router’s clock is not marked', async () => {
+  const { wrapper, router } = await dashboard()
+  router.push('state', state())
+  // Leases read from a file written under a right clock, while the router's is still the build's.
+  router.push('leases', leases([['192.168.1.143', 'plug-kitchen', -86_400], ['192.168.1.142', 'phone', -90_000]]))
+  await flushPromises()
+  const rows = wrapper.findAll('.dash__leases tbody tr')
+  expect(rows.map((row) => row.find('td').text())).toEqual(['just now', 'just now'])
+  expect(rows.map((row) => row.classes().includes('ofo-table__row--new'))).toEqual([false, false])
 })
 
 test('with no lease yet the card says so, and one lease is not "all 1 leases"', async () => {
