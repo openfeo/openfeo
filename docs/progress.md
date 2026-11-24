@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | parts 1 and 2 of 5, and 3a, 2026-11-23 | #68, #81, #101, #103, #128; follow-up #124 |
+| M4 API and panel | parts 1 and 2 of 5, and 3a, 2026-11-23 | #68, #81, #101, #103, #128; follow-ups #124, #129 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -400,6 +400,24 @@ else stays with the LAN it points into as the router has it. A pool that a move 
 round is said at once, and what was said of a reservation, a WAN or a LAN goes with it when it is
 removed, together with what was said of those after it, whose places changed, and with what was
 typed for it and kept under its name.
+
+**2026-11-24, [#129](https://github.com/openfeo/openfeo/pull/129), M4 part 3a minors.** Nine of the
+twelve minors that the review of #128 left. The hour's line and the hour's peak leave out ten seconds
+of which under half was read: where the line had just come back, or the router had just booted, a
+second or two used to stand for ten, so a one-second burst could be said as the hour's peak. On the
+dashboard a lease is marked as new when it joined within a minute of the router's clock, on either
+side of it; leases far ahead of the clock (a lease file read while the clock is still the build's)
+are no longer all marked until the clock is set. A read of the counters that fails is logged when
+the failing begins and when it ends, not each second of it, now that they are read all the time. Two
+tests can now fail on what they claim: the page tests set the router's clock a day behind the
+browser's, so a page that counted a lease's age on the browser's clock is caught, and the socket
+test tells the change that touches no lease from the one after it by the state that is sent between
+them. Three comments say rightly that a PPPoE WAN's interface is named all the while and is there
+only during a session; the limit in `GetHistory`'s refusal comes from its constant; a field is named
+for what it holds; and `@openfeo/ui` no longer exports a function that only it uses. Of the other
+three, one needed nothing, and two wait: the lease table is built on every change of the World for
+sockets that follow only the state, and a new subscriber to the counters waits up to a second for
+its first sample.
 
 ## Tooling and process
 
