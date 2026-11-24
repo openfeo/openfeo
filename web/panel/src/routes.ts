@@ -11,6 +11,7 @@ import { createRouter, createWebHistory, type Router, type RouterHistory } from 
 
 import ConfigUnreadable from './pages/ConfigUnreadable.vue'
 import Dashboard from './pages/Dashboard.vue'
+import Firewall from './pages/Firewall.vue'
 import FirstPassword from './pages/FirstPassword.vue'
 import Lan from './pages/Lan.vue'
 import Leases from './pages/Leases.vue'
@@ -27,7 +28,7 @@ export const PATHS: Record<Screen, string> = {
 }
 
 /** The pages behind the login, each by the address it starts at. */
-export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan', leases: '/leases' } as const
+export const PAGES = { dashboard: '/', wan: '/wan', lan: '/lan', leases: '/leases', firewall: '/firewall' } as const
 
 /** The gates: a screen that is one of these has exactly one address. */
 const GATES = new Set<string>([PATHS.login, PATHS['first-password'], PATHS['config-unreadable']])
@@ -53,6 +54,7 @@ export function panelRoutes(session: PanelSession, history: RouterHistory = crea
           { path: 'wan/:name?', component: Wan },
           { path: 'lan/:name?', component: Lan },
           { path: 'leases', component: Leases },
+          { path: 'firewall', component: Firewall },
         ],
       },
       { path: PATHS.login, component: Login },

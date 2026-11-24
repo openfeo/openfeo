@@ -171,6 +171,9 @@ test('an address with no place in the new subnet is marked at its field', async 
   // What is on no page yet is listed above this one, by its path.
   const above = wrapper.find('.unfit')
   expect(above.findAll('li').map((item) => item.text())).toEqual(['dns.records[0].address: 192.168.1.200'])
+  // Each is a setting of another page, and the banner says which.
+  expect(above.find('.said__line').text()).toBe('They are set on other pages: a forward or a rule on Firewall, a local name on DNS. Choose a subnet they fit in, or change them there first.')
+  expect(above.findAll('.said__line a').map((link) => link.attributes('href'))).toContain('/firewall')
   expect(tabs(wrapper)[0]?.find('.ofo-pill').text()).toBe('problem')
 
   // Put right by hand, the field says nothing more, and the tab has nothing to point at.
@@ -468,6 +471,9 @@ test('a LAN that a forward points into cannot be removed, and the page says what
   expect(remove()?.text()).toBe('Remove lan0')
   expect((remove()?.element as HTMLButtonElement).disabled).toBe(true)
   expect(wrapper.find('.page__foot').text()).toContain('Cannot be removed yet: port forward lan-http points into it.')
+  // What is in the way is a link to where it is removed.
+  const ways = wrapper.findAll('.page__foot a')
+  expect(ways.map((way) => [way.text(), way.attributes('href')])).toEqual([['port forward lan-http points into it', '/firewall']])
   await remove()?.trigger('click')
   expect(store().draft.value!.lans).toHaveLength(2)
 
@@ -477,6 +483,30 @@ test('a LAN that a forward points into cannot be removed, and the page says what
   expect(remove()?.text()).toBe('Remove iot')
   expect((remove()?.element as HTMLButtonElement).disabled).toBe(false)
   expect(wrapper.find('.page__foot').text()).not.toContain('Cannot be removed')
+})
+
+test('a LAN can be removed once the draft has nothing pointing into it', async () => {
+  const config = routerConfig()
+  config.lans[1]!.reaches = ['wan', 'lan0']
+  const { wrapper, store } = await page('/lan', config)
+  const remove = () => wrapper.findAll('button').find((button) => button.text() === 'Remove lan0')
+  expect(wrapper.findAll('.page__foot a').map((way) => way.text())).toEqual(['port forward lan-http points into it', 'iot may reach it'])
+  // Both are taken away where they are edited, in the same draft: the forward, then the tick.
+  store().edit((draft) => (draft.firewall!.portForwards = []))
+  await flushPromises()
+  expect((remove()?.element as HTMLButtonElement).disabled).toBe(true)
+  expect(wrapper.findAll('.page__foot a').map((way) => way.text())).toEqual(['iot may reach it'])
+  store().edit((draft) => (draft.lans[1]!.reaches = ['wan']))
+  await flushPromises()
+  expect((remove()?.element as HTMLButtonElement).disabled).toBe(false)
+  expect(wrapper.find('.page__foot').text()).not.toContain('Cannot be removed')
+  await remove()?.trigger('click')
+  await flushPromises()
+  expect(store().draft.value!.lans.map((lan) => lan.name)).toEqual(['iot'])
+  // What is applied lists each of the three: the tick taken away, the LAN's removal, and the
+  // removal of the forward that stood in its way.
+  expect(what(store().changes.value)).toEqual(['iot may reach', 'lan0 LAN', 'port forward lan-http '])
+  expect(store().changes.value.map((change) => change.after)).toEqual(['the internet', 'removed', 'removed'])
 })
 
 test('Add LAN asks for a name and adds an empty LAN; Remove takes one away', async () => {
@@ -605,11 +635,12 @@ test('what the LAN may reach is a line, not a field', async () => {
   config.lans[1]!.reaches = ['wan', 'lan0']
   const { wrapper } = await page('/lan', config)
   const line = () => section(wrapper, 'Network').find('.reach')
-  expect(line().text()).toBe('May reach: wan. Changed on the Firewall page.')
+  expect(line().text()).toBe('May reach: the internet. Changed on the Firewall page.')
   expect(line().find('input').exists()).toBe(false)
+  expect([line().find('a').text(), line().find('a').attributes('href')]).toEqual(['Firewall', '/firewall'])
   await tabs(wrapper)[1]?.trigger('click')
   await flushPromises()
-  expect(line().text()).toBe('May reach: wan, lan0. Changed on the Firewall page.')
+  expect(line().text()).toBe('May reach: the internet, lan0. Changed on the Firewall page.')
 })
 
 test('IPv6 and its advertisements are switches, and the rest is under Advanced', async () => {
