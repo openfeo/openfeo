@@ -24,6 +24,6 @@ const path = computed(() => sparkPath(props.spark ?? []))
     <svg v-if="spark" class="ofo-stat__spark" :class="`ofo-spark--s${series ?? 1}`" viewBox="0 0 180 28" preserveAspectRatio="none" aria-hidden="true">
       <path :d="path" />
     </svg>
-    <div v-else-if="foot" class="ofo-stat__foot">{{ foot }}</div>
+    <div v-if="foot" class="ofo-stat__foot">{{ foot }}</div>
   </div>
 </template>

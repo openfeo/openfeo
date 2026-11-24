@@ -19,5 +19,5 @@ pub use client::{
     Client, ClientConfig, Input, Lease, LeaseError, Output, PARAMETERS, State, Timestamp, Unbound,
 };
 pub use server::{
-    Destination, LeaseRecord, NakReason, Reservation, Server, ServerConfig, ServerEvent,
+    Destination, Joined, LeaseRecord, NakReason, Reservation, Server, ServerConfig, ServerEvent,
 };

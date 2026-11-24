@@ -13,6 +13,7 @@ pub mod dhcp6_server;
 pub mod dns;
 pub mod effects;
 pub mod lan6;
+pub mod leases;
 pub mod links;
 pub mod nft;
 pub mod public;

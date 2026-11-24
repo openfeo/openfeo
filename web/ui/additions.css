@@ -47,3 +47,11 @@
 /* ofo.css gives the save bar its count and its buttons and no place for a sentence beside
    them: why an apply is not offered while another change waits to be confirmed. */
 .ofo-savebar__held { align-self: center; font-size: 13px; color: var(--ink-muted); }
+
+/* ofo.css has no way to mark a row out. A lease that has just arrived carries an oxide edge
+   for a minute (the approved mockup's), so that the device just plugged in is the one seen. */
+.ofo-table__row--new td:first-child { box-shadow: inset 3px 0 0 var(--oxide); }
+
+/* ofo.css gives a chart its head and its plot and nowhere to say something of the picture as
+   a whole: that the hour before could not be read, so the line starts from now. */
+.ofo-chart__note { margin: 0 0 var(--space-3); font-size: 13px; line-height: 20px; color: var(--ink-muted); }

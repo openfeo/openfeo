@@ -566,6 +566,40 @@ impl Shared {
         state(&self.world.borrow(), &system)
     }
 
+    /// Every LAN's leases now (SPEC §8.3), on the clock [`Self::state`] uses.
+    #[must_use]
+    pub fn leases(&self) -> openfeo_config::state::Leases {
+        let boot = boot_ms();
+        let now_unix_ms = self.wall_offset_ms(boot).saturating_add(boot);
+        openfeo_reconcile::leases::leases(&self.world.borrow(), now_unix_ms)
+    }
+
+    /// The last hour of `links`' byte counters (SPEC §8.3, §10): each link the router has
+    /// samples of, in the order asked.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for no link, or more than [`crate::limits::MAX_HISTORY_LINKS`]: the
+    /// answer has to fit a frame.
+    pub fn history(
+        &self,
+        links: &[String],
+    ) -> Result<Vec<openfeo_config::state::LinkHistory>, ApiError> {
+        if links.is_empty() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidArgument,
+                "a history of no link",
+            ));
+        }
+        if links.len() > crate::limits::MAX_HISTORY_LINKS {
+            return Err(ApiError::new(
+                ErrorCode::InvalidArgument,
+                "at most 8 links in one call",
+            ));
+        }
+        Ok(self.telemetry.history(links))
+    }
+
     /// The wall clock minus the boot clock, in milliseconds. The two are read a moment apart,
     /// so the difference jitters; it is held steady and moved only when the wall clock steps
     /// (SNTP), so that a time derived from it (when a WAN came up) is the same in every
@@ -615,13 +649,20 @@ pub(crate) mod tests {
 
     pub(crate) const PASSWORD: &str = "lab-admin-password";
 
+    /// No counters to speak of: one link, `p0`, whose bytes received are the clock.
     pub(crate) struct NoCounters;
 
     impl CounterSource for NoCounters {
         fn read(&self) -> Pin<Box<dyn Future<Output = Option<Counters>> + Send + '_>> {
             Box::pin(async {
+                let monotonic_ms = boot_ms();
                 Some(Counters {
-                    monotonic_ms: boot_ms(),
+                    monotonic_ms,
+                    links: vec![openfeo_config::state::LinkCounters {
+                        name: "p0".to_owned(),
+                        rx_bytes: monotonic_ms,
+                        ..Default::default()
+                    }],
                     ..Counters::default()
                 })
             })

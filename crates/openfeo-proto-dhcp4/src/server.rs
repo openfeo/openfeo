@@ -60,6 +60,18 @@ pub struct ServerConfig {
     pub reservations: Vec<Reservation>,
 }
 
+/// When a lease's device first took the address it holds (SPEC §7.6). A renewal keeps it, and
+/// so does a device that asks afresh for the address it still holds; a lease taken again after
+/// it ran out or was released, or one on another address, has joined anew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Joined {
+    /// Before this server started: the wall-clock time a lease file gave, in seconds since the
+    /// Unix epoch, kept as written. The server's own clock cannot say a time before it began.
+    Unix(u64),
+    /// While this server ran: on its own clock, like every other time in the record.
+    At(Timestamp),
+}
+
 /// One active lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRecord {
@@ -69,6 +81,7 @@ pub struct LeaseRecord {
     pub hostname: Option<String>,
     pub granted_at: Timestamp,
     pub expires_at: Timestamp,
+    pub joined: Joined,
 }
 
 /// What the driver feeds in.
@@ -231,6 +244,10 @@ impl Server {
                 let capped = LeaseRecord {
                     expires_at: lease.expires_at.min(now + lease_secs),
                     granted_at: lease.granted_at.min(now),
+                    joined: match lease.joined {
+                        Joined::At(at) => Joined::At(at.min(now)),
+                        from_file @ Joined::Unix(_) => from_file,
+                    },
                     ..lease
                 };
                 server.leases.entry(capped.address).or_insert(capped);
@@ -507,6 +524,11 @@ impl Server {
                     .as_ref()
                     .and_then(|lease| lease.hostname.clone())
             });
+        // Held already: the device has not joined again, whatever made it ask.
+        let joined = previous_lease
+            .as_ref()
+            .filter(|lease| lease.address == address)
+            .map_or(Joined::At(now), |lease| lease.joined);
         let previous = previous_lease.map(|lease| lease.address);
         if let Some(previous) = previous
             && previous != address
@@ -526,6 +548,7 @@ impl Server {
             hostname,
             granted_at: now,
             expires_at: now + Timestamp::from(self.granted_secs()),
+            joined,
         };
         self.leases.insert(address, record.clone());
         let reply = self.reply(
@@ -1415,6 +1438,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at,
+            joined: Joined::At(0),
         };
         let mut s = Server::new(
             config_with_pool(ip("192.168.1.100"), ip("192.168.1.102")),
@@ -1516,6 +1540,7 @@ mod tests {
             hostname: Some("andy-s-iphone".into()),
             granted_at: 3,
             expires_at: 3 + 43_200,
+            joined: Joined::At(3),
         };
         assert_eq!(events(&out), vec![ServerEvent::Granted(record.clone())]);
         assert_eq!(s.leases(), vec![record]);
@@ -1677,6 +1702,7 @@ mod tests {
             hostname: Some("pc".into()),
             granted_at: 0,
             expires_at: 40_000,
+            joined: Joined::At(0),
         };
         let mut s = Server::new(config(), vec![record], 100);
         let out = s.handle(
@@ -1691,6 +1717,111 @@ mod tests {
         assert!(
             matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.hostname.as_deref() == Some("pc"))
         );
+    }
+
+    /// A REQUEST in INIT-REBOOT: no server named, no `ciaddr`, the address asked for by option.
+    fn reboot_request(mac: [u8; 6], xid: u32, address: Ipv4Addr) -> Vec<u8> {
+        request(
+            mac,
+            xid,
+            Ipv4Addr::UNSPECIFIED,
+            vec![DhcpOption::RequestedIpAddress(address)],
+        )
+    }
+
+    /// SPEC §7.6: the joined time is when the device first took the address it holds.
+    #[test]
+    fn a_renewal_keeps_the_joined_time() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        let out = s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Granted(ref r) if r.joined == Joined::At(3))
+        );
+        let out = s.handle(Input::Packet(request(MAC_A, 2, addr, vec![])), 21_603);
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.granted_at == 21_603 && r.joined == Joined::At(3)),
+            "{out:?}"
+        );
+        assert_eq!(s.leases()[0].joined, Joined::At(3));
+    }
+
+    /// A device plugged in again, restarted or back on the Wi-Fi while its lease runs has not
+    /// joined again: it asks afresh and is given what it holds.
+    #[test]
+    fn a_fresh_ask_for_the_address_still_held_keeps_the_joined_time() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
+        // DISCOVER and REQUEST again: offered its own address at once, with no probe.
+        let out = s.handle(Input::Packet(discover(MAC_A, 2, vec![])), 100);
+        assert_eq!(sends(&out)[0].1.yiaddr, addr);
+        let out = s.handle(Input::Packet(our_request(MAC_A, 2, addr)), 101);
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.granted_at == 101 && r.joined == Joined::At(3)),
+            "{out:?}"
+        );
+        let out = s.handle(Input::Packet(reboot_request(MAC_A, 3, addr)), 200);
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.granted_at == 200 && r.joined == Joined::At(3)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_lease_taken_again_after_it_ran_out_has_joined_anew() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
+        let out = s.handle(Input::Timeout, 43_203);
+        assert!(matches!(events(&out)[0], ServerEvent::Expired(_)));
+        let out = s.handle(Input::Packet(reboot_request(MAC_A, 2, addr)), 50_000);
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Granted(ref r) if r.joined == Joined::At(50_000)),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_moved_to_another_address_has_joined_anew() {
+        let mut s = Server::new(config(), vec![], 0);
+        let addr = offered(&mut s, MAC_A, 0);
+        s.handle(Input::Packet(our_request(MAC_A, 1, addr)), 3);
+        let other = ip("192.168.1.150");
+        assert_ne!(addr, other);
+        let out = s.handle(Input::Packet(reboot_request(MAC_A, 2, other)), 500);
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Granted(ref r) if r.address == other && r.joined == Joined::At(500)),
+            "{out:?}"
+        );
+        assert_eq!(s.leases().len(), 1, "the address it left is free again");
+    }
+
+    /// A lease file's joined time is a wall-clock one from before this server's clock began:
+    /// it is kept as written. One on this server's clock cannot lie ahead of it.
+    #[test]
+    fn a_restored_lease_keeps_what_its_file_gave() {
+        let restored = |joined| LeaseRecord {
+            address: ip("192.168.1.120"),
+            mac: MAC_A,
+            client_id: None,
+            hostname: None,
+            granted_at: 0,
+            expires_at: 40_000,
+            joined,
+        };
+        let mut s = Server::new(config(), vec![restored(Joined::Unix(1_700_000_000))], 10);
+        assert_eq!(s.leases()[0].joined, Joined::Unix(1_700_000_000));
+        let out = s.handle(
+            Input::Packet(request(MAC_A, 1, ip("192.168.1.120"), vec![])),
+            20,
+        );
+        assert!(
+            matches!(events(&out)[0], ServerEvent::Renewed(ref r) if r.joined == Joined::Unix(1_700_000_000)),
+            "{out:?}"
+        );
+        let s = Server::new(config(), vec![restored(Joined::At(50))], 10);
+        assert_eq!(s.leases()[0].joined, Joined::At(10));
     }
 
     #[test]
@@ -1804,6 +1935,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at: 1_000,
+            joined: Joined::At(0),
         };
         let mut s = Server::new(
             config_with_pool(ip("192.168.1.100"), ip("192.168.1.150")),
@@ -1846,6 +1978,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at: 1_800_000_000,
+            joined: Joined::At(0),
         };
         let s = Server::new(config(), vec![record], 100);
         assert_eq!(s.leases()[0].expires_at, 100 + 43_200);
@@ -1914,6 +2047,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at: 30_000,
+            joined: Joined::At(0),
         };
         let capped = ServerConfig {
             lease_cap: Some(20),
@@ -1984,6 +2118,7 @@ mod tests {
             hostname: None,
             granted_at: 0,
             expires_at: 100,
+            joined: Joined::At(0),
         };
         let expired = LeaseRecord {
             address: ip("192.168.1.121"),

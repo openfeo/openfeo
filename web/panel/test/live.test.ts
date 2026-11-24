@@ -1,11 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
+import { create, ErrorCode, LeasesSchema, LinkHistorySchema, RouterError, type LinkHistory } from '@openfeo/client'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import { useLive } from '../src/live'
 import { FakeRouter } from './fake-router'
 import { counters, event, NOW, state } from './fixtures'
+
+/** A link's history: a sample a second from `fromSecs` to `toSecs`, 125 000 bytes received in each. */
+function hour(name: string, fromSecs: number, toSecs: number): LinkHistory {
+  const seconds = Array.from({ length: toSecs - fromSecs + 1 }, (_, n) => fromSecs + n)
+  return create(LinkHistorySchema, {
+    name,
+    monotonicMs: seconds.map((second) => BigInt(second) * 1_000n),
+    rxBytes: seconds.map((second) => BigInt(second) * 125_000n),
+    txBytes: seconds.map((second) => BigInt(second) * 12_500n),
+  })
+}
+
+/** Let what was asked of the router be answered. */
+const answered = () => vi.advanceTimersByTimeAsync(0)
 
 beforeEach(() => {
   vi.useFakeTimers()
@@ -24,16 +39,19 @@ function started() {
   return { router, live }
 }
 
-test('it subscribes to state, counters and eight events of backlog, and lets go on unmount', () => {
+test('it subscribes to state, leases, counters and every event the router keeps, and lets go on unmount', () => {
   const { router, live } = started()
   expect(router.open('state')).toHaveLength(1)
+  expect(router.open('leases')).toHaveLength(1)
   expect(router.open('counters')).toHaveLength(1)
   expect(router.open('events')).toHaveLength(1)
-  expect(router.open('events')[0]?.backlog).toBe(8)
+  expect(router.open('events')[0]?.backlog).toBe(256)
   expect(live.state.value).toBeNull()
+  expect(live.leases.value).toBeNull()
   expect(live.connection.value).toBe('open')
   live.stop()
   expect(router.open('state')).toHaveLength(0)
+  expect(router.open('leases')).toHaveLength(0)
   expect(router.open('counters')).toHaveLength(0)
   expect(router.open('events')).toHaveLength(0)
   // And it no longer hears the connection.
@@ -51,13 +69,181 @@ test('the state is the latest pushed', () => {
   expect(live.state.value?.generation).toBe(43n)
 })
 
-test('the newest eight events are kept, newest first', () => {
+test('as many events are kept as the router keeps, newest first', () => {
+  // The chart marks where a WAN came back within the hour, so the list is not cut at what
+  // the dashboard shows of it.
   const { router, live } = started()
-  for (let n = 1; n <= 10; n++) {
+  for (let n = 1; n <= 260; n++) {
     router.push('events', event(`wan.wan0.${n % 2 === 0 ? 'up' : 'down'}`, { n: String(n) }))
   }
-  expect(live.events.value).toHaveLength(8)
-  expect(live.events.value.map((each) => each.fields.n)).toEqual(['10', '9', '8', '7', '6', '5', '4', '3'])
+  expect(live.events.value).toHaveLength(256)
+  expect(live.events.value.slice(0, 3).map((each) => each.fields.n)).toEqual(['260', '259', '258'])
+  expect(live.events.value.at(-1)?.fields.n).toBe('5')
+})
+
+test('the lease table is kept and its clock carried on', () => {
+  const { router, live } = started()
+  expect(live.routerClock.value).toBeUndefined()
+  const table = create(LeasesSchema, { timeUnix: 1_800_000_000n, leases: [{ lan: 'lan0', address: '192.168.1.143', joinedUnix: 1_799_999_880n }] })
+  router.push('leases', table)
+  expect(live.leases.value?.leases.map((lease) => lease.address)).toEqual(['192.168.1.143'])
+  expect(live.routerClock.value).toBe(1_800_000_000)
+  // Between two tables the router's clock is carried on by the time since the last arrived.
+  vi.advanceTimersByTime(5_000)
+  expect(live.routerClock.value).toBe(1_800_000_005)
+  // The next table says the time itself, and it is taken as said.
+  router.push('leases', create(LeasesSchema, { timeUnix: 1_800_000_100n }))
+  expect(live.routerClock.value).toBe(1_800_000_100)
+  expect(live.leases.value?.leases).toEqual([])
+  // A browser clock set back holds the router's where it was.
+  vi.setSystemTime(new Date(NOW.getTime() - 3_600_000))
+  vi.advanceTimersByTime(1_000)
+  expect(live.routerClock.value).toBe(1_800_000_100)
+  live.stop()
+})
+
+test('the history is asked for once the state names a WAN, and the live samples follow it', async () => {
+  const { router, live } = started()
+  router.historyNow = [hour('ppp-wan0', 100, 200)]
+  expect(router.calls.history).toEqual([])
+  router.push('state', state())
+  expect(router.calls.history).toEqual([['ppp-wan0']])
+  await answered()
+  expect(live.historyFailed.value).toBe(false)
+  const kept = () => live.samples.value.get('ppp-wan0') ?? []
+  expect(kept()).toHaveLength(101)
+  expect([kept()[0]?.atMs, kept().at(-1)?.atMs]).toEqual([100_000, 200_000])
+  // The state again asks nothing again.
+  router.push('state', state())
+  expect(router.calls.history).toHaveLength(1)
+  // Each live sample of the WAN's link is added; other links are not kept.
+  router.push('counters', counters(201_000n, [['ppp-wan0', 25_125_000n, 2_512_500n], ['br-lan0', 5n, 5n]]))
+  expect(kept().at(-1)).toEqual({ atMs: 201_000, rxBytes: 25_125_000n, txBytes: 2_512_500n })
+  expect(kept()).toHaveLength(102)
+  expect([...live.samples.value.keys()]).toEqual(['ppp-wan0'])
+  live.stop()
+})
+
+test('the sparkline is filled from the history at once', async () => {
+  const { router, live } = started()
+  router.historyNow = [hour('ppp-wan0', 100, 200)]
+  router.push('state', state())
+  expect(live.history.value).toEqual({ rx: [], tx: [] })
+  await answered()
+  expect(live.history.value.rx).toHaveLength(60)
+  expect(live.history.value.rx.at(-1)).toBe(1_000_000)
+  expect(live.history.value.tx.at(-1)).toBe(100_000)
+  live.stop()
+})
+
+test('a history that cannot be read is said, and the live samples still gather', async () => {
+  const { router, live } = started()
+  router.historyNow = new RouterError(ErrorCode.UNAVAILABLE, 'the connection to the router was lost')
+  router.push('state', state())
+  await answered()
+  expect(live.historyFailed.value).toBe(true)
+  router.push('counters', counters(201_000n, [['ppp-wan0', 1n, 1n]]))
+  router.push('counters', counters(202_000n, [['ppp-wan0', 2n, 2n]]))
+  expect(live.samples.value.get('ppp-wan0')?.map((sample) => sample.atMs)).toEqual([201_000, 202_000])
+  // When the socket opens anew it is asked again, and an answer takes the word back.
+  router.historyNow = [hour('ppp-wan0', 100, 200)]
+  router.setConnection('reconnecting')
+  router.setConnection('open')
+  await answered()
+  expect(live.historyFailed.value).toBe(false)
+  expect(live.samples.value.get('ppp-wan0')).toHaveLength(103)
+  live.stop()
+})
+
+test('a reconnect fills the time away and repeats nothing', async () => {
+  const { router, live } = started()
+  router.historyNow = [hour('ppp-wan0', 100, 200)]
+  router.push('state', state())
+  await answered()
+  router.push('counters', counters(201_000n, [['ppp-wan0', 25_125_000n, 2_512_500n]]))
+  // The socket is away for a minute; the router went on reading.
+  router.setConnection('reconnecting')
+  expect(live.samples.value.get('ppp-wan0')).toHaveLength(102)
+  router.historyNow = [hour('ppp-wan0', 100, 260)]
+  router.setConnection('open')
+  expect(router.calls.history).toEqual([['ppp-wan0'], ['ppp-wan0']])
+  // A live sample arrives before the answer does: it is not lost to it, nor counted twice.
+  router.push('counters', counters(261_000n, [['ppp-wan0', 32_625_000n, 3_262_500n]]))
+  await answered()
+  const times = (live.samples.value.get('ppp-wan0') ?? []).map((sample) => sample.atMs)
+  expect(times).toHaveLength(162)
+  expect(times).toEqual(Array.from({ length: 162 }, (_, n) => (100 + n) * 1_000))
+  live.stop()
+})
+
+test('samples of an earlier boot are dropped', async () => {
+  const { router, live } = started()
+  router.historyNow = [hour('ppp-wan0', 5_000, 5_100)]
+  router.push('state', state())
+  await answered()
+  expect(live.samples.value.get('ppp-wan0')).toHaveLength(101)
+  // The router restarted: its boot clock began again, and so did its counters.
+  router.historyNow = [hour('ppp-wan0', 1, 8)]
+  router.push('counters', counters(9_000n, [['ppp-wan0', 1_125_000n, 112_500n]]))
+  expect(live.samples.value.get('ppp-wan0')?.map((sample) => sample.atMs)).toEqual([9_000])
+  // The new boot's history is asked for, and joined on.
+  expect(router.calls.history).toHaveLength(2)
+  await answered()
+  expect(live.samples.value.get('ppp-wan0')?.map((sample) => sample.atMs)).toEqual([1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 7_000, 8_000, 9_000])
+  live.stop()
+})
+
+test('a history from before the boot that the page now watches is not joined on', async () => {
+  // The answer was on its way when the router restarted.
+  const { router, live } = started()
+  router.historyNow = [hour('ppp-wan0', 5_000, 5_100)]
+  const letGo = router.holdCall('history')
+  router.push('state', state())
+  router.push('counters', counters(5_101_000n, [['ppp-wan0', 1n, 1n]]))
+  router.historyNow = [hour('ppp-wan0', 1, 1)]
+  router.push('counters', counters(2_000n, [['ppp-wan0', 2n, 2n]]))
+  expect(router.calls.history).toHaveLength(2)
+  letGo()
+  await answered()
+  const times = (live.samples.value.get('ppp-wan0') ?? []).map((sample) => sample.atMs)
+  expect(times).toEqual([1_000, 2_000])
+  live.stop()
+})
+
+test('an hour is kept and no more, and a WAN that is gone is forgotten', async () => {
+  const { router, live } = started()
+  router.historyNow = [hour('ppp-wan0', 1, 3_600)]
+  router.push('state', state())
+  await answered()
+  expect(live.samples.value.get('ppp-wan0')).toHaveLength(3_600)
+  router.push('counters', counters(3_700_000n, [['ppp-wan0', 462_500_000n, 46_250_000n]]))
+  const kept = live.samples.value.get('ppp-wan0') ?? []
+  expect([kept[0]?.atMs, kept.at(-1)?.atMs]).toEqual([100_000, 3_700_000])
+  const none = state()
+  none.wans = []
+  router.push('state', none)
+  expect([...live.samples.value.keys()]).toEqual([])
+  live.stop()
+})
+
+test('a WAN with no interface is not asked about, and nine WANs are asked about in two calls', async () => {
+  const { router, live } = started()
+  const many = state()
+  const first = many.wans[0]
+  if (first !== undefined) {
+    // (A PPPoE WAN between sessions has no interface to name.)
+    many.wans = [
+      ...Array.from({ length: 9 }, (_, n) => ({ ...first, name: `wan${n}`, interface: `p${n}` })),
+      { ...first, name: 'wan9', interface: '' },
+    ]
+  }
+  router.push('state', many)
+  await answered()
+  expect(router.calls.history).toEqual([
+    ['p0', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7'],
+    ['p8'],
+  ])
+  live.stop()
 })
 
 test("two counters samples make rates, and the default WAN's last sixty are kept", () => {
@@ -125,7 +311,7 @@ test('told that events were lost, it asks for the backlog again and replaces its
   router.lose()
   expect(before?.closed).toBe(true)
   expect(router.open('events')).toHaveLength(1)
-  expect(router.open('events')[0]?.backlog).toBe(8)
+  expect(router.open('events')[0]?.backlog).toBe(256)
   expect(live.events.value).toEqual([])
   router.push('events', event('wan.wan0.down', { n: 'new' }))
   expect(live.events.value.map((each) => each.fields.n)).toEqual(['new'])

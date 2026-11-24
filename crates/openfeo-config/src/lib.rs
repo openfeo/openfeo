@@ -40,8 +40,9 @@ pub mod pb {
 pub mod state {
     pub use crate::generated::{
         AddressOrigin, AddressState, ConfigEffect, ConfigEffectKind, ConfigProblem,
-        ConfigViolation, Counters, LanState, LinkCounters, PendingConfig, PortState, PortUse,
-        PortUseKind, State, SystemState, WanKind, WanPhase, WanState,
+        ConfigViolation, Counters, LanState, Lease, Leases, LinkCounters, LinkHistory,
+        PendingConfig, PortState, PortUse, PortUseKind, State, SystemState, WanKind, WanPhase,
+        WanState,
     };
 }
 
@@ -56,12 +57,13 @@ pub mod api {
     pub use crate::generated::{
         ApplyConfigRequest, ApplyConfigResponse, Auth, Caller, ChangePasswordRequest,
         ChangePasswordResponse, ClientMsg, ConfirmConfigRequest, ConfirmConfigResponse, Error,
-        ErrorCode, GetConfigRequest, GetConfigResponse, GetStateRequest, GetStateResponse,
-        GetStatusResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Request,
-        Response, RevertConfigRequest, RevertConfigResponse, ServerMsg, Session,
-        SetInitialPasswordRequest, SetInitialPasswordResponse, Subscribe, SubscribeRequest,
-        SubscribeResponse, Telemetry, Unsubscribe, ValidateConfigRequest, ValidateConfigResponse,
-        client_msg, request, response, server_msg, subscribe_response, telemetry,
+        ErrorCode, GetConfigRequest, GetConfigResponse, GetHistoryRequest, GetHistoryResponse,
+        GetLeasesRequest, GetLeasesResponse, GetStateRequest, GetStateResponse, GetStatusResponse,
+        LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, Request, Response,
+        RevertConfigRequest, RevertConfigResponse, ServerMsg, Session, SetInitialPasswordRequest,
+        SetInitialPasswordResponse, Subscribe, SubscribeRequest, SubscribeResponse, Telemetry,
+        Unsubscribe, ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response,
+        server_msg, subscribe_response, telemetry,
     };
 }
 

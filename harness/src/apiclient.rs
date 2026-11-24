@@ -27,12 +27,12 @@ use openfeo_api::pb::state_service_client::StateServiceClient;
 use openfeo_config::Config;
 use openfeo_config::api::{
     ApplyConfigRequest, Auth, ClientMsg, ConfirmConfigRequest, Error, GetConfigRequest,
-    GetConfigResponse, GetStateRequest, Request, RevertConfigRequest, ServerMsg, Subscribe,
-    ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response, server_msg,
-    telemetry,
+    GetConfigResponse, GetHistoryRequest, GetLeasesRequest, GetStateRequest, Request,
+    RevertConfigRequest, ServerMsg, Subscribe, ValidateConfigRequest, ValidateConfigResponse,
+    client_msg, request, response, server_msg, telemetry,
 };
 use openfeo_config::events::Event;
-use openfeo_config::state::{Counters, State};
+use openfeo_config::state::{Counters, Leases, LinkHistory, State};
 use prost::Message as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -760,6 +760,59 @@ impl Ws {
         self.until(timeout, "state", |message| match message.body {
             Some(server_msg::Body::Telemetry(push)) => match push.body {
                 Some(telemetry::Body::State(state)) if wanted(&state) => Some(state),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// Ask for the lease table over the socket (`GetLeases`).
+    ///
+    /// # Errors
+    ///
+    /// When no table comes back.
+    pub fn leases(&mut self) -> Result<Leases> {
+        match self.ask(request::Body::GetLeases(GetLeasesRequest {}))? {
+            server_msg::Body::Response(response) => match response.body {
+                Some(openfeo_config::api::response::Body::GetLeases(reply)) => {
+                    reply.leases.context("no table in the reply")
+                }
+                other => bail!("not the leases: {other:?}"),
+            },
+            other => bail!("not a response: {other:?}"),
+        }
+    }
+
+    /// Ask for the last hour of `links`' byte counters (`GetHistory`): the links the router
+    /// has samples of, or its refusal.
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes, or it is neither.
+    pub fn history(&mut self, links: &[&str]) -> Result<Result<Vec<LinkHistory>, Error>> {
+        let ask = GetHistoryRequest {
+            links: links.iter().map(|link| (*link).to_owned()).collect(),
+        };
+        Ok(match self.answered(request::Body::GetHistory(ask))? {
+            Ok(response::Body::GetHistory(answer)) => Ok(answer.links),
+            Ok(other) => bail!("not the history: {other:?}"),
+            Err(error) => Err(error),
+        })
+    }
+
+    /// The next `leases` push that satisfies `wanted`.
+    ///
+    /// # Errors
+    ///
+    /// When none arrives in time.
+    pub fn leases_where(
+        &mut self,
+        timeout: Duration,
+        wanted: impl Fn(&Leases) -> bool,
+    ) -> Result<Leases> {
+        self.until(timeout, "leases", |message| match message.body {
+            Some(server_msg::Body::Telemetry(push)) => match push.body {
+                Some(telemetry::Body::Leases(leases)) if wanted(&leases) => Some(leases),
                 _ => None,
             },
             _ => None,

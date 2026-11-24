@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andrew Newton
 
-// The router keeps no history and computes no rates (SPEC §10): it sends counters, each
-// sample stamped with when it was read. Two samples and their own clock give a rate, which
-// stays right when a slow reader is sent only the latest one.
+// The router computes no rates (SPEC §10): it sends counters, each sample stamped with when
+// it was read. Two samples and their own clock give a rate, which stays right when a slow
+// reader is sent only the latest one. (It keeps the last hour of the byte counters too:
+// history.ts makes rates of those by the same rule.)
 
 import type { Counters } from './gen/openfeo/v1/state_pb.js'
 

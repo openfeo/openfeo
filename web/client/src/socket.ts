@@ -19,7 +19,7 @@ import {
   type ServerMsg,
 } from './gen/openfeo/v1/api_pb.js'
 import type { Event } from './gen/openfeo/v1/events_pb.js'
-import type { Counters, State } from './gen/openfeo/v1/state_pb.js'
+import type { Counters, Leases, State } from './gen/openfeo/v1/state_pb.js'
 import type { Timers, WebSocketLike } from './options.js'
 import type { TokenStore } from './token-store.js'
 
@@ -27,7 +27,7 @@ import type { TokenStore } from './token-store.js'
 export type Connection = 'idle' | 'connecting' | 'open' | 'reconnecting'
 /** Why a session ended: this client logged out, the router no longer knew it, or it was ended from elsewhere. */
 export type SessionEnd = 'logout' | 'lapsed' | 'revoked'
-export type Topic = 'state' | 'counters' | 'events'
+export type Topic = 'state' | 'leases' | 'counters' | 'events'
 
 export interface Subscription {
   /** Stop listening. The topic is unsubscribed when its last listener closes. */
@@ -107,6 +107,7 @@ export class Link {
   /** Requests made before the socket was ready, sent once `Auth` is acknowledged. */
   #held: { id: number; ask: Ask }[] = []
   readonly #state = new Set<(state: State) => void>()
+  readonly #leases = new Set<(leases: Leases) => void>()
   readonly #counters = new Set<(counters: Counters) => void>()
   readonly #events = new Set<EventListener>()
   #backlog = 0
@@ -176,6 +177,10 @@ export class Link {
     return this.#listen('state', this.#state, listener)
   }
 
+  subscribeLeases(listener: (leases: Leases) => void): Subscription {
+    return this.#listen('leases', this.#leases, listener)
+  }
+
   subscribeCounters(listener: (counters: Counters) => void): Subscription {
     return this.#listen('counters', this.#counters, listener)
   }
@@ -235,6 +240,9 @@ export class Link {
     const topics: Topic[] = []
     if (this.#state.size > 0) {
       topics.push('state')
+    }
+    if (this.#leases.size > 0) {
+      topics.push('leases')
     }
     if (this.#counters.size > 0) {
       topics.push('counters')
@@ -376,6 +384,8 @@ export class Link {
       const pushed = body.value.body
       if (pushed.case === 'state') {
         deliver(this.#state, pushed.value)
+      } else if (pushed.case === 'leases') {
+        deliver(this.#leases, pushed.value)
       } else if (pushed.case === 'counters') {
         deliver(this.#counters, pushed.value)
       }

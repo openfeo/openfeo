@@ -198,8 +198,31 @@ message AddressState {
   bool deprecated = 5;
 }
 
+// One device holding an address from a LAN's DHCPv4 server (SPEC §7.6).
+message Lease {
+  string lan = 1;
+  string address = 2;
+  string mac = 3;
+  // The reservation's name, else the one the device gave; empty for none.
+  string hostname = 4;
+  // When the device first took this address (wall clock, seconds). A renewal does not move it.
+  uint64 joined_unix = 5;
+  uint64 expires_unix = 6;
+}
+
+// Every LAN's leases (SPEC §8.3): what `GetLeases` answers and the `leases` topic pushes.
+message Leases {
+  // The router's wall clock when this was built: ages are counted against it, not the reader's.
+  uint64 time_unix = 1;
+  // By LAN in config order, then by address.
+  repeated Lease leases = 2;
+  // More leases exist than are here; those that joined longest ago were left out.
+  bool truncated = 3;
+}
+
 // Interface and connection counters at one moment (SPEC §10). The router computes no rates: a
-// client takes two of these and their times.
+// client takes two of these and their times. They are read once a second whether or not
+// anyone listens, and the last hour of each link's byte counters is kept (`LinkHistory`).
 message Counters {
   // When they were read, on the clock that counts from the kernel's boot.
   uint64 monotonic_ms = 1;
@@ -216,4 +239,16 @@ message LinkCounters {
   uint64 tx_packets = 5;
   uint64 rx_errors = 6;
   uint64 tx_errors = 7;
+}
+
+// The byte counters of one link over the last hour, as they were read (SPEC §10): what
+// `GetHistory` answers. A link that did not exist for a while has no samples for that while,
+// and a reader sees the gap in the times.
+message LinkHistory {
+  string name = 1;
+  // When each sample was read, on the clock of `Counters.monotonic_ms`; oldest first.
+  repeated uint64 monotonic_ms = 2;
+  // One per sample.
+  repeated uint64 rx_bytes = 3;
+  repeated uint64 tx_bytes = 4;
 }

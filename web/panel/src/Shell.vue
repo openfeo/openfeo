@@ -72,6 +72,7 @@ const nav = computed<NavEntry[]>(() => [
   { kind: 'group', label: 'Network' },
   { kind: 'item', label: 'WAN', icon: 'globe', to: PAGES.wan, current: at(PAGES.wan) },
   { kind: 'item', label: 'LAN & DHCP', icon: 'network', to: PAGES.lan, current: at(PAGES.lan) },
+  { kind: 'item', label: 'Leases', icon: 'monitor-smartphone', to: PAGES.leases, current: at(PAGES.leases) },
 ])
 
 // The theme is the one thing kept in local storage; where that is blocked, a choice lasts the page.
@@ -84,7 +85,8 @@ function setTheme(chosen: Theme): void {
 
 // What the settings pages have changed is applied from here, whichever of them is shown:
 // the bar beneath the page counts it, and one dialog says what an apply does before it is sent.
-const settings = computed(() => at(PAGES.wan) || at(PAGES.lan))
+// (Leases is one of them: Reserve on a row is a change like any other.)
+const settings = computed(() => at(PAGES.wan) || at(PAGES.lan) || at(PAGES.leases))
 /**
  * Why another apply is not offered just now: one is waiting to be confirmed, or one was sent
  * and the router has not yet said whether it took it (another would be asked of a router

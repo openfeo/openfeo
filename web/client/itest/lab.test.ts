@@ -11,12 +11,15 @@ import { ask } from '../../scripts/labctl.mjs'
 import {
   ErrorCode,
   rates,
+  ratesOver,
   Router,
   RouterError,
+  samplesOf,
   WanPhase,
   type Connection,
   type Counters,
   type Event,
+  type Leases,
   type RouterOptions,
   type SessionEnd,
 } from '../src/index.js'
@@ -129,6 +132,63 @@ test('a second router logs in, and counters a second apart give finite rates', a
     expect(Number.isFinite(rate.rxBitsPerSec) && rate.rxBitsPerSec >= 0, rate.name).toBe(true)
     expect(Number.isFinite(rate.txBitsPerSec) && rate.txBitsPerSec >= 0, rate.name).toBe(true)
   }
+})
+
+test('the history reaches back before this test asked', async () => {
+  // The router reads its counters every second whether or not anyone is subscribed (SPEC §10).
+  const wan = (await b.state()).wans[0]
+  expect(wan?.interface).toBeTruthy()
+  if (wan === undefined) {
+    return
+  }
+  const links = await b.history([wan.interface, 'no-such-link'])
+  expect(links.map((link) => link.name)).toEqual([wan.interface])
+  const [hour] = links
+  if (hour === undefined) {
+    return
+  }
+  const samples = samplesOf(hour)
+  expect(samples.length).toBeGreaterThanOrEqual(3)
+  for (const [at, sample] of samples.entries()) {
+    const before = samples[at - 1]
+    if (before !== undefined) {
+      const apart = sample.atMs - before.atMs
+      expect(apart >= 800 && apart <= 2_500, `samples ${apart} ms apart`).toBe(true)
+    }
+  }
+  // A rate for every sample but the first, by the rule the live samples are read by.
+  const points = ratesOver(samples)
+  expect(points).toHaveLength(samples.length - 1)
+  expect(points.every((point) => Number.isFinite(point.rxBitsPerSec) && point.rxBitsPerSec >= 0)).toBe(true)
+  // A call that names no link is refused.
+  const none = await b.history([]).then(
+    () => undefined,
+    (error: unknown) => error,
+  )
+  expect(none).toBeInstanceOf(RouterError)
+  expect((none as RouterError).code).toBe(ErrorCode.INVALID_ARGUMENT)
+})
+
+test('a device that joins is pushed in the lease table, and the call agrees', async () => {
+  const named = (table: Leases) => table.leases.find((lease) => lease.hostname === 'plug-kitchen')
+  const pushed = waitFor<Leases>('a lease named plug-kitchen', 30_000, (done) => {
+    const subscription = b.subscribe('leases', (table) => {
+      if (named(table) !== undefined) {
+        done(table)
+      }
+    })
+    return () => subscription.close()
+  })
+  await ask('join plug-kitchen')
+  const table = await pushed
+  const lease = named(table)
+  expect(lease?.lan).toBe('lan0')
+  expect(lease?.address).toMatch(/^192\.168\.1\.\d+$/)
+  expect(lease?.mac).toMatch(/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/)
+  // Joined just now and still running, by the table's own clock.
+  expect(Math.abs(Number(table.timeUnix - (lease?.joinedUnix ?? 0n)))).toBeLessThanOrEqual(30)
+  expect((lease?.expiresUnix ?? 0n) > table.timeUnix).toBe(true)
+  expect(named(await b.leases())?.address).toBe(lease?.address)
 })
 
 test('a lost carrier is pushed as an event and a state, and its return too', async () => {

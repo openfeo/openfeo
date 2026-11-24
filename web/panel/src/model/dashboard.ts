@@ -69,21 +69,30 @@ export interface Tile {
   series?: 1 | 2
 }
 
-/** What is live beside the state: the default WAN's rate, its last minute, the tracked connections. */
+/** What is live beside the state: the default WAN's rate, its last minute, its hour's peak, the tracked connections. */
 export interface Live {
   rate?: LinkRate | undefined
   history: { rx: number[]; tx: number[] }
+  /** The highest ten-second average of the last hour, each way, in bits per second. */
+  peak?: { rx: number; tx: number } | undefined
   conntrack?: { count: number; max: number } | undefined
 }
 
 /** The four tiles: download, upload, clients, connections. */
 export function tiles(state: State, live: Live): Tile[] {
-  const flow = (label: string, bitsPerSec: number | undefined, spark: number[], series: 1 | 2): Tile => {
-    if (bitsPerSec === undefined) {
-      return { label, value: DASH, spark, series }
+  const flow = (label: string, bitsPerSec: number | undefined, spark: number[], series: 1 | 2, most: number | undefined): Tile => {
+    const tile: Tile = { label, value: DASH, spark, series }
+    if (bitsPerSec !== undefined) {
+      const { value, unit } = rate(bitsPerSec)
+      tile.value = value
+      tile.unit = unit
     }
-    const { value, unit } = rate(bitsPerSec)
-    return { label, value, unit, spark, series }
+    if (most !== undefined) {
+      // With its own unit: a number always has one, and the peak's need not be the rate's.
+      const top = rate(most)
+      tile.foot = `peak ${top.value} ${top.unit} in the last hour`
+    }
+    return tile
   }
   const leased: Tile = { label: 'Clients', value: String(clients(state)) }
   if (state.lans.length > 0) {
@@ -94,8 +103,8 @@ export function tiles(state: State, live: Live): Tile[] {
       ? { label: 'Connections', value: DASH }
       : { label: 'Connections', value: String(live.conntrack.count), foot: `of ${live.conntrack.max} tracked` }
   return [
-    flow('Download', live.rate?.rxBitsPerSec, live.history.rx, 1),
-    flow('Upload', live.rate?.txBitsPerSec, live.history.tx, 2),
+    flow('Download', live.rate?.rxBitsPerSec, live.history.rx, 1, live.peak?.rx),
+    flow('Upload', live.rate?.txBitsPerSec, live.history.tx, 2, live.peak?.tx),
     leased,
     tracked,
   ]

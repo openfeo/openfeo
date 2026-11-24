@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 
 use libfuzzer_sys::fuzz_target;
 use openfeo_proto_dhcp4::server::Input;
-use openfeo_proto_dhcp4::{LeaseRecord, Reservation, Server, ServerConfig};
+use openfeo_proto_dhcp4::{Joined, LeaseRecord, Reservation, Server, ServerConfig};
 
 const SERVER: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
 const POOL_START: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 100);
@@ -43,6 +43,7 @@ fn leases() -> Vec<LeaseRecord> {
             hostname: Some("pc".to_owned()),
             granted_at: 0,
             expires_at: 3_000,
+            joined: Joined::Unix(1_700_000_000),
         },
         LeaseRecord {
             address: Ipv4Addr::new(192, 168, 1, 101),
@@ -51,6 +52,7 @@ fn leases() -> Vec<LeaseRecord> {
             hostname: None,
             granted_at: 0,
             expires_at: 50_000,
+            joined: Joined::At(0),
         },
     ]
 }

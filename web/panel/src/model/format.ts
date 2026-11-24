@@ -25,6 +25,11 @@ export function rate(bitsPerSec: number): { value: string; unit: RateUnit } {
   return { value: scaled.toFixed(1), unit: RATE_UNITS[unit] ?? 'bit/s' }
 }
 
+/** How many bits per second one of `unit` is: what a chart divides by to say every value in one unit. */
+export function unitScale(unit: RateUnit): number {
+  return 1000 ** Math.max(0, RATE_UNITS.indexOf(unit))
+}
+
 /** A length of time by its two largest units: `3d 4h`, `4h 12m`, `12m 5s`, `42s`. */
 export function duration(secs: number): string {
   const whole = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0

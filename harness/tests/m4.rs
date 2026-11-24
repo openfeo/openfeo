@@ -171,6 +171,18 @@ const SCENARIOS: &[Scenario] = &[
         name: "leases_survive_a_restart_after_the_clock_stepped",
         run: leases_survive_a_restart_after_the_clock_stepped,
     },
+    Scenario {
+        name: "a_lease_is_listed_and_keeps_its_joined_time",
+        run: a_lease_is_listed_and_keeps_its_joined_time,
+    },
+    Scenario {
+        name: "an_hour_of_counters_is_kept_with_nobody_watching",
+        run: an_hour_of_counters_is_kept_with_nobody_watching,
+    },
+    Scenario {
+        name: "the_panel_shows_the_hour_and_the_leases_in_a_browser",
+        run: the_panel_shows_the_hour_and_the_leases_in_a_browser,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -1106,9 +1118,10 @@ fn a_harness_build_takes_one_extra_host_name(lab: &mut Lab) -> anyhow::Result<()
 }
 
 /// What a test inside the lab may ask of it (`web/scripts/labctl.mjs`): the WAN port's carrier
-/// and the LAN port's, taken away and given back as the link-flap scenarios do, and the LAN
+/// and the LAN port's, taken away and given back as the link-flap scenarios do, the LAN
 /// host moved to another subnet (`lan-to <cidr> <gateway>`: [`rehome`]), as a person follows a
-/// router whose address they changed.
+/// router whose address they changed, and a device that joins the LAN (`join <hostname>`:
+/// [`join`]).
 fn lab_verb(lab: &Lab, qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
     let words: Vec<&str> = verb.split_whitespace().collect();
     match words.as_slice() {
@@ -1117,13 +1130,33 @@ fn lab_verb(lab: &Lab, qmp: &mut Qmp, verb: &str) -> anyhow::Result<()> {
         ["lan-down"] => qmp.set_link("p2", false),
         ["lan-up"] => qmp.set_link("p2", true),
         ["lan-to", cidr, gateway] => rehome(lab, cidr, gateway),
+        ["join", hostname] => join(lab, hostname),
         _ => anyhow::bail!("no such verb: {verb}"),
     }
 }
 
+/// A device joins `lan0`: the harness's own DHCP client takes a lease there under `hostname`.
+/// Unlike udhcpc's script it puts no address on the interface, so whatever else runs in the
+/// namespace (a browser, Node) keeps the address it had.
+fn join(lab: &Lab, hostname: &str) -> anyhow::Result<()> {
+    let events = lanclient::dhcp_client(
+        env!("CARGO_BIN_EXE_openfeo-harness"),
+        &lab.lan0,
+        "lan0",
+        &["--hostname", hostname],
+        Duration::from_secs(15),
+    )?;
+    ensure!(
+        events.iter().any(|event| event["event"] == "bound"),
+        "{hostname} was given no lease: {events:?}"
+    );
+    Ok(())
+}
+
 /// `@openfeo/client`'s own tests (SPEC §11), run by Node inside the LAN namespace against the
-/// booted router: the first password, login, state, counters and rates, a WAN that goes and
-/// comes, a LAN link that goes silent and returns, and a session ended from elsewhere.
+/// booted router: the first password, login, state, counters and rates, the history that was
+/// kept before anyone asked, a device that joins and is pushed in the lease table, a WAN that
+/// goes and comes, a LAN link that goes silent and returns, and a session ended from elsewhere.
 /// Skipped, with the reason, on a machine without Node or the workspace's packages.
 fn the_javascript_client_works_from_the_lan(lab: &mut Lab) -> anyhow::Result<()> {
     web::node_ready()?;
@@ -2455,6 +2488,38 @@ fn leases_survive_a_restart_after_the_clock_stepped(lab: &mut Lab) -> anyhow::Re
     // A session need not outlive a year.
     let token = api.login(PASSWORD)?;
     let mut ws = api.ws_with(&token)?;
+    // The lease table follows the clock (M4 part 3a): the device is still listed, running
+    // and joined a moment ago, by the table's own clock. Stamped once on the old clock, its
+    // lease would have run out a year ago and the table would be empty until the next lease.
+    let deadline = Instant::now() + SOON;
+    let table = loop {
+        let table = ws.leases()?;
+        if !table.leases.is_empty() {
+            break table;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "after the clock stepped the lease is not in the table: {table:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    ensure!(
+        table.time_unix.abs_diff(host_now + YEAR.unsigned_abs()) <= 120,
+        "the table's clock is {}, not a year on from {host_now}",
+        table.time_unix
+    );
+    let listed = &table.leases[0];
+    ensure!(
+        listed.address == ip
+            && listed.expires_unix > table.time_unix
+            && listed.joined_unix <= table.time_unix
+            && table.time_unix - listed.joined_unix <= 180,
+        "on the new clock the lease should be running and a few minutes old: {listed:?} at {}",
+        table.time_unix
+    );
     let view = ws.config()?;
     let config = view.config.context("no config")?;
     let mut cur = Cursor::default();
@@ -2485,4 +2550,233 @@ fn leases_survive_a_restart_after_the_clock_stepped(lab: &mut Lab) -> anyhow::Re
         udhcpc_env(&again, "ip")
     );
     no_task_failed(lab)
+}
+
+/// SPEC §7.6 and §8.3 (M4 part 3a): a device that takes a lease is in the lease table, pushed
+/// to a subscriber and answered to a call, with the name it gave and when it joined. Asking
+/// again for the address it holds moves the lease's end and not its joined time; and the
+/// joined time outlives a restart of the LAN's server, which reads it back from the lease
+/// file.
+fn a_lease_is_listed_and_keeps_its_joined_time(lab: &mut Lab) -> anyhow::Result<()> {
+    const NAMED: &[&str] = &["-x", "hostname:plug-kitchen"];
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    ws.subscribe("leases", 0)?;
+    let empty = ws.leases_where(SOON, |_| true)?;
+    ensure!(
+        empty.leases.is_empty() && !empty.truncated,
+        "a table before anyone took a lease: {empty:?}"
+    );
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    ensure!(
+        empty.time_unix.abs_diff(host_now) <= 30,
+        "the table's clock is {}, and the VM's clock chip follows this host's {host_now}",
+        empty.time_unix
+    );
+    let first = lanclient::udhcpc(&lab.lan0, "lan0", &lab.run_dir, NAMED, UDHCPC_TIMEOUT)?;
+    let ip = udhcpc_env(&first, "ip")?.to_owned();
+    let table = ws.leases_where(SOON, |table| !table.leases.is_empty())?;
+    ensure!(table.leases.len() == 1, "one client, one lease: {table:?}");
+    let lease = table.leases[0].clone();
+    ensure!(
+        lease.lan == "lan0" && lease.address == ip && lease.hostname == "plug-kitchen",
+        "the lease udhcpc was given, with its name: {lease:?}"
+    );
+    ensure!(
+        re(r"^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$").is_match(&lease.mac),
+        "a hardware address: {lease:?}"
+    );
+    ensure!(
+        lease.joined_unix.abs_diff(table.time_unix) <= 5 && lease.expires_unix > table.time_unix,
+        "joined just now and still running, by the table's own clock: {table:?}"
+    );
+    let asked = ws.leases()?;
+    ensure!(
+        asked.leases == table.leases,
+        "the call and the push disagree: {asked:?}"
+    );
+    // The same client asks afresh for the address it holds, as a device plugged in again
+    // does: the lease's end moves on, and when it joined does not.
+    std::thread::sleep(Duration::from_secs(2));
+    let again = lanclient::udhcpc(
+        &lab.lan0,
+        "lan0",
+        &lab.run_dir,
+        &["-r", &ip, "-x", "hostname:plug-kitchen"],
+        UDHCPC_TIMEOUT,
+    )?;
+    ensure!(
+        udhcpc_env(&again, "ip")? == ip,
+        "another address: {again:?}"
+    );
+    let renewed = ws.leases_where(SOON, |table| {
+        table
+            .leases
+            .first()
+            .is_some_and(|now| now.expires_unix > lease.expires_unix)
+    })?;
+    ensure!(
+        renewed.leases[0].joined_unix == lease.joined_unix,
+        "asking again moved the joined time from {} to {}",
+        lease.joined_unix,
+        renewed.leases[0].joined_unix
+    );
+    // A reservation for some other device restarts the LAN's server, which starts from the
+    // lease file: the joined time is in it.
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    applied(&mut ws, &with_reservation(&config), &view.tag, true, 0)?;
+    lab.console()?.wait_for(
+        &mut Cursor::default(),
+        &re(r"openfeo: lan lan0 dhcp restored 1 leases"),
+        SOON,
+    )?;
+    let deadline = Instant::now() + SOON;
+    let restored = loop {
+        let table = ws.leases()?;
+        if let Some(found) = table.leases.first() {
+            break found.clone();
+        }
+        ensure!(Instant::now() < deadline, "no lease after the restart");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    ensure!(
+        restored.address == ip && restored.joined_unix == lease.joined_unix,
+        "after the server restarted: {restored:?}, joined {} before",
+        lease.joined_unix
+    );
+    no_task_failed(lab)
+}
+
+/// SPEC §10 (M4 part 3a): the router reads its counters every second whether or not anyone
+/// is subscribed, and keeps the last hour of each link's bytes. Traffic that passed while no
+/// socket was open is in the history asked for afterwards, a sample a second; a link the
+/// router has none of is left out; and a request that names no link is refused.
+fn an_hour_of_counters_is_kept_with_nobody_watching(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let _server = isp_http_target(lab)?;
+    // No socket is open and nothing is subscribed while the LAN fetches from the ISP.
+    for _ in 0..5 {
+        let body = lanclient::http_get(
+            &lab.lan0,
+            "203.0.113.1:8080".parse()?,
+            "/",
+            Duration::from_secs(5),
+        )?;
+        ensure!(body == ISP_HTTP_BODY, "unexpected body {body:?}");
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    let mut ws = api.ws_with(&token)?;
+    let links = ws
+        .history(&["p0", "nope"])?
+        .map_err(|error| anyhow::anyhow!("the history was refused: {error:?}"))?;
+    ensure!(
+        links.len() == 1 && links[0].name == "p0",
+        "only the link the router has: {:?}",
+        links.iter().map(|link| &link.name).collect::<Vec<_>>()
+    );
+    let p0 = &links[0];
+    ensure!(
+        p0.monotonic_ms.len() >= 5
+            && p0.rx_bytes.len() == p0.monotonic_ms.len()
+            && p0.tx_bytes.len() == p0.monotonic_ms.len(),
+        "{} samples of p0, with {} and {} byte counts",
+        p0.monotonic_ms.len(),
+        p0.rx_bytes.len(),
+        p0.tx_bytes.len()
+    );
+    for pair in p0.monotonic_ms.windows(2) {
+        let apart = pair[1].saturating_sub(pair[0]);
+        ensure!(
+            (800..=2_500).contains(&apart),
+            "samples {apart} ms apart: {:?}",
+            p0.monotonic_ms
+        );
+    }
+    ensure!(
+        p0.rx_bytes.is_sorted() && p0.tx_bytes.is_sorted(),
+        "a counter fell: {p0:?}"
+    );
+    // The five fetches lie within the last eight samples or so, read while nobody watched.
+    let recent = &p0.rx_bytes[p0.rx_bytes.len().saturating_sub(10)..];
+    let grew = recent[recent.len() - 1] - recent[0];
+    ensure!(
+        grew >= 5 * ISP_HTTP_BODY.len() as u64,
+        "five bodies were fetched and p0 received {grew} bytes in that time: {recent:?}"
+    );
+    refused(ws.history(&[])?, ErrorCode::InvalidArgument)?;
+    no_task_failed(lab)
+}
+
+/// Status and leases in a real browser (SPEC §7.6, §8.4, §10, M4 part 3a;
+/// `web/panel/e2e/leases.spec.ts`): the router runs for a while before the browser is started,
+/// and the dashboard's chart is drawn back into that time; a device that joins (the lab's
+/// `join` verb) appears in Newest leases without a reload; on the Leases page it is reserved,
+/// the change applied and confirmed; and the chart marks where the WAN came back. The config
+/// the router ends up with has the reservation. Skipped as the other browser scenarios are.
+fn the_panel_shows_the_hour_and_the_leases_in_a_browser(lab: &mut Lab) -> anyhow::Result<()> {
+    const WINDOW: u32 = 40;
+    web::ready()?;
+    boot(lab, &format!("openfeo.confirm_secs={WINDOW}"))?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    web::settle(&lab.lan0, "lan0")?;
+    // Nobody looks for a while. What the chart then draws of this time is what the router
+    // kept of it, read with no subscriber.
+    std::thread::sleep(Duration::from_secs(20));
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "leases.spec",
+        ])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e-leases"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright-leases.log"),
+        Duration::from_secs(360),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+    let confirmed = lab.console()?.count(&re(r"openfeo: config: confirmed"));
+    ensure!(
+        confirmed == 1,
+        "the change was confirmed {confirmed} times on the console, not once"
+    );
+    no_task_failed(lab)?;
+    password_never_logged(lab)?;
+    // What the router ended up with: the device that joined, reserved at the address it took.
+    let api = api(lab)?;
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let config = ws.config()?.config.context("no config")?;
+    let reserved: Vec<(&str, &str)> = config
+        .lans
+        .first()
+        .and_then(|lan| lan.dhcp.as_ref())
+        .into_iter()
+        .flat_map(|dhcp| &dhcp.r#static)
+        .map(|lease| (lease.hostname.as_str(), lease.ip.as_str()))
+        .collect();
+    let table = ws.leases()?;
+    let lease = table
+        .leases
+        .iter()
+        .find(|lease| lease.hostname == "plug-kitchen")
+        .with_context(|| format!("no lease named plug-kitchen in {table:?}"))?;
+    ensure!(
+        reserved.contains(&("plug-kitchen", lease.address.as_str())),
+        "the reservations are {reserved:?}, and the lease is {lease:?}"
+    );
+    Ok(())
 }

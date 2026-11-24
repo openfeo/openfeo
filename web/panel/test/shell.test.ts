@@ -22,12 +22,12 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-test('the sidebar lists the dashboard, then Network with WAN and LAN & DHCP', async () => {
+test('the sidebar lists the dashboard, then Network with WAN, LAN & DHCP and Leases', async () => {
   const { wrapper, errors } = await panelAt('/')
   const nav = wrapper.find('nav.ofo-nav')
   // In the order they stand: an item, the group's name, its two items.
-  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())).toEqual(['Dashboard', 'Network', 'WAN', 'LAN & DHCP'])
-  expect(nav.findAll('.ofo-nav__item').map((item) => item.attributes('href'))).toEqual(['/', '/wan', '/lan'])
+  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())).toEqual(['Dashboard', 'Network', 'WAN', 'LAN & DHCP', 'Leases'])
+  expect(nav.findAll('.ofo-nav__item').map((item) => item.attributes('href'))).toEqual(['/', '/wan', '/lan', '/leases'])
   expect(nav.findAll('.ofo-nav__group').map((group) => group.text())).toEqual(['Network'])
   expect(errors).toEqual([])
 })
@@ -41,6 +41,7 @@ test('the entry of the page being shown is the current one', async () => {
   expect(current((await panelAt('/')).wrapper)).toEqual(['Dashboard'])
   expect(current((await panelAt('/wan')).wrapper)).toEqual(['WAN'])
   expect(current((await panelAt('/lan/lan0')).wrapper)).toEqual(['LAN & DHCP'])
+  expect(current((await panelAt('/leases')).wrapper)).toEqual(['Leases'])
 })
 
 test('a click in the sidebar changes the page without a reload', async () => {
@@ -86,17 +87,17 @@ test('a refused config is said on every page', async () => {
 
 test('the router is listened to once, whichever page is shown', async () => {
   const { router, routes } = await panelAt('/')
-  const open = () => [router.open('state').length, router.open('counters').length, router.open('events').length]
-  expect(open()).toEqual([1, 1, 1])
+  const open = () => (['state', 'leases', 'counters', 'events'] as const).map((topic) => router.open(topic).length)
+  expect(open()).toEqual([1, 1, 1, 1])
   await routes.push('/wan')
   await flushPromises()
   await routes.push('/lan/lan0')
   await flushPromises()
   await routes.push('/')
   await flushPromises()
-  expect(open()).toEqual([1, 1, 1])
+  expect(open()).toEqual([1, 1, 1, 1])
   // And none was closed and opened again on the way.
-  expect(router.listening).toHaveLength(3)
+  expect(router.listening).toHaveLength(4)
 })
 
 test('an address of no page goes to the dashboard', async () => {

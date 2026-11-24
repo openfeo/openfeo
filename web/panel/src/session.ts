@@ -18,6 +18,8 @@ export type PanelRouter = Pick<
   | 'login'
   | 'logout'
   | 'state'
+  | 'leases'
+  | 'history'
   | 'subscribe'
   | 'onConnection'
   | 'onSessionEnd'

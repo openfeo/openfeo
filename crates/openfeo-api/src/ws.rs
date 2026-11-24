@@ -18,8 +18,9 @@ use axum::response::{IntoResponse, Response};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{Sink, SinkExt as _, StreamExt as _};
 use openfeo_config::api::{
-    ChangePasswordResponse, ConfirmConfigResponse, ErrorCode, GetStateResponse, LogoutResponse,
-    Request, RevertConfigResponse, ServerMsg, request, response,
+    ChangePasswordResponse, ConfirmConfigResponse, ErrorCode, GetHistoryResponse,
+    GetLeasesResponse, GetStateResponse, LogoutResponse, Request, RevertConfigResponse, ServerMsg,
+    request, response,
 };
 use prost::Message as _;
 use tokio::sync::broadcast;
@@ -146,6 +147,12 @@ pub(crate) async fn perform(
         Some(request::Body::GetState(_)) => response::Body::GetState(GetStateResponse {
             state: Some(shared.state()),
         }),
+        Some(request::Body::GetLeases(_)) => response::Body::GetLeases(GetLeasesResponse {
+            leases: Some(shared.leases()),
+        }),
+        Some(request::Body::GetHistory(ask)) => response::Body::GetHistory(GetHistoryResponse {
+            links: shared.history(&ask.links)?,
+        }),
         Some(request::Body::Logout(_)) => {
             shared.logout(token);
             response::Body::Logout(LogoutResponse {})
@@ -215,20 +222,31 @@ struct Feeds {
     events: broadcast::Receiver<Arc<openfeo_world::Event>>,
     counters: Option<CountersSub>,
     had_state: bool,
+    had_leases: bool,
+}
+
+/// The topics a connection has just subscribed to, of those that begin with what stands.
+struct Newly {
+    state: bool,
+    leases: bool,
 }
 
 impl Feeds {
-    /// Take up or drop the counters as the connection wants them; true when it has just
-    /// subscribed to `state`.
-    fn follow(&mut self, conn: &Conn, shared: &Arc<Shared>) -> bool {
+    /// Take up or drop the counters as the connection wants them, and say which of `state`
+    /// and `leases` it has just subscribed to.
+    fn follow(&mut self, conn: &Conn, shared: &Arc<Shared>) -> Newly {
         match (conn.wants(Topic::Counters), self.counters.is_some()) {
             (true, false) => self.counters = Some(shared.telemetry.subscribe()),
             (false, true) => self.counters = None,
             _ => {}
         }
-        let wants_state = conn.wants(Topic::State);
-        let newly = wants_state && !self.had_state;
+        let (wants_state, wants_leases) = (conn.wants(Topic::State), conn.wants(Topic::Leases));
+        let newly = Newly {
+            state: wants_state && !self.had_state,
+            leases: wants_leases && !self.had_leases,
+        };
         self.had_state = wants_state;
+        self.had_leases = wants_leases;
         newly
     }
 }
@@ -254,6 +272,7 @@ async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
         events: shared.publisher.events(),
         counters: None,
         had_state: false,
+        had_leases: false,
     };
     let auth_deadline = tokio::time::sleep(limits.auth_frame);
     tokio::pin!(auth_deadline);
@@ -285,11 +304,14 @@ async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
                 Some(Ok(Message::Close(_)) | Err(_)) | None => return,
             },
             () = &mut auth_deadline, if !conn.authenticated() => conn.on_auth_deadline(),
-            changed = world.changed(), if conn.wants(Topic::State) => {
+            changed = world.changed(), if conn.wants(Topic::State) || conn.wants(Topic::Leases) => {
                 if changed.is_err() {
                     return;
                 }
+                // Each is dropped unless subscribed, and a table with the leases of the last
+                // one is dropped too: most changes of the World touch no lease.
                 conn.push_state(&shared.state());
+                conn.push_leases(&shared.leases());
                 Vec::new()
             }
             event = feeds.events.recv(), if conn.wants(Topic::Events) => {
@@ -332,11 +354,23 @@ async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
             return;
         }
         // Follow what the connection now wants.
-        if feeds.follow(&conn, &shared) {
-            // "Now, and after every change": the first push is the state as it stands.
-            world.borrow_and_update();
-            conn.push_state(&shared.state());
-        }
+        let newly = feeds.follow(&conn, &shared);
+        begin(&newly, &mut conn, &mut world, &shared);
+    }
+}
+
+/// "Now, and after every change": what a connection is sent for the topics it has just
+/// subscribed to.
+fn begin(newly: &Newly, conn: &mut Conn, world: &mut openfeo_runtime::WorldRx, shared: &Shared) {
+    if newly.state {
+        // The first push is the state as it stands, and the World it was made from is seen.
+        world.borrow_and_update();
+        conn.push_state(&shared.state());
+    }
+    if newly.state || newly.leases {
+        // The table as it stands for a new subscriber; and, for one who was already there,
+        // the lease that changed in the World just marked as seen.
+        conn.push_leases(&shared.leases());
     }
 }
 
@@ -379,7 +413,7 @@ async fn act(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -553,6 +587,161 @@ mod tests {
         assert!(
             matches!(still, server_msg::Body::Response(_)),
             "the caller's stays"
+        );
+    }
+
+    /// A lease on `lan0` that runs for longer than any test.
+    pub(crate) fn lease_fact(last: u8, name: &str) -> openfeo_world::LeaseFact {
+        openfeo_world::LeaseFact {
+            address: std::net::Ipv4Addr::new(192, 168, 1, last),
+            mac: openfeo_world::MacAddr([2, 0, 0, 0, 0, last]),
+            hostname: (!name.is_empty()).then(|| name.to_owned()),
+            expires_unix: u64::from(u32::MAX),
+            joined_unix: 1_700_000_000,
+        }
+    }
+
+    /// SPEC §8.3: the table when subscribed and whenever a lease in it changes, and the same
+    /// table to a call.
+    #[tokio::test]
+    async fn a_lease_is_pushed_to_a_subscriber_and_answered_to_a_call() {
+        use openfeo_config::api::GetLeasesRequest;
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        ws.subscribe("leases", 0).await;
+        let first = ws.next_leases().await;
+        assert_eq!(first.leases, Vec::new(), "the table as it stands");
+        assert!(first.time_unix > 1_700_000_000, "the router's clock");
+        api.shared.publisher.update(|world| {
+            Arc::make_mut(&mut world.leases)
+                .insert("lan0".to_owned(), vec![lease_fact(143, "plug-kitchen")]);
+        });
+        let pushed = ws.next_leases().await;
+        assert_eq!(pushed.leases.len(), 1);
+        let lease = &pushed.leases[0];
+        assert_eq!(
+            (
+                lease.lan.as_str(),
+                lease.address.as_str(),
+                lease.mac.as_str(),
+                lease.hostname.as_str(),
+                lease.joined_unix
+            ),
+            (
+                "lan0",
+                "192.168.1.143",
+                "02:00:00:00:00:8f",
+                "plug-kitchen",
+                1_700_000_000
+            )
+        );
+        // A change of the World that touches no lease, then one that does: only the second
+        // is a table.
+        api.shared
+            .publisher
+            .update(|world| world.set_wan_cause("wan0", "nothing to do with leases"));
+        api.shared.publisher.update(|world| {
+            Arc::make_mut(&mut world.leases)
+                .entry("lan0".to_owned())
+                .or_default()
+                .push(lease_fact(144, ""));
+        });
+        assert_eq!(
+            ws.next_leases().await.leases.len(),
+            2,
+            "nothing was sent for the change that touched no lease"
+        );
+        let reply = ws.ask(request::Body::GetLeases(GetLeasesRequest {})).await;
+        let Some(server_msg::Body::Response(reply)) = Some(reply) else {
+            panic!("not a response");
+        };
+        let Some(response::Body::GetLeases(answer)) = reply.body else {
+            panic!("not the leases: {reply:?}");
+        };
+        assert_eq!(answer.leases.map(|table| table.leases.len()), Some(2));
+    }
+
+    /// SPEC §8.3, §10: the hour is there for whoever asks, without having subscribed to
+    /// anything; and a request names at least one link and at most eight.
+    #[tokio::test]
+    async fn the_history_is_answered_and_its_request_is_bounded() {
+        use openfeo_config::api::GetHistoryRequest;
+        let (api, token) = TestApi::with_password(PASSWORD).await;
+        let mut ws = api.ws_with(&token).await;
+        // The test API's source has one link; give it two reads.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let ask = |links: &[&str]| {
+            request::Body::GetHistory(GetHistoryRequest {
+                links: links.iter().map(|link| (*link).to_owned()).collect(),
+            })
+        };
+        let server_msg::Body::Response(reply) = ws.ask(ask(&["p0", "nope"])).await else {
+            panic!("not a response");
+        };
+        let Some(response::Body::GetHistory(answer)) = reply.body else {
+            panic!("not the history: {reply:?}");
+        };
+        assert_eq!(
+            answer.links.len(),
+            1,
+            "only the link the router has samples of"
+        );
+        let p0 = &answer.links[0];
+        assert_eq!(p0.name, "p0");
+        assert!(p0.monotonic_ms.len() >= 2, "{p0:?}");
+        assert!(p0.monotonic_ms.is_sorted(), "oldest first");
+        assert_eq!(
+            p0.rx_bytes, p0.monotonic_ms,
+            "the test source's bytes are its clock"
+        );
+        assert_eq!(p0.tx_bytes.len(), p0.monotonic_ms.len());
+        for links in [&[][..], &["a", "b", "c", "d", "e", "f", "g", "h", "i"][..]] {
+            let server_msg::Body::Error(error) = ws.ask(ask(links)).await else {
+                panic!("{} links were answered", links.len());
+            };
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{links:?}");
+        }
+        let server_msg::Body::Response(_) =
+            ws.ask(ask(&["a", "b", "c", "d", "e", "f", "g", "h"])).await
+        else {
+            panic!("eight links were refused");
+        };
+    }
+
+    /// Subscribing to `state` marks the World as seen. A lease that changed in that World,
+    /// before the driver had looked at it, must still reach whoever follows the leases.
+    #[tokio::test]
+    async fn subscribing_to_the_state_loses_no_lease() {
+        use openfeo_config::api::{server_msg, telemetry};
+        let (shared, _dir) = crate::server::tests::shared(
+            openfeo_config::admin::ConfigState::Loaded,
+            Limits::default(),
+        );
+        let mut world = shared.world.clone();
+        let mut conn = Conn::subscribed(&[Topic::State, Topic::Leases]);
+        conn.push_leases(&shared.leases());
+        assert!(conn.next_out().is_some(), "the table as it stood: empty");
+        shared.publisher.update(|world| {
+            Arc::make_mut(&mut world.leases).insert("lan0".to_owned(), vec![lease_fact(143, "")]);
+        });
+        let newly = Newly {
+            state: true,
+            leases: false,
+        };
+        begin(&newly, &mut conn, &mut world, &shared);
+        assert!(!world.has_changed().unwrap(), "the World is seen");
+        let mut tables = Vec::new();
+        while let Some(message) = conn.next_out() {
+            if let Some(server_msg::Body::Telemetry(push)) = message.body
+                && let Some(telemetry::Body::Leases(table)) = push.body
+            {
+                tables.push(table.leases.len());
+            }
+        }
+        assert_eq!(
+            tables,
+            [1],
+            "the lease that came with the World that was marked seen"
         );
     }
 
