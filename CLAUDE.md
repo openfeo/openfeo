@@ -7,7 +7,9 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 ## Commands
 - `make bin`           static musl binary (`--features harness` by default; `FEATURES=` for a release build);
                        builds the panel first and embeds it (a bare `cargo build` embeds a placeholder page: ADR-0025)
-- `make panel`         the web panel into `$(BUILD)/panel` with its notices (Node 22; `web/` is an npm workspace)
+- `make panel`         the web panel into `$(BUILD)/panel` with the notices of everything in the binary
+                       (Node 22; `web/` is an npm workspace; `cargo about` at the Makefile's `CARGO_ABOUT_VERSION`
+                       writes the Rust crates' notices, so `make bin`, `kernel` and `test-harness` need it too)
 - `make web-lint`, `make web-test`  the web workspace's own checks (type-check, ESLint, the layering and licence
                        gates, generated files up to date; vitest); `make lint` and `make test` run them
 - `make kernel`        fetch/verify/build Linux (see `kernel/`) with the binary embedded → `build/bzImage`

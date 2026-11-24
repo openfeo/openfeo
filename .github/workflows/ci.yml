@@ -29,6 +29,9 @@ jobs:
           targets: x86_64-unknown-linux-musl
           components: clippy, rustfmt
       - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@v2 # the Rust crates' notices in /licences.txt (make panel)
+        with:
+          tool: cargo-about@0.9.2 # the Makefile's CARGO_ABOUT_VERSION: make panel refuses another
       - uses: actions/setup-node@v4
         with:
           node-version-file: web/.nvmrc # the web workspace: make web-lint, make web-test, make panel (ADR-0025)
@@ -57,6 +60,9 @@ jobs:
       - uses: bufbuild/buf-action@v1 # the panel's message code is generated when the image is built
         with:
           setup_only: true
+      - uses: taiki-e/install-action@v2 # the Rust crates' notices in /licences.txt (make panel)
+        with:
+          tool: cargo-about@0.9.2 # the Makefile's CARGO_ABOUT_VERSION: make panel refuses another
       - uses: actions/setup-node@v4
         with:
           node-version-file: web/.nvmrc # the web workspace: make web-lint, make web-test, make panel (ADR-0025)

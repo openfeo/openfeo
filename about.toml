@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andrew Newton
+#
+# What `cargo about` accepts and looks at when it writes the notices of the Rust crates in the
+# binary (SPEC §13, §14), which `make panel` puts into /licences.txt (scripts/rust-notices.sh).
+# It is run offline there, so every text comes from the crate as it was published and no
+# service is asked what a licence is.
+#
+# The list is deny.toml's, in its order: where a crate offers a choice, the first of these it
+# offers is the one its notice is given under. web/scripts/check-licences.test.mjs holds the two
+# lists together.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "LGPL-2.1-or-later",
+    "GPL-2.0-only",
+    "GPL-2.0-or-later",
+    "CC0-1.0",
+    "Unlicense",
+    "0BSD",
+]
+
+# The binary that ships: what is linked into it, not what builds or tests it.
+targets = ["x86_64-unknown-linux-musl"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# The workspace's own crates are OpenFeO, not third parties.
+private = { ignore = true }

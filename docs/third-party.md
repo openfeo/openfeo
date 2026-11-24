@@ -16,6 +16,11 @@ mini-gmp, used by nftables for its arbitrary-precision arithmetic (`--with-mini-
 inside the nftables tarball under the LGPL-3.0-or-later / GPL-2.0-or-later dual licence of GMP;
 OpenFeO uses it under GPL-2.0-or-later, so the GPLv2 combination stands.
 
+The binary is linked statically against [musl libc](https://musl.libc.org) (MIT): the Rust
+target `x86_64-unknown-linux-musl` brings its own, 1.2.5 with the toolchain this is built by.
+Its allocator is [mimalloc](https://github.com/microsoft/mimalloc) (MIT), C built by the
+`libmimalloc-sys` crate's build script and checked by `cargo deny` like every other crate.
+
 Since M4 the binary also carries [ring](https://github.com/briansmith/ring) 0.17 (Apache-2.0
 AND ISC), the cryptography under rustls for the API's HTTPS listener: a Rust crate whose
 primitives are C and assembly derived from BoringSSL, built by its own build script and checked
@@ -32,7 +37,10 @@ handful of [Lucide](https://lucide.dev) icons (ISC). The fonts are
 files only (SPEC §14). `web/scripts/check-licences.mjs`, part of `make lint`, holds every npm
 package that can reach the page to the list `cargo deny` applies; the panel's build writes each
 one's licence text and the fonts' into one file, which the router serves at `/licences.txt` without
-a login. That file names more packages than the page contains (a package's build-time helpers are
+a login. Since M4 part 3b that file covers the whole binary: the Rust crates' notices are written
+into it by `cargo about` (`about.toml`, against the list `cargo deny` applies), and the C
+libraries' texts are taken from the pinned sources (`web/scripts/c-notices.json`); musl's, which
+no build input carries as a file, is kept in `web/scripts/licence-texts/` at the version above. That file names more packages than the page contains (a package's build-time helpers are
 counted with it), which errs on the side of saying too much. @bufbuild/protobuf is published
 without its licence file; its text is kept in `web/scripts/licence-texts/`.
 

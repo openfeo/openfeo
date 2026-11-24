@@ -334,10 +334,22 @@ fn the_panel_and_its_files_are_served(api: &Api) -> anyhow::Result<()> {
         notices.status,
         notices.header("content-type")
     );
-    for needed in ["SIL OPEN FONT LICENSE", "@bufbuild/protobuf", "vue "] {
+    // One file for the whole binary (SPEC §13): a Rust crate, the C libraries linked into it
+    // (libnftables and the libc among them), an npm package and the fonts.
+    for needed in [
+        "\nThe router: Rust crates\n",
+        "\ntokio ",
+        "\nThe router: C libraries\n",
+        "\nnftables ",
+        "\nmusl libc ",
+        "\nThe panel: npm packages\n",
+        "@bufbuild/protobuf",
+        "\nvue ",
+        "SIL OPEN FONT LICENSE",
+    ] {
         ensure!(
             notices.text().contains(needed),
-            "the notices do not mention {needed}"
+            "the notices do not have {needed:?}"
         );
     }
     Ok(())

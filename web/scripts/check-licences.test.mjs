@@ -74,3 +74,18 @@ test("the accepted list is deny.toml's", () => {
   const { accepted } = JSON.parse(readFileSync(new URL('./licences.json', import.meta.url), 'utf8'))
   assert.deepEqual([...accepted].sort(), [...allowed].sort())
 })
+
+test("cargo about accepts what deny.toml accepts", () => {
+  // The Rust crates' notices are written against the same list the crates are checked by.
+  const list = (text, key) => {
+    const start = text.indexOf(`${key} = [`)
+    assert.ok(start >= 0, `no ${key} list`)
+    const body = text.slice(start, text.indexOf('\n]', start))
+    return [...body.matchAll(/^\s*"([^"]+)",/gm)].map((m) => m[1])
+  }
+  const deny = readFileSync(new URL('../../deny.toml', import.meta.url), 'utf8')
+  const allowed = list(deny.slice(deny.indexOf('[licenses]')), 'allow')
+  const about = list(readFileSync(new URL('../../about.toml', import.meta.url), 'utf8'), 'accepted')
+  assert.ok(allowed.includes('MIT') && allowed.length > 5, 'deny.toml was read')
+  assert.deepEqual([...about].sort(), [...allowed].sort())
+})
