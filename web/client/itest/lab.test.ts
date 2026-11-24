@@ -97,6 +97,8 @@ test('sets the first password, is logged in, and reads the state', async () => {
   const once = await a.state()
   expect(once.system?.hostname).toBe('openfeo')
   expect(once.system?.tlsFingerprint).toBe(status.tlsFingerprint)
+  // Which resolvers the forwarder is asking, and where each came from: the lab's, by wan0's lease.
+  expect(once.dns?.resolvers.map((resolver) => [resolver.address, resolver.wan])).toEqual([['203.0.113.1', 'wan0']])
 })
 
 test('a second router logs in, and counters a second apart give finite rates', async () => {

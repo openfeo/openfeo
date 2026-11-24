@@ -6,14 +6,20 @@ import { expect, test, vi } from 'vitest'
 
 import {
   CountersSchema,
+  DnsSchema,
   ErrorCode,
   EventSchema,
+  FirewallSchema,
   LeasesSchema,
   LinkHistorySchema,
   memoryTokenStore,
+  PortForwardSchema,
+  RecordSchema,
   Router,
   RouterError,
+  RuleSchema,
   StateSchema,
+  SystemSchema,
   type Connection,
   type Counters,
   type Event,
@@ -194,6 +200,37 @@ test('a changed password resolves and the session stays', async () => {
   await change
   expect(store.get()).toBe('tok')
   expect(ends).toEqual([])
+})
+
+test('reboot asks for a restart and resolves when it is answered', async () => {
+  const { router, socket, store, ends } = setup()
+  const asked = router.reboot()
+  socket().accept()
+  const frame = socket().last()
+  expect(frame.body.case === 'request' && frame.body.value.body.case).toBe('reboot')
+  socket().receive({ id: frame.id, body: { case: 'response', value: { body: { case: 'reboot', value: {} } } } })
+  await asked
+  // The answer comes before the router goes: the session is still this one's until it does.
+  expect(store.get()).toBe('tok')
+  expect(ends).toEqual([])
+})
+
+test('a refused reboot is a RouterError', async () => {
+  const { router, socket } = setup()
+  const asked = router.reboot()
+  socket().accept()
+  socket().receive({ id: socket().last().id, body: { case: 'error', value: { code: ErrorCode.UNAVAILABLE, message: 'not now' } } })
+  expect((await refusal(asked)).code).toBe(ErrorCode.UNAVAILABLE)
+})
+
+test('the messages a settings page makes are exported', () => {
+  expect(create(PortForwardSchema, { name: 'ssh', proto: 'tcp', port: 2222 }).port).toBe(2222)
+  expect(create(RuleSchema, { name: 'web6', ports: ['80', '443'] }).ports).toEqual(['80', '443'])
+  expect(create(RecordSchema, { name: 'nas' }).name).toBe('nas')
+  expect(create(FirewallSchema, {}).portForwards).toEqual([])
+  expect(create(DnsSchema, {}).useWanDns).toBeUndefined()
+  expect(create(SystemSchema, { hostname: 'openfeo' }).hostname).toBe('openfeo')
+  expect(create(StateSchema, { dns: { resolvers: [{ address: '203.0.113.1', wan: 'wan0' }] } }).dns?.resolvers[0]?.wan).toBe('wan0')
 })
 
 test('a topic is subscribed once however many listen, and unsubscribed when the last one closes', () => {

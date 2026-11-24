@@ -265,6 +265,16 @@ export class Router {
   }
 
   /**
+   * Restart the router. It answers first and begins about a second later, ending its PPPoE
+   * sessions and writing its lease files before it goes. Every session ends with it, this one
+   * too: its sessions are kept in memory. A change of config that is waiting to be confirmed is
+   * not confirmed by a restart; the router comes back on the confirmed config.
+   */
+  async reboot(): Promise<void> {
+    await this.#link.request({ case: 'reboot', value: {} })
+  }
+
+  /**
    * Listen to a topic until the subscription is closed: `state` is the whole state now and
    * after every change, `leases` the whole lease table now and whenever a lease in it
    * changes, `counters` a sample each second, `events` each event as it happens (with the
