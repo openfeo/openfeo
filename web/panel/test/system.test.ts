@@ -323,6 +323,32 @@ test('a wait is counted down at the field and the button is held for it', async 
   expect(disabled(wrapper, 'Change password')).toBe(true)
 })
 
+test('the wait a wrong password earns is said for as long as the button is held', async () => {
+  // Review Focus 4: retyping takes "that is not the password" away, since it was said of
+  // what was there; the wait is still the router's, and a held button says why it is held.
+  const { wrapper, router } = await page(routerConfig(), state(), (fake) => {
+    fake.changeRefusal = new RouterError(ErrorCode.INVALID_ARGUMENT, 'the old password is wrong', { retryAfterSecs: 8 })
+  })
+  await fill(wrapper, 'not the password', NEW)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(alertAt(wrapper, 'Current password').text()).toBe('That is not the current password. Wait 8 s.')
+  await type(wrapper, 'Current password', OLD)
+  expect(alertAt(wrapper, 'Current password').text()).toBe('Wait 8 s before trying again.')
+  expect(disabled(wrapper, 'Change password')).toBe(true)
+  await vi.advanceTimersByTimeAsync(5_000)
+  expect(alertAt(wrapper, 'Current password').text()).toBe('Wait 3 s before trying again.')
+  expect(disabled(wrapper, 'Change password')).toBe(true)
+  await vi.advanceTimersByTimeAsync(3_000)
+  expect(alertAt(wrapper, 'Current password').exists()).toBe(false)
+  expect(disabled(wrapper, 'Change password')).toBe(false)
+  router.changeRefusal = null
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(router.calls.changePassword.at(-1)).toEqual([OLD, NEW])
+  expect(section(wrapper, 'Password').find('.changed').exists()).toBe(true)
+})
+
 test('a double press sends one call', async () => {
   const { wrapper, router } = await page()
   await fill(wrapper, OLD, NEW)

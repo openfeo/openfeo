@@ -101,12 +101,19 @@ const wait = computed(() => (waitUntil.value === null ? 0 : Math.max(0, Math.cei
 const pending = computed(() => store.pending.value !== undefined)
 const nextProblem = computed(() => (leftNext.value ? (lengthProblem(next.value) ?? undefined) : undefined))
 const againProblem = computed(() => (leftAgain.value && again.value !== next.value ? 'The two passwords differ.' : undefined))
+/**
+ * What the Current field says: that the password there was wrong, and for as long as the
+ * router asks for a wait, how long it is, since the button is held for it and a held button
+ * says why. Retyping takes the first away (it was said of what was there) and not the second.
+ */
 const currentProblem = computed(() => {
-  if (refused.value === null || (refused.value === 'soon' && wait.value === 0)) {
-    return undefined
+  if (refused.value === 'wrong') {
+    return wait.value > 0 ? `That is not the current password. Wait ${wait.value} s.` : 'That is not the current password.'
   }
-  const words = refused.value === 'wrong' ? 'That is not the current password.' : 'Too many tries.'
-  return wait.value > 0 ? `${words} Wait ${wait.value} s.` : words
+  if (wait.value > 0) {
+    return refused.value === 'soon' ? `Too many tries. Wait ${wait.value} s.` : `Wait ${wait.value} s before trying again.`
+  }
+  return undefined
 })
 function typedCurrent(text: string): void {
   current.value = text
