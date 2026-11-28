@@ -231,6 +231,24 @@ body {
   margin-bottom: var(--space-4);
 }
 
+/* The Ports page: the strip in a card of its own above the table, and a line beneath. */
+.ports__strip {
+  margin-bottom: var(--space-5);
+}
+
+.ports__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.ports__note {
+  margin: var(--space-4) 0 var(--space-5);
+  max-width: 80ch;
+  font-size: 13px;
+  line-height: 20px;
+}
+
 .tabsrow .ofo-tabs {
   flex: 1;
 }

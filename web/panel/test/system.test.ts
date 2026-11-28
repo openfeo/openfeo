@@ -55,8 +55,10 @@ test('the page is in the navigation under Router and has the save bar', async ()
   const { wrapper, errors } = await page()
   const nav = wrapper.find('nav.ofo-nav')
   expect(nav.findAll('.ofo-nav__group').map((group) => group.text())).toEqual(['Network', 'Router'])
-  // Router's group comes after Network's pages, and System is in it.
-  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text()).slice(-2)).toEqual(['Router', 'System'])
+  // Router's group comes after Network's pages, and System is the last entry in it.
+  const entries = nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())
+  expect(entries.indexOf('Router')).toBeGreaterThan(entries.indexOf('DNS'))
+  expect(entries.slice(entries.indexOf('Router')).at(-1)).toBe('System')
   const entry = wrapper.findAll('.ofo-nav__item').find((item) => item.text() === 'System')
   expect(entry?.attributes('href')).toBe('/system')
   expect(entry?.attributes('aria-current')).toBe('page')

@@ -55,6 +55,8 @@ export interface LiveData {
    */
   routerClock: ComputedRef<number | undefined>
   conntrack: Ref<{ count: number; max: number } | null>
+  /** The counters as the router last read them; `null` until it first has, and while it is away. */
+  counters: Ref<Counters | null>
   /** The most recent events, newest first: as many as the router keeps. */
   events: Ref<Event[]>
   connection: Ref<Connection>
@@ -92,6 +94,7 @@ export function useLive(router: PanelRouter): LiveData {
     return lastMinute((wan === undefined ? undefined : samples.value.get(wan.interface)) ?? [])
   })
   const conntrack = ref<{ count: number; max: number } | null>(null)
+  const counters = shallowRef<Counters | null>(null)
   const events = ref<Event[]>([])
   const connection = ref<Connection>(router.connection)
   const lostAt = ref<Date | null>(null)
@@ -224,6 +227,7 @@ export function useLive(router: PanelRouter): LiveData {
 
   function sampled(sample: Counters): void {
     conntrack.value = { count: sample.conntrack, max: sample.conntrackMax }
+    counters.value = sample
     if (previous !== undefined) {
       rates.value = new Map(ratesOf(previous, sample).map((rate) => [rate.name, rate]))
     }
@@ -270,6 +274,7 @@ export function useLive(router: PanelRouter): LiveData {
       // sample after the gap starts afresh.
       rates.value = null
       conntrack.value = null
+      counters.value = null
       previous = undefined
     }
   }
@@ -283,6 +288,7 @@ export function useLive(router: PanelRouter): LiveData {
     leases,
     routerClock,
     conntrack,
+    counters,
     events,
     connection,
     lostAt,

@@ -108,3 +108,21 @@ export function portSpeed(port: { carrier: boolean; speedMbps?: number | undefin
   }
   return mbps < 1000 ? `${mbps}M` : `${mbps / 1000}G`
 }
+
+const BYTE_UNITS = ['B', 'kB', 'MB', 'GB', 'TB'] as const
+
+/**
+ * A count of bytes in words, by thousands, as rates are said: `0 B`, `999 B`, `1.0 kB`,
+ * `412.8 GB`. One decimal from kB up; a count that would round up to a thousand moves to the
+ * next unit, and past TB there is none.
+ */
+export function bytes(count: bigint): string {
+  let value = Number(count)
+  let unit = 0
+  while (unit < BYTE_UNITS.length - 1 && value >= 999.95) {
+    value /= 1000
+    unit += 1
+  }
+  return unit === 0 ? `${String(count)} B` : `${value.toFixed(1)} ${BYTE_UNITS[unit] ?? ''}`
+}
+

@@ -3,7 +3,7 @@
 
 import { expect, test } from 'vitest'
 
-import { clock, countdown, duration, durationWords, hourMinute, portSpeed, rate, since } from '../src/model/format'
+import { bytes, clock, countdown, duration, durationWords, hourMinute, portSpeed, rate, since } from '../src/model/format'
 
 test('rates step by a thousand and keep one decimal', () => {
   expect(rate(941_200_000)).toEqual({ value: '941.2', unit: 'Mbit/s' })
@@ -97,3 +97,16 @@ test('a time of day is hours and minutes', () => {
   expect(hourMinute(new Date(2026, 10, 10, 22, 41, 59))).toBe('22:41')
   expect(hourMinute(new Date(2026, 10, 10, 9, 5, 0))).toBe('09:05')
 })
+
+test('bytes are said by thousands with one decimal', () => {
+  expect(bytes(0n)).toBe('0 B')
+  expect(bytes(999n)).toBe('999 B')
+  expect(bytes(1_000n)).toBe('1.0 kB')
+  expect(bytes(38_100_000n)).toBe('38.1 MB')
+  expect(bytes(412_800_000_000n)).toBe('412.8 GB')
+  expect(bytes(7_240_000_000_000n)).toBe('7.2 TB')
+  // A count that rounds up to a thousand moves to the next unit, and there is none past TB.
+  expect(bytes(999_960n)).toBe('1.0 MB')
+  expect(bytes(2_500_000_000_000_000n)).toBe('2500.0 TB')
+})
+
