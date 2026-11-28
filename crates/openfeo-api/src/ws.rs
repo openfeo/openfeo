@@ -185,6 +185,7 @@ pub(crate) async fn perform(
             response::Body::RevertConfig(RevertConfigResponse {})
         }
         Some(request::Body::Reboot(_)) => response::Body::Reboot(shared.reboot(at.peer)),
+        Some(request::Body::Logs(ask)) => response::Body::Logs(shared.logs(&ask)?),
         None => {
             return Err(ApiError::new(
                 ErrorCode::InvalidArgument,

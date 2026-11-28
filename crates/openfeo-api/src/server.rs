@@ -13,10 +13,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openfeo_config::Admin;
 use openfeo_config::admin::{ConfigState, write_password_hash};
-use openfeo_config::api::{ErrorCode, GetStatusResponse, Session};
+use openfeo_config::api::{ErrorCode, GetStatusResponse, LogsRequest, LogsResponse, Session};
 use openfeo_config::state::State;
 use openfeo_reconcile::state::{SystemFacts, state};
 use openfeo_runtime::clock::boot_ms;
+use openfeo_runtime::log::{Filter, Ring};
 use openfeo_runtime::{Publisher, WorldRx};
 use openfeo_world::health::HealthView;
 use tokio::sync::watch;
@@ -29,8 +30,10 @@ use crate::gate::Names;
 use crate::keeper::Keeper;
 use crate::limits::{
     AUTH_FRAME_TIMEOUT, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_CONNECTIONS,
-    MAX_CONNECTIONS_PER_SOURCE, PING_INTERVAL, REQUEST_TIMEOUT, SESSION_IDLE_MS,
+    MAX_CONNECTIONS_PER_SOURCE, MAX_LOG_BYTES, MAX_LOG_CONTAINS, MAX_LOG_LINES, PING_INTERVAL,
+    REQUEST_TIMEOUT, SESSION_IDLE_MS,
 };
+use crate::logs::{level_of, to_pb};
 use crate::telemetry::Telemetry;
 
 /// A change in the offset between the wall clock and the boot clock larger than this is the
@@ -201,6 +204,8 @@ pub struct Shared {
     extra_host: Option<String>,
     /// How a restart is asked of the router.
     restarter: Arc<dyn crate::Restarter>,
+    /// The log the router keeps.
+    pub(crate) log: Arc<Ring>,
     /// One password change at a time: the check for "no password yet" and the write are one
     /// step.
     password: tokio::sync::Mutex<()>,
@@ -258,6 +263,8 @@ pub struct SharedParts {
     pub default_window_secs: u32,
     /// How a restart is asked of the router.
     pub restarter: Arc<dyn crate::Restarter>,
+    /// The log the router keeps.
+    pub log: Arc<Ring>,
 }
 
 impl Shared {
@@ -284,6 +291,7 @@ impl Shared {
             version: parts.version,
             extra_host: parts.extra_host,
             restarter: parts.restarter,
+            log: parts.log,
             limits: parts.limits,
             fingerprint: watch::Sender::new(String::new()),
             sessions_ended: watch::Sender::new(0),
@@ -585,6 +593,48 @@ impl Shared {
         openfeo_config::api::RebootResponse {}
     }
 
+    /// The router's two clocks now, in milliseconds: the time since the kernel booted, and the
+    /// wall clock as [`Self::state`] steadies it.
+    #[must_use]
+    pub fn clocks(&self) -> (u64, u64) {
+        let boot = boot_ms();
+        (boot, self.wall_offset_ms(boot).saturating_add(boot))
+    }
+
+    /// The newest lines of the log that match (SPEC §8.3, M4 part 3c), with the two clocks a
+    /// reader places them by.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for a level that is none, and for a text longer than
+    /// [`MAX_LOG_CONTAINS`].
+    pub fn logs(&self, ask: &LogsRequest) -> Result<LogsResponse, ApiError> {
+        let level = level_of(ask.level)
+            .map_err(|none| ApiError::new(ErrorCode::InvalidArgument, &none.to_string()))?;
+        if ask.contains.len() > MAX_LOG_CONTAINS {
+            return Err(ApiError::new(
+                ErrorCode::InvalidArgument,
+                &format!("the text to look for is longer than {MAX_LOG_CONTAINS} bytes"),
+            ));
+        }
+        let lines = match usize::try_from(ask.limit) {
+            Ok(0) | Err(_) => MAX_LOG_LINES,
+            Ok(limit) => limit.min(MAX_LOG_LINES),
+        };
+        let filter = Filter {
+            level,
+            contains: ask.contains.clone(),
+        };
+        let page = self.log.page(&filter, ask.before_seq, lines, MAX_LOG_BYTES);
+        let (uptime_ms, time_unix_ms) = self.clocks();
+        Ok(LogsResponse {
+            lines: page.lines.iter().map(to_pb).collect(),
+            earlier: page.earlier,
+            uptime_ms,
+            time_unix_ms,
+        })
+    }
+
     /// Every LAN's leases now (SPEC §8.3), on the clock [`Self::state`] uses.
     #[must_use]
     pub fn leases(&self) -> openfeo_config::state::Leases {
@@ -720,6 +770,7 @@ pub(crate) mod tests {
             extra_host: None,
             default_window_secs: crate::keeper::DEFAULT_WINDOW_SECS,
             restarter: Arc::new(crate::testing::Counted::default()),
+            log: Arc::new(Ring::new(openfeo_runtime::log::DEFAULT_RING_BYTES)),
         });
         shared.fingerprint.send_replace("AB:CD".to_owned());
         (shared, dir)

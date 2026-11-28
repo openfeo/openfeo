@@ -65,6 +65,7 @@ message Request {
     GetLeasesRequest get_leases = 9;
     GetHistoryRequest get_history = 10;
     RebootRequest reboot = 11;
+    LogsRequest logs = 12;
   }
 }
 
@@ -82,6 +83,7 @@ message Response {
     GetLeasesResponse get_leases = 9;
     GetHistoryResponse get_history = 10;
     RebootResponse reboot = 11;
+    LogsResponse logs = 12;
   }
 }
 
@@ -289,11 +291,57 @@ message RebootRequest {}
 
 message RebootResponse {}
 
+enum LogLevel {
+  LOG_LEVEL_UNSPECIFIED = 0;
+  LOG_LEVEL_ERROR = 1;
+  LOG_LEVEL_WARN = 2;
+  LOG_LEVEL_INFO = 3;
+  LOG_LEVEL_DEBUG = 4;
+}
+
+// One line of the router's log (SPEC §10).
+message LogLine {
+  // Only grows while the router runs; the first line written is 1.
+  uint64 seq = 1;
+  // Since the kernel booted.
+  uint64 uptime_ms = 2;
+  LogLevel level = 3;
+  // `message key=value`: the line without its priority and without the `openfeo:` that the
+  // console's copy begins with.
+  string text = 4;
+}
+
+message LogsRequest {
+  // This level and everything more serious; unspecified means every line.
+  LogLevel level = 1;
+  // Only lines whose text holds this, without regard to ASCII case; empty for all.
+  string contains = 2;
+  // Only lines before this one; 0 for the newest.
+  uint64 before_seq = 3;
+  // At most this many, the newest that match; 0 for as many as one answer holds. The router
+  // caps it at 1000 lines and 512 KiB of text.
+  uint32 limit = 4;
+}
+
+message LogsResponse {
+  // Oldest first.
+  repeated LogLine lines = 1;
+  // Older lines that match exist.
+  bool earlier = 2;
+  // The router's two clocks now, so that a reader can say when a line was written: a line is
+  // `uptime_ms - line.uptime_ms` older than `time_unix_ms`, whatever the wall clock said then.
+  uint64 uptime_ms = 3;
+  uint64 time_unix_ms = 4;
+}
+
 service SystemService {
   // Restart the router. It answers at once and the restart begins about a second later: the
   // PPPoE sessions are ended and the lease files written first (SPEC §6.3). Every session ends
   // with it; a change of config that waits to be confirmed is not confirmed by it.
   rpc Reboot(RebootRequest) returns (RebootResponse);
+  // The newest lines of the log that match, read back from the router's memory. A caller
+  // reaches further back with the number of the oldest line it has (`before_seq`).
+  rpc Logs(LogsRequest) returns (LogsResponse);
 }
 
 // ---- Plain HTTP, before login ----

@@ -175,6 +175,7 @@ impl Server {
             extra_host: deps.extra_host,
             default_window_secs: deps.confirm_secs,
             restarter: deps.restarter,
+            log: deps.log,
         });
         let loaded = cert::load(&deps.tls_dir).unwrap_or_else(|err| {
             warn!("tls: {err}; issuing a new certificate");

@@ -20,6 +20,7 @@ pub mod http;
 pub mod keeper;
 pub mod limits;
 pub mod listener;
+pub mod logs;
 pub mod pb;
 pub mod server;
 pub mod telemetry;
@@ -33,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use openfeo_config::admin::ConfigState;
+use openfeo_runtime::log::Ring;
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::{Publisher, WorldRx};
 use openfeo_world::World;
@@ -96,6 +98,8 @@ pub struct ApiDeps {
     pub confirm_secs: u32,
     /// How a restart is asked of the router.
     pub restarter: Arc<dyn Restarter>,
+    /// The log the router keeps (SPEC §10).
+    pub log: Arc<Ring>,
 }
 
 /// Bind and serve the API until a listener fails.

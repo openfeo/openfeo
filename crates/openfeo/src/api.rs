@@ -210,6 +210,8 @@ pub fn spawn(
                 extra_host,
                 confirm_secs: confirm_secs.unwrap_or(openfeo_api::keeper::DEFAULT_WINDOW_SECS),
                 restarter: Arc::new(restarts.clone()),
+                // A ring nothing writes to, until the router hands over its own.
+                log: Arc::new(openfeo_runtime::log::Ring::new(0)),
             })
             .await
         }

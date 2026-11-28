@@ -14,10 +14,11 @@ use openfeo_config::api::{
     ApplyConfigRequest, ApplyConfigResponse, ChangePasswordRequest, ChangePasswordResponse,
     ConfirmConfigRequest, ConfirmConfigResponse, ErrorCode, GetConfigRequest, GetConfigResponse,
     GetHistoryRequest, GetHistoryResponse, GetLeasesRequest, GetLeasesResponse, GetStateRequest,
-    GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, RebootRequest,
-    RebootResponse, RevertConfigRequest, RevertConfigResponse, ServerMsg,
-    SetInitialPasswordRequest, SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse,
-    ValidateConfigRequest, ValidateConfigResponse, server_msg, subscribe_response, telemetry,
+    GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, LogsRequest,
+    LogsResponse, RebootRequest, RebootResponse, RevertConfigRequest, RevertConfigResponse,
+    ServerMsg, SetInitialPasswordRequest, SetInitialPasswordResponse, SubscribeRequest,
+    SubscribeResponse, ValidateConfigRequest, ValidateConfigResponse, server_msg,
+    subscribe_response, telemetry,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -321,6 +322,14 @@ impl SystemService for Grpc {
     ) -> Result<Response<RebootResponse>, Status> {
         token(&self.shared, &request)?;
         Ok(Response::new(self.shared.reboot(from(&request)?)))
+    }
+
+    async fn logs(&self, request: Request<LogsRequest>) -> Result<Response<LogsResponse>, Status> {
+        token(&self.shared, &request)?;
+        self.shared
+            .logs(request.get_ref())
+            .map(Response::new)
+            .map_err(|error| status(&error))
     }
 }
 

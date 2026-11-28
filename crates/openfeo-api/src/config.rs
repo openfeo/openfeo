@@ -605,6 +605,7 @@ mod tests {
                 extra_host: None,
                 default_window_secs: window_secs,
                 restarter: restarter.clone(),
+                log: Arc::new(openfeo_runtime::log::Ring::new(1 << 20)),
             });
             Rig {
                 shared,
@@ -637,6 +638,7 @@ mod tests {
                 extra_host: None,
                 default_window_secs: 120,
                 restarter: self.restarter.clone(),
+                log: Arc::new(openfeo_runtime::log::Ring::new(1 << 20)),
             })
         }
 
