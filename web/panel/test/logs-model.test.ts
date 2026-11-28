@@ -66,6 +66,9 @@ test('what waited while paused goes after what is shown', () => {
   // The bound holds, the newest kept: the top of the page is where what is kept ends.
   expect(said(resumed(shown, appended([], lines(7, 8, 9)), 3))).toEqual([7, 8, 9])
   expect(resumed(shown, [])).toBe(shown)
+  // What waited and is already shown is not shown again.
+  expect(said(resumed(shown, appended([], lines(2, 3))))).toEqual([1, 2, 3])
+  expect(resumed(shown, appended([], lines(1, 2)))).toBe(shown)
 })
 
 test('earlier lines go on top, once', () => {

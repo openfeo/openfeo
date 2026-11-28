@@ -27,7 +27,7 @@ export interface Clocks {
 const row = (line: LogLine): Row => ({ kind: 'line', line })
 
 /** The number of the newest line in `rows`; 0 when there is none. */
-function newest(rows: Row[]): bigint {
+export function newest(rows: Row[]): bigint {
   for (let at = rows.length - 1; at >= 0; at--) {
     const each = rows[at]
     if (each?.kind === 'line') {
@@ -74,12 +74,16 @@ export function gapped(rows: Row[]): Row[] {
  * it is left: the top of the page is where what is kept ends, as it always is.
  */
 export function resumed(shown: Row[], waiting: Row[], kept = KEPT_LINES): Row[] {
-  if (waiting.length === 0) {
+  // A line that waited and is already shown (an answer's last lines may come once more in the
+  // batch after it) is not shown again.
+  const last = newest(shown)
+  const fresh = waiting.filter((each) => each.kind === 'gap' || each.line.seq > last)
+  if (fresh.length === 0) {
     return shown
   }
   // A mark that begins what waited would stand beside one that ends what is shown.
-  const after = shown.at(-1)?.kind === 'gap' && waiting[0]?.kind === 'gap' ? waiting.slice(1) : waiting
-  return bounded([...shown, ...after], kept)
+  const after = shown.at(-1)?.kind === 'gap' && fresh[0]?.kind === 'gap' ? fresh.slice(1) : fresh
+  return after.length === 0 ? shown : bounded([...shown, ...after], kept)
 }
 
 /** `rows` with `lines` before them: the ones older than the oldest shown, and no line twice. */

@@ -295,6 +295,22 @@ test('Pause holds the view and counts what arrives', async () => {
   expect(texts(wrapper).at(-1)).toBe('info  link p0 up')
 })
 
+test('a line already shown does not wait to be shown again', async () => {
+  // The router answers a question before it sends the lines it was about to: the last lines
+  // of an answer may come once more in the batch after it. While the view is held still they
+  // are neither counted nor, once it follows again, shown twice.
+  const { wrapper, router } = await page()
+  await button(wrapper, 'Pause').trigger('click')
+  await level(wrapper, 'Debug').trigger('click')
+  await flushPromises()
+  router.push('logs', batch([LINES[3]!, line(43, 'link p0 down')]))
+  await flushPromises()
+  expect(button(wrapper, /^Follow/).text()).toBe('Follow (1 new)')
+  await button(wrapper, /^Follow/).trigger('click')
+  expect(texts(wrapper).slice(-2)).toEqual(['info  admin: login from 192.168.1.142', 'info  link p0 down'])
+  expect(texts(wrapper).filter((each) => each.endsWith('admin: login from 192.168.1.142'))).toHaveLength(1)
+})
+
 test('what waits while paused is bounded', async () => {
   const { wrapper, router } = await page()
   await button(wrapper, 'Pause').trigger('click')

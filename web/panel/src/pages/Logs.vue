@@ -16,6 +16,7 @@ import {
   KEPT_LINES,
   levelWord,
   lineCount,
+  newest,
   PAGE_LINES,
   preceded,
   resumed,
@@ -129,7 +130,13 @@ function arrived(batch: LogBatch): void {
   if (following.value) {
     show(appended(rows.value, wanted))
   } else {
-    waiting.value = appended(waiting.value, wanted)
+    // Only what is not on the page already waits: the router answers a question before it
+    // sends the lines it was about to, so an answer's last lines may come once more.
+    const shown = newest(rows.value)
+    waiting.value = appended(
+      waiting.value,
+      wanted.filter((line) => line.seq > shown),
+    )
   }
 }
 
