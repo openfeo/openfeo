@@ -205,6 +205,32 @@ body {
   margin-bottom: var(--space-5);
 }
 
+/* The Routes page: the choice of family above the table, and a line beneath it. */
+.routes__tools {
+  margin-bottom: var(--space-4);
+}
+
+.routes__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.routes__none {
+  margin: 0;
+}
+
+.routes__note {
+  margin: var(--space-4) 0 var(--space-5);
+  max-width: 80ch;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.routes__failed {
+  margin-bottom: var(--space-4);
+}
+
 .tabsrow .ofo-tabs {
   flex: 1;
 }

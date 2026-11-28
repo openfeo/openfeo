@@ -76,6 +76,7 @@ const nav = computed<NavEntry[]>(() => [
   { kind: 'item', label: 'Leases', icon: 'monitor-smartphone', to: PAGES.leases, current: at(PAGES.leases) },
   { kind: 'item', label: 'Firewall', icon: 'shield', to: PAGES.firewall, current: at(PAGES.firewall) },
   { kind: 'item', label: 'DNS', icon: 'text', to: PAGES.dns, current: at(PAGES.dns) },
+  { kind: 'item', label: 'Routes', icon: 'route', to: PAGES.routes, current: at(PAGES.routes) },
   { kind: 'group', label: 'Router' },
   { kind: 'item', label: 'System', icon: 'settings', to: PAGES.system, current: at(PAGES.system) },
 ])

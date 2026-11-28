@@ -30,7 +30,7 @@ test('every screen has an address of its own', () => {
 })
 
 test('the pages behind the login each have an address, and none is a gate', () => {
-  expect(PAGES).toEqual({ dashboard: '/', wan: '/wan', lan: '/lan', leases: '/leases', firewall: '/firewall', dns: '/dns', system: '/system' })
+  expect(PAGES).toEqual({ dashboard: '/', wan: '/wan', lan: '/lan', leases: '/leases', firewall: '/firewall', dns: '/dns', routes: '/routes', system: '/system' })
   for (const path of [...Object.values(PAGES), '/wan/wan0', '/lan/lan0', '/leases']) {
     expect(correction('dashboard', path), path).toBeNull()
     expect(correction('login', path), path).toBe('/login')
