@@ -238,10 +238,24 @@ fn apply_addr(cache: &mut Cache, msg: &AddressMessage, present: bool) -> bool {
     let removed = cache.addrs.len() != before;
     if present {
         cache.addrs.insert(addr);
-        true
-    } else {
-        removed
+        return true;
     }
+    // With a link's last IPv4 address the kernel drops every IPv4 route through the link,
+    // and announces only the address's own (ADR-0027): a lease that runs out takes the
+    // default route with it. A cache that went on holding those routes would have the
+    // applier believe them there when the lease returns.
+    let bare = !addr.net.addr().is_ipv6()
+        && !cache
+            .addrs
+            .iter()
+            .any(|a| a.ifindex == addr.ifindex && !a.net.addr().is_ipv6());
+    let routes = cache.routes.len();
+    if bare {
+        cache
+            .routes
+            .retain(|route| route.v6 || route.oif != Some(addr.ifindex));
+    }
+    removed || cache.routes.len() != routes
 }
 
 fn apply_route(cache: &mut Cache, msg: &RouteMessage, present: bool) -> bool {
@@ -573,5 +587,59 @@ mod tests {
         cache.routes.insert(through(7));
         assert!(apply(&mut cache, &RouteNetlinkMessage::DelLink(link)));
         assert!(cache.routes.is_empty());
+    }
+
+    /// An address message for `address` on interface 7.
+    fn addr_of(address: &str, prefix: u8) -> AddressMessage {
+        let mut msg = AddressMessage::default();
+        let address: IpAddr = address.parse().unwrap();
+        msg.header.family = if address.is_ipv6() {
+            AddressFamily::Inet6
+        } else {
+            AddressFamily::Inet
+        };
+        msg.header.prefix_len = prefix;
+        msg.header.index = 7;
+        msg.attributes.push(AddressAttribute::Address(address));
+        msg.attributes.push(AddressAttribute::Local(address));
+        msg
+    }
+
+    /// The kernel drops every IPv4 route through a link with its last IPv4 address, and
+    /// announces only the address's own (ADR-0027): a lease that runs out takes the default
+    /// route with it.
+    #[test]
+    fn the_last_ipv4_address_takes_the_links_ipv4_routes_with_it() {
+        let through = |oif: u32, v6: bool| Route {
+            v6,
+            oif: Some(oif),
+            ..route_from(&route_of(RouteType::Unicast)).expect("a route")
+        };
+        let mut cache = Cache::default();
+        for message in [
+            addr_of("192.0.2.1", 24),
+            addr_of("203.0.113.9", 24),
+            addr_of("2001:db8::1", 64),
+        ] {
+            assert!(apply(&mut cache, &RouteNetlinkMessage::NewAddress(message)));
+        }
+        cache.routes.insert(through(7, false));
+        cache.routes.insert(through(7, true));
+        cache.routes.insert(through(8, false));
+        // One IPv4 address goes and one is left: the routes stay.
+        let gone = RouteNetlinkMessage::DelAddress(addr_of("203.0.113.9", 24));
+        assert!(apply(&mut cache, &gone));
+        assert_eq!(cache.routes.len(), 3);
+        // The IPv6 address goes: nothing of IPv4 changes, and IPv6's routes are announced.
+        let gone = RouteNetlinkMessage::DelAddress(addr_of("2001:db8::1", 64));
+        assert!(apply(&mut cache, &gone));
+        assert_eq!(cache.routes.len(), 3);
+        // The last IPv4 address goes: this link's IPv4 routes go with it, and no other route.
+        let gone = RouteNetlinkMessage::DelAddress(addr_of("192.0.2.1", 24));
+        assert!(apply(&mut cache, &gone));
+        assert_eq!(
+            cache.routes.into_iter().collect::<Vec<_>>(),
+            vec![through(8, false), through(7, true)]
+        );
     }
 }

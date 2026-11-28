@@ -151,7 +151,10 @@ login and a right one, for the lab's passwords and tokens (the console shows INF
 of it, DEBUG included); `@openfeo/client`'s routes and log calls under Node (`web/client/itest/views.test.ts`); and the
 panel in Chromium (`web/panel/e2e/views.spec.ts`), which reads Routes and Ports, has the LAN port's counter move by
 fetching the notices, follows Logs through a cut ISP and downloads the log. The `netlink` sandbox suite holds the
-monitor to dropping a removed link's routes, which the kernel does not announce (ADR-0027). Each of the eight web
+monitor to dropping the routes the kernel drops without announcing them (ADR-0027): a removed link's, and the IPv4
+routes of a link that lost its last IPv4 address; and an `m1` scenario lets the WAN's DHCP lease run out with the lab's
+Kea stopped (`Lab::stop_kea`) and come back, after which the default route is added again and the LAN host reaches the
+ISP. Each of the eight web
 scenarios names its own test or spec file (`lab.test`, `config.test`, `views.test`, `panel.spec`, `config.spec`,
 `leases.spec`, `settings.spec`, `views.spec`),
 since one process numbers its requests to the lab from 1. A lab verb may carry arguments: `lan-to <cidr> <gateway>`

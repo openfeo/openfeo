@@ -89,6 +89,10 @@ const SCENARIOS: &[Scenario] = &[
         run: a_removed_link_takes_its_routes_out_of_the_cache,
     },
     Scenario {
+        name: "a_link_that_loses_its_last_ipv4_address_loses_its_routes_in_the_cache",
+        run: a_link_that_loses_its_last_ipv4_address_loses_its_routes_in_the_cache,
+    },
+    Scenario {
         name: "an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time",
         run: an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time,
     },
@@ -1038,6 +1042,104 @@ fn a_removed_link_takes_its_routes_out_of_the_cache(_lab: &mut Lab) -> anyhow::R
         anyhow::Ok(())
     });
     let _ = netns::ip(&["link", "del", "gone0"]);
+    result?
+}
+
+/// A link that loses its last IPv4 address loses every IPv4 route through it, and the kernel
+/// announces only the address's own (ADR-0027): a lease that runs out takes the default route
+/// with it, and a cache that waits to be told goes on holding that route, so that the applier
+/// never adds it again. While another IPv4 address is left, the routes stay.
+fn a_link_that_loses_its_last_ipv4_address_loses_its_routes_in_the_cache(
+    _lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "bare0"]);
+    netns::ip(&[
+        "link", "add", "bare0", "type", "veth", "peer", "name", "bare1",
+    ])?;
+    netns::ip(&["link", "set", "bare1", "up"])?;
+    netns::ip(&["link", "set", "bare0", "up"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let bare0 = rx.borrow().link_by_name("bare0").context("bare0")?.index;
+        let first: IpNet = "192.0.2.1/24".parse()?;
+        let second: IpNet = "203.0.113.9/24".parse()?;
+        for net in [first, second] {
+            nl.addr_add(bare0, net).await?;
+            wait_until(&mut rx, "an address on bare0", |c| {
+                c.addrs.iter().any(|a| a.ifindex == bare0 && a.net == net)
+            })
+            .await?;
+        }
+        let route = Route {
+            v6: false,
+            table: TABLE_MAIN,
+            dst: Some("198.51.100.0/24".parse()?),
+            gateway: Some("192.0.2.2".parse()?),
+            oif: Some(bare0),
+            protocol: RTPROT_OPENFEO,
+            priority: 10,
+            kind: RouteKind::Unicast,
+            pref_src: None,
+        };
+        nl.route_add(&route).await?;
+        wait_until(&mut rx, "the route through bare0", |c| {
+            c.routes.contains(&route)
+        })
+        .await?;
+        let in_kernel = || -> anyhow::Result<bool> {
+            Ok(!netns::ip(&["route", "show", "198.51.100.0/24"])?
+                .trim()
+                .is_empty())
+        };
+        // One address goes and one is left: the kernel keeps the route, and so does the cache.
+        nl.addr_del(bare0, second).await?;
+        wait_until(&mut rx, "the second address gone", |c| {
+            !c.addrs
+                .iter()
+                .any(|a| a.ifindex == bare0 && a.net == second)
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ensure!(
+            in_kernel()?,
+            "the kernel dropped the route with an address to spare"
+        );
+        ensure!(
+            rx.borrow().routes.contains(&route),
+            "the cache dropped a route the kernel still holds"
+        );
+        // The last one goes: the kernel drops the route and says nothing of it.
+        nl.addr_del(bare0, first).await?;
+        wait_until(&mut rx, "the last address gone", |c| {
+            !c.addrs
+                .iter()
+                .any(|a| a.ifindex == bare0 && !a.net.addr().is_ipv6())
+        })
+        .await?;
+        ensure!(!in_kernel()?, "the kernel kept the route");
+        let left = |c: &Cache| -> Vec<String> {
+            c.routes
+                .iter()
+                .filter(|r| r.oif == Some(bare0) && !r.v6)
+                .map(openfeo_netlink::describe)
+                .collect()
+        };
+        if wait_until(&mut rx, "no IPv4 route through bare0", |c| {
+            left(c).is_empty()
+        })
+        .await
+        .is_err()
+        {
+            anyhow::bail!(
+                "the cache still holds IPv4 routes through a link with no IPv4 address: {:?}",
+                left(&rx.borrow())
+            );
+        }
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "bare0"]);
     result?
 }
 

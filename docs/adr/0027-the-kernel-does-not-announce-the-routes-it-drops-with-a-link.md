@@ -22,12 +22,28 @@ A PPPoE session that ends and comes back is a new interface (ADR-0023), and so i
 sub-interface whose tag was changed. Each left its routes in the cache, where a dump would list
 them: a default route through an interface that is gone, beside the one in use.
 
+The same happens without the link going. When a link loses its last IPv4 address the kernel
+turns IPv4 off on it and drops every IPv4 route through it, and announces only the address's
+own: its connected route and its entries in the local table. The sandbox scenario
+`a_link_that_loses_its_last_ipv4_address_loses_its_routes_in_the_cache` shows it, and shows
+that the routes stay while another IPv4 address is left. Here the stale routes did harm before
+anyone listed them. A DHCP lease that runs out has the router remove the WAN's address; the
+default route went with it unannounced, and the cache kept it. When the lease came back by the
+same gateway, the applier found the route in the cache and did not add it: the WAN was up, by
+the router's own account, and nothing was routed. The QEMU scenario
+`a_dhcp_lease_that_ran_out_and_came_back_routes_again` failed on exactly that ("the default
+route was added 1 times, not once for each lease") before this decision.
+
 ## Decision
 
 The monitor drops a removed link's routes itself: on `RTM_DELLINK` it takes out of the cache
 every route whose output interface is that link's index, and says the cache changed if it took
 any. Whatever was routed through a link is gone with it, in both families; the deletions the
 kernel does announce for the IPv6 routes then find nothing to remove.
+
+Likewise on `RTM_DELADDR`: when the address that went was the link's last IPv4 address, the
+monitor takes every IPv4 route through that link out of the cache. IPv6 is left alone there:
+an IPv6 address that goes takes no other route with it, and what it does take is announced.
 
 The dump also leaves out a route whose interface the cache cannot name. Between a route's
 notification and its link's that is an instant; it is not relied on for the case above.
@@ -41,4 +57,8 @@ notification and its link's that is an instant; it is not relied on for the case
 - A link that is set down and kept loses its IPv4 routes as silently, and keeps its index, so
   this does not cover it. The router sets no link down that it keeps. If that changes, the
   routes have to be dumped afresh when a link goes down.
-- The applier no longer finds, in the cache, routes of its own through a link that went.
+- The applier no longer finds, in the cache, routes of its own through a link that went or
+  that lost its addresses: a lease that returns gets its routes again.
+- A route whose preferred source is an address that goes, while the link keeps another, is
+  dropped by the kernel as well; recent kernels announce that one. The router gives no IPv4
+  route a preferred source.
