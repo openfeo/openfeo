@@ -123,6 +123,8 @@ test('the page opens at Info, following', async () => {
   expect(code.findAll('.ofo-code__err').map((each) => each.text())).toEqual(['error'])
   expect(code.findAll('.ofo-code__ok')).toHaveLength(0)
   expect([code.attributes('role'), code.classes().includes('ofo-code--wrap')]).toEqual(['log', true])
+  // The block itself is what scrolls, inside its own frame, and the keyboard can reach it.
+  expect([code.classes().includes('logs__view'), code.attributes('tabindex')]).toEqual([true, '0'])
   expect(wrapper.find('.logs__note').text()).toBe(
     'Following: new lines appear at the bottom. Pause holds the view still while you read. The router keeps about the last 8 MiB in memory, so a restart clears it.',
   )

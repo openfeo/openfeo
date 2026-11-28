@@ -242,12 +242,13 @@ const drawn = computed(() => {
 })
 
 // While following, the view stays at its end.
-const view = useTemplateRef<HTMLElement>('view')
+const view = useTemplateRef<{ $el: HTMLElement }>('view')
 watch(
   drawn,
   () => {
-    if (following.value && view.value !== null) {
-      view.value.scrollTop = view.value.scrollHeight
+    const block = view.value?.$el
+    if (following.value && block !== undefined) {
+      block.scrollTop = block.scrollHeight
     }
   },
   { flush: 'post' },
@@ -297,10 +298,8 @@ onBeforeUnmount(() => {
         <span v-else class="ofo-muted">Download has the rest.</span>
       </p>
       <p v-if="rows.length === 0" class="logs__none ofo-muted">No lines match.</p>
-      <!-- It scrolls, so the keyboard can reach it. -->
-      <div v-else ref="view" class="logs__view" tabindex="0">
-        <OfoCode label="The router’s log" :lines="drawn" live wrap />
-      </div>
+      <!-- The block is what scrolls, inside its own frame; so the keyboard can reach it. -->
+      <OfoCode v-else ref="view" class="logs__view" tabindex="0" label="The router’s log" :lines="drawn" live wrap />
       <p class="logs__note ofo-muted">
         Following: new lines appear at the bottom. Pause holds the view still while you read. The router keeps about the last 8 MiB in memory, so a
         restart clears it.

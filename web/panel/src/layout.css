@@ -294,10 +294,11 @@ body {
   margin: 0;
 }
 
+/* As tall as the window leaves it, so that the page itself does not scroll and the line
+   beneath stays in sight; never less than a dozen lines. */
 .logs__view {
-  max-height: 70vh;
+  max-height: max(15rem, calc(100vh - 21rem));
   overflow-y: auto;
-  border-radius: var(--radius-md);
 }
 
 .logs__note {

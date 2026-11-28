@@ -79,7 +79,7 @@ test('the firewall, a local name, the password and a restart', async ({ page, ba
   await page.getByRole('button', { name: 'Set password' }).click()
   await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
   await expect(page.locator('.ofo-nav__group')).toHaveText(['Network', 'Router'])
-  await expect(page.locator('.ofo-nav__item .ofo-nav__label')).toHaveText(['Dashboard', 'WAN', 'LAN & DHCP', 'Leases', 'Firewall', 'DNS', 'System'])
+  await expect(page.locator('.ofo-nav__item .ofo-nav__label')).toHaveText(['Dashboard', 'WAN', 'LAN & DHCP', 'Leases', 'Firewall', 'DNS', 'Routes', 'Ports', 'Logs', 'System'])
 
   // 2. Firewall: the grid says what the lab's one LAN may reach; a forward is added, applied
   // and confirmed.

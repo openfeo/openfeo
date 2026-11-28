@@ -192,6 +192,10 @@ const SCENARIOS: &[Scenario] = &[
         run: the_routes_dump_has_the_default_route_and_each_lans_subnet,
     },
     Scenario {
+        name: "the_panel_shows_the_routes_the_ports_and_the_log_in_a_browser",
+        run: the_panel_shows_the_routes_the_ports_and_the_log_in_a_browser,
+    },
+    Scenario {
         name: "the_javascript_client_reads_the_routes_and_the_log_from_the_lan",
         run: the_javascript_client_reads_the_routes_and_the_log_from_the_lan,
     },
@@ -3189,6 +3193,46 @@ fn the_javascript_client_reads_the_routes_and_the_log_from_the_lan(
     ctl.serve_while(
         vitest,
         &lab.run_dir.join("client-views-itest.log"),
+        Duration::from_secs(300),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// The views in a real browser (SPEC §8.4, M4 part 3c; `web/panel/e2e/views.spec.ts`): Routes
+/// shows the default route as the WAN's and the LAN's subnet on its bridge; Ports shows the
+/// WAN's port up and a LAN port whose counter moves when the page fetches something; on Logs
+/// the line of a cut ISP appears without a reload, Errors hides it, a text in another case
+/// finds it, Pause holds what arrives while the ISP returns, and Download saves a file of
+/// every level that has the line. Skipped as the other browser scenarios are.
+fn the_panel_shows_the_routes_the_ports_and_the_log_in_a_browser(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    web::ready()?;
+    boot(lab, "")?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    web::settle(&lab.lan0, "lan0")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "views.spec",
+        ])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e-views"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright-views.log"),
         Duration::from_secs(300),
         |verb| lab_verb(lab, &mut qmp, verb),
     )?;
