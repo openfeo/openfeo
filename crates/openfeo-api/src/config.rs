@@ -1131,10 +1131,11 @@ mod tests {
         assert!(refused.shared.check_config(moved(dhcp())).await.is_ok());
     }
 
-    /// A restart is not a change of config, and one that is pending does not stand in its
-    /// way: the router comes back on the confirmed config (SPEC §5.5, §6.3).
+    /// A restart is not a change of config: with one pending, the router is still asked to
+    /// restart, once. (`reboot` cannot refuse, so this holds it to asking; that the router
+    /// then comes back on the confirmed config is the harness's to show: SPEC §5.5, §6.3.)
     #[tokio::test]
-    async fn a_restart_is_not_refused_while_a_change_is_pending() {
+    async fn a_restart_is_asked_of_the_router_while_a_change_is_pending() {
         let rig = Rig::new(120);
         rig.apply(&moved(dhcp()), false, 0).await.unwrap();
         let _answer = rig.shared.reboot("192.168.1.23".parse().unwrap());
