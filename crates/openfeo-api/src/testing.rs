@@ -128,11 +128,30 @@ impl crate::Restarter for Counted {
     }
 }
 
+/// The routes a test says the kernel holds.
+#[derive(Debug, Default)]
+pub(crate) struct Routes(std::sync::Mutex<Vec<openfeo_config::api::Route>>);
+
+impl Routes {
+    /// From now on the kernel holds these.
+    pub(crate) fn set(&self, routes: Vec<openfeo_config::api::Route>) {
+        *self.0.lock().unwrap() = routes;
+    }
+}
+
+impl crate::RouteSource for Routes {
+    fn routes(&self) -> Vec<openfeo_config::api::Route> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 pub(crate) struct TestApi {
     pub(crate) shared: Arc<Shared>,
     restarter: Arc<Counted>,
     /// The log the API reads: a test writes its lines here.
     pub(crate) log: Arc<Ring>,
+    /// The routes the API answers: a test sets them here.
+    pub(crate) routes: Arc<Routes>,
     pub(crate) https: SocketAddr,
     pub(crate) http: SocketAddr,
     pub(crate) config_path: PathBuf,
@@ -184,6 +203,7 @@ pub(crate) async fn spawn_api_full(
     });
     let restarter = Arc::new(Counted::default());
     let log = Arc::new(Ring::new(DEFAULT_RING_BYTES));
+    let routes = Arc::new(Routes::default());
     let server = Server::bind(ApiDeps {
         world,
         publisher,
@@ -204,6 +224,7 @@ pub(crate) async fn spawn_api_full(
         confirm_secs: crate::keeper::DEFAULT_WINDOW_SECS,
         restarter: restarter.clone(),
         log: log.clone(),
+        routes: routes.clone(),
     })
     .await
     .unwrap();
@@ -219,6 +240,7 @@ pub(crate) async fn spawn_api_full(
         shared,
         restarter,
         log,
+        routes,
         https,
         http,
         config_path,

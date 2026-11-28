@@ -167,6 +167,15 @@ pub struct Boot {
     pub confirm_secs: Option<u32>,
 }
 
+/// The routes of a router that has not been given the kernel's yet.
+struct NoRoutes;
+
+impl openfeo_api::RouteSource for NoRoutes {
+    fn routes(&self) -> Vec<openfeo_config::api::Route> {
+        Vec::new()
+    }
+}
+
 /// Run the API as a supervised task: restarted if it dies, named by health if it will not
 /// stay up, like any other.
 pub fn spawn(
@@ -212,6 +221,8 @@ pub fn spawn(
                 restarter: Arc::new(restarts.clone()),
                 // A ring nothing writes to, until the router hands over its own.
                 log: Arc::new(openfeo_runtime::log::Ring::new(0)),
+                // And routes that are none, until it hands over the kernel's.
+                routes: Arc::new(NoRoutes),
             })
             .await
         }

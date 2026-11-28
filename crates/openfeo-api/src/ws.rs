@@ -187,6 +187,7 @@ pub(crate) async fn perform(
         }
         Some(request::Body::Reboot(_)) => response::Body::Reboot(shared.reboot(at.peer)),
         Some(request::Body::Logs(ask)) => response::Body::Logs(shared.logs(&ask)?),
+        Some(request::Body::DumpRoutes(_)) => response::Body::DumpRoutes(shared.dump_routes()),
         None => {
             return Err(ApiError::new(
                 ErrorCode::InvalidArgument,

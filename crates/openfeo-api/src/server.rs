@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use openfeo_config::Admin;
 use openfeo_config::admin::{ConfigState, write_password_hash};
 use openfeo_config::api::{
-    ErrorCode, GetStatusResponse, LogBatch, LogsRequest, LogsResponse, Session,
+    DumpRoutesResponse, ErrorCode, GetStatusResponse, LogBatch, LogsRequest, LogsResponse, Session,
 };
 use openfeo_config::state::State;
 use openfeo_reconcile::state::{SystemFacts, state};
@@ -209,6 +209,8 @@ pub struct Shared {
     restarter: Arc<dyn crate::Restarter>,
     /// The log the router keeps.
     pub(crate) log: Arc<Ring>,
+    /// Where the kernel's routes are read from.
+    routes: Arc<dyn crate::RouteSource>,
     /// One password change at a time: the check for "no password yet" and the write are one
     /// step.
     password: tokio::sync::Mutex<()>,
@@ -268,6 +270,8 @@ pub struct SharedParts {
     pub restarter: Arc<dyn crate::Restarter>,
     /// The log the router keeps.
     pub log: Arc<Ring>,
+    /// Where the kernel's routes are read from.
+    pub routes: Arc<dyn crate::RouteSource>,
 }
 
 impl Shared {
@@ -295,6 +299,7 @@ impl Shared {
             extra_host: parts.extra_host,
             restarter: parts.restarter,
             log: parts.log,
+            routes: parts.routes,
             limits: parts.limits,
             fingerprint: watch::Sender::new(String::new()),
             sessions_ended: watch::Sender::new(0),
@@ -638,6 +643,14 @@ impl Shared {
         })
     }
 
+    /// Every route the kernel holds (SPEC §8.3, M4 part 3c), as the router follows them.
+    #[must_use]
+    pub fn dump_routes(&self) -> DumpRoutesResponse {
+        DumpRoutesResponse {
+            routes: self.routes.routes(),
+        }
+    }
+
     /// Lines of the log as a push carries them, with the two clocks now.
     #[must_use]
     pub fn log_batch(&self, lines: &[Line]) -> LogBatch {
@@ -785,6 +798,7 @@ pub(crate) mod tests {
             default_window_secs: crate::keeper::DEFAULT_WINDOW_SECS,
             restarter: Arc::new(crate::testing::Counted::default()),
             log: Arc::new(Ring::new(openfeo_runtime::log::DEFAULT_RING_BYTES)),
+            routes: Arc::new(crate::testing::Routes::default()),
         });
         shared.fingerprint.send_replace("AB:CD".to_owned());
         (shared, dir)

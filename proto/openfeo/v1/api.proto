@@ -68,6 +68,7 @@ message Request {
     GetHistoryRequest get_history = 10;
     RebootRequest reboot = 11;
     LogsRequest logs = 12;
+    DumpRoutesRequest dump_routes = 13;
   }
 }
 
@@ -86,6 +87,7 @@ message Response {
     GetHistoryResponse get_history = 10;
     RebootResponse reboot = 11;
     LogsResponse logs = 12;
+    DumpRoutesResponse dump_routes = 13;
   }
 }
 
@@ -358,6 +360,46 @@ service SystemService {
   // The newest lines of the log that match, read back from the router's memory. A caller
   // reaches further back with the number of the oldest line it has (`before_seq`).
   rpc Logs(LogsRequest) returns (LogsResponse);
+}
+
+// ---- Diagnostics ----
+
+enum RouteKind {
+  ROUTE_KIND_UNSPECIFIED = 0;
+  ROUTE_KIND_UNICAST = 1;
+  ROUTE_KIND_UNREACHABLE = 2;
+  ROUTE_KIND_BLACKHOLE = 3;
+  ROUTE_KIND_PROHIBIT = 4;
+  // The kernel's own entries for its addresses, broadcasts and multicast.
+  ROUTE_KIND_LOCAL = 5;
+}
+
+// One route the kernel holds.
+message Route {
+  bool v6 = 1;
+  // `main`, `local`, the name of the WAN whose table it is, or the number.
+  string table = 2;
+  // A block, `192.0.2.0/24`; empty for the default route.
+  string destination = 3;
+  // Empty when the destination is on the link.
+  string gateway = 4;
+  // Empty when the route has none.
+  string interface = 5;
+  // Who put it there: `kernel`, `openfeo`, `ra`, or the number.
+  string protocol = 6;
+  uint32 metric = 7;
+  RouteKind kind = 8;
+}
+
+message DumpRoutesRequest {}
+
+message DumpRoutesResponse {
+  repeated Route routes = 1;
+}
+
+service DiagnosticsService {
+  // Every route the kernel holds, both families and every table, as the router follows them.
+  rpc DumpRoutes(DumpRoutesRequest) returns (DumpRoutesResponse);
 }
 
 // ---- Plain HTTP, before login ----

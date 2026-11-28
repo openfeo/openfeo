@@ -12,13 +12,13 @@ use std::sync::Arc;
 use futures::Stream;
 use openfeo_config::api::{
     ApplyConfigRequest, ApplyConfigResponse, ChangePasswordRequest, ChangePasswordResponse,
-    ConfirmConfigRequest, ConfirmConfigResponse, ErrorCode, GetConfigRequest, GetConfigResponse,
-    GetHistoryRequest, GetHistoryResponse, GetLeasesRequest, GetLeasesResponse, GetStateRequest,
-    GetStateResponse, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, LogsRequest,
-    LogsResponse, RebootRequest, RebootResponse, RevertConfigRequest, RevertConfigResponse,
-    ServerMsg, SetInitialPasswordRequest, SetInitialPasswordResponse, SubscribeRequest,
-    SubscribeResponse, ValidateConfigRequest, ValidateConfigResponse, server_msg,
-    subscribe_response, telemetry,
+    ConfirmConfigRequest, ConfirmConfigResponse, DumpRoutesRequest, DumpRoutesResponse, ErrorCode,
+    GetConfigRequest, GetConfigResponse, GetHistoryRequest, GetHistoryResponse, GetLeasesRequest,
+    GetLeasesResponse, GetStateRequest, GetStateResponse, LoginRequest, LoginResponse,
+    LogoutRequest, LogoutResponse, LogsRequest, LogsResponse, RebootRequest, RebootResponse,
+    RevertConfigRequest, RevertConfigResponse, ServerMsg, SetInitialPasswordRequest,
+    SetInitialPasswordResponse, SubscribeRequest, SubscribeResponse, ValidateConfigRequest,
+    ValidateConfigResponse, server_msg, subscribe_response, telemetry,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,6 +32,7 @@ use crate::limits::EVENT_BACKLOG;
 use crate::logs::LogFeed;
 use crate::pb::auth_service_server::AuthService;
 use crate::pb::config_service_server::ConfigService;
+use crate::pb::diagnostics_service_server::DiagnosticsService;
 use crate::pb::state_service_server::StateService;
 use crate::pb::system_service_server::SystemService;
 use crate::server::{ApiError, Shared};
@@ -341,6 +342,17 @@ impl SystemService for Grpc {
             .logs(request.get_ref())
             .map(Response::new)
             .map_err(|error| status(&error))
+    }
+}
+
+#[tonic::async_trait]
+impl DiagnosticsService for Grpc {
+    async fn dump_routes(
+        &self,
+        request: Request<DumpRoutesRequest>,
+    ) -> Result<Response<DumpRoutesResponse>, Status> {
+        token(&self.shared, &request)?;
+        Ok(Response::new(self.shared.dump_routes()))
     }
 }
 
@@ -912,6 +924,80 @@ mod tests {
             0,
             "and gives it back"
         );
+    }
+
+    fn sample_routes() -> Vec<openfeo_config::api::Route> {
+        use openfeo_config::api::{Route, RouteKind};
+        vec![
+            Route {
+                v6: false,
+                table: "main".to_owned(),
+                destination: String::new(),
+                gateway: "203.0.113.1".to_owned(),
+                interface: "p0".to_owned(),
+                protocol: "openfeo".to_owned(),
+                metric: 10,
+                kind: RouteKind::Unicast.into(),
+            },
+            Route {
+                v6: true,
+                table: "wan0".to_owned(),
+                destination: "2001:db8:1::/48".to_owned(),
+                gateway: String::new(),
+                interface: String::new(),
+                protocol: "openfeo".to_owned(),
+                metric: 1000,
+                kind: RouteKind::Blackhole.into(),
+            },
+        ]
+    }
+
+    /// SPEC §8.3 (M4 part 3c): the dump is what the router's view of the kernel has, whole and
+    /// in its order, on the socket and over gRPC.
+    #[tokio::test]
+    async fn dump_routes_answers_what_the_source_has() {
+        use crate::pb::diagnostics_service_client::DiagnosticsServiceClient;
+        use openfeo_config::api::{DumpRoutesRequest, request, response, server_msg};
+        let (api, token) = crate::testing::TestApi::with_password(PASSWORD).await;
+        let mut diagnostics = DiagnosticsServiceClient::new(api.channel().await);
+        let mut ws = api.ws_with(&token).await;
+        let none = diagnostics
+            .dump_routes(with_token(DumpRoutesRequest {}, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(none.routes, Vec::new());
+        api.routes.set(sample_routes());
+        let over_grpc = diagnostics
+            .dump_routes(with_token(DumpRoutesRequest {}, &token))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(over_grpc.routes, sample_routes());
+        let server_msg::Body::Response(reply) = ws
+            .ask(request::Body::DumpRoutes(DumpRoutesRequest {}))
+            .await
+        else {
+            panic!("not a response");
+        };
+        let Some(response::Body::DumpRoutes(on_the_socket)) = reply.body else {
+            panic!("not the answer to DumpRoutes: {reply:?}");
+        };
+        assert_eq!(on_the_socket.routes, sample_routes());
+    }
+
+    #[tokio::test]
+    async fn dump_routes_needs_a_session() {
+        use crate::pb::diagnostics_service_client::DiagnosticsServiceClient;
+        use openfeo_config::api::DumpRoutesRequest;
+        let (api, _token) = crate::testing::TestApi::with_password(PASSWORD).await;
+        api.routes.set(sample_routes());
+        let mut diagnostics = DiagnosticsServiceClient::new(api.channel().await);
+        let refused = diagnostics
+            .dump_routes(with_token(DumpRoutesRequest {}, ""))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Unauthenticated);
     }
 
     /// SPEC §8.3 (M4 part 3b): `SystemService.Reboot` needs a session like every other call.

@@ -606,6 +606,7 @@ mod tests {
                 default_window_secs: window_secs,
                 restarter: restarter.clone(),
                 log: Arc::new(openfeo_runtime::log::Ring::new(1 << 20)),
+                routes: Arc::new(crate::testing::Routes::default()),
             });
             Rig {
                 shared,
@@ -639,6 +640,7 @@ mod tests {
                 default_window_secs: 120,
                 restarter: self.restarter.clone(),
                 log: Arc::new(openfeo_runtime::log::Ring::new(1 << 20)),
+                routes: Arc::new(crate::testing::Routes::default()),
             })
         }
 
