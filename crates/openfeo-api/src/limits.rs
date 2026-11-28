@@ -25,6 +25,13 @@ pub const MAX_LOG_LINES: usize = 1000;
 /// The most text one `Logs` answer or one push of the log holds, in bytes: half a frame, so
 /// that either fits one with every line's own fields.
 pub const MAX_LOG_BYTES: usize = 512 * 1024;
+/// The most lines one push of the log holds.
+pub const LOG_BATCH: usize = 256;
+/// How many lines behind the newest a reader of the log may be before it is moved up to there
+/// and told that it lost some: the log's own queue, as [`EVENT_QUEUE`] is the events'.
+pub const LOG_QUEUE: u64 = 1024;
+/// The least time between two pushes of the log to one reader.
+pub const LOG_PACE: Duration = Duration::from_millis(100);
 /// The longest text a `Logs` call may look for, in bytes: every line is searched for it while
 /// the log is held still.
 pub const MAX_LOG_CONTAINS: usize = 256;

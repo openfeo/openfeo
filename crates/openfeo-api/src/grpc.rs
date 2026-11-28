@@ -29,6 +29,7 @@ use crate::events::to_pb;
 use crate::http::{Arrival, Local, Peer};
 use crate::keeper::Why;
 use crate::limits::EVENT_BACKLOG;
+use crate::logs::LogFeed;
 use crate::pb::auth_service_server::AuthService;
 use crate::pb::config_service_server::ConfigService;
 use crate::pb::state_service_server::StateService;
@@ -161,8 +162,8 @@ impl AuthService for Grpc {
     }
 }
 
-/// What a push becomes on the stream; word of lost events ends it, so the caller subscribes
-/// again and takes a backlog.
+/// What a push becomes on the stream; word of lost events, or of lost lines of the log, ends
+/// it, so the caller subscribes again (and, for events, takes a backlog).
 fn stream_item(message: ServerMsg) -> Option<Result<SubscribeResponse, Status>> {
     let body = match message.body? {
         server_msg::Body::Event(event) => subscribe_response::Body::Event(event),
@@ -174,6 +175,7 @@ fn stream_item(message: ServerMsg) -> Option<Result<SubscribeResponse, Status>> 
         server_msg::Body::Error(error) => {
             return Some(Err(Status::data_loss(error.message)));
         }
+        server_msg::Body::Logs(batch) => subscribe_response::Body::Logs(batch),
         server_msg::Body::Response(_) => return None,
     };
     Some(Ok(SubscribeResponse { body: Some(body) }))
@@ -204,6 +206,9 @@ async fn feed(
     let mut counters = conn
         .wants(Topic::Counters)
         .then(|| shared.telemetry.subscribe());
+    let mut logs = conn
+        .wants(Topic::Logs)
+        .then(|| LogFeed::from_now(&shared.log));
     if conn.wants(Topic::Events) {
         for event in shared.backlog(backlog.min(u32::try_from(EVENT_BACKLOG).unwrap_or(u32::MAX))) {
             conn.push_event(&event);
@@ -245,6 +250,12 @@ async fn feed(
                 Some(sample) => conn.push_counters(&sample),
                 None => return,
             },
+            batch = async {
+                match logs.as_mut() {
+                    Some(feed) => feed.next().await,
+                    None => std::future::pending().await,
+                }
+            } => conn.push_logs(shared.log_batch(&batch.lines), batch.lost),
             changed = ended.changed() => {
                 if changed.is_err() || !shared.session_is_live(&token) {
                     let _ = tx.send(Err(Status::unauthenticated("the session ended"))).await;

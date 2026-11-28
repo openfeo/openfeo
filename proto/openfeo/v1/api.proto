@@ -33,6 +33,8 @@ message ServerMsg {
     Event event = 3;
     Telemetry telemetry = 4;
     Error error = 5;
+    // Lines of the log, to a subscriber of `logs`; queued, as an event is.
+    LogBatch logs = 6;
   }
 }
 
@@ -42,7 +44,7 @@ message Auth {
 }
 
 message Subscribe {
-  // `state`, `leases`, `counters` or `events`.
+  // `state`, `leases`, `counters`, `events` or `logs`.
   string topic = 1;
   // For `events`: send this many recent events first.
   uint32 backlog = 2;
@@ -115,6 +117,8 @@ message Error {
   string message = 2;
   // With RESOURCE_EXHAUSTED after a wrong password: how long to wait.
   uint32 retry_after_secs = 3;
+  // With DATA_LOSS on a socket: the topic whose pushes were dropped, `events` or `logs`.
+  string topic = 4;
 }
 
 // ---- Authentication ----
@@ -200,6 +204,7 @@ message SubscribeResponse {
     Counters counters = 2;
     Event event = 3;
     Leases leases = 4;
+    LogBatch logs = 5;
   }
 }
 
@@ -309,6 +314,17 @@ message LogLine {
   // `message key=value`: the line without its priority and without the `openfeo:` that the
   // console's copy begins with.
   string text = 4;
+}
+
+// Lines of the log written since the subscription to `logs`, or since the batch before: at
+// most 256 lines and 512 KiB of text, and at most ten batches a second. A reader more than
+// 1024 lines behind is moved up to there and told DATA_LOSS.
+message LogBatch {
+  // Oldest first.
+  repeated LogLine lines = 1;
+  // The router's two clocks now, as in LogsResponse.
+  uint64 uptime_ms = 2;
+  uint64 time_unix_ms = 3;
 }
 
 message LogsRequest {

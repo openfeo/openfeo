@@ -13,11 +13,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openfeo_config::Admin;
 use openfeo_config::admin::{ConfigState, write_password_hash};
-use openfeo_config::api::{ErrorCode, GetStatusResponse, LogsRequest, LogsResponse, Session};
+use openfeo_config::api::{
+    ErrorCode, GetStatusResponse, LogBatch, LogsRequest, LogsResponse, Session,
+};
 use openfeo_config::state::State;
 use openfeo_reconcile::state::{SystemFacts, state};
 use openfeo_runtime::clock::boot_ms;
-use openfeo_runtime::log::{Filter, Ring};
+use openfeo_runtime::log::{Filter, Line, Ring};
 use openfeo_runtime::{Publisher, WorldRx};
 use openfeo_world::health::HealthView;
 use tokio::sync::watch;
@@ -106,6 +108,7 @@ impl ApiError {
             code: self.code.into(),
             message: self.message.clone(),
             retry_after_secs: self.retry_after_secs,
+            topic: String::new(),
         }
     }
 }
@@ -633,6 +636,17 @@ impl Shared {
             uptime_ms,
             time_unix_ms,
         })
+    }
+
+    /// Lines of the log as a push carries them, with the two clocks now.
+    #[must_use]
+    pub fn log_batch(&self, lines: &[Line]) -> LogBatch {
+        let (uptime_ms, time_unix_ms) = self.clocks();
+        LogBatch {
+            lines: lines.iter().map(to_pb).collect(),
+            uptime_ms,
+            time_unix_ms,
+        }
     }
 
     /// Every LAN's leases now (SPEC §8.3), on the clock [`Self::state`] uses.
