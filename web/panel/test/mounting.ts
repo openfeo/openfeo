@@ -24,8 +24,8 @@ export function signedIn(): FakeRouter {
 
 const wrappers: VueWrapper[] = []
 
-/** The panel at `path`. Anything a component threw is in `errors`. */
-export async function panelAt(path: string, router: FakeRouter = signedIn()) {
+/** The panel at `path`, with anything more a test hands its pages in `provided`. Anything a component threw is in `errors`. */
+export async function panelAt(path: string, router: FakeRouter = signedIn(), provided: Record<symbol, unknown> = {}) {
   const session = useSession(router)
   await session.refresh()
   const routes = panelRoutes(session, createMemoryHistory())
@@ -34,7 +34,7 @@ export async function panelAt(path: string, router: FakeRouter = signedIn()) {
   const wrapper = mount(App, {
     global: {
       plugins: [routes],
-      provide: { [ROUTER as symbol]: router, [SESSION as symbol]: session },
+      provide: { [ROUTER as symbol]: router, [SESSION as symbol]: session, ...provided },
       config: { errorHandler: (error) => errors.push(error) },
     },
     attachTo: document.body,

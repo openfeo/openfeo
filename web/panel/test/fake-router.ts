@@ -106,8 +106,8 @@ export class FakeRouter implements PanelRouter {
   revertAnswer: Reverted | RouterError = { answered: true }
   /** The routes the kernel holds: `dumpRoutes` answers them, throws, or asks a test for each answer. */
   routesNow: Route[] | RouterError | (() => Promise<Route[]>) = []
-  /** What `logs` answers for what it was asked: lines, or a refusal. */
-  logsNow: (ask: LogsAsk) => LogsResponse | RouterError = () => create(LogsResponseSchema, {})
+  /** What `logs` answers for what it was asked: lines, a refusal, or an answer a test gives when it chooses. */
+  logsNow: (ask: LogsAsk) => LogsResponse | RouterError | Promise<LogsResponse> = () => create(LogsResponseSchema, {})
   /** The refusal `changePassword` throws, when it does. */
   changeRefusal: RouterError | null = null
   /** The refusal `reboot` throws, when it does. */
@@ -278,7 +278,7 @@ export class FakeRouter implements PanelRouter {
     if (answer instanceof RouterError) {
       throw answer
     }
-    return answer
+    return await answer
   }
 
   subscribe(topic: 'state', onPush: (state: State) => void): Subscription

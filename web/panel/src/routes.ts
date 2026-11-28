@@ -17,6 +17,7 @@ import FirstPassword from './pages/FirstPassword.vue'
 import Lan from './pages/Lan.vue'
 import Leases from './pages/Leases.vue'
 import Login from './pages/Login.vue'
+import Logs from './pages/Logs.vue'
 import Ports from './pages/Ports.vue'
 import Routes from './pages/Routes.vue'
 import System from './pages/System.vue'
@@ -41,6 +42,7 @@ export const PAGES = {
   dns: '/dns',
   routes: '/routes',
   ports: '/ports',
+  logs: '/logs',
   system: '/system',
 } as const
 
@@ -72,6 +74,7 @@ export function panelRoutes(session: PanelSession, history: RouterHistory = crea
           { path: 'dns', component: Dns },
           { path: 'routes', component: Routes },
           { path: 'ports', component: Ports },
+          { path: 'logs', component: Logs },
           { path: 'system', component: System },
         ],
       },
