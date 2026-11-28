@@ -92,9 +92,9 @@ pub fn write_password_hash(path: &Path, hash: &str, ports: &PortMap) -> Result<(
     };
     let rendered = match fs::read_to_string(path) {
         Ok(text) => {
-            let mut doc: DocumentMut = text
-                .parse()
-                .map_err(|err: toml_edit::TomlError| ConfigError::Toml(err.to_string()))?;
+            let mut doc: DocumentMut = text.parse().map_err(|err: toml_edit::TomlError| {
+                crate::file::syntax(&text, err.message(), err.span())
+            })?;
             let admin = doc
                 .entry("admin")
                 .or_insert_with(|| Item::Table(Table::new()));
@@ -201,6 +201,25 @@ mod tests {
         fs::write(&path, "config_version = = 1\n").unwrap();
         assert!(write_password_hash(&path, HASH, &PortMap::default()).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "config_version = = 1\n");
+    }
+
+    /// SPEC §9: the error a broken file earns is logged, and says where it broke without the
+    /// line it broke on, which may be the one with a password.
+    #[test]
+    fn a_broken_file_is_refused_without_its_line_being_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let before = "config_version = 1\n[[wans]]\nname = \"wan0\"\n[wans.pppoe]\nusername = \"user@isp.example\"\npassword = \"hunter2-with-a-\"-in-it\"\n";
+        fs::write(&path, before).unwrap();
+        let Err(ConfigError::Toml(said)) = write_password_hash(&path, HASH, &PortMap::default())
+        else {
+            panic!("a file that is not TOML was written to");
+        };
+        assert!(said.starts_with("line 6, column "), "{said}");
+        for held in ["hunter2", "in-it", "password"] {
+            assert!(!said.contains(held), "the error repeats the line: {said}");
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]
