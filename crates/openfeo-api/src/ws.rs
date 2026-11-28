@@ -238,8 +238,6 @@ struct Newly {
 }
 
 impl Feeds {
-    /// Take up or drop the counters as the connection wants them, and say which of `state`
-    /// and `leases` it has just subscribed to.
     /// Take a place in the log for a connection that has just subscribed to it, and give it
     /// up for one that no longer is.
     fn follow_log(&mut self, conn: &Conn, shared: &Shared) {
@@ -250,6 +248,8 @@ impl Feeds {
         }
     }
 
+    /// Take up or drop the counters as the connection wants them, and say which of `state`
+    /// and `leases` it has just subscribed to.
     fn follow(&mut self, conn: &Conn, shared: &Arc<Shared>) -> Newly {
         match (conn.wants(Topic::Counters), self.counters.is_some()) {
             (true, false) => self.counters = Some(shared.telemetry.subscribe()),
