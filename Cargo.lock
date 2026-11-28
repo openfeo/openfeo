@@ -1667,6 +1667,7 @@ version = "0.1.0"
 dependencies = [
  "openfeo-config",
  "openfeo-world",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",
