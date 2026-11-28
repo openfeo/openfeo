@@ -92,7 +92,7 @@ pub fn run(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Result<()> {
 }
 
 async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Result<()> {
-    init_logging();
+    let log = init_logging();
     info!("router mode={mode} version={version}");
 
     let hung = Arc::new(AtomicBool::new(false));
@@ -174,6 +174,8 @@ async fn main_async(mode: Mode, cmdline: &Cmdline, version: &str) -> anyhow::Res
             version: version.to_owned(),
             extra_host: crate::panel_host::from_cmdline(cmdline),
             confirm_secs: crate::confirm_secs::from_cmdline(cmdline),
+            log,
+            cache: cache_rx.clone(),
         },
         restarts,
     );
@@ -313,17 +315,19 @@ fn load_identity() -> Identity {
     Identity { ipv6_secret, ula }
 }
 
-/// `tracing` into the 8 MiB ring and `/dev/kmsg` (stderr when that is not openable).
-fn init_logging() {
+/// `tracing` into the 8 MiB ring and `/dev/kmsg` (stderr when that is not openable). The
+/// ring, for the API to read (SPEC §8.3).
+fn init_logging() -> Arc<Ring> {
     let ring = Arc::new(Ring::new(DEFAULT_RING_BYTES));
     let kmsg = std::fs::OpenOptions::new()
         .write(true)
         .open(KMSG)
         .ok()
         .map(|file| Box::new(file) as Box<dyn std::io::Write + Send>);
-    if let Err(err) = openfeo_runtime::log::init("openfeo", ring, kmsg) {
+    if let Err(err) = openfeo_runtime::log::init("openfeo", ring.clone(), kmsg) {
         let _ = writeln!(std::io::stderr(), "openfeo: logging: {err}");
     }
+    ring
 }
 
 fn spawn_chaos(knob: Chaos, hung: Arc<AtomicBool>) {

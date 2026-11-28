@@ -15,9 +15,10 @@ use openfeo_api::telemetry::CounterSource;
 use openfeo_api::{ApiDeps, Limits, Listen};
 use openfeo_config::admin::ConfigState;
 use openfeo_config::state::{Counters, LinkCounters};
-use openfeo_netlink::{LinkStats, Netlink};
+use openfeo_netlink::{Cache, LinkStats, Netlink};
 use openfeo_platform::sysctl;
 use openfeo_runtime::clock::boot_ms;
+use openfeo_runtime::log::Ring;
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{Publisher, Supervisor};
 use openfeo_world::health::HealthView;
@@ -25,6 +26,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::router::CONFIG_PATH;
+use crate::routes::RouterRoutes;
 use crate::version::build_epoch;
 
 /// Where the listener's certificate and key are kept (SPEC §9).
@@ -165,15 +167,10 @@ pub struct Boot {
     /// A shorter window for a change of config, in a harness build ([`crate::confirm_secs`]);
     /// always `None` in a release build, which waits the 120 s of SPEC §5.5.
     pub confirm_secs: Option<u32>,
-}
-
-/// The routes of a router that has not been given the kernel's yet.
-struct NoRoutes;
-
-impl openfeo_api::RouteSource for NoRoutes {
-    fn routes(&self) -> Vec<openfeo_config::api::Route> {
-        Vec::new()
-    }
+    /// The router's log, for `SystemService.Logs` and the topic `logs`.
+    pub log: Arc<Ring>,
+    /// The netlink monitor's view of the kernel, for `DiagnosticsService.DumpRoutes`.
+    pub cache: watch::Receiver<Arc<Cache>>,
 }
 
 /// Run the API as a supervised task: restarted if it dies, named by health if it will not
@@ -198,7 +195,10 @@ pub fn spawn(
             version,
             extra_host,
             confirm_secs,
+            log,
+            cache,
         } = boot.clone();
+        let routes = Arc::new(RouterRoutes::new(cache, world.clone()));
         async move {
             openfeo_api::run(ApiDeps {
                 world,
@@ -219,10 +219,8 @@ pub fn spawn(
                 extra_host,
                 confirm_secs: confirm_secs.unwrap_or(openfeo_api::keeper::DEFAULT_WINDOW_SECS),
                 restarter: Arc::new(restarts.clone()),
-                // A ring nothing writes to, until the router hands over its own.
-                log: Arc::new(openfeo_runtime::log::Ring::new(0)),
-                // And routes that are none, until it hands over the kernel's.
-                routes: Arc::new(NoRoutes),
+                log,
+                routes,
             })
             .await
         }
