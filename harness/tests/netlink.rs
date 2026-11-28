@@ -85,6 +85,10 @@ const SCENARIOS: &[Scenario] = &[
         run: addr_and_route_primitives,
     },
     Scenario {
+        name: "a_removed_link_takes_its_routes_out_of_the_cache",
+        run: a_removed_link_takes_its_routes_out_of_the_cache,
+    },
+    Scenario {
         name: "an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time",
         run: an_address_with_lifetimes_is_deprecated_by_the_kernel_on_time,
     },
@@ -965,6 +969,75 @@ fn addr_and_route_primitives(_lab: &mut Lab) -> anyhow::Result<()> {
         anyhow::Ok(())
     });
     let _ = netns::ip(&["link", "del", "rv0"]);
+    result?
+}
+
+/// A link that is removed takes the routes through it with it, and the cache must not go on
+/// holding them (ADR-0027): the kernel does not announce the IPv4 routes it drops with a link,
+/// so a cache that waits to be told lists, for ever, a route through an interface that is gone.
+fn a_removed_link_takes_its_routes_out_of_the_cache(_lab: &mut Lab) -> anyhow::Result<()> {
+    let _ = netns::ip(&["link", "del", "gone0"]);
+    netns::ip(&[
+        "link", "add", "gone0", "type", "veth", "peer", "name", "gone1",
+    ])?;
+    netns::ip(&["link", "set", "gone1", "up"])?;
+    netns::ip(&["link", "set", "gone0", "up"])?;
+    let result = block_on(async {
+        let (nl, monitor) = Netlink::connect().await?;
+        let mut rx = monitor.subscribe();
+        tokio::spawn(monitor.run());
+        let gone0 = rx.borrow().link_by_name("gone0").context("gone0")?.index;
+        let net: IpNet = "192.0.2.1/24".parse()?;
+        nl.addr_add(gone0, net).await?;
+        wait_until(&mut rx, "192.0.2.1/24 on gone0", |c| {
+            c.addrs.iter().any(|a| a.ifindex == gone0 && a.net == net)
+        })
+        .await?;
+        let route = Route {
+            v6: false,
+            table: TABLE_MAIN,
+            dst: Some("198.51.100.0/24".parse()?),
+            gateway: Some("192.0.2.2".parse()?),
+            oif: Some(gone0),
+            protocol: RTPROT_OPENFEO,
+            priority: 10,
+            kind: RouteKind::Unicast,
+            pref_src: None,
+        };
+        nl.route_add(&route).await?;
+        wait_until(&mut rx, "the route through gone0", |c| {
+            c.routes.contains(&route)
+        })
+        .await?;
+        nl.link_del(gone0).await?;
+        wait_until(&mut rx, "gone0 gone", |c| c.link_by_name("gone0").is_none()).await?;
+        // The kernel no longer has the route, said or unsaid.
+        let shown = netns::ip(&["route", "show", "198.51.100.0/24"])?;
+        ensure!(
+            shown.trim().is_empty(),
+            "the kernel kept the route: {shown}"
+        );
+        let through_it = |c: &Cache| -> Vec<String> {
+            c.routes
+                .iter()
+                .filter(|r| r.oif == Some(gone0))
+                .map(openfeo_netlink::describe)
+                .collect()
+        };
+        if wait_until(&mut rx, "no route through gone0", |c| {
+            through_it(c).is_empty()
+        })
+        .await
+        .is_err()
+        {
+            anyhow::bail!(
+                "the cache still holds routes through a link that is gone: {:?}",
+                through_it(&rx.borrow())
+            );
+        }
+        anyhow::Ok(())
+    });
+    let _ = netns::ip(&["link", "del", "gone0"]);
     result?
 }
 

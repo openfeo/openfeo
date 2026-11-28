@@ -520,6 +520,8 @@ pub fn describe(route: &Route) -> String {
         RouteKind::Unicast => String::new(),
         RouteKind::Blackhole => "blackhole ".to_owned(),
         RouteKind::Unreachable => "unreachable ".to_owned(),
+        RouteKind::Prohibit => "prohibit ".to_owned(),
+        RouteKind::Local => "local ".to_owned(),
     };
     text.push_str(
         &route
@@ -561,6 +563,8 @@ fn route_message_builder(route: &Route) -> RouteMessage {
         RouteKind::Unicast => RouteType::Unicast,
         RouteKind::Blackhole => RouteType::BlackHole,
         RouteKind::Unreachable => RouteType::Unreachable,
+        RouteKind::Prohibit => RouteType::Prohibit,
+        RouteKind::Local => RouteType::Local,
     };
     if route.v6 {
         let mut builder = RouteMessageBuilder::<Ipv6Addr>::new()

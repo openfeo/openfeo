@@ -306,6 +306,9 @@ fn describe(route: &Route, ifname: &str) -> String {
         RouteKind::Unicast => String::new(),
         RouteKind::Blackhole => "blackhole ".to_owned(),
         RouteKind::Unreachable => "unreachable ".to_owned(),
+        // Kinds the router never installs, said as what they are if one is ever described.
+        RouteKind::Prohibit => "prohibit ".to_owned(),
+        RouteKind::Local => "local ".to_owned(),
     };
     text.push_str(
         &route

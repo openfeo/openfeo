@@ -111,6 +111,12 @@ pub enum RouteKind {
     /// `RTN_UNREACHABLE`: dropped with an ICMP destination unreachable, no interface (a down
     /// WAN's default, SPEC §7.3).
     Unreachable,
+    /// `RTN_PROHIBIT`: dropped with an ICMP administratively prohibited, no interface. The
+    /// router installs none; one put there by hand is reported as what it is.
+    Prohibit,
+    /// `RTN_LOCAL`, `RTN_BROADCAST`, `RTN_ANYCAST` and `RTN_MULTICAST`: the kernel's own
+    /// entries for the addresses it holds, each on its interface. The router installs none.
+    Local,
 }
 
 /// What a policy rule does with a packet it matches (`FR_ACT_*`).

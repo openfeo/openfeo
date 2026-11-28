@@ -216,7 +216,12 @@ fn apply_link(cache: &mut Cache, msg: &LinkMessage, present: bool) -> bool {
     if present {
         cache.links.insert(link.index, link.clone()) != Some(link)
     } else {
-        cache.links.remove(&link.index).is_some()
+        // Whatever was routed through a link is gone with it, and the kernel does not say so
+        // for the IPv4 routes (ADR-0027). The IPv6 deletions it does announce find nothing.
+        let routes = cache.routes.len();
+        cache.routes.retain(|route| route.oif != Some(link.index));
+        let had_link = cache.links.remove(&link.index).is_some();
+        had_link || cache.routes.len() != routes
     }
 }
 
@@ -413,6 +418,10 @@ fn route_from(msg: &RouteMessage) -> Option<Route> {
         kind: match msg.header.kind {
             RouteType::BlackHole => RouteKind::Blackhole,
             RouteType::Unreachable => RouteKind::Unreachable,
+            RouteType::Prohibit => RouteKind::Prohibit,
+            RouteType::Local | RouteType::Broadcast | RouteType::Anycast | RouteType::Multicast => {
+                RouteKind::Local
+            }
             _ => RouteKind::Unicast,
         },
         pref_src: None,
@@ -431,9 +440,13 @@ fn route_from(msg: &RouteMessage) -> Option<Route> {
             _ => {}
         }
     }
-    // The kernel reports an IPv6 blackhole or unreachable route with `lo` as its device where
-    // the IPv4 one has none (ADR-0020); neither has an interface either way.
-    if route.kind != RouteKind::Unicast {
+    // The kernel reports an IPv6 route that refuses (blackhole, unreachable, prohibit) with
+    // `lo` as its device where the IPv4 one has none (ADR-0020); none has an interface either
+    // way. A unicast route and one of the kernel's own entries leave by theirs.
+    if matches!(
+        route.kind,
+        RouteKind::Blackhole | RouteKind::Unreachable | RouteKind::Prohibit
+    ) {
         route.oif = None;
     }
     Some(route)
@@ -483,5 +496,82 @@ mod tests {
             .retain(|a| !matches!(a, AddressAttribute::CacheInfo(_)));
         let addr = addr_from(&plain).expect("an address");
         assert_eq!((addr.preferred_until_ms, addr.valid_until_ms), (None, None));
+    }
+
+    /// A route message of `kind` to 192.0.2.0/24 that names interface 7.
+    fn route_of(kind: RouteType) -> RouteMessage {
+        let mut msg = RouteMessage::default();
+        msg.header.address_family = AddressFamily::Inet;
+        msg.header.destination_prefix_length = 24;
+        msg.header.kind = kind;
+        msg.attributes.push(RouteAttribute::Destination(
+            "192.0.2.0".parse::<Ipv4Addr>().unwrap().into(),
+        ));
+        msg.attributes.push(RouteAttribute::Oif(7));
+        msg
+    }
+
+    /// The local table's entries for an address, its broadcasts and multicast were read as
+    /// unicast routes; they are the kernel's own, and each belongs to an interface.
+    #[test]
+    fn the_kernels_own_entries_are_local_and_keep_their_interface() {
+        for kind in [
+            RouteType::Local,
+            RouteType::Broadcast,
+            RouteType::Anycast,
+            RouteType::Multicast,
+        ] {
+            let route = route_from(&route_of(kind)).expect("a route");
+            assert_eq!(route.kind, RouteKind::Local, "{kind:?}");
+            assert_eq!(route.oif, Some(7), "{kind:?}");
+        }
+        let unicast = route_from(&route_of(RouteType::Unicast)).expect("a route");
+        assert_eq!((unicast.kind, unicast.oif), (RouteKind::Unicast, Some(7)));
+    }
+
+    /// Like the two other kinds that refuse, whatever device the kernel reports (ADR-0020).
+    #[test]
+    fn a_prohibit_route_is_its_own_kind_and_has_no_interface() {
+        let route = route_from(&route_of(RouteType::Prohibit)).expect("a route");
+        assert_eq!((route.kind, route.oif), (RouteKind::Prohibit, None));
+        for (kind, wanted) in [
+            (RouteType::BlackHole, RouteKind::Blackhole),
+            (RouteType::Unreachable, RouteKind::Unreachable),
+        ] {
+            let route = route_from(&route_of(kind)).expect("a route");
+            assert_eq!((route.kind, route.oif), (wanted, None));
+        }
+    }
+
+    /// The kernel says nothing of the IPv4 routes it drops with a link (ADR-0027): whatever
+    /// was routed through a link that is removed is gone with it.
+    #[test]
+    fn a_link_that_goes_takes_its_routes_with_it() {
+        let through = |oif: u32| Route {
+            oif: Some(oif),
+            ..route_from(&route_of(RouteType::Unicast)).expect("a route")
+        };
+        let mut cache = Cache::default();
+        let mut link = LinkMessage::default();
+        link.header.index = 7;
+        assert!(apply(
+            &mut cache,
+            &RouteNetlinkMessage::NewLink(link.clone())
+        ));
+        cache.routes.insert(through(7));
+        cache.routes.insert(through(8));
+        assert!(apply(
+            &mut cache,
+            &RouteNetlinkMessage::DelLink(link.clone())
+        ));
+        assert_eq!(
+            cache.routes.into_iter().collect::<Vec<_>>(),
+            vec![through(8)]
+        );
+        // A link the cache never had, with a route left through it all the same.
+        let mut cache = Cache::default();
+        cache.routes.insert(through(7));
+        assert!(apply(&mut cache, &RouteNetlinkMessage::DelLink(link)));
+        assert!(cache.routes.is_empty());
     }
 }
