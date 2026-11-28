@@ -56,7 +56,10 @@ pub struct Halt {
 impl Halt {
     /// Have the manager stop every instance, each as any stop is (its goodbye, `STOP_GRACE` at
     /// most), start nothing after, and leave what they published in the World. Returns once
-    /// they have stopped or been dropped. A manager that is not running has nothing to stop.
+    /// they have stopped or been dropped. A manager that is busy stopping instances for a
+    /// change of config finishes that first and starts none of their replacements; one that
+    /// the supervisor is about to start again takes the ask when it starts, before anything
+    /// else; one the supervisor has given up for good has nothing to stop.
     pub async fn halt(&self) {
         let (done, stopped) = oneshot::channel();
         if self.ask.send(done).await.is_ok() {
@@ -80,6 +83,12 @@ impl Halting {
             Some(done) => done,
             None => std::future::pending().await,
         }
+    }
+
+    /// A halt that has been asked and not yet taken, without waiting for one.
+    fn waiting(&self) -> Option<oneshot::Sender<()>> {
+        // One manager at a time holds the asks, and this is it: the lock is free.
+        self.asks.try_lock().ok()?.try_recv().ok()
     }
 }
 
@@ -177,6 +186,12 @@ async fn manage<F: Family>(
             // The World may have moved on while they stopped: look again before starting.
             continue;
         }
+        // Asked while this was busy above, or before it began: nothing more is started.
+        if let Some(halting) = &halting
+            && let Some(done) = halting.waiting()
+        {
+            return halt_now(F::PREFIX, running, done, halting).await;
+        }
         for (key, slice) in wanted {
             if running.contains_key(&key) {
                 continue;
@@ -203,19 +218,27 @@ async fn manage<F: Family>(
                 let Some(halting) = &halting else {
                     continue;
                 };
-                halting.halted.store(true, Ordering::SeqCst);
-                let stops: Vec<_> = std::mem::take(&mut running)
-                    .into_values()
-                    .map(|(_, task)| task.stop())
-                    .collect();
-                futures::future::join_all(stops).await;
-                debug!("{}: halted", F::PREFIX);
-                // Whoever asked may have stopped waiting; the family is halted all the same.
-                let _ = done.send(());
-                return halted(halting).await;
+                return halt_now(F::PREFIX, running, done, halting).await;
             }
         }
     }
+}
+
+/// Halt: stop every instance that is running, together, say so to whoever asked, and stay
+/// halted for ever.
+async fn halt_now<S>(
+    prefix: &str,
+    running: BTreeMap<String, (S, Stoppable)>,
+    done: oneshot::Sender<()>,
+    halting: &Halting,
+) -> Result<(), TaskError> {
+    halting.halted.store(true, Ordering::SeqCst);
+    let stops: Vec<_> = running.into_values().map(|(_, task)| task.stop()).collect();
+    futures::future::join_all(stops).await;
+    debug!("{prefix}: halted");
+    // Whoever asked may have stopped waiting; the family is halted all the same.
+    let _ = done.send(());
+    halted(halting).await
 }
 
 /// A halted manager: it answers whoever asks again, and does nothing else, for ever.
@@ -610,6 +633,66 @@ mod tests {
             *other_log.lock().unwrap(),
             ["started wan0 10", "started wan1 20"],
             "the other family was not stopped and is still managed"
+        );
+    }
+
+    /// SPEC §6.3: nothing is started in their place. A halt that arrives while the manager
+    /// is stopping an instance for a change of config must not find that instance's
+    /// replacement started: on a PPPoE WAN that is a new discovery begun as the router goes.
+    #[tokio::test(start_paused = true)]
+    async fn a_halt_asked_while_an_instance_stops_for_a_change_starts_nothing_in_its_place() {
+        let (rig, halt) = haltable(&[("wan0", 10), ("wan1", 20)], Duration::from_secs(2));
+        settle().await;
+        // wan0's slice changes: the manager begins to stop it, which takes two seconds.
+        rig.reconfigure(&[("wan0", 11), ("wan1", 20)]).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let halted = tokio::spawn(async move { halt.halt().await });
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(halted.is_finished(), "the halt was answered");
+        assert_eq!(
+            rig.log(),
+            [
+                "started wan0 10",
+                "started wan1 20",
+                "stopped wan0",
+                "stopped wan1"
+            ],
+            "the changed instance was not started again, and the other was stopped with it"
+        );
+    }
+
+    /// A manager that the supervisor starts again (it failed, and waited its turn) with a halt
+    /// already asked takes the ask before anything else, and starts nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_manager_that_starts_with_a_halt_already_asked_starts_nothing() {
+        let (publisher, world_rx) =
+            Publisher::new(World::new(config(&[("wan0", 10)]), PortMap::default()));
+        let publisher = Arc::new(publisher);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let family = Arc::new(Fake {
+            log: log.clone(),
+            slow: Duration::ZERO,
+            gone: Arc::new(AtomicBool::new(false)),
+        });
+        let supervisor = Supervisor::new(HealthTracker::new());
+        let (halt, halting) = halting();
+        // Asked while no manager is running: the ask waits for the one that comes.
+        let asked = tokio::spawn(async move { halt.halt().await });
+        settle().await;
+        assert!(!asked.is_finished(), "nobody has taken the ask yet");
+        let _manager = tokio::spawn(manage(
+            family,
+            supervisor,
+            publisher,
+            world_rx,
+            Some(halting),
+        ));
+        settle().await;
+        assert!(asked.is_finished(), "the manager that came took it");
+        assert_eq!(
+            *log.lock().unwrap(),
+            Vec::<String>::new(),
+            "and started nothing"
         );
     }
 

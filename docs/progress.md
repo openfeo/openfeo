@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | parts 1 and 2 of 5, and 3a and 3b, 2026-11-24 | #68, #81, #101, #103, #128, #132; follow-ups #124, #129 |
+| M4 API and panel | parts 1, 2 and 3 of 5, 2026-11-28 | #68, #81, #101, #103, #128, #132, #135; follow-ups #124, #129, #134 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -385,7 +385,45 @@ first, the script was run against an empty cache before and after, and a crate w
 cannot be read stops the build where it used to be left out. And the wait a wrong current
 password earns stopped being said once the password was retyped, while the button stayed held:
 it is said for as long as the button is. libnftnl's label is the one its sources carry,
-GPL-2.0-or-later. Slice 3c (the views: Routes, Ports, Logs) follows.
+GPL-2.0-or-later.
+
+**2026-11-28, [#135](https://github.com/openfeo/openfeo/pull/135), M4 part 3c: views.** The last
+of part 3's three slices, and with it part 3: Routes, Ports and Logs, and what the router had to
+gain for them. The log ring keeps each line as a record (a number that only grows, the time
+since the kernel booted, its level, its text), can be read on from a number, read back under one
+rule for level and text, and waited on; a line is one line of at most 16 KiB, and other crates'
+lines are kept from INFO up, since the HTTP/2 library writes a DEBUG line for every frame.
+`SystemService` gains `Logs`, and there is a topic `logs`: a reader keeps its place in the ring
+by number and holds no queue, and one more than 1024 lines behind is moved up and told
+(`DATA_LOSS`, which now names its topic). `DiagnosticsService` begins with `DumpRoutes`: every
+route the kernel holds, through a trait the router implements over the netlink monitor's cache,
+which learns the two kinds of route it had folded into unicast. `@openfeo/client` has the three
+calls and the router's rule again in TypeScript, held to the same cases; `@openfeo/ui` has
+`OfoCode`. Routes lists the main table and each WAN's own with whose each route is; Ports is the
+strip and a table with each port's bytes since the router started; Logs follows the log, filters
+by level and text, pauses, reaches back, and downloads the whole of it as a file. Proven by
+1176 unit tests on the Rust side and 674 on the web side, and by 218 harness scenarios in all,
+eight of them new. Five are `m4`'s (49 in all): the dump with the ISP cut and returned; the log
+read by level and text, read back whole a page at a time and followed through a cut ISP; the
+whole log read for the lab's passwords and tokens; the client's own run under Node; and
+Playwright's Chromium on the three pages, with the log downloaded under the page's content
+security policy as it stands. The other three are below. Two kernel quirks came out of it
+(ADR-0027). The kernel does not
+announce the routes it drops with a link, which left a returned PPPoE session's old routes in
+the cache; and, found by the whole-branch review, nor those it drops with a link's last IPv4
+address. That one was older than this work and did harm: a DHCP lease that ran out took the
+default route out of the kernel and left it in the cache, and when the lease came back the
+applier did not add it again, so the WAN was up by the router's own account and nothing was
+routed. A sandbox scenario shows the kernel doing each, and an `m1` scenario lets a lease run
+out and come back: it failed before the fix ("the default route was added 1 times, not once
+for each lease"). The review found two more things, fixed in the
+same pull request: a line could show twice when the filter was changed while the view was
+paused; and a config file that does not parse was refused in the parser's own words, which
+print the line it stopped on, so a line with a password could reach the log, which the panel
+now reads and downloads. An error says where a file broke and not what the line held. An older
+test of the log that failed one run in fifty was mended on the way: it listened for a line whose
+call site another test's thread could reach first, which `tracing` then leaves off. Part 4
+(diagnostics: the other dumps, ping, traceroute, capture, the support bundle) follows.
 
 ## Follow-ups
 
@@ -459,6 +497,21 @@ for what it holds; and `@openfeo/ui` no longer exports a function that only it u
 three, one needed nothing, and two are filed: the lease table is built on every change of the World
 for sockets that follow only the state (#130), and a new subscriber to the counters waits up to a
 second for its first sample (#131).
+
+**2026-11-28, [#134](https://github.com/openfeo/openfeo/pull/134), M4 part 3b minors.** Six of the
+seven minors that the review of #132 left. A restart asked while a family manager is busy stopping
+an instance for a change of config no longer finds that instance's replacement started (on a PPPoE
+WAN, a new discovery begun as the router goes, and less time for the session's goodbye): the
+manager takes a halt that is waiting before it starts anything, and one that the supervisor starts
+again with a halt already asked starts nothing either. On the System page, what the router said of
+a change of config that was waiting, when it refused a new password for it, goes once the change is
+settled and is not said twice beside the held button's own line. `make check-env` holds `cargo
+about` to the version `make panel` takes, and says which to install. The Firewall page writes
+whether the router answers ping through the model's own function, which nothing used; what stands
+in the way of removing a LAN is its words alone again, the part nothing read gone; and a test that
+could not fail on what its name claimed is named for what it shows. The seventh is filed: the Rust
+standard library is in the binary and its notices are not in `/licences.txt` (#133), to be settled
+with the notices of the image as a whole.
 
 ## Tooling and process
 

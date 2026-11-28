@@ -9,9 +9,13 @@ import {
   LoginResponseSchema,
   SetInitialPasswordRequestSchema,
   SetInitialPasswordResponseSchema,
+  LogLevel,
   type Caller,
   type GetStatusResponse,
+  type LogBatch,
+  type LogsResponse,
   type Response as Reply,
+  type Route,
   type Session,
 } from './gen/openfeo/v1/api_pb.js'
 import type { Config } from './gen/openfeo/v1/config_pb.js'
@@ -19,7 +23,7 @@ import type { Event } from './gen/openfeo/v1/events_pb.js'
 import type { ConfigEffect, ConfigViolation, Counters, Leases, LinkHistory, State } from './gen/openfeo/v1/state_pb.js'
 import { call, type Http } from './http.js'
 import type { RouterOptions, Timers, WebSocketLike } from './options.js'
-import { Link, type Ask, type Connection, type SessionEnd, type Subscription } from './socket.js'
+import { Link, type Ask, type Connection, type SessionEnd, type Subscription, type Topic } from './socket.js'
 import { memoryTokenStore, type TokenStore } from './token-store.js'
 
 /**
@@ -275,18 +279,58 @@ export class Router {
   }
 
   /**
+   * Every route the kernel holds, both families and every table: `main`, `local` (the
+   * kernel's own entries for its addresses), and each WAN's own under that WAN's name. A page
+   * that lists routes chooses which of them a person reads.
+   */
+  async dumpRoutes(): Promise<Route[]> {
+    const reply = await this.#link.request({ case: 'dumpRoutes', value: {} })
+    if (reply.body.case !== 'dumpRoutes') {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered a call for the routes with something else')
+    }
+    return reply.body.value.routes
+  }
+
+  /**
+   * The newest lines of the router's log that match, oldest first: `level` and everything more
+   * serious, `contains` anywhere in the line without regard to ASCII case. At most `limit`
+   * lines, and never more than the router's own cap (1000 lines, 512 KiB); `earlier` says that
+   * older lines match, and `beforeSeq` set to the oldest line's number fetches them. The
+   * answer carries the router's two clocks: a line was written `uptimeMs - line.uptimeMs`
+   * before `timeUnixMs`, whatever the router's clock said at the time.
+   */
+  async logs(ask: { level?: LogLevel; contains?: string; beforeSeq?: bigint; limit?: number } = {}): Promise<LogsResponse> {
+    const reply = await this.#link.request({
+      case: 'logs',
+      value: { level: ask.level ?? LogLevel.UNSPECIFIED, contains: ask.contains ?? '', beforeSeq: ask.beforeSeq ?? 0n, limit: ask.limit ?? 0 },
+    })
+    if (reply.body.case !== 'logs') {
+      throw new RouterError(ErrorCode.INTERNAL, 'the router answered a call for the log with something else')
+    }
+    return reply.body.value
+  }
+
+  /**
    * Listen to a topic until the subscription is closed: `state` is the whole state now and
    * after every change, `leases` the whole lease table now and whenever a lease in it
    * changes, `counters` a sample each second, `events` each event as it happens (with the
-   * last `backlog` first; `onLost` when the router had to drop some).
+   * last `backlog` first; `onLost` when the router had to drop some), `logs` every line of
+   * the log written from now on, in batches and at every level (`logMatches` picks; `onLost`
+   * when lines were skipped, by the router or while the socket was away).
    */
   subscribe(topic: 'state', onPush: (state: State) => void): Subscription
   subscribe(topic: 'leases', onPush: (leases: Leases) => void): Subscription
   subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
   subscribe(topic: 'events', onPush: (event: Event) => void, options?: { backlog?: number; onLost?: () => void }): Subscription
+  subscribe(topic: 'logs', onPush: (batch: LogBatch) => void, options?: { onLost?: () => void }): Subscription
   subscribe(
-    topic: 'state' | 'leases' | 'counters' | 'events',
-    onPush: ((state: State) => void) | ((leases: Leases) => void) | ((counters: Counters) => void) | ((event: Event) => void),
+    topic: Topic,
+    onPush:
+      | ((state: State) => void)
+      | ((leases: Leases) => void)
+      | ((counters: Counters) => void)
+      | ((event: Event) => void)
+      | ((batch: LogBatch) => void),
     options: { backlog?: number; onLost?: () => void } = {},
   ): Subscription {
     switch (topic) {
@@ -298,6 +342,8 @@ export class Router {
         return this.#link.subscribeCounters(onPush as (counters: Counters) => void)
       case 'events':
         return this.#link.subscribeEvents(onPush as (event: Event) => void, options.backlog ?? 0, options.onLost)
+      case 'logs':
+        return this.#link.subscribeLogs(onPush as (batch: LogBatch) => void, options.onLost)
     }
   }
 

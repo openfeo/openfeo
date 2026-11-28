@@ -55,8 +55,10 @@ test('the page is in the navigation under Router and has the save bar', async ()
   const { wrapper, errors } = await page()
   const nav = wrapper.find('nav.ofo-nav')
   expect(nav.findAll('.ofo-nav__group').map((group) => group.text())).toEqual(['Network', 'Router'])
-  // Router's group comes after Network's pages, and System is in it.
-  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text()).slice(-2)).toEqual(['Router', 'System'])
+  // Router's group comes after Network's pages, and System is the last entry in it.
+  const entries = nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())
+  expect(entries.indexOf('Router')).toBeGreaterThan(entries.indexOf('DNS'))
+  expect(entries.slice(entries.indexOf('Router')).at(-1)).toBe('System')
   const entry = wrapper.findAll('.ofo-nav__item').find((item) => item.text() === 'System')
   expect(entry?.attributes('href')).toBe('/system')
   expect(entry?.attributes('aria-current')).toBe('page')
@@ -380,6 +382,30 @@ test('while a change waits to be confirmed the password cannot be changed, and t
   await button(wrapper, 'Change password').trigger('click')
   await flushPromises()
   expect(password.find('.failed').text()).toBe('A change of config is waiting to be confirmed. Confirm or revert it first.')
+})
+
+test('what the router said of a waiting change is said once, and goes when the change is settled', async () => {
+  // The router knew of a change this page had not yet heard of.
+  const { wrapper, router } = await page(routerConfig(), state(), (fake) => {
+    fake.changeRefusal = new RouterError(ErrorCode.FAILED_PRECONDITION, 'a change of config is pending; confirm or revert it before changing the password')
+  })
+  const password = section(wrapper, 'Password')
+  const WAITING = 'A change of config is waiting to be confirmed. Confirm or revert it first.'
+  await fill(wrapper, OLD, NEW)
+  await button(wrapper, 'Change password').trigger('click')
+  await flushPromises()
+  expect(password.find('.failed').text()).toBe(WAITING)
+  // The state catches up: the sentence is where the held button is explained, and nowhere else.
+  router.push('state', pendingState(13))
+  await flushPromises()
+  expect(password.find('.held').text()).toBe(WAITING)
+  expect(password.find('.failed').exists()).toBe(false)
+  // Settled: nothing is waiting, and nothing says so.
+  router.push('state', state())
+  await flushPromises()
+  expect(password.find('.held').exists()).toBe(false)
+  expect(password.find('.failed').exists()).toBe(false)
+  expect(disabled(wrapper, 'Change password')).toBe(false)
 })
 
 test('anything else the router says of a password change is said under the button', async () => {

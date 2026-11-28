@@ -56,14 +56,16 @@ pub mod events {
 pub mod api {
     pub use crate::generated::{
         ApplyConfigRequest, ApplyConfigResponse, Auth, Caller, ChangePasswordRequest,
-        ChangePasswordResponse, ClientMsg, ConfirmConfigRequest, ConfirmConfigResponse, Error,
-        ErrorCode, GetConfigRequest, GetConfigResponse, GetHistoryRequest, GetHistoryResponse,
-        GetLeasesRequest, GetLeasesResponse, GetStateRequest, GetStateResponse, GetStatusResponse,
-        LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, RebootRequest, RebootResponse,
-        Request, Response, RevertConfigRequest, RevertConfigResponse, ServerMsg, Session,
-        SetInitialPasswordRequest, SetInitialPasswordResponse, Subscribe, SubscribeRequest,
-        SubscribeResponse, Telemetry, Unsubscribe, ValidateConfigRequest, ValidateConfigResponse,
-        client_msg, request, response, server_msg, subscribe_response, telemetry,
+        ChangePasswordResponse, ClientMsg, ConfirmConfigRequest, ConfirmConfigResponse,
+        DumpRoutesRequest, DumpRoutesResponse, Error, ErrorCode, GetConfigRequest,
+        GetConfigResponse, GetHistoryRequest, GetHistoryResponse, GetLeasesRequest,
+        GetLeasesResponse, GetStateRequest, GetStateResponse, GetStatusResponse, LogBatch,
+        LogLevel, LogLine, LoginRequest, LoginResponse, LogoutRequest, LogoutResponse, LogsRequest,
+        LogsResponse, RebootRequest, RebootResponse, Request, Response, RevertConfigRequest,
+        RevertConfigResponse, Route, RouteKind, ServerMsg, Session, SetInitialPasswordRequest,
+        SetInitialPasswordResponse, Subscribe, SubscribeRequest, SubscribeResponse, Telemetry,
+        Unsubscribe, ValidateConfigRequest, ValidateConfigResponse, client_msg, request, response,
+        server_msg, subscribe_response, telemetry,
     };
 }
 

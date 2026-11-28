@@ -20,6 +20,7 @@ import {
   ruleProblems,
   setReach,
   settle,
+  setWanPing,
 } from '../model/firewall'
 import RefusedList from '../parts/RefusedList.vue'
 import SettingCell from '../parts/SettingCell.vue'
@@ -135,6 +136,9 @@ function protocol(at: number, proto: string): void {
 // ---- The router itself ----
 
 const pings = computed(() => draft.value?.firewall?.wanPing === true)
+function ping(on: boolean): void {
+  store.edit((config) => setWanPing(config, on, store.base.value))
+}
 
 // ---- What the router refused where no field is ----
 
@@ -347,7 +351,7 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
       </OfoFormSection>
 
       <OfoFormSection title="The router itself" text="What the router answers from the internet.">
-        <OfoToggle label="Answer ping from the internet" :model-value="pings" :disabled="!editable" @update:model-value="(on) => change((firewall) => (firewall.wanPing = on))" />
+        <OfoToggle label="Answer ping from the internet" :model-value="pings" :disabled="!editable" @update:model-value="ping" />
       </OfoFormSection>
     </template>
   </div>

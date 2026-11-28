@@ -31,6 +31,7 @@ use crate::gate::origin_allowed;
 use crate::http::{Arrival, Local, Peer};
 use crate::keeper::Why;
 use crate::limits::{MAX_FRAME, MAX_SOCKETS};
+use crate::logs::{Batch, LogFeed};
 use crate::server::{ApiError, Shared};
 use crate::telemetry::CountersSub;
 
@@ -185,6 +186,8 @@ pub(crate) async fn perform(
             response::Body::RevertConfig(RevertConfigResponse {})
         }
         Some(request::Body::Reboot(_)) => response::Body::Reboot(shared.reboot(at.peer)),
+        Some(request::Body::Logs(ask)) => response::Body::Logs(shared.logs(&ask)?),
+        Some(request::Body::DumpRoutes(_)) => response::Body::DumpRoutes(shared.dump_routes()),
         None => {
             return Err(ApiError::new(
                 ErrorCode::InvalidArgument,
@@ -222,6 +225,8 @@ fn frame(message: &ServerMsg) -> Message {
 struct Feeds {
     events: broadcast::Receiver<Arc<openfeo_world::Event>>,
     counters: Option<CountersSub>,
+    /// The connection's place in the log, while it is subscribed to it.
+    logs: Option<LogFeed>,
     had_state: bool,
     had_leases: bool,
 }
@@ -233,6 +238,16 @@ struct Newly {
 }
 
 impl Feeds {
+    /// Take a place in the log for a connection that has just subscribed to it, and give it
+    /// up for one that no longer is.
+    fn follow_log(&mut self, conn: &Conn, shared: &Shared) {
+        match (conn.wants(Topic::Logs), self.logs.is_some()) {
+            (true, false) => self.logs = Some(LogFeed::from_now(&shared.log)),
+            (false, true) => self.logs = None,
+            _ => {}
+        }
+    }
+
     /// Take up or drop the counters as the connection wants them, and say which of `state`
     /// and `leases` it has just subscribed to.
     fn follow(&mut self, conn: &Conn, shared: &Arc<Shared>) -> Newly {
@@ -261,6 +276,14 @@ async fn next_counters(
     }
 }
 
+/// The next lines of the log for a connection that follows it; never, for one that does not.
+async fn next_logs(logs: &mut Option<LogFeed>) -> Batch {
+    match logs {
+        Some(feed) => feed.next().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
     let shared = slot.shared.clone();
     let limits = shared.limits;
@@ -272,6 +295,7 @@ async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
     let mut feeds = Feeds {
         events: shared.publisher.events(),
         counters: None,
+        logs: None,
         had_state: false,
         had_leases: false,
     };
@@ -294,7 +318,11 @@ async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
                         // events that follow it meet without a gap.
                         feeds.events = shared.publisher.events();
                     }
-                    conn.on_binary(&bytes, &mut slot)
+                    let outs = conn.on_binary(&bytes, &mut slot);
+                    // A reader of the log is sent every line written after it subscribed: its
+                    // place is taken here, before the acknowledgement leaves.
+                    feeds.follow_log(&conn, &shared);
+                    outs
                 }
                 Some(Ok(Message::Text(_))) => conn.on_text(),
                 Some(Ok(Message::Pong(_))) => {
@@ -321,6 +349,10 @@ async fn drive(socket: WebSocket, mut slot: Slot, at: Arrival) {
                     Err(broadcast::error::RecvError::Lagged(_)) => conn.events_lost(),
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
+                Vec::new()
+            }
+            batch = next_logs(&mut feeds.logs) => {
+                conn.push_logs(shared.log_batch(&batch.lines), batch.lost);
                 Vec::new()
             }
             sample = next_counters(&mut feeds.counters) => {

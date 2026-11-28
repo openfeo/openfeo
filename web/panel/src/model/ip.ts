@@ -117,3 +117,44 @@ export function isCidr6(text: string): boolean {
   const parts = /^([^/]+)\/(0|[1-9]\d{0,2})$/.exec(text)
   return parts !== null && Number(parts[2]) <= 128 && isIp6(parts[1] ?? '')
 }
+
+/** An IPv6 block: its address as one number, and how many of its bits are the network's. */
+export interface Cidr6 {
+  address: bigint
+  prefix: number
+}
+
+/** The 128 bits of an IPv6 address that `isIp6` takes, as one number. */
+function parse6(text: string): bigint | null {
+  if (!isIp6(text)) {
+    return null
+  }
+  const words = (half: string): number[] =>
+    half === ''
+      ? []
+      : half.split(':').flatMap((group) => {
+          const quad = group.includes('.') ? parse4(group) : null
+          return quad === null ? [Number.parseInt(group, 16)] : [quad >>> 16, quad & 0xffff]
+        })
+  const [head = '', tail] = text.split('::')
+  const before = words(head)
+  const after = tail === undefined ? [] : words(tail)
+  const all = [...before, ...Array.from({ length: 8 - before.length - after.length }, () => 0), ...after]
+  return all.reduce((sum, word) => (sum << 16n) | BigInt(word), 0n)
+}
+
+/** An IPv6 block as it is written, `2001:db8:1::/48`; `null` when it is not one. */
+export function parseCidr6(text: string): Cidr6 | null {
+  if (!isCidr6(text)) {
+    return null
+  }
+  const [address = '', prefix = ''] = text.split('/')
+  const bits = parse6(address)
+  return bits === null ? null : { address: bits, prefix: Number(prefix) }
+}
+
+/** Whether `inner` lies within `outer`: no wider, and the same in every bit `outer` fixes. */
+export function within6(inner: Cidr6, outer: Cidr6): boolean {
+  const free = BigInt(128 - outer.prefix)
+  return inner.prefix >= outer.prefix && inner.address >> free === outer.address >> free
+}

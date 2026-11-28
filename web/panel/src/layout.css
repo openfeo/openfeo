@@ -205,6 +205,109 @@ body {
   margin-bottom: var(--space-5);
 }
 
+/* The Routes page: the choice of family above the table, and a line beneath it. */
+.routes__tools {
+  margin-bottom: var(--space-4);
+}
+
+.routes__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.routes__none {
+  margin: 0;
+}
+
+.routes__note {
+  margin: var(--space-4) 0 var(--space-5);
+  max-width: 80ch;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.routes__failed {
+  margin-bottom: var(--space-4);
+}
+
+/* The Ports page: the strip in a card of its own above the table, and a line beneath. */
+.ports__strip {
+  margin-bottom: var(--space-5);
+}
+
+.ports__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.ports__note {
+  margin: var(--space-4) 0 var(--space-5);
+  max-width: 80ch;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+/* The Logs page: what is shown and the two buttons in a row, the buttons at its far end; the
+   lines in a box of bounded height that scrolls; a line above it and one beneath. */
+.logs__tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.logs__show {
+  font-size: 13px;
+}
+
+.logs__filter {
+  width: 280px;
+  max-width: 100%;
+}
+
+.logs__actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.logs__waiting {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.logs__failed,
+.logs__download-failed {
+  margin-bottom: var(--space-4);
+}
+
+.logs__earlier {
+  margin: 0 0 var(--space-3);
+  font-size: 13px;
+}
+
+.logs__none {
+  margin: 0;
+}
+
+/* As tall as the window leaves it, so that the page itself does not scroll and the line
+   beneath stays in sight; never less than a dozen lines. */
+.logs__view {
+  max-height: max(15rem, calc(100vh - 21rem));
+  overflow-y: auto;
+}
+
+.logs__note {
+  margin: var(--space-4) 0 var(--space-5);
+  max-width: 80ch;
+  font-size: 13px;
+  line-height: 20px;
+}
+
 .tabsrow .ofo-tabs {
   flex: 1;
 }

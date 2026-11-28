@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, ensure};
 use openfeo_config::api::{
-    ApplyConfigRequest, ErrorCode, GetStateResponse, GetStatusResponse, Request, client_msg,
-    request, server_msg,
+    ApplyConfigRequest, ErrorCode, GetStateResponse, GetStatusResponse, LogLevel, LogLine,
+    LogsRequest, LogsResponse, Request, Route, RouteKind, client_msg, request, server_msg,
 };
 use openfeo_config::events::Event;
 use openfeo_config::state::{AddressOrigin, ConfigEffectKind, State, WanKind, WanPhase, WanState};
@@ -186,6 +186,26 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "the_state_says_which_resolvers_are_in_use",
         run: the_state_says_which_resolvers_are_in_use,
+    },
+    Scenario {
+        name: "the_routes_dump_has_the_default_route_and_each_lans_subnet",
+        run: the_routes_dump_has_the_default_route_and_each_lans_subnet,
+    },
+    Scenario {
+        name: "the_panel_shows_the_routes_the_ports_and_the_log_in_a_browser",
+        run: the_panel_shows_the_routes_the_ports_and_the_log_in_a_browser,
+    },
+    Scenario {
+        name: "the_javascript_client_reads_the_routes_and_the_log_from_the_lan",
+        run: the_javascript_client_reads_the_routes_and_the_log_from_the_lan,
+    },
+    Scenario {
+        name: "the_log_is_read_by_level_and_text_and_followed",
+        run: the_log_is_read_by_level_and_text_and_followed,
+    },
+    Scenario {
+        name: "no_line_in_the_log_holds_a_password_or_a_token",
+        run: no_line_in_the_log_holds_a_password_or_a_token,
     },
     Scenario {
         name: "a_restart_asked_over_the_api_stops_in_order_and_keeps_the_leases",
@@ -2856,6 +2876,368 @@ fn the_state_says_which_resolvers_are_in_use(lab: &mut Lab) -> anyhow::Result<()
     ws.state_where(SOON, |state| resolvers_of(state) == [typed.clone()])
         .context("with the switch off the WAN's resolver is still in use")?;
     no_task_failed(lab)
+}
+
+/// The IPv4 default routes of the main table that forward: what a WAN that is up carries.
+fn defaults4(routes: &[Route]) -> Vec<&Route> {
+    routes
+        .iter()
+        .filter(|route| {
+            !route.v6
+                && route.table == "main"
+                && route.destination.is_empty()
+                && route.kind() == RouteKind::Unicast
+        })
+        .collect()
+}
+
+/// SPEC §8.3 (M4 part 3c): `DumpRoutes` answers what the kernel holds, on the socket and over
+/// gRPC, for a session: the default route by the WAN, the LAN's subnet on its bridge, and the
+/// kernel's own entry for the router's address in the local table. With the WAN's carrier
+/// taken, the dump and the state agree on whether the WAN still carries a default route.
+fn the_routes_dump_has_the_default_route_and_each_lans_subnet(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let mut states = api.ws_with(&token)?;
+    states.subscribe("state", 0)?;
+    let up = states.state_where(SOON, |state| {
+        state.wans[0].phase() == WanPhase::Up && state.wans[0].default4
+    })?;
+    let wan = up.wans[0].clone();
+    let routes = ws.routes()?;
+    let found = defaults4(&routes);
+    ensure!(
+        found.len() == 1
+            && found[0].gateway == wan.gateway4
+            && !wan.gateway4.is_empty()
+            && found[0].interface == wan.interface
+            && found[0].protocol == "openfeo",
+        "the IPv4 default route of main is not wan0's ({} via {}): {found:?}, of {routes:?}",
+        wan.interface,
+        wan.gateway4
+    );
+    ensure!(
+        routes.iter().any(|route| !route.v6
+            && route.table == "main"
+            && route.destination == "192.168.1.0/24"
+            && route.gateway.is_empty()
+            && route.interface == "br-lan0"
+            && route.protocol == "kernel"
+            && route.kind() == RouteKind::Unicast),
+        "lan0's subnet is not on its bridge: {routes:?}"
+    );
+    ensure!(
+        routes.iter().any(|route| route.table == "local"
+            && route.destination == "192.168.1.1/32"
+            && route.interface == "br-lan0"
+            && route.kind() == RouteKind::Local),
+        "the router's own address is not in the local table as the kernel's entry: {routes:?}"
+    );
+    ensure!(
+        routes
+            .iter()
+            .all(|route| route.kind() != RouteKind::Unspecified),
+        "a route of no kind: {routes:?}"
+    );
+    // The same over gRPC, and not for a stranger.
+    let over_grpc = api
+        .grpc_dump_routes(Some(&token))?
+        .map_err(|status| anyhow::anyhow!("DumpRoutes over gRPC: {status}"))?;
+    let main4 = |routes: &[Route]| -> Vec<Route> {
+        routes
+            .iter()
+            .filter(|route| !route.v6 && route.table == "main")
+            .cloned()
+            .collect()
+    };
+    ensure!(
+        main4(&over_grpc) == main4(&routes),
+        "gRPC answers other routes: {over_grpc:?}"
+    );
+    match api.grpc_dump_routes(None)? {
+        Err(refusal) if refusal.code() == tonic::Code::Unauthenticated => {}
+        other => anyhow::bail!("DumpRoutes without a session: {other:?}"),
+    }
+    // The ISP goes. Whatever the router makes of its default route, the dump says what the
+    // state says.
+    let agree = |ws: &mut Ws, phase: WanPhase| -> anyhow::Result<bool> {
+        let deadline = Instant::now() + SOON;
+        loop {
+            let state = ws.request_state()?;
+            let routes = ws.routes()?;
+            let carried = defaults4(&routes)
+                .iter()
+                .any(|route| route.interface == wan.interface);
+            if state.wans[0].phase() == phase && carried == state.wans[0].default4 {
+                return Ok(carried);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "wan0 is {:?} and the state says default4 = {}, while the dump {} a default \
+                 route through {}",
+                state.wans[0].phase(),
+                state.wans[0].default4,
+                if carried { "has" } else { "has not" },
+                wan.interface
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let mut qmp = lab.qmp()?;
+    qmp.set_link("p0", false)?;
+    states.state_where(SOON, |state| state.wans[0].phase() == WanPhase::Down)?;
+    agree(&mut ws, WanPhase::Down)?;
+    qmp.set_link("p0", true)?;
+    states.state_where(Duration::from_secs(60), |state| {
+        state.wans[0].phase() == WanPhase::Up && state.wans[0].default4
+    })?;
+    ensure!(
+        agree(&mut ws, WanPhase::Up)?,
+        "wan0 is up again and the dump has no default route through it"
+    );
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// SPEC §8.3 (M4 part 3c): `Logs` reads the log back by level and by text and reaches back
+/// page by page without a gap or a repeat; a subscriber to `logs` is sent the line the router
+/// writes when the ISP is cut, and the call then finds that same line.
+fn the_log_is_read_by_level_and_text_and_followed(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let asked = |ws: &mut Ws, ask: LogsRequest| -> anyhow::Result<LogsResponse> {
+        ws.logs(ask)?
+            .map_err(|error| anyhow::anyhow!("Logs was refused: {error:?}"))
+    };
+    let logins = asked(
+        &mut ws,
+        LogsRequest {
+            level: LogLevel::Info.into(),
+            contains: "ADMIN: LOGIN FROM".to_owned(),
+            ..LogsRequest::default()
+        },
+    )?;
+    ensure!(
+        !logins.lines.is_empty()
+            && logins.lines.iter().all(|line| {
+                line.text.contains("admin: login from 192.168.1.") && line.level() == LogLevel::Info
+            }),
+        "the login's own line, found by a text in another case: {logins:?}"
+    );
+    ensure!(
+        logins.time_unix_ms > 0
+            && logins
+                .lines
+                .iter()
+                .all(|line| line.uptime_ms > 0 && line.uptime_ms <= logins.uptime_ms),
+        "the clocks of the answer and of its lines: {logins:?}"
+    );
+    let errors = asked(
+        &mut ws,
+        LogsRequest {
+            level: LogLevel::Error.into(),
+            ..LogsRequest::default()
+        },
+    )?;
+    ensure!(
+        errors
+            .lines
+            .iter()
+            .all(|line| line.level() == LogLevel::Error),
+        "asked for errors: {errors:?}"
+    );
+    let upto = the_log_reads_back_the_same_by_pages(&mut ws)?;
+    // Followed: the line the router writes when the ISP is cut is pushed, and is then in the
+    // log under the same number.
+    let mut feed = api.ws_with(&token)?;
+    feed.subscribe("logs", 0)?;
+    let mut qmp = lab.qmp()?;
+    qmp.set_link("p0", false)?;
+    let pushed = feed.log_line(SOON, &re(r"^link p0 down$"))?;
+    ensure!(
+        pushed.level() == LogLevel::Info && pushed.seq > upto,
+        "the pushed line: {pushed:?}, after {upto}"
+    );
+    let cut = LogsRequest {
+        contains: "link p0 down".to_owned(),
+        ..LogsRequest::default()
+    };
+    let read_back = asked(&mut ws, cut.clone())?;
+    ensure!(
+        read_back.lines.contains(&pushed),
+        "the line that was pushed is not the one read back: {pushed:?}, {read_back:?}"
+    );
+    let over_grpc = api
+        .grpc_logs(Some(&token), cut.clone())?
+        .map_err(|status| anyhow::anyhow!("Logs over gRPC: {status}"))?;
+    ensure!(
+        over_grpc.lines.contains(&pushed),
+        "gRPC reads other lines: {over_grpc:?}"
+    );
+    match api.grpc_logs(None, cut)? {
+        Err(status) if status.code() == tonic::Code::Unauthenticated => {}
+        other => anyhow::bail!("Logs without a session: {other:?}"),
+    }
+    qmp.set_link("p0", true)?;
+    feed.log_line(Duration::from_secs(60), &re(r"^link p0 up$"))?;
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// The whole log, five lines at a time and a thousand at a time: the same lines, their
+/// numbers rising by one from 1, at DEBUG as well as INFO. The number of the newest line read.
+fn the_log_reads_back_the_same_by_pages(ws: &mut Ws) -> anyhow::Result<u64> {
+    let by_fives = ws.whole_log(5)?;
+    let by_thousands = ws.whole_log(1000)?;
+    let newest = |lines: &[LogLine]| lines.last().map_or(0, |line| line.seq);
+    let upto = newest(&by_fives).min(newest(&by_thousands));
+    let until = |lines: Vec<LogLine>| -> Vec<LogLine> {
+        lines.into_iter().filter(|line| line.seq <= upto).collect()
+    };
+    let (by_fives, by_thousands) = (until(by_fives), until(by_thousands));
+    ensure!(
+        by_fives.len() > 20 && by_fives == by_thousands,
+        "read back {} lines by fives and {} by thousands",
+        by_fives.len(),
+        by_thousands.len()
+    );
+    ensure!(
+        by_fives
+            .iter()
+            .zip(1u64..)
+            .all(|(line, number)| line.seq == number),
+        "the numbers do not rise by one from 1: {:?}",
+        by_fives.iter().map(|line| line.seq).collect::<Vec<_>>()
+    );
+    ensure!(
+        by_fives.iter().any(|line| line.level() == LogLevel::Debug)
+            && by_fives.iter().any(|line| line.level() == LogLevel::Info),
+        "the log has no line at DEBUG, or none at INFO"
+    );
+    Ok(upto)
+}
+
+/// The design's anti-goal, a secret on a new road: after a first password, a wrong login, a
+/// right one, a socket and a gRPC call, no line anywhere in the log, at any level, holds a
+/// password or a token. The console shows INFO and up; the log sent to the panel is all of it.
+fn no_line_in_the_log_holds_a_password_or_a_token(lab: &mut Lab) -> anyhow::Result<()> {
+    const WRONG: &str = "lab-wrong-password";
+    let (api, first, _) = boot_claimed(lab)?;
+    ensure!(api.login(WRONG).is_err(), "a wrong password logged in");
+    // The wait a wrong password earns.
+    std::thread::sleep(Duration::from_secs(2));
+    let second = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&second)?;
+    ws.subscribe("state", 0)?;
+    ws.subscribe("logs", 0)?;
+    api.grpc_state(&first)?;
+    api.grpc_logs(Some(&first), LogsRequest::default())?
+        .map_err(|status| anyhow::anyhow!("Logs over gRPC: {status}"))?;
+    let lines = ws.whole_log(1000)?;
+    for said in ["admin: login from", "admin: login refused from"] {
+        ensure!(
+            lines.iter().any(|line| line.text.contains(said)),
+            "the log has no line saying {said:?}: it holds {} lines",
+            lines.len()
+        );
+    }
+    for (what, secret) in [
+        ("the password", PASSWORD),
+        ("the wrong password", WRONG),
+        ("the first session's token", first.as_str()),
+        ("the second session's token", second.as_str()),
+    ] {
+        let held: Vec<&LogLine> = lines
+            .iter()
+            .filter(|line| line.text.contains(secret))
+            .collect();
+        ensure!(
+            held.is_empty(),
+            "{what} is in the log: line {}",
+            held[0].seq
+        );
+    }
+    ensure!(
+        lab.console()?.count(&re(WRONG)) == 0,
+        "the wrong password is on the console"
+    );
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// `@openfeo/client`'s calls for the routes and the log (SPEC §8.3, M4 part 3c), run by Node
+/// inside the LAN namespace against the booted router (`web/client/itest/views.test.ts`): the
+/// dump with the default route and the LAN, the log read back by level, by text and by page,
+/// and a subscription to `logs` that is sent the line of a cut ISP, which the client's own
+/// rule then matches as the router's does. Skipped as the other client scenarios are.
+fn the_javascript_client_reads_the_routes_and_the_log_from_the_lan(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    web::node_ready()?;
+    boot(lab, "")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut vitest = web::tool(&lab.lan0, "vitest")?;
+    vitest
+        .args([
+            "run",
+            "--config",
+            "client/itest/vitest.config.ts",
+            "views.test",
+        ])
+        .env("OPENFEO_ROUTER", "https://192.168.1.1")
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir())
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    ctl.serve_while(
+        vitest,
+        &lab.run_dir.join("client-views-itest.log"),
+        Duration::from_secs(300),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// The views in a real browser (SPEC §8.4, M4 part 3c; `web/panel/e2e/views.spec.ts`): Routes
+/// shows the default route as the WAN's and the LAN's subnet on its bridge; Ports shows the
+/// WAN's port up and a LAN port whose counter moves when the page fetches something; on Logs
+/// the line of a cut ISP appears without a reload, Errors hides it, a text in another case
+/// finds it, Pause holds what arrives while the ISP returns, and Download saves a file of
+/// every level that has the line. Skipped as the other browser scenarios are.
+fn the_panel_shows_the_routes_the_ports_and_the_log_in_a_browser(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    web::ready()?;
+    boot(lab, "")?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    web::settle(&lab.lan0, "lan0")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "views.spec",
+        ])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e-views"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright-views.log"),
+        Duration::from_secs(300),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+    no_task_failed(lab)?;
+    password_never_logged(lab)
 }
 
 /// The API logs who asked for a restart.

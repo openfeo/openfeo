@@ -143,9 +143,20 @@ first (read in the concentrator's `pppd` log), one against a concentrator killed
 (`Lab::kill_pppoe_server`), and one with a change left unconfirmed; and the panel in Chromium
 (`web/panel/e2e/settings.spec.ts`), which adds a port forward and a local name, changes the password to
 `lab-second-password` and restarts the router from the System page, after which the scenario asks the router what
-it ended up with under the new password. Each of the six web
-scenarios names its own test or spec file (`lab.test`, `config.test`, `panel.spec`, `config.spec`, `leases.spec`,
-`settings.spec`),
+it ended up with under the new password. Five more (M4 part 3c) are for the views: the routes dumped over the API
+(`Ws::routes`, `Api::grpc_dump_routes`) with the ISP cut and returned, where the dump is held to the state's own
+account of the default route; the log read by level and by text, read back whole a page at a time and followed on the
+topic `logs` through a cut ISP (`Ws::{logs, whole_log, log_line}`, `Api::grpc_logs`); the whole log read, after a wrong
+login and a right one, for the lab's passwords and tokens (the console shows INFO and up; the log the API sends is all
+of it, DEBUG included); `@openfeo/client`'s routes and log calls under Node (`web/client/itest/views.test.ts`); and the
+panel in Chromium (`web/panel/e2e/views.spec.ts`), which reads Routes and Ports, has the LAN port's counter move by
+fetching the notices, follows Logs through a cut ISP and downloads the log. The `netlink` sandbox suite holds the
+monitor to dropping the routes the kernel drops without announcing them (ADR-0027): a removed link's, and the IPv4
+routes of a link that lost its last IPv4 address; and an `m1` scenario lets the WAN's DHCP lease run out with the lab's
+Kea stopped (`Lab::stop_kea`) and come back, after which the default route is added again and the LAN host reaches the
+ISP. Each of the eight web
+scenarios names its own test or spec file (`lab.test`, `config.test`, `views.test`, `panel.spec`, `config.spec`,
+`leases.spec`, `settings.spec`, `views.spec`),
 since one process numbers its requests to the lab from 1. A lab verb may carry arguments: `lan-to <cidr> <gateway>`
 re-homes the LAN host as `rehome` does, for a test that follows a router it moved, and `join <hostname>` has a device
 take a lease on `lan0` under that name (the harness's own DHCP client, which puts no address on the interface, so the

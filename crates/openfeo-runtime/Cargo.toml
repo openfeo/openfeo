@@ -17,6 +17,7 @@ thiserror.workspace = true
 [dev-dependencies]
 openfeo-config = { path = "../openfeo-config" }
 tokio = { workspace = true, features = ["test-util"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

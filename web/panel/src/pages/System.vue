@@ -86,6 +86,8 @@ const refused = ref<'wrong' | 'soon' | null>(null)
 const waitUntil = ref<number | null>(null)
 /** Anything else the router said of the change. */
 const failed = ref<string | null>(null)
+/** The router refused because a change of config is waiting, which this page had not yet heard. */
+const refusedWaiting = ref(false)
 const PENDING = 'A change of config is waiting to be confirmed. Confirm or revert it first.'
 onBeforeUnmount(forget)
 
@@ -99,6 +101,11 @@ function forget(): void {
 /** The seconds still to wait, counted down by the page's clock. */
 const wait = computed(() => (waitUntil.value === null ? 0 : Math.max(0, Math.ceil((waitUntil.value - live.now.value.getTime()) / 1000))))
 const pending = computed(() => store.pending.value !== undefined)
+// Once the state says a change is waiting, the held button's own line says so; and once it
+// says none is, nothing does. What the router said was true of the moment it said it.
+watch(pending, () => {
+  refusedWaiting.value = false
+})
 const nextProblem = computed(() => (leftNext.value ? (lengthProblem(next.value) ?? undefined) : undefined))
 const againProblem = computed(() => (leftAgain.value && again.value !== next.value ? 'The two passwords differ.' : undefined))
 /**
@@ -139,6 +146,7 @@ async function changePassword(): Promise<void> {
   }
   changing.value = true
   failed.value = null
+  refusedWaiting.value = false
   refused.value = null
   changed.value = false
   try {
@@ -156,7 +164,7 @@ async function changePassword(): Promise<void> {
     } else if (said?.code === ErrorCode.RESOURCE_EXHAUSTED) {
       refused.value = 'soon'
     } else if (said?.code === ErrorCode.FAILED_PRECONDITION) {
-      failed.value = PENDING
+      refusedWaiting.value = true
     } else {
       failed.value = error instanceof Error ? error.message : 'The password could not be changed.'
     }
@@ -305,7 +313,9 @@ const unplaced = computed(() => store.violations.value.filter((violation) => !cl
         <div class="ofo-span-2">
           <OfoButton :disabled="changing || wait > 0 || pending" @click="changePassword">Change password</OfoButton>
         </div>
-        <p v-if="failed" class="failed ofo-field--error ofo-span-2 page__none"><span class="ofo-field__help" role="alert">{{ failed }}</span></p>
+        <p v-if="failed || (refusedWaiting && !pending)" class="failed ofo-field--error ofo-span-2 page__none">
+          <span class="ofo-field__help" role="alert">{{ failed ?? PENDING }}</span>
+        </p>
       </OfoFormSection>
 
       <OfoFormSection title="Restart" text="Everything goes offline for about a minute. You log in again when it is back.">

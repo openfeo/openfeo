@@ -143,14 +143,14 @@ test('what stands in the way of removing a LAN is named', () => {
   })
   config.firewall!.rules = more.firewall!.rules
   config.lans[1]!.reaches = ['wan', 'lan0']
-  // Each says what it is and where it is: a forward, a rule, another LAN's tick in the grid.
+  // Each says what it is: a forward, a rule, another LAN's tick. All are removed on Firewall.
   expect(blockers(config, config.lans[0]!)).toEqual([
-    { text: 'port forward lan-http points into it', kind: 'forward' },
-    { text: 'rule cameras points into it', kind: 'rule' },
-    { text: 'rule ssh points into it', kind: 'rule' },
-    { text: 'iot may reach it', kind: 'reach' },
+    'port forward lan-http points into it',
+    'rule cameras points into it',
+    'rule ssh points into it',
+    'iot may reach it',
   ])
-  expect(blockers(config, config.lans[1]!)).toEqual([{ text: 'rule cameras starts from it', kind: 'rule' }])
+  expect(blockers(config, config.lans[1]!)).toEqual(['rule cameras starts from it'])
   // A LAN nothing points at is free to go; so is one with no address yet.
   const guest = newLan('guest')
   config.lans.push(guest)

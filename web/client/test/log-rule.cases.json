@@ -1,0 +1,15 @@
+[
+  { "level": "error", "text": "sntp: no answer from 203.0.113.1", "wanted": "error", "contains": "", "matches": true },
+  { "level": "warn", "text": "pppoe wan0: 3 echoes unanswered", "wanted": "error", "contains": "", "matches": false },
+  { "level": "warn", "text": "pppoe wan0: 3 echoes unanswered", "wanted": "warn", "contains": "", "matches": true },
+  { "level": "error", "text": "x", "wanted": "info", "contains": "", "matches": true },
+  { "level": "debug", "text": "x", "wanted": "info", "contains": "", "matches": false },
+  { "level": "debug", "text": "x", "wanted": "debug", "contains": "", "matches": true },
+  { "level": "debug", "text": "x", "wanted": "", "contains": "", "matches": true },
+  { "level": "info", "text": "link p0 down", "wanted": "info", "contains": "P0 DOWN", "matches": true },
+  { "level": "info", "text": "link p0 down", "wanted": "info", "contains": "p1", "matches": false },
+  { "level": "info", "text": "link p0 down", "wanted": "info", "contains": " ", "matches": true },
+  { "level": "info", "text": "link p0 down", "wanted": "error", "contains": "p0", "matches": false },
+  { "level": "info", "text": "dhcp lan0: leased to Küche", "wanted": "info", "contains": "küche", "matches": true },
+  { "level": "info", "text": "dhcp lan0: leased to Küche", "wanted": "info", "contains": "KÜCHE", "matches": false }
+]

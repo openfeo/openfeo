@@ -20,6 +20,7 @@ pub mod http;
 pub mod keeper;
 pub mod limits;
 pub mod listener;
+pub mod logs;
 pub mod pb;
 pub mod server;
 pub mod telemetry;
@@ -33,6 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use openfeo_config::admin::ConfigState;
+use openfeo_runtime::log::Ring;
 use openfeo_runtime::supervise::TaskError;
 use openfeo_runtime::{Publisher, WorldRx};
 use openfeo_world::World;
@@ -60,6 +62,13 @@ pub struct Listen {
 pub trait Restarter: Send + Sync {
     /// Begin a restart of the router.
     fn restart(&self);
+}
+
+/// Where the routes are read from: the router's view of the kernel's tables. The API does not
+/// follow the kernel itself (only the netlink crates call it), so the router hands it this.
+pub trait RouteSource: Send + Sync {
+    /// Every route, both families and every table, as the wire says it.
+    fn routes(&self) -> Vec<openfeo_config::api::Route>;
 }
 
 /// What the API needs from the router.
@@ -96,6 +105,10 @@ pub struct ApiDeps {
     pub confirm_secs: u32,
     /// How a restart is asked of the router.
     pub restarter: Arc<dyn Restarter>,
+    /// The log the router keeps (SPEC §10).
+    pub log: Arc<Ring>,
+    /// Where the kernel's routes are read from.
+    pub routes: Arc<dyn RouteSource>,
 }
 
 /// Bind and serve the API until a listener fails.
@@ -114,6 +127,7 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
 
     use pb::auth_service_server::AuthServiceServer;
     use pb::config_service_server::ConfigServiceServer;
+    use pb::diagnostics_service_server::DiagnosticsServiceServer;
     use pb::state_service_server::StateServiceServer;
     use pb::system_service_server::SystemServiceServer;
 
@@ -121,7 +135,9 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
     let auth = AuthServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
     let config = ConfigServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
     let state = StateServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
-    let system = SystemServiceServer::new(grpc).max_decoding_message_size(limits::MAX_BODY);
+    let system = SystemServiceServer::new(grpc.clone()).max_decoding_message_size(limits::MAX_BODY);
+    let diagnostics =
+        DiagnosticsServiceServer::new(grpc).max_decoding_message_size(limits::MAX_BODY);
     http::routes()
         .route("/ws", axum::routing::get(ws::upgrade))
         .route_service(
@@ -139,6 +155,13 @@ pub(crate) fn routes(shared: &Arc<server::Shared>) -> axum::Router<Arc<server::S
         .route_service(
             &format!("/{}/{{*call}}", SystemServiceServer::<grpc::Grpc>::NAME),
             system,
+        )
+        .route_service(
+            &format!(
+                "/{}/{{*call}}",
+                DiagnosticsServiceServer::<grpc::Grpc>::NAME
+            ),
+            diagnostics,
         )
 }
 

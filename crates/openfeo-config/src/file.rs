@@ -141,7 +141,63 @@ pub fn render_dhcp4_server_leases(
 /// [`ConfigError::Toml`] for syntax errors.
 pub fn table(text: &str) -> Result<toml::Table, ConfigError> {
     text.parse::<toml::Table>()
-        .map_err(|err| ConfigError::Toml(err.to_string()))
+        .map_err(|err| syntax(text, err.message(), err.span()))
+}
+
+/// A syntax error as it is said: where in `text`, and what was wrong.
+///
+/// A TOML parser's own account of an error prints the line it stopped on, and that line may
+/// be the one with a password or the admin's hash. The error is logged, shown in the state and
+/// sent with the log (SPEC §8.3, §9), so the line never leaves here: only its number does.
+pub(crate) fn syntax(
+    text: &str,
+    message: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> ConfigError {
+    let message = message.replace('\n', "; ");
+    ConfigError::Toml(match span {
+        Some(span) => {
+            let (line, column) = position(text, span.start);
+            format!("line {line}, column {column}: {message}")
+        }
+        None => message,
+    })
+}
+
+/// The line and column of byte `at` of `text`, both from 1, the column in characters.
+fn position(text: &str, at: usize) -> (usize, usize) {
+    let at = at.min(text.len());
+    let before = &text.as_bytes()[..at];
+    // As many lines as the newlines before it cut the text into.
+    let line = before.split(|byte| *byte == b'\n').count();
+    let start = before
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let column = text
+        .get(start..at)
+        .map_or(at - start, |so_far| so_far.chars().count())
+        + 1;
+    (line, column)
+}
+
+/// A document that does not fit the schema, as it is said.
+///
+/// serde says what it found as well as what it wanted (``invalid type: integer `12345678`,
+/// expected a string``), and what it found may be a password typed without its quotes. The
+/// kind of thing is kept and the thing itself is not (SPEC §9).
+fn shape(err: &serde_json::Error) -> ConfigError {
+    let said = err.to_string();
+    for lead in ["invalid type: ", "invalid value: "] {
+        if let Some(rest) = said.strip_prefix(lead)
+            && let Some(at) = rest.rfind(", expected ")
+        {
+            let found = &rest[..at];
+            let kind = found.split(['`', '"']).next().unwrap_or(found).trim_end();
+            return ConfigError::Shape(format!("{lead}{kind}{}", &rest[at..]));
+        }
+    }
+    ConfigError::Shape(said)
 }
 
 /// Read a (possibly migrated) table into a schema type through its JSON mapping.
@@ -150,14 +206,13 @@ pub fn table(text: &str) -> Result<toml::Table, ConfigError> {
 ///
 /// [`ConfigError::Shape`] when the document does not fit the schema.
 pub fn from_table<T: DeserializeOwned>(table: toml::Table) -> Result<T, ConfigError> {
-    let json = serde_json::to_value(table).map_err(|err| ConfigError::Shape(err.to_string()))?;
-    serde_json::from_value(json).map_err(|err| ConfigError::Shape(err.to_string()))
+    let json = serde_json::to_value(table).map_err(|err| shape(&err))?;
+    serde_json::from_value(json).map_err(|err| shape(&err))
 }
 
 fn to_toml<T: Serialize>(value: &T) -> Result<String, ConfigError> {
-    let json = serde_json::to_value(value).map_err(|err| ConfigError::Shape(err.to_string()))?;
-    let table: toml::Table =
-        serde_json::from_value(json).map_err(|err| ConfigError::Shape(err.to_string()))?;
+    let json = serde_json::to_value(value).map_err(|err| shape(&err))?;
+    let table: toml::Table = serde_json::from_value(json).map_err(|err| shape(&err))?;
     toml::to_string(&table).map_err(|err| ConfigError::Toml(err.to_string()))
 }
 
@@ -308,6 +363,67 @@ ipv4 = "192.168.1.1/24"
             parse("config_version = \n"),
             Err(ConfigError::Toml(_))
         ));
+    }
+
+    /// SPEC §9: no secret reaches a log line or an error, and this error is logged, shown in
+    /// the state and, since M4 part 3c, in the log the panel downloads. A file that does not
+    /// parse is refused with what was wrong and where, without the line it was wrong on: the
+    /// line may be the one that holds a password.
+    #[test]
+    fn a_syntax_error_says_where_and_not_what_the_line_held() {
+        let pppoe = "config_version = 1\n\n[[wans]]\nname = \"wan0\"\n[wans.pppoe]\nusername = \"user@isp.example\"\npassword = \"hunter2-with-a-\"-in-it\"\n";
+        let Err(ConfigError::Toml(said)) = parse(pppoe) else {
+            panic!("a string broken by its own quote parsed");
+        };
+        assert!(said.starts_with("line 7, column "), "{said}");
+        for held in ["hunter2", "in-it", "password"] {
+            assert!(!said.contains(held), "the error repeats the line: {said}");
+        }
+        let hash = "config_version = 1\n[admin]\npassword_hash = \"$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$abcdefgh\n";
+        let Err(error) = parse(hash) else {
+            panic!("an unterminated string parsed");
+        };
+        let said = error.to_string();
+        assert!(said.starts_with("TOML syntax: line 3, column "), "{said}");
+        assert!(
+            !said.contains("argon2id") && !said.contains("abcdefgh"),
+            "{said}"
+        );
+        // What was wrong is still said.
+        assert!(
+            said.len() > "TOML syntax: line 3, column 1: ".len(),
+            "{said}"
+        );
+    }
+
+    /// A password typed without its quotes is a number, and serde says what it found as well
+    /// as what it wanted. The kind is said; the value is not.
+    #[test]
+    fn a_value_of_the_wrong_type_is_not_repeated() {
+        for (wrong, kind) in [
+            ("12345678", "integer"),
+            ("1234.5678", "floating point"),
+            ("true", "boolean"),
+        ] {
+            let text = format!(
+                "config_version = 1\n[[wans]]\nname = \"wan0\"\n[wans.pppoe]\nusername = \"user@isp.example\"\npassword = {wrong}\n"
+            );
+            let Err(ConfigError::Shape(said)) = parse(&text) else {
+                panic!("a password that is {kind} parsed");
+            };
+            assert!(!said.contains(wrong), "the error repeats the value: {said}");
+            assert!(
+                said.contains(&format!("invalid type: {kind}, expected")),
+                "{said}"
+            );
+        }
+        // A string where a number belongs is not repeated either.
+        let Err(ConfigError::Shape(said)) =
+            parse("config_version = 1\n[[lans]]\nname = \"lan0\"\nvlan = \"hunter2\"\n")
+        else {
+            panic!("a tag that is a string parsed");
+        };
+        assert!(!said.contains("hunter2"), "{said}");
     }
 
     #[test]

@@ -63,7 +63,11 @@ export function watch(page: Page, hosts: string[]): Watch {
   })
   page.on('pageerror', (error) => problems.push(`uncaught: ${error.message}`))
   const elsewhere = (url: string) => {
-    if (!hosts.includes(new URL(url).host)) {
+    const at = new URL(url)
+    // A file the page made for the browser to save is the page's own: its address is `blob:`
+    // and then the page's origin.
+    const host = at.protocol === 'blob:' ? new URL(at.pathname).host : at.host
+    if (!hosts.includes(host)) {
       problems.push(`asked of another host: ${url}`)
     }
   }

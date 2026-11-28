@@ -366,20 +366,48 @@ fn report_web(report: &mut impl FnMut(&str, bool, &str)) {
     report("npm", on_path("npm"), "");
     report("web/node_modules", web::installed(), " (make web-install)");
     // `make panel` writes the Rust crates' notices with it, and refuses a version that is not
-    // the Makefile's.
-    match cargo_about() {
-        Some(version) => report("cargo about", true, &format!(" ({version})")),
-        None => report(
-            "cargo about",
-            false,
-            " (cargo install cargo-about --locked, at the Makefile's CARGO_ABOUT_VERSION)",
-        ),
-    }
+    // the Makefile's, which `make check-env` hands over.
+    let wanted = std::env::var("OPENFEO_CARGO_ABOUT").ok();
+    let (ok, detail) = about_row(
+        cargo_about().as_deref(),
+        wanted.as_deref().filter(|version| !version.is_empty()),
+    );
+    report("cargo about", ok, &detail);
     match web::chromium() {
         Ok(_) => println!("{:<30} ok", "Playwright's Chromium"),
         Err(why) => println!(
             "{:<30} no ({why}; the browser and client scenarios skip: make panel-browser)",
             "Playwright's Chromium"
+        ),
+    }
+}
+
+/// The `cargo about` row: what the installed tool `said` of itself (`cargo-about 0.9.2`), held
+/// to the version `make panel` takes when one was `wanted`. Whether it will do, and the detail
+/// to print beside it.
+fn about_row(said: Option<&str>, wanted: Option<&str>) -> (bool, String) {
+    match (said, wanted) {
+        (Some(said), Some(wanted)) if said.split_whitespace().nth(1) == Some(wanted) => {
+            (true, format!(" ({said})"))
+        }
+        (Some(said), Some(wanted)) => (
+            false,
+            format!(
+                " ({said}, and make panel takes {wanted}: cargo install cargo-about --locked --version {wanted})"
+            ),
+        ),
+        (Some(said), None) => (
+            true,
+            format!(" ({said}; run make check-env to hold it to the Makefile's version)"),
+        ),
+        (None, Some(wanted)) => (
+            false,
+            format!(" (cargo install cargo-about --locked --version {wanted})"),
+        ),
+        (None, None) => (
+            false,
+            " (cargo install cargo-about --locked, at the Makefile's CARGO_ABOUT_VERSION)"
+                .to_owned(),
         ),
     }
 }
@@ -535,7 +563,7 @@ fn sandbox_works() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::kea_error_line;
+    use super::{about_row, kea_error_line};
 
     #[test]
     fn kea_error_line_keeps_the_message_without_the_log_prefix() {
@@ -556,5 +584,42 @@ mod tests {
             "kea-dhcp4: Permission denied"
         );
         assert_eq!(kea_error_line(""), "no output");
+    }
+
+    /// `make panel` takes one version of `cargo about`, the Makefile's: a machine with another
+    /// cannot build the image, and the check must not say it can.
+    #[test]
+    fn the_cargo_about_row_holds_the_tool_to_the_makefiles_version() {
+        assert_eq!(
+            about_row(Some("cargo-about 0.9.2"), Some("0.9.2")),
+            (true, " (cargo-about 0.9.2)".to_owned())
+        );
+        assert_eq!(
+            about_row(Some("cargo-about 0.9.1"), Some("0.9.2")),
+            (
+                false,
+                " (cargo-about 0.9.1, and make panel takes 0.9.2: cargo install cargo-about --locked --version 0.9.2)"
+                    .to_owned()
+            )
+        );
+        // 0.9.20 is not 0.9.2.
+        assert!(!about_row(Some("cargo-about 0.9.20"), Some("0.9.2")).0);
+        assert_eq!(
+            about_row(None, Some("0.9.2")),
+            (
+                false,
+                " (cargo install cargo-about --locked --version 0.9.2)".to_owned()
+            )
+        );
+        // Run by hand there is no version to hold it to, and the row says so.
+        assert_eq!(
+            about_row(Some("cargo-about 0.9.1"), None),
+            (
+                true,
+                " (cargo-about 0.9.1; run make check-env to hold it to the Makefile's version)"
+                    .to_owned()
+            )
+        );
+        assert!(!about_row(None, None).0);
     }
 }

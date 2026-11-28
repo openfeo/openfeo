@@ -24,6 +24,7 @@ mod pppoe;
 mod ra;
 mod restart;
 mod router;
+mod routes;
 mod state;
 mod time;
 mod version;

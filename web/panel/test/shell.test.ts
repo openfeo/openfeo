@@ -27,8 +27,8 @@ test('the sidebar lists the dashboard, then Network with its pages in the order 
   const { wrapper, errors } = await panelAt('/')
   const nav = wrapper.find('nav.ofo-nav')
   // In the order they stand: an item, the group's name, its two items.
-  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())).toEqual(['Dashboard', 'Network', 'WAN', 'LAN & DHCP', 'Leases', 'Firewall', 'DNS', 'Router', 'System'])
-  expect(nav.findAll('.ofo-nav__item').map((item) => item.attributes('href'))).toEqual(['/', '/wan', '/lan', '/leases', '/firewall', '/dns', '/system'])
+  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())).toEqual(['Dashboard', 'Network', 'WAN', 'LAN & DHCP', 'Leases', 'Firewall', 'DNS', 'Routes', 'Router', 'Ports', 'Logs', 'System'])
+  expect(nav.findAll('.ofo-nav__item').map((item) => item.attributes('href'))).toEqual(['/', '/wan', '/lan', '/leases', '/firewall', '/dns', '/routes', '/ports', '/logs', '/system'])
   expect(nav.findAll('.ofo-nav__group').map((group) => group.text())).toEqual(['Network', 'Router'])
   expect(errors).toEqual([])
 })
@@ -45,6 +45,9 @@ test('the entry of the page being shown is the current one', async () => {
   expect(current((await panelAt('/leases')).wrapper)).toEqual(['Leases'])
   expect(current((await panelAt('/firewall')).wrapper)).toEqual(['Firewall'])
   expect(current((await panelAt('/dns')).wrapper)).toEqual(['DNS'])
+  expect(current((await panelAt('/routes')).wrapper)).toEqual(['Routes'])
+  expect(current((await panelAt('/ports')).wrapper)).toEqual(['Ports'])
+  expect(current((await panelAt('/logs')).wrapper)).toEqual(['Logs'])
   expect(current((await panelAt('/system')).wrapper)).toEqual(['System'])
 })
 

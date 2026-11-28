@@ -473,6 +473,14 @@ impl Lab {
         self.start_kea_on("wan0")
     }
 
+    /// Stop the lab's Kea DHCPv4 server; `true` when one was running: the ISP whose server
+    /// stops answering, so that a lease runs out. [`Lab::start_kea`] brings it back.
+    pub fn stop_kea(&mut self) -> bool {
+        let before = self.daemons.len();
+        self.daemons.retain(|daemon| daemon.name != "kea-dhcp4");
+        self.daemons.len() != before
+    }
+
     /// As [`Lab::start_kea`], on another interface of ISP A (a tagged `wan0.<vid>`).
     ///
     /// # Errors

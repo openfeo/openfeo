@@ -11,6 +11,7 @@ import {
   ErrorCode,
   GetStatusResponseSchema,
   LeasesSchema,
+  LogsResponseSchema,
   RouterError,
   SessionSchema,
   type Applied,
@@ -22,7 +23,11 @@ import {
   type GetStatusResponse,
   type Leases,
   type LinkHistory,
+  type LogBatch,
+  type LogLevel,
+  type LogsResponse,
   type Reverted,
+  type Route,
   type Session,
   type SessionEnd,
   type State,
@@ -32,8 +37,21 @@ import {
 
 import type { PanelRouter } from '../src/session'
 
-type Listener = ((state: State) => void) | ((leases: Leases) => void) | ((counters: Counters) => void) | ((event: Event) => void)
-type Topic = 'state' | 'leases' | 'counters' | 'events'
+type Pushed = State | Leases | Counters | Event | LogBatch
+type Listener =
+  | ((state: State) => void)
+  | ((leases: Leases) => void)
+  | ((counters: Counters) => void)
+  | ((event: Event) => void)
+  | ((batch: LogBatch) => void)
+type Topic = 'state' | 'leases' | 'counters' | 'events' | 'logs'
+/** What a call for the log may ask. */
+export interface LogsAsk {
+  level?: LogLevel
+  contains?: string
+  beforeSeq?: bigint
+  limit?: number
+}
 
 interface Listening {
   topic: Topic
@@ -86,6 +104,10 @@ export class FakeRouter implements PanelRouter {
   confirmRefusal: RouterError | null = null
   /** What `revert` answers, or the refusal it throws. */
   revertAnswer: Reverted | RouterError = { answered: true }
+  /** The routes the kernel holds: `dumpRoutes` answers them, throws, or asks a test for each answer. */
+  routesNow: Route[] | RouterError | (() => Promise<Route[]>) = []
+  /** What `logs` answers for what it was asked: lines, a refusal, or an answer a test gives when it chooses. */
+  logsNow: (ask: LogsAsk) => LogsResponse | RouterError | Promise<LogsResponse> = () => create(LogsResponseSchema, {})
   /** The refusal `changePassword` throws, when it does. */
   changeRefusal: RouterError | null = null
   /** The refusal `reboot` throws, when it does. */
@@ -109,6 +131,9 @@ export class FakeRouter implements PanelRouter {
     /** Each change of password asked: the old one and the new, as they were given. */
     changePassword: [] as [old: string, next: string][],
     reboot: 0,
+    dumpRoutes: 0,
+    /** Each call for the log, as it was asked. */
+    logs: [] as LogsAsk[],
   }
   readonly listening: Listening[] = []
   readonly #connectionListeners = new Set<(connection: Connection) => void>()
@@ -232,10 +257,35 @@ export class FakeRouter implements PanelRouter {
     }
   }
 
+  async dumpRoutes(): Promise<Route[]> {
+    this.calls.dumpRoutes += 1
+    // What the router held when it was asked, however long the answer then takes.
+    const known = this.routesNow
+    if (typeof known === 'function') {
+      return known()
+    }
+    await this.#held.get('dumpRoutes')?.promise
+    if (known instanceof RouterError) {
+      throw known
+    }
+    return known
+  }
+
+  async logs(ask: LogsAsk = {}): Promise<LogsResponse> {
+    this.calls.logs.push({ ...ask })
+    const answer = this.logsNow(ask)
+    await this.#held.get('logs')?.promise
+    if (answer instanceof RouterError) {
+      throw answer
+    }
+    return await answer
+  }
+
   subscribe(topic: 'state', onPush: (state: State) => void): Subscription
   subscribe(topic: 'leases', onPush: (leases: Leases) => void): Subscription
   subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
   subscribe(topic: 'events', onPush: (event: Event) => void, options?: { backlog?: number; onLost?: () => void }): Subscription
+  subscribe(topic: 'logs', onPush: (batch: LogBatch) => void, options?: { onLost?: () => void }): Subscription
   subscribe(topic: Topic, onPush: Listener, options: { backlog?: number; onLost?: () => void } = {}): Subscription {
     // As the client does: with no session there is nothing to subscribe on, and it says so at once.
     if (!this.authenticated) {
@@ -271,15 +321,16 @@ export class FakeRouter implements PanelRouter {
   push(topic: 'leases', value: Leases): void
   push(topic: 'counters', value: Counters): void
   push(topic: 'events', value: Event): void
-  push(topic: Topic, value: State | Leases | Counters | Event): void {
+  push(topic: 'logs', value: LogBatch): void
+  push(topic: Topic, value: Pushed): void {
     for (const entry of this.open(topic)) {
-      ;(entry.onPush as (value: State | Leases | Counters | Event) => void)(value)
+      ;(entry.onPush as (value: Pushed) => void)(value)
     }
   }
 
-  /** The router says events were dropped. */
-  lose(): void {
-    for (const entry of this.open('events')) {
+  /** The router says events were dropped, or lines of the log. */
+  lose(topic: 'events' | 'logs' = 'events'): void {
+    for (const entry of this.open(topic)) {
       entry.onLost?.()
     }
   }
@@ -303,7 +354,7 @@ export class FakeRouter implements PanelRouter {
   }
 
   /** Make calls of one kind wait until the returned function is called. */
-  holdCall(name: 'config' | 'validate' | 'apply' | 'confirm' | 'revert' | 'history' | 'changePassword' | 'reboot'): () => void {
+  holdCall(name: 'config' | 'validate' | 'apply' | 'confirm' | 'revert' | 'history' | 'changePassword' | 'reboot' | 'dumpRoutes' | 'logs'): () => void {
     const gate = held<void>()
     this.#held.set(name, gate)
     return () => {

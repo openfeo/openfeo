@@ -14,9 +14,19 @@ export type { DescField, DescMessage } from '@bufbuild/protobuf'
 export {
   ErrorCode,
   GetStatusResponseSchema,
+  LogBatchSchema,
+  LogLevel,
+  LogLineSchema,
+  LogsResponseSchema,
+  RouteKind,
+  RouteSchema,
   SessionSchema,
   type Caller,
   type GetStatusResponse,
+  type LogBatch,
+  type LogLine,
+  type LogsResponse,
+  type Route,
   type Session,
 } from './gen/openfeo/v1/api_pb.js'
 export {

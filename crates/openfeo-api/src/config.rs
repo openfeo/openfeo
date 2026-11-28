@@ -605,6 +605,8 @@ mod tests {
                 extra_host: None,
                 default_window_secs: window_secs,
                 restarter: restarter.clone(),
+                log: Arc::new(openfeo_runtime::log::Ring::new(1 << 20)),
+                routes: Arc::new(crate::testing::Routes::default()),
             });
             Rig {
                 shared,
@@ -637,6 +639,8 @@ mod tests {
                 extra_host: None,
                 default_window_secs: 120,
                 restarter: self.restarter.clone(),
+                log: Arc::new(openfeo_runtime::log::Ring::new(1 << 20)),
+                routes: Arc::new(crate::testing::Routes::default()),
             })
         }
 
@@ -1131,10 +1135,11 @@ mod tests {
         assert!(refused.shared.check_config(moved(dhcp())).await.is_ok());
     }
 
-    /// A restart is not a change of config, and one that is pending does not stand in its
-    /// way: the router comes back on the confirmed config (SPEC §5.5, §6.3).
+    /// A restart is not a change of config: with one pending, the router is still asked to
+    /// restart, once. (`reboot` cannot refuse, so this holds it to asking; that the router
+    /// then comes back on the confirmed config is the harness's to show: SPEC §5.5, §6.3.)
     #[tokio::test]
-    async fn a_restart_is_not_refused_while_a_change_is_pending() {
+    async fn a_restart_is_asked_of_the_router_while_a_change_is_pending() {
         let rig = Rig::new(120);
         rig.apply(&moved(dhcp()), false, 0).await.unwrap();
         let _answer = rig.shared.reboot("192.168.1.23".parse().unwrap());
@@ -1329,6 +1334,24 @@ mod tests {
             console.clone(),
             Some(Box::new(std::io::sink())),
         ));
+        // Once through first: a change applied and confirmed. `tracing` decides whether a log
+        // line's call site is on the first time any thread reaches it, by that thread's
+        // subscriber when this one is the only one there is; a call site that another test's
+        // thread reached first is off for this test too. After this every call site on the
+        // way has been reached, and the cache is rebuilt from here, where the subscriber is.
+        let tag = rig.shared.config_view().await.tag;
+        rig.shared
+            .apply_config(ApplyConfigRequest {
+                config: Some(with_reservation((*world.config).clone())),
+                tag,
+                immediate: false,
+                timeout_secs: 0,
+            })
+            .await
+            .unwrap();
+        rig.shared.confirm_config().await.unwrap();
+        tracing::callsite::rebuild_interest_cache();
+        let before = console.newest();
         // A valid apply, typing a new PPPoE password; then confirmed; then an invalid one.
         let mut typed = with_reservation((*world.config).clone());
         let Some(wan::Kind::Pppoe(account)) = &mut typed.wans[0].kind else {
@@ -1360,7 +1383,12 @@ mod tests {
             .await
             .unwrap_err();
         let violations = rig.shared.check_config(bad).await.unwrap_err();
-        let mut said = console.tail(256);
+        // What was said from here on: the lines of the change that typed a secret.
+        let mut said: Vec<String> = console
+            .after(before, 256, usize::MAX)
+            .iter()
+            .map(|line| line.text.to_string())
+            .collect();
         said.push(format!("{err:?}"));
         said.push(err.message.clone());
         said.push(format!("{violations:?}"));

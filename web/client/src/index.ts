@@ -7,6 +7,7 @@
 
 export { RouterError } from './errors.js'
 export * from './messages.js'
+export { logMatches } from './log-rule.js'
 export { averaged, GAP_MS, ratesOver, samplesOf, type LinkSample, type RatePoint } from './history.js'
 export type { RouterOptions, Timers, WebSocketLike } from './options.js'
 export { rates, type LinkRate } from './rates.js'

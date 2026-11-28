@@ -11,8 +11,8 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use openfeo_config::api::{
-    ClientMsg, Error, ErrorCode, Request, Response, ServerMsg, Telemetry, client_msg, server_msg,
-    telemetry,
+    ClientMsg, Error, ErrorCode, LogBatch, Request, Response, ServerMsg, Telemetry, client_msg,
+    server_msg, telemetry,
 };
 use openfeo_config::events::Event;
 use openfeo_config::state::{Counters, Lease, Leases, State};
@@ -64,6 +64,8 @@ pub enum Topic {
     Counters,
     /// Events as they happen; queued.
     Events,
+    /// The log's lines as they are written; queued in the log itself, sent in batches.
+    Logs,
 }
 
 impl Topic {
@@ -75,6 +77,7 @@ impl Topic {
             "leases" => Some(Topic::Leases),
             "counters" => Some(Topic::Counters),
             "events" => Some(Topic::Events),
+            "logs" => Some(Topic::Logs),
             _ => None,
         }
     }
@@ -87,6 +90,7 @@ impl Topic {
             Topic::Leases => "leases",
             Topic::Counters => "counters",
             Topic::Events => "events",
+            Topic::Logs => "logs",
         }
     }
 }
@@ -105,7 +109,11 @@ pub struct Conn {
     leases_pushed: Option<(Vec<Lease>, bool)>,
     counters: Option<Counters>,
     events: VecDeque<Event>,
-    lost: bool,
+    /// Lines of the log not yet sent. The driver reads the log only when the writer is free,
+    /// so this is one batch at most; the queue is the log itself.
+    logs: Option<LogBatch>,
+    /// The queued topics whose pushes were dropped and whose reader has yet to be told.
+    lost: BTreeSet<Topic>,
 }
 
 fn error(id: u32, code: ErrorCode, message: &str) -> ServerMsg {
@@ -115,6 +123,21 @@ fn error(id: u32, code: ErrorCode, message: &str) -> ServerMsg {
             code: code.into(),
             message: message.to_owned(),
             retry_after_secs: 0,
+            topic: String::new(),
+        })),
+    }
+}
+
+/// Word that pushes on `topic` were dropped: the socket goes on, and its reader knows which
+/// of its subscriptions has a gap.
+fn loss(topic: Topic, message: &str) -> ServerMsg {
+    ServerMsg {
+        id: 0,
+        body: Some(server_msg::Body::Error(Error {
+            code: ErrorCode::DataLoss.into(),
+            message: message.to_owned(),
+            retry_after_secs: 0,
+            topic: topic.as_str().to_owned(),
         })),
     }
 }
@@ -147,7 +170,7 @@ impl Conn {
     /// The driver itself fell behind the event bus: say so, as when the queue overflows.
     pub fn events_lost(&mut self) {
         if self.wants(Topic::Events) {
-            self.lost = true;
+            self.lost.insert(Topic::Events);
         }
     }
 
@@ -246,7 +269,11 @@ impl Conn {
                     Topic::Counters => self.counters = None,
                     Topic::Events => {
                         self.events.clear();
-                        self.lost = false;
+                        self.lost.remove(&Topic::Events);
+                    }
+                    Topic::Logs => {
+                        self.logs = None;
+                        self.lost.remove(&Topic::Logs);
                     }
                 }
                 vec![Out::Send(ack(id))]
@@ -329,16 +356,37 @@ impl Conn {
         }
     }
 
+    /// Lines of the log, with whether some were skipped before them. Dropped unless
+    /// subscribed. Lines that follow others not yet sent go after them, in one batch with
+    /// the newer clocks.
+    pub fn push_logs(&mut self, batch: LogBatch, lost: bool) {
+        if !self.wants(Topic::Logs) {
+            return;
+        }
+        if lost {
+            self.lost.insert(Topic::Logs);
+        }
+        match &mut self.logs {
+            Some(waiting) => {
+                waiting.lines.extend(batch.lines);
+                waiting.uptime_ms = batch.uptime_ms;
+                waiting.time_unix_ms = batch.time_unix_ms;
+            }
+            None => self.logs = Some(batch),
+        }
+    }
+
     fn queue_event(&mut self, event: Event) {
         if self.events.len() >= EVENT_QUEUE {
             self.events.pop_front();
-            self.lost = true;
+            self.lost.insert(Topic::Events);
         }
         self.events.push_back(event);
     }
 
-    /// What the writer sends next: replies first, then word of lost events, then the latest
-    /// state, leases and counters, then events in order.
+    /// What the writer sends next: replies first, then word of lost events and of lost lines
+    /// of the log, then the latest state, leases and counters, then events in order, then the
+    /// log's lines.
     pub fn next_out(&mut self) -> Option<ServerMsg> {
         if self.closed {
             return None;
@@ -346,13 +394,13 @@ impl Conn {
         if let Some(reply) = self.replies.pop_front() {
             return Some(reply);
         }
-        if self.lost {
-            self.lost = false;
-            return Some(error(
-                0,
-                ErrorCode::DataLoss,
-                "events were dropped: this reader fell behind",
-            ));
+        if let Some(topic) = self.lost.pop_first() {
+            let message = if topic == Topic::Logs {
+                "log lines were dropped: this reader fell behind"
+            } else {
+                "events were dropped: this reader fell behind"
+            };
+            return Some(loss(topic, message));
         }
         let telemetry = |topic: Topic, body: telemetry::Body| ServerMsg {
             id: 0,
@@ -373,9 +421,15 @@ impl Conn {
                 telemetry::Body::Counters(counters),
             ));
         }
-        self.events.pop_front().map(|event| ServerMsg {
+        if let Some(event) = self.events.pop_front() {
+            return Some(ServerMsg {
+                id: 0,
+                body: Some(server_msg::Body::Event(event)),
+            });
+        }
+        self.logs.take().map(|batch| ServerMsg {
             id: 0,
-            body: Some(server_msg::Body::Event(event)),
+            body: Some(server_msg::Body::Logs(batch)),
         })
     }
 }
@@ -383,7 +437,8 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use openfeo_config::api::{
-        Auth, GetStateRequest, GetStateResponse, Subscribe, Unsubscribe, request, response,
+        Auth, GetStateRequest, GetStateResponse, LogLevel, LogLine, Subscribe, Unsubscribe,
+        request, response,
     };
 
     use super::*;
@@ -602,6 +657,113 @@ mod tests {
         assert_eq!(numbers.len(), 256);
         assert_eq!(numbers.first(), Some(&44));
         assert_eq!(numbers.last(), Some(&299), "the newest survive");
+    }
+
+    fn batch(numbers: std::ops::RangeInclusive<u64>) -> LogBatch {
+        LogBatch {
+            lines: numbers
+                .map(|seq| LogLine {
+                    seq,
+                    uptime_ms: 5_000 + seq,
+                    level: LogLevel::Info.into(),
+                    text: format!("line {seq}"),
+                })
+                .collect(),
+            uptime_ms: 9_000,
+            time_unix_ms: 1_795_000_000_000,
+        }
+    }
+
+    fn lost_topic(message: &ServerMsg) -> Option<&str> {
+        match &message.body {
+            Some(server_msg::Body::Error(error)) if error.code() == ErrorCode::DataLoss => {
+                Some(error.topic.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn log_numbers(message: &ServerMsg) -> Option<Vec<u64>> {
+        match &message.body {
+            Some(server_msg::Body::Logs(batch)) => {
+                Some(batch.lines.iter().map(|line| line.seq).collect())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn logs_is_a_topic_by_name() {
+        assert_eq!(Topic::parse("logs"), Some(Topic::Logs));
+        assert_eq!(Topic::Logs.as_str(), "logs");
+        let mut conn = authed();
+        let out = conn.on_binary(&encode(&client(2, subscribe("logs", 0))), &mut Fake);
+        assert!(matches!(&out[..], [Out::Send(message)] if message.id == 2));
+        assert!(conn.wants(Topic::Logs));
+    }
+
+    #[test]
+    fn a_batch_is_not_sent_to_a_reader_that_did_not_ask() {
+        let mut conn = authed();
+        conn.push_logs(batch(1..=3), true);
+        assert_eq!(drain(&mut conn), Vec::new());
+        // One that asked and asked no longer is sent nothing of what waited.
+        conn.on_binary(&encode(&client(2, subscribe("logs", 0))), &mut Fake);
+        drain(&mut conn);
+        conn.push_logs(batch(1..=3), true);
+        conn.on_binary(
+            &encode(&client(
+                3,
+                Body::Unsubscribe(Unsubscribe {
+                    topic: "logs".into(),
+                }),
+            )),
+            &mut Fake,
+        );
+        assert_eq!(drain(&mut conn), Vec::new());
+    }
+
+    /// SPEC §8.3 (M4 part 3c): word of the loss comes before the lines that follow the gap,
+    /// once, and says which topic it is about.
+    #[test]
+    fn a_loss_on_logs_is_told_once_before_the_batch_and_names_logs() {
+        let mut conn = authed();
+        conn.on_binary(&encode(&client(2, subscribe("logs", 0))), &mut Fake);
+        drain(&mut conn);
+        conn.push_logs(batch(1..=3), false);
+        let first = drain(&mut conn);
+        assert_eq!(first.len(), 1);
+        assert_eq!(log_numbers(&first[0]), Some(vec![1, 2, 3]));
+        let Some(server_msg::Body::Logs(sent)) = &first[0].body else {
+            panic!("not a batch");
+        };
+        assert_eq!(
+            (sent.uptime_ms, sent.time_unix_ms),
+            (9_000, 1_795_000_000_000)
+        );
+        conn.push_logs(batch(900..=902), true);
+        conn.push_logs(batch(903..=904), false);
+        let after = drain(&mut conn);
+        assert_eq!(lost_topic(&after[0]), Some("logs"), "said first");
+        assert_eq!(after.iter().filter_map(lost_topic).count(), 1);
+        let numbers: Vec<u64> = after.iter().filter_map(log_numbers).flatten().collect();
+        assert_eq!(numbers, vec![900, 901, 902, 903, 904]);
+    }
+
+    #[test]
+    fn a_loss_on_events_names_events() {
+        let mut conn = authed();
+        conn.on_binary(&encode(&client(2, subscribe("events", 0))), &mut Fake);
+        conn.on_binary(&encode(&client(3, subscribe("logs", 0))), &mut Fake);
+        drain(&mut conn);
+        conn.events_lost();
+        conn.push_logs(batch(1..=1), false);
+        let after = drain(&mut conn);
+        assert_eq!(
+            after.iter().filter_map(lost_topic).collect::<Vec<_>>(),
+            vec!["events"]
+        );
+        assert_eq!(after.iter().filter_map(log_numbers).count(), 1);
     }
 
     #[test]

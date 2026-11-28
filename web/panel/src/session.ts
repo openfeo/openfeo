@@ -30,6 +30,8 @@ export type PanelRouter = Pick<
   | 'revert'
   | 'changePassword'
   | 'reboot'
+  | 'dumpRoutes'
+  | 'logs'
 >
 
 export type Screen = 'first-password' | 'config-unreadable' | 'login' | 'dashboard'

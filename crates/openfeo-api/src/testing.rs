@@ -15,6 +15,7 @@ use hyper_util::rt::TokioIo;
 use openfeo_config::admin::ConfigState;
 use openfeo_reconcile::fixtures;
 use openfeo_runtime::Publisher;
+use openfeo_runtime::log::{DEFAULT_RING_BYTES, Ring};
 use openfeo_world::health::HealthView;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -127,9 +128,30 @@ impl crate::Restarter for Counted {
     }
 }
 
+/// The routes a test says the kernel holds.
+#[derive(Debug, Default)]
+pub(crate) struct Routes(std::sync::Mutex<Vec<openfeo_config::api::Route>>);
+
+impl Routes {
+    /// From now on the kernel holds these.
+    pub(crate) fn set(&self, routes: Vec<openfeo_config::api::Route>) {
+        *self.0.lock().unwrap() = routes;
+    }
+}
+
+impl crate::RouteSource for Routes {
+    fn routes(&self) -> Vec<openfeo_config::api::Route> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
 pub(crate) struct TestApi {
     pub(crate) shared: Arc<Shared>,
     restarter: Arc<Counted>,
+    /// The log the API reads: a test writes its lines here.
+    pub(crate) log: Arc<Ring>,
+    /// The routes the API answers: a test sets them here.
+    pub(crate) routes: Arc<Routes>,
     pub(crate) https: SocketAddr,
     pub(crate) http: SocketAddr,
     pub(crate) config_path: PathBuf,
@@ -180,6 +202,8 @@ pub(crate) async fn spawn_api_full(
         unhealthy: Vec::new(),
     });
     let restarter = Arc::new(Counted::default());
+    let log = Arc::new(Ring::new(DEFAULT_RING_BYTES));
+    let routes = Arc::new(Routes::default());
     let server = Server::bind(ApiDeps {
         world,
         publisher,
@@ -199,6 +223,8 @@ pub(crate) async fn spawn_api_full(
         extra_host: None,
         confirm_secs: crate::keeper::DEFAULT_WINDOW_SECS,
         restarter: restarter.clone(),
+        log: log.clone(),
+        routes: routes.clone(),
     })
     .await
     .unwrap();
@@ -213,6 +239,8 @@ pub(crate) async fn spawn_api_full(
     TestApi {
         shared,
         restarter,
+        log,
+        routes,
         https,
         http,
         config_path,

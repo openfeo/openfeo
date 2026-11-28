@@ -64,3 +64,6 @@
 /* ofo.css gives a chart its head and its plot and nowhere to say something of the picture as
    a whole: that the hour before could not be read, so the line starts from now. */
 .ofo-chart__note { margin: 0 0 var(--space-3); font-size: 13px; line-height: 20px; color: var(--ink-muted); }
+
+/* A code block whose long lines wrap (a log's), where the stylesheet's own scrolls sideways. */
+.ofo-code--wrap { white-space: pre-wrap; overflow-wrap: anywhere; }

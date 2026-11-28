@@ -251,9 +251,13 @@ test("two counters samples make rates, and the default WAN's last sixty are kept
   const { router, live } = started()
   router.push('state', state())
   router.push('counters', counters(1_000n, [['ppp-wan0', 0n, 0n], ['br-lan0', 0n, 0n]]))
-  // One sample is no rate; it does say how many connections are tracked.
+  // One sample is no rate; it does say how many connections are tracked, and it is kept as it came.
   expect(live.rates.value).toBeNull()
   expect(live.conntrack.value).toEqual({ count: 1842, max: 262_144 })
+  expect(live.counters.value?.links.map((link) => [link.name, link.rxBytes])).toEqual([
+    ['ppp-wan0', 0n],
+    ['br-lan0', 0n],
+  ])
   expect(live.history.value).toEqual({ rx: [], tx: [] })
   router.push('counters', counters(2_000n, [['ppp-wan0', 125_000n, 12_500n], ['br-lan0', 250_000n, 0n]]))
   expect(live.rates.value?.get('ppp-wan0')).toEqual({ name: 'ppp-wan0', rxBitsPerSec: 1_000_000, txBitsPerSec: 100_000 })
@@ -289,6 +293,7 @@ test('a lost connection clears the rates and notes when, and its return clears t
   // The numbers stop: they are not left at their last value as though still true.
   expect(live.rates.value).toBeNull()
   expect(live.conntrack.value).toBeNull()
+  expect(live.counters.value).toBeNull()
   // What the router last said of itself stays on screen.
   expect(live.state.value?.generation).toBe(42n)
   // When it was lost does not move while it stays lost.

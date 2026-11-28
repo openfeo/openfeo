@@ -84,6 +84,10 @@ const SCENARIOS: &[Scenario] = &[
         run: dhcp_lease_renews_at_t1,
     },
     Scenario {
+        name: "a_dhcp_lease_that_ran_out_and_came_back_routes_again",
+        run: a_dhcp_lease_that_ran_out_and_came_back_routes_again,
+    },
+    Scenario {
         name: "dhcp_wan_link_flap_reacquires",
         run: dhcp_wan_link_flap_reacquires,
     },
@@ -690,6 +694,51 @@ fn dhcp_wan_gets_a_lease_and_nats(lab: &mut Lab) -> anyhow::Result<()> {
     anyhow::ensure!(
         kea_log_count(lab, "DHCP4_LEASE_ALLOC") >= 1,
         "Kea did not log the allocation"
+    );
+    Ok(())
+}
+
+/// The ISP's server stops answering until the lease runs out, and comes back. The router gives
+/// up the address, and the kernel drops the default route with it without saying so
+/// (ADR-0027); when the lease returns, by the same gateway, the router adds the route again and
+/// a LAN host reaches the ISP as before. A router that went on believing it had the route
+/// would say the WAN is up and route nothing.
+fn a_dhcp_lease_that_ran_out_and_came_back_routes_again(lab: &mut Lab) -> anyhow::Result<()> {
+    const DEFAULT_ADDED: &str =
+        r"openfeo: add route default via 203\.0\.113\.1 dev p0 proto 200 metric 10";
+    let (mut cur, _) = boot_dhcp(lab)?;
+    let _server = http_target(lab, &lab.isp0, "203.0.113.1", ISP_HTTP_BODY)?;
+    lab.console()?.wait_for(&mut cur, &re(READY), SOON)?;
+    lab.lan_side_host()?;
+    let body = lanclient::http_get(&lab.lan0, ISP_HTTP.parse()?, "/", HTTP_TIMEOUT)?;
+    anyhow::ensure!(body == ISP_HTTP_BODY, "before: unexpected body {body:?}");
+    anyhow::ensure!(lab.stop_kea(), "no Kea to stop");
+    // The lease is 60 s and was last renewed at most 20 s ago.
+    lab.console()?.wait_for(
+        &mut cur,
+        &re(r"openfeo: wan wan0 dhcp expired"),
+        Duration::from_secs(90),
+    )?;
+    lab.console()?
+        .wait_for(&mut cur, &re(r"openfeo: del addr \S+ dev p0"), SOON)?;
+    lab.start_kea()?;
+    lab.console()?.wait_for(
+        &mut cur,
+        &re(r"openfeo: wan wan0 dhcp bound"),
+        Duration::from_secs(90),
+    )?;
+    lab.console()?.wait_for(&mut cur, &re(READY), SOON)?;
+    let added = lab.console()?.count(&re(DEFAULT_ADDED));
+    anyhow::ensure!(
+        added == 2,
+        "the default route was added {added} times, not once for each lease"
+    );
+    let body = lanclient::http_get(&lab.lan0, ISP_HTTP.parse()?, "/", HTTP_TIMEOUT)
+        .context("after the lease came back, the LAN host no longer reaches the ISP")?;
+    anyhow::ensure!(body == ISP_HTTP_BODY, "after: unexpected body {body:?}");
+    anyhow::ensure!(
+        lab.console()?.count(&re(r"openfeo: apply \S+ failed")) == 0,
+        "an apply failed"
     );
     Ok(())
 }

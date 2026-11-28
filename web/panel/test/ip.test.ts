@@ -3,7 +3,7 @@
 
 import { expect, test } from 'vitest'
 
-import { contains, format4, hostCount, hostRange, isCidr6, isIp6, network, parse4, parseCidr4, parseMac } from '../src/model/ip'
+import { contains, format4, hostCount, hostRange, isCidr6, isIp6, network, parse4, parseCidr4, parseCidr6, parseMac, within6 } from '../src/model/ip'
 
 test('an address is read strictly and written back the same', () => {
   expect(parse4('192.168.1.1')).toBe(3232235777)
@@ -71,4 +71,25 @@ test('an IPv6 address or prefix is told from what is not one', () => {
   for (const not of ['2001:db8:1::', '2001:db8:1::/129', '2001:db8:1::/', '2001:db8:1::/4 8', '192.168.1.1/24', '2001:db8:1::/048']) {
     expect(isCidr6(not), not).toBe(false)
   }
+})
+
+test('an IPv6 block is read as its number and its length', () => {
+  expect(parseCidr6('2001:db8:1::/48')).toEqual({ address: 0x2001_0db8_0001_0000_0000_0000_0000_0000n, prefix: 48 })
+  expect(parseCidr6('::/0')).toEqual({ address: 0n, prefix: 0 })
+  expect(parseCidr6('fe80::1/128')?.address).toBe(0xfe80_0000_0000_0000_0000_0000_0000_0001n)
+  expect(parseCidr6('::ffff:192.0.2.1/128')?.address).toBe(0xffff_c000_0201n)
+  expect(parseCidr6('2001:DB8:1:222::1/64')?.address).toBe(0x2001_0db8_0001_0222_0000_0000_0000_0001n)
+  for (const not of ['', '2001:db8::', '2001:db8::/129', '2001:db8:::/48', '192.0.2.0/24', '2001:db8::/x', 'g::/8']) {
+    expect(parseCidr6(not), not).toBeNull()
+  }
+})
+
+test('one IPv6 block lies within another when it is no wider and begins the same', () => {
+  const block = (text: string) => parseCidr6(text)!
+  expect(within6(block('2001:db8:1:ff00::/56'), block('2001:db8:1::/48'))).toBe(true)
+  expect(within6(block('2001:db8:1::/48'), block('2001:db8:1::/48'))).toBe(true)
+  expect(within6(block('2001:db8::/32'), block('2001:db8:1::/48'))).toBe(false)
+  expect(within6(block('2001:db8:2::/48'), block('2001:db8:1::/48'))).toBe(false)
+  expect(within6(block('fe80::/64'), block('fe80::/10'))).toBe(true)
+  expect(within6(block('2001:db8::/64'), block('::/0'))).toBe(true)
 })

@@ -10,6 +10,7 @@
 
 #![allow(unsafe_code)] // setns(2) on the calling thread, as `lanclient` does
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,14 +24,16 @@ use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::TokioIo;
 use nix::sched::{CloneFlags, setns};
+use openfeo_api::pb::diagnostics_service_client::DiagnosticsServiceClient;
 use openfeo_api::pb::state_service_client::StateServiceClient;
 use openfeo_api::pb::system_service_client::SystemServiceClient;
 use openfeo_config::Config;
 use openfeo_config::api::{
-    ApplyConfigRequest, Auth, ClientMsg, ConfirmConfigRequest, Error, GetConfigRequest,
-    GetConfigResponse, GetHistoryRequest, GetLeasesRequest, GetStateRequest, RebootRequest,
-    Request, RevertConfigRequest, ServerMsg, Subscribe, ValidateConfigRequest,
-    ValidateConfigResponse, client_msg, request, response, server_msg, telemetry,
+    ApplyConfigRequest, Auth, ClientMsg, ConfirmConfigRequest, DumpRoutesRequest, Error, ErrorCode,
+    GetConfigRequest, GetConfigResponse, GetHistoryRequest, GetLeasesRequest, GetStateRequest,
+    LogLine, LogsRequest, LogsResponse, RebootRequest, Request, RevertConfigRequest, Route,
+    ServerMsg, Subscribe, ValidateConfigRequest, ValidateConfigResponse, client_msg, request,
+    response, server_msg, telemetry,
 };
 use openfeo_config::events::Event;
 use openfeo_config::state::{Counters, Leases, LinkHistory, State};
@@ -432,6 +435,51 @@ impl Api {
         })
     }
 
+    /// `DiagnosticsService.DumpRoutes` over gRPC, with a token or without: `Ok(Err(status))`
+    /// is the router's refusal.
+    ///
+    /// # Errors
+    ///
+    /// When the channel cannot be opened or nothing answers.
+    pub fn grpc_dump_routes(
+        &self,
+        token: Option<&str>,
+    ) -> Result<Result<Vec<Route>, tonic::Status>> {
+        self.inside(|| async move {
+            let channel = self.channel().await?;
+            let request = with_bearer(DumpRoutesRequest {}, token)?;
+            let answer = tokio::time::timeout(
+                STEP,
+                DiagnosticsServiceClient::new(channel).dump_routes(request),
+            )
+            .await
+            .map_err(|_| anyhow!("DumpRoutes: nothing within {} s", STEP.as_secs()))?;
+            Ok(answer.map(|reply| reply.into_inner().routes))
+        })
+    }
+
+    /// `SystemService.Logs` over gRPC, with a token or without: `Ok(Err(status))` is the
+    /// router's refusal.
+    ///
+    /// # Errors
+    ///
+    /// When the channel cannot be opened or nothing answers.
+    pub fn grpc_logs(
+        &self,
+        token: Option<&str>,
+        ask: LogsRequest,
+    ) -> Result<Result<LogsResponse, tonic::Status>> {
+        self.inside(|| async move {
+            let channel = self.channel().await?;
+            let request = with_bearer(ask, token)?;
+            let answer =
+                tokio::time::timeout(STEP, SystemServiceClient::new(channel).logs(request))
+                    .await
+                    .map_err(|_| anyhow!("Logs: nothing within {} s", STEP.as_secs()))?;
+            Ok(answer.map(tonic::Response::into_inner))
+        })
+    }
+
     /// Open `/ws`, with this `Origin` if any. `Ok(Err(status))` is a refused upgrade.
     ///
     /// # Errors
@@ -462,6 +510,7 @@ impl Api {
                 got: got_rx,
                 send: send_tx,
                 next_id: 1,
+                log_lines: VecDeque::new(),
             })),
             Ok(Ok(Err(status))) => Ok(Err(status)),
             Ok(Err(err)) => Err(err),
@@ -556,12 +605,25 @@ async fn socket(
     }
 }
 
+/// `message` as a gRPC request, with the token as its bearer if there is one.
+fn with_bearer<T>(message: T, token: Option<&str>) -> Result<tonic::Request<T>> {
+    let mut request = tonic::Request::new(message);
+    if let Some(token) = token {
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse()?);
+    }
+    Ok(request)
+}
+
 /// An open WebSocket speaking the envelope; dropping it closes the connection.
 #[derive(Debug)]
 pub struct Ws {
     got: Receiver<Got>,
     send: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     next_id: u32,
+    /// Lines of the log pushed in a batch and not yet asked for by [`Ws::log_line`].
+    log_lines: VecDeque<LogLine>,
 }
 
 impl Ws {
@@ -839,6 +901,96 @@ impl Ws {
             Ok(other) => bail!("not the history: {other:?}"),
             Err(error) => Err(error),
         })
+    }
+
+    /// Every route the kernel holds (`DumpRoutes`).
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes, or it is a refusal.
+    pub fn routes(&mut self) -> Result<Vec<Route>> {
+        match self.answered(request::Body::DumpRoutes(DumpRoutesRequest {}))? {
+            Ok(response::Body::DumpRoutes(answer)) => Ok(answer.routes),
+            Ok(other) => bail!("not the routes: {other:?}"),
+            Err(error) => bail!("the routes were refused: {error:?}"),
+        }
+    }
+
+    /// The newest lines of the log that match (`Logs`), or the router's refusal.
+    ///
+    /// # Errors
+    ///
+    /// When no reply comes, or it is neither.
+    pub fn logs(&mut self, ask: LogsRequest) -> Result<Result<LogsResponse, Error>> {
+        Ok(match self.answered(request::Body::Logs(ask))? {
+            Ok(response::Body::Logs(answer)) => Ok(answer),
+            Ok(other) => bail!("not lines of the log: {other:?}"),
+            Err(error) => Err(error),
+        })
+    }
+
+    /// Every line the log holds, oldest first, read back `page` lines at a time from the
+    /// newest there is when it is asked.
+    ///
+    /// # Errors
+    ///
+    /// When a call is not answered or is refused.
+    pub fn whole_log(&mut self, page: u32) -> Result<Vec<LogLine>> {
+        let mut lines: Vec<LogLine> = Vec::new();
+        let mut before_seq = 0;
+        loop {
+            let answer = self
+                .logs(LogsRequest {
+                    before_seq,
+                    limit: page,
+                    ..LogsRequest::default()
+                })?
+                .map_err(|error| anyhow!("the log was refused: {error:?}"))?;
+            let Some(oldest) = answer.lines.first() else {
+                break;
+            };
+            before_seq = oldest.seq;
+            lines.splice(0..0, answer.lines);
+            if !answer.earlier {
+                break;
+            }
+        }
+        Ok(lines)
+    }
+
+    /// The next line pushed on `logs` whose text matches. Lines that came in the same batch
+    /// after it are kept for the next call.
+    ///
+    /// # Errors
+    ///
+    /// When none arrives in time, or the router says lines of the log were dropped.
+    pub fn log_line(&mut self, timeout: Duration, wanted: &crate::lines::Regex) -> Result<LogLine> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            while let Some(line) = self.log_lines.pop_front() {
+                if wanted.is_match(&line.text) {
+                    return Ok(line);
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(
+                !left.is_zero(),
+                "no line of the log matching {wanted} within {timeout:?}"
+            );
+            match self
+                .msg(left)
+                .context("waiting for a line of the log")?
+                .body
+            {
+                Some(server_msg::Body::Logs(batch)) => self.log_lines.extend(batch.lines),
+                Some(server_msg::Body::Error(error))
+                    if error.code() == ErrorCode::DataLoss && error.topic == "logs" =>
+                {
+                    bail!("the router dropped lines of the log: {}", error.message);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// The next `leases` push that satisfies `wanted`.
