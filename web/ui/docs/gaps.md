@@ -62,3 +62,10 @@ across, the working answer lives in `additions.css` or in a component, as noted.
   `additions.css` is a select for a row of a table edited in place.
 - Nothing documents a grid of ticks (which network may reach which, the SPEC's "zone
   matrix"). The Firewall page's is a plain `ofo-table` whose cells hold bare ticks.
+- The CodeBlock guideline is markup to write by hand. `OfoCode` takes the lines as data, each
+  a list of parts with one of the four tones or none, so that a page cannot put markup of its
+  own in a log line; with `live` it is a log to assistive technology (`role="log"`).
+- A code block scrolls sideways when a line is long, which suits a command and not a log:
+  `ofo-code--wrap` in `additions.css` wraps the line.
+- The design system's icon list has none for routes, ports or logs. The navigation uses
+  Lucide's `route`, `ethernet-port` and `file-text`, as the mockup the maintainer approved did.

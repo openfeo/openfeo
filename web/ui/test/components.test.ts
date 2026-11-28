@@ -9,6 +9,7 @@ import {
   OfoButton,
   OfoCard,
   OfoChart,
+  OfoCode,
   OfoDataTable,
   OfoEmpty,
   OfoField,
@@ -565,4 +566,52 @@ test('a chart with nothing to draw still has its scale, and says what it was tol
   expect(chart.find('path.line.rx').attributes('d')).toBe('')
   expect(chart.findAll('g.event')).toHaveLength(0)
   expect(chart.find('.ofo-chart__key--rx').text()).toBe('Download – bit/s')
+})
+
+const LOG = [
+  { key: '41', parts: [{ text: '14:12:03 ', tone: 'dim' as const }, { text: 'warn  ', tone: 'warn' as const }, { text: 'pppoe wan0: 3 echoes unanswered' }] },
+  { key: '42', parts: [{ text: '14:27:19 ', tone: 'dim' as const }, { text: 'error ', tone: 'err' as const }, { text: 'sntp: no answer from 203.0.113.1' }] },
+  { key: '43', parts: [{ text: 'done', tone: 'ok' as const }] },
+]
+
+test('OfoCode draws each line’s parts in their tones', () => {
+  const code = mount(OfoCode, { props: { label: 'The log', lines: LOG } })
+  expect(code.element.tagName.toLowerCase()).toBe('pre')
+  expect(code.classes()).toEqual(['ofo-code'])
+  // One line of text for each line, whatever the template's own layout is.
+  expect(code.element.textContent).toBe('14:12:03 warn  pppoe wan0: 3 echoes unanswered\n14:27:19 error sntp: no answer from 203.0.113.1\ndone\n')
+  // A part with a tone is a span of that tone; one without is bare text.
+  expect(code.findAll('span').map((span) => [span.classes().join(' '), span.element.textContent])).toEqual([
+    ['ofo-code__dim', '14:12:03 '],
+    ['ofo-code__warn', 'warn  '],
+    ['ofo-code__dim', '14:27:19 '],
+    ['ofo-code__err', 'error '],
+    ['ofo-code__ok', 'done'],
+  ])
+})
+
+test('text is text: markup in a line is shown, not made', () => {
+  const code = mount(OfoCode, { props: { label: 'The log', lines: [{ key: '1', parts: [{ text: '<b>x</b>' }, { text: '<i>y</i>', tone: 'dim' }] }] } })
+  expect(code.element.textContent).toBe('<b>x</b><i>y</i>\n')
+  expect(code.find('b').exists()).toBe(false)
+  expect(code.find('i').exists()).toBe(false)
+})
+
+test('a live block is a log to assistive tech, and any block has its name', async () => {
+  const code = mount(OfoCode, { props: { label: 'The log', lines: LOG, live: true } })
+  expect([code.attributes('role'), code.attributes('aria-live'), code.attributes('aria-label')]).toEqual(['log', 'polite', 'The log'])
+  await code.setProps({ live: false })
+  expect([code.attributes('role'), code.attributes('aria-live'), code.attributes('aria-label')]).toEqual(['group', undefined, 'The log'])
+})
+
+test('a block told to wrap has the class that wraps', () => {
+  const code = mount(OfoCode, { props: { label: 'The log', lines: LOG, wrap: true } })
+  expect(code.classes()).toEqual(['ofo-code', 'ofo-code--wrap'])
+})
+
+test('the icons the views are found by are there', () => {
+  for (const name of ['route', 'ethernet-port', 'file-text'] as const) {
+    const icon = mount(OfoIcon, { props: { name } })
+    expect(icon.element.childElementCount, name).toBeGreaterThan(0)
+  }
 })
