@@ -35,6 +35,15 @@
    that fits a row. */
 .ofo-input--sm { height: 30px; }
 
+/* And one height of select: a table edited in place has choices in its rows too (a port
+   forward's protocol, where a rule starts from). */
+.ofo-select--sm { height: 30px; }
+
+/* ofo.css has a tick only with its text beside it. In a grid whose row and column say what
+   each tick is (which network may reach which) the text is given to assistive technology and
+   not shown, and the box stands alone in its cell. */
+.ofo-choice--bare { gap: 0; }
+
 /* ofo.css has no list for what a change of config alters (the apply dialog of the approved
    mockup): whose setting in a narrow column, then what it was, struck through, and what it
    becomes, in mono because a machine reads them. */

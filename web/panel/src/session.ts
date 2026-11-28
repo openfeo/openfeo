@@ -28,6 +28,8 @@ export type PanelRouter = Pick<
   | 'apply'
   | 'confirm'
   | 'revert'
+  | 'changePassword'
+  | 'reboot'
 >
 
 export type Screen = 'first-password' | 'config-unreadable' | 'login' | 'dashboard'

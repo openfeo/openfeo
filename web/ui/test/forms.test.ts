@@ -142,6 +142,22 @@ test('a radio is checked only when the model is its value', async () => {
   expect(input.checked).toBe(false)
 })
 
+test('a bare choice shows no label and is still named', async () => {
+  // A tick in a grid: its row and its column say what it is, to the eye.
+  const tick = mount(OfoChoice, { props: { modelValue: false, label: 'iot may reach lan0', bare: true } })
+  expect(tick.classes()).toContain('ofo-choice--bare')
+  expect(tick.text()).toBe('')
+  const input = tick.find('input')
+  expect(input.attributes('aria-label')).toBe('iot may reach lan0')
+  await input.setValue(true)
+  expect(tick.emitted('update:modelValue')).toEqual([[true]])
+  // An ordinary choice is named by its text, and has no second name.
+  const plain = mount(OfoChoice, { props: { modelValue: false, label: 'p3' } })
+  expect(plain.find('input').attributes('aria-label')).toBeUndefined()
+  expect(plain.classes()).not.toContain('ofo-choice--bare')
+  expect(plain.text()).toBe('p3')
+})
+
 test('a choice group is a fieldset with its legend, the choices in a row', () => {
   const group = seen(mount(OfoChoiceGroup, { props: { legend: 'Type' }, slots: { default: '<label class="ofo-choice"></label>' } }))
   expect(group.element.tagName).toBe('FIELDSET')
@@ -183,6 +199,15 @@ test('a select is a real select of its options', () => {
   expect(options.map((option) => option.attributes('value'))).toEqual(['24', '25', '31'])
   expect((select.element as HTMLSelectElement).value).toBe('24')
   expect((options[2]?.element as HTMLOptionElement).disabled).toBe(true)
+})
+
+test('a small select is the small control, for a table row', () => {
+  const options = [
+    { value: 'tcp', label: 'TCP' },
+    { value: 'udp', label: 'UDP' },
+  ]
+  expect(mount(OfoSelect, { props: { modelValue: 'tcp', options, small: true } }).classes()).toContain('ofo-select--sm')
+  expect(mount(OfoSelect, { props: { modelValue: 'tcp', options } }).classes()).not.toContain('ofo-select--sm')
 })
 
 test('a toggle and a select are v-models over real controls', async () => {

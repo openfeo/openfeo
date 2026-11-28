@@ -55,3 +55,9 @@ addresses:
   - interface: p0
     address: 203.0.113.100/24
     origin: ADDRESS_ORIGIN_CONFIG
+dns:
+  resolvers:
+    - address: 203.0.113.1
+      wan: wan0
+    - address: "2001:db8:ffff::1"
+      wan: wan0

@@ -176,12 +176,14 @@ pub fn spawn(
     health: &watch::Receiver<HealthView>,
     nl: &Netlink,
     boot: Boot,
+    restarts: crate::restart::Restarts,
 ) {
     let (publisher, world, health) = (publisher.clone(), world.clone(), health.clone());
     let counters: Arc<dyn CounterSource> = Arc::new(RouterCounters::new(nl.clone()));
     supervisor.spawn("api", move || {
         let (publisher, world, health) = (publisher.clone(), world.clone(), health.clone());
         let counters = counters.clone();
+        let restarts = restarts.clone();
         let Boot {
             config_state,
             version,
@@ -207,6 +209,7 @@ pub fn spawn(
                 limits: Limits::default(),
                 extra_host,
                 confirm_secs: confirm_secs.unwrap_or(openfeo_api::keeper::DEFAULT_WINDOW_SECS),
+                restarter: Arc::new(restarts.clone()),
             })
             .await
         }

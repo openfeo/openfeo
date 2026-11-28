@@ -571,6 +571,8 @@ mod tests {
 
     struct Rig {
         shared: Arc<Shared>,
+        /// Counts the restarts asked of the router.
+        restarter: Arc<crate::testing::Counted>,
         dir: tempfile::TempDir,
         events: tokio::sync::broadcast::Receiver<Arc<openfeo_world::Event>>,
     }
@@ -590,6 +592,7 @@ mod tests {
                 healthy: true,
                 unhealthy: Vec::new(),
             });
+            let restarter = Arc::new(crate::testing::Counted::default());
             let shared = Shared::new(SharedParts {
                 world,
                 publisher,
@@ -601,9 +604,11 @@ mod tests {
                 limits: Limits::default(),
                 extra_host: None,
                 default_window_secs: window_secs,
+                restarter: restarter.clone(),
             });
             Rig {
                 shared,
+                restarter,
                 dir,
                 events,
             }
@@ -631,7 +636,13 @@ mod tests {
                 limits: Limits::default(),
                 extra_host: None,
                 default_window_secs: 120,
+                restarter: self.restarter.clone(),
             })
+        }
+
+        /// How many restarts were asked of the router.
+        fn restarts(&self) -> usize {
+            self.restarter.asked()
         }
 
         fn config_path(&self) -> std::path::PathBuf {
@@ -1118,6 +1129,16 @@ mod tests {
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert!(err.message.contains("refused"), "{}", err.message);
         assert!(refused.shared.check_config(moved(dhcp())).await.is_ok());
+    }
+
+    /// A restart is not a change of config, and one that is pending does not stand in its
+    /// way: the router comes back on the confirmed config (SPEC §5.5, §6.3).
+    #[tokio::test]
+    async fn a_restart_is_not_refused_while_a_change_is_pending() {
+        let rig = Rig::new(120);
+        rig.apply(&moved(dhcp()), false, 0).await.unwrap();
+        let _answer = rig.shared.reboot("192.168.1.23".parse().unwrap());
+        assert_eq!(rig.restarts(), 1);
     }
 
     #[tokio::test]

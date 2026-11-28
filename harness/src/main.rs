@@ -356,8 +356,8 @@ fn busybox_has(applet: &str) -> bool {
 }
 
 /// What the web workspace needs: Node and npm for its own checks (`make web-lint`,
-/// `make web-test`) and the panel's build, and Playwright's Chromium for the browser scenarios,
-/// which skip without it.
+/// `make web-test`) and the panel's build, `cargo about` for the notices that build writes, and
+/// Playwright's Chromium for the browser scenarios, which skip without it.
 fn report_web(report: &mut impl FnMut(&str, bool, &str)) {
     match web::node_version() {
         Ok(version) => report("node >= 22.12", true, &format!(" ({version})")),
@@ -365,6 +365,16 @@ fn report_web(report: &mut impl FnMut(&str, bool, &str)) {
     }
     report("npm", on_path("npm"), "");
     report("web/node_modules", web::installed(), " (make web-install)");
+    // `make panel` writes the Rust crates' notices with it, and refuses a version that is not
+    // the Makefile's.
+    match cargo_about() {
+        Some(version) => report("cargo about", true, &format!(" ({version})")),
+        None => report(
+            "cargo about",
+            false,
+            " (cargo install cargo-about --locked, at the Makefile's CARGO_ABOUT_VERSION)",
+        ),
+    }
     match web::chromium() {
         Ok(_) => println!("{:<30} ok", "Playwright's Chromium"),
         Err(why) => println!(
@@ -372,6 +382,18 @@ fn report_web(report: &mut impl FnMut(&str, bool, &str)) {
             "Playwright's Chromium"
         ),
     }
+}
+
+/// The installed `cargo about`'s version, as it says it: a cargo subcommand, found wherever
+/// cargo looks.
+fn cargo_about() -> Option<String> {
+    let said = std::process::Command::new("cargo")
+        .args(["about", "--version"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let version = String::from_utf8_lossy(&said.stdout).trim().to_owned();
+    (!version.is_empty()).then_some(version)
 }
 
 fn on_path(bin: &str) -> bool {

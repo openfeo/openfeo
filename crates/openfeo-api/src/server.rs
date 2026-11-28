@@ -119,6 +119,12 @@ pub fn line_password_changed(from: IpAddr) -> String {
     format!("admin: password changed from {from}")
 }
 
+/// `system: restart asked from 192.168.1.23`.
+#[must_use]
+pub fn line_restart_asked(from: IpAddr) -> String {
+    format!("system: restart asked from {from}")
+}
+
 /// `admin: login from 192.168.1.23`.
 #[must_use]
 pub fn line_login(from: IpAddr) -> String {
@@ -193,6 +199,8 @@ pub struct Shared {
     recent: Mutex<Recent>,
     verifier: Verifier,
     extra_host: Option<String>,
+    /// How a restart is asked of the router.
+    restarter: Arc<dyn crate::Restarter>,
     /// One password change at a time: the check for "no password yet" and the write are one
     /// step.
     password: tokio::sync::Mutex<()>,
@@ -248,6 +256,8 @@ pub struct SharedParts {
     pub extra_host: Option<String>,
     /// The window an apply is given when it names none (SPEC §5.5).
     pub default_window_secs: u32,
+    /// How a restart is asked of the router.
+    pub restarter: Arc<dyn crate::Restarter>,
 }
 
 impl Shared {
@@ -273,6 +283,7 @@ impl Shared {
             config_state: parts.config_state,
             version: parts.version,
             extra_host: parts.extra_host,
+            restarter: parts.restarter,
             limits: parts.limits,
             fingerprint: watch::Sender::new(String::new()),
             sessions_ended: watch::Sender::new(0),
@@ -566,6 +577,14 @@ impl Shared {
         state(&self.world.borrow(), &system)
     }
 
+    /// Have the router restart (SPEC §6.3), and say in the log who asked. It answers at once:
+    /// the router stops what has a goodbye to say and restarts in its own time.
+    pub fn reboot(&self, from: IpAddr) -> openfeo_config::api::RebootResponse {
+        info!("{}", line_restart_asked(from));
+        self.restarter.restart();
+        openfeo_config::api::RebootResponse {}
+    }
+
     /// Every LAN's leases now (SPEC §8.3), on the clock [`Self::state`] uses.
     #[must_use]
     pub fn leases(&self) -> openfeo_config::state::Leases {
@@ -700,6 +719,7 @@ pub(crate) mod tests {
             limits,
             extra_host: None,
             default_window_secs: crate::keeper::DEFAULT_WINDOW_SECS,
+            restarter: Arc::new(crate::testing::Counted::default()),
         });
         shared.fingerprint.send_replace("AB:CD".to_owned());
         (shared, dir)
@@ -1035,6 +1055,10 @@ pub(crate) mod tests {
             "admin: password changed from 192.168.1.23"
         );
         assert_eq!(line_login(lan()), "admin: login from 192.168.1.23");
+        assert_eq!(
+            line_restart_asked(lan()),
+            "system: restart asked from 192.168.1.23"
+        );
         assert_eq!(
             line_login_refused(lan(), 4_000),
             "admin: login refused from 192.168.1.23 (wait 4 s)"

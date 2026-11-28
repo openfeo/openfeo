@@ -61,6 +61,13 @@ pub fn decode(buf: &[u8]) -> Vec<Msg> {
 #[allow(clippy::module_name_repetitions)]
 pub struct CtlPipe(File);
 
+/// A pipe whose write end is already held as a file (a test's own pipe).
+impl From<File> for CtlPipe {
+    fn from(file: File) -> Self {
+        Self(file)
+    }
+}
+
 impl CtlPipe {
     /// Adopt the descriptor named by [`CTL_FD_ENV`]; `None` when not running under PID 1.
     #[must_use]

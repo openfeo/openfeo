@@ -12,6 +12,10 @@ BUILD_EPOCH    := $(or $(SOURCE_DATE_EPOCH),$(shell git log -1 --format=%ct 2>/d
 FILTER         ?=
 FUZZ_TARGET    ?= config_toml
 FUZZ_SECS      ?= 60
+# The cargo-about that writes the Rust crates' notices into /licences.txt (SPEC §13). One
+# version, so that the file is the same wherever it is built; CI and scripts/cloud-setup.sh
+# install this one.
+CARGO_ABOUT_VERSION := 0.9.2
 
 # openfeo-nft's build script compiles the pinned C sources against our kernel's UAPI headers
 # (ADR-0012); every cargo invocation below inherits these.
@@ -21,6 +25,8 @@ export OPENFEO_UAPI_INCLUDE := $(BUILD)/kernel/headers/include
 BIN := target/$(TARGET)/$(PROFILE)/openfeo
 # Where `make panel` leaves the built panel for the binary to embed.
 PANEL_DIST := $(BUILD)/panel
+# What `cargo about` wrote of the Rust crates, before it is joined to the other notices.
+RUST_NOTICES := $(BUILD)/notices/rust.txt
 
 KERNEL_ENV := KERNEL_VERSION=$(KERNEL_VERSION) BUILD=$(BUILD)
 
@@ -78,13 +84,15 @@ web-lint: web-gen
 web-test: web-gen
 	cd web && npm test
 # The panel as the binary embeds it: the client built, the page and its files, and the notices
-# of what it bundles (served at /licences.txt).
+# of everything in the binary (served at /licences.txt): the Rust crates' by `cargo about`, the
+# C libraries' from the pinned sources, the npm packages' and the fonts'.
 # Built beside its place and copied over only where a file's content changed, so that a panel
 # that did not change leaves the directory untouched and cargo does not rebuild the binary.
-panel: web-gen
+panel: web-gen nft-src
 	cd web && npm run -s build -w @openfeo/client
 	cd web && npm run -s build -w panel -- --outDir $(PANEL_DIST).new --emptyOutDir
-	node web/scripts/notices.mjs $(PANEL_DIST).new/licences.txt
+	scripts/rust-notices.sh $(CARGO_ABOUT_VERSION) $(RUST_NOTICES) $(FEATURES)
+	node web/scripts/notices.mjs --rust $(RUST_NOTICES) --c $(OPENFEO_NFT_SRC) $(PANEL_DIST).new/licences.txt
 	mkdir -p $(PANEL_DIST)
 	rsync -rc --delete $(PANEL_DIST).new/ $(PANEL_DIST)/
 # The Chromium the panel's Playwright run drives (SPEC §11); kept in Playwright's own cache.

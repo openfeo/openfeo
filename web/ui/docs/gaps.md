@@ -55,3 +55,10 @@ across, the working answer lives in `additions.css` or in a component, as noted.
   rule, `.ofo-chart .axis text`. `OfoChart` names them `ofo-chart__level` and
   `ofo-chart__tick` so that a test and a later rule can tell them apart; they carry no rule
   of their own today.
+- A tick always has its text beside it. `OfoChoice` takes `bare` for one in a grid, where the
+  row and the column already say what it is: the label goes to assistive technology and is not
+  shown (`ofo-choice--bare` in `additions.css`).
+- There is one height of select, as there was one of input. `ofo-select--sm` in
+  `additions.css` is a select for a row of a table edited in place.
+- Nothing documents a grid of ticks (which network may reach which, the SPEC's "zone
+  matrix"). The Firewall page's is a plain `ofo-table` whose cells hold bare ticks.

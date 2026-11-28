@@ -3,9 +3,11 @@
 <script setup lang="ts">
 import { nextTick } from 'vue'
 
-const props = withDefaults(defineProps<{ modelValue: string; options: { value: string; label: string; disabled?: boolean }[]; disabled?: boolean }>(), {
-  disabled: false,
-})
+// `small` is the height a table row takes, as OfoInput's is.
+const props = withDefaults(
+  defineProps<{ modelValue: string; options: { value: string; label: string; disabled?: boolean }[]; disabled?: boolean; small?: boolean }>(),
+  { disabled: false, small: false },
+)
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 
 async function chosen(event: Event): Promise<void> {
@@ -20,7 +22,7 @@ async function chosen(event: Event): Promise<void> {
 </script>
 
 <template>
-  <select class="ofo-select" :value="modelValue" :disabled="disabled" @change="chosen">
+  <select class="ofo-select" :class="{ 'ofo-select--sm': small }" :value="modelValue" :disabled="disabled" @change="chosen">
     <option v-for="option in options" :key="option.value" :value="option.value" :disabled="option.disabled" :selected="option.value === modelValue">
       {{ option.label }}
     </option>

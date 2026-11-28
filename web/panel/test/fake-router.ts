@@ -86,6 +86,10 @@ export class FakeRouter implements PanelRouter {
   confirmRefusal: RouterError | null = null
   /** What `revert` answers, or the refusal it throws. */
   revertAnswer: Reverted | RouterError = { answered: true }
+  /** The refusal `changePassword` throws, when it does. */
+  changeRefusal: RouterError | null = null
+  /** The refusal `reboot` throws, when it does. */
+  rebootRefusal: RouterError | null = null
   /** Calls that wait until a test lets them go, by name. */
   readonly #held = new Map<string, ReturnType<typeof held<void>>>()
 
@@ -102,6 +106,9 @@ export class FakeRouter implements PanelRouter {
     apply: [] as { config: Config; tag: string; immediate: boolean }[],
     confirm: 0,
     revert: 0,
+    /** Each change of password asked: the old one and the new, as they were given. */
+    changePassword: [] as [old: string, next: string][],
+    reboot: 0,
   }
   readonly listening: Listening[] = []
   readonly #connectionListeners = new Set<(connection: Connection) => void>()
@@ -209,6 +216,22 @@ export class FakeRouter implements PanelRouter {
     return this.revertAnswer
   }
 
+  async changePassword(oldPassword: string, newPassword: string): Promise<void> {
+    this.calls.changePassword.push([oldPassword, newPassword])
+    await this.#held.get('changePassword')?.promise
+    if (this.changeRefusal !== null) {
+      throw this.changeRefusal
+    }
+  }
+
+  async reboot(): Promise<void> {
+    this.calls.reboot += 1
+    await this.#held.get('reboot')?.promise
+    if (this.rebootRefusal !== null) {
+      throw this.rebootRefusal
+    }
+  }
+
   subscribe(topic: 'state', onPush: (state: State) => void): Subscription
   subscribe(topic: 'leases', onPush: (leases: Leases) => void): Subscription
   subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
@@ -280,7 +303,7 @@ export class FakeRouter implements PanelRouter {
   }
 
   /** Make calls of one kind wait until the returned function is called. */
-  holdCall(name: 'config' | 'validate' | 'apply' | 'confirm' | 'revert' | 'history'): () => void {
+  holdCall(name: 'config' | 'validate' | 'apply' | 'confirm' | 'revert' | 'history' | 'changePassword' | 'reboot'): () => void {
     const gate = held<void>()
     this.#held.set(name, gate)
     return () => {

@@ -7,6 +7,7 @@
 import { flushPromises } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
+import { LIVE, type LiveData } from '../src/live'
 import { NOW, state } from './fixtures'
 import { panelAt, unmountAll } from './mounting'
 
@@ -22,13 +23,13 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-test('the sidebar lists the dashboard, then Network with WAN, LAN & DHCP and Leases', async () => {
+test('the sidebar lists the dashboard, then Network with its pages in the order they are built', async () => {
   const { wrapper, errors } = await panelAt('/')
   const nav = wrapper.find('nav.ofo-nav')
   // In the order they stand: an item, the group's name, its two items.
-  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())).toEqual(['Dashboard', 'Network', 'WAN', 'LAN & DHCP', 'Leases'])
-  expect(nav.findAll('.ofo-nav__item').map((item) => item.attributes('href'))).toEqual(['/', '/wan', '/lan', '/leases'])
-  expect(nav.findAll('.ofo-nav__group').map((group) => group.text())).toEqual(['Network'])
+  expect(nav.findAll('.ofo-nav__item, .ofo-nav__group').map((entry) => entry.text())).toEqual(['Dashboard', 'Network', 'WAN', 'LAN & DHCP', 'Leases', 'Firewall', 'DNS', 'Router', 'System'])
+  expect(nav.findAll('.ofo-nav__item').map((item) => item.attributes('href'))).toEqual(['/', '/wan', '/lan', '/leases', '/firewall', '/dns', '/system'])
+  expect(nav.findAll('.ofo-nav__group').map((group) => group.text())).toEqual(['Network', 'Router'])
   expect(errors).toEqual([])
 })
 
@@ -42,6 +43,9 @@ test('the entry of the page being shown is the current one', async () => {
   expect(current((await panelAt('/wan')).wrapper)).toEqual(['WAN'])
   expect(current((await panelAt('/lan/lan0')).wrapper)).toEqual(['LAN & DHCP'])
   expect(current((await panelAt('/leases')).wrapper)).toEqual(['Leases'])
+  expect(current((await panelAt('/firewall')).wrapper)).toEqual(['Firewall'])
+  expect(current((await panelAt('/dns')).wrapper)).toEqual(['DNS'])
+  expect(current((await panelAt('/system')).wrapper)).toEqual(['System'])
 })
 
 test('a click in the sidebar changes the page without a reload', async () => {
@@ -107,4 +111,22 @@ test('an address of no page goes to the dashboard', async () => {
     expect(wrapper.find('h1').text(), path).toBe('Dashboard')
     unmountAll()
   }
+})
+
+test('a router that was asked to restart and stays away is said to be away', async () => {
+  const { wrapper, router, store } = await panelAt('/system')
+  router.push('state', state())
+  await flushPromises()
+  const said = () => wrapper.findAll('.said .ofo-banner').map((banner) => banner.text())
+  const live = (wrapper.findComponent({ name: 'Shell' }).vm.$ as unknown as { provides: Record<symbol, unknown> }).provides[LIVE as symbol] as LiveData
+  expect(store().pending.value).toBeUndefined()
+  live.restart()
+  router.setConnection('reconnecting')
+  await flushPromises()
+  expect(said()).toEqual(['The router is restarting. You log in again when it is back.'])
+  await vi.advanceTimersByTimeAsync(119_000)
+  expect(said()).toEqual(['The router is restarting. You log in again when it is back.'])
+  // Two minutes on it should have been back: the page says since when it has heard nothing.
+  await vi.advanceTimersByTimeAsync(2_000)
+  expect(said()).toEqual(['The router was asked to restart at 19:42:30 and has not answered since.'])
 })

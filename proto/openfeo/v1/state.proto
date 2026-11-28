@@ -20,6 +20,20 @@ message State {
   repeated LanState lans = 5;
   // Every address the kernel holds.
   repeated AddressState addresses = 6;
+  // What the DNS forwarder is asking.
+  DnsState dns = 7;
+}
+
+// The resolvers the forwarder sends to what it cannot answer itself.
+message DnsState {
+  // In the order the forwarder asks them.
+  repeated DnsResolver resolvers = 1;
+}
+
+message DnsResolver {
+  string address = 1;
+  // The WAN it was learned from; empty when it is one the owner typed.
+  string wan = 2;
 }
 
 message SystemState {

@@ -47,7 +47,7 @@ test('the hour and the leases, from the dashboard to a reservation', async ({ pa
   await page.getByLabel('Repeat password').fill(PASSWORD)
   await page.getByRole('button', { name: 'Set password' }).click()
   await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()
-  await expect(page.locator('.ofo-nav__item .ofo-nav__label')).toHaveText(['Dashboard', 'WAN', 'LAN & DHCP', 'Leases'])
+  await expect(page.locator('.ofo-nav__item .ofo-nav__label')).toHaveText(['Dashboard', 'WAN', 'LAN & DHCP', 'Leases', 'Firewall', 'DNS', 'System'])
   const chart = page.locator('.ofo-chart', { has: page.locator('h2', { hasText: /^wan0$/ }) })
   await expect(chart.locator('svg')).toHaveAttribute('aria-label', 'Download and upload on wan0 over the last hour')
   await expect(chart.getByRole('button', { name: '1 h' })).toHaveAttribute('aria-pressed', 'true')

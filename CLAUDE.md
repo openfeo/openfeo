@@ -7,7 +7,9 @@ the harness get ADRs too (`docs/adr/NNNN-title.md`: Context, Decision, Consequen
 ## Commands
 - `make bin`           static musl binary (`--features harness` by default; `FEATURES=` for a release build);
                        builds the panel first and embeds it (a bare `cargo build` embeds a placeholder page: ADR-0025)
-- `make panel`         the web panel into `$(BUILD)/panel` with its notices (Node 22; `web/` is an npm workspace)
+- `make panel`         the web panel into `$(BUILD)/panel` with the notices of everything in the binary
+                       (Node 22; `web/` is an npm workspace; `cargo about` at the Makefile's `CARGO_ABOUT_VERSION`
+                       writes the Rust crates' notices, so `make bin`, `kernel` and `test-harness` need it too)
 - `make web-lint`, `make web-test`  the web workspace's own checks (type-check, ESLint, the layering and licence
                        gates, generated files up to date; vitest); `make lint` and `make test` run them
 - `make kernel`        fetch/verify/build Linux (see `kernel/`) with the binary embedded → `build/bzImage`
@@ -65,7 +67,8 @@ readable, and unprivileged user namespaces enabled. Host-side `pppd` (M3) additi
 group-accessible via a udev rule. Tools: `qemu-system-x86_64`, `ip`, `kea-dhcp4` and `kea-dhcp6` (the ISP's servers),
 `busybox` (`udhcpc`, the reference DHCP client; `udhcpc6`, the stateless DHCPv6 one), `dnsmasq` (the upstream resolver), `dig` (the DNS client), `ntpdate` (the reference time client), `mkfs.ext4`,
 `ping`, `python3` (HTTP targets and the lab's SNTP server);
-building needs `musl-gcc`, `pkg-config`, `bison`, `flex` and `rsync` (the kernel's `headers_install`). The sandboxed nft scenarios need the
+building needs `musl-gcc`, `pkg-config`, `bison`, `flex`, `rsync` (the kernel's `headers_install`) and `cargo about` (the
+notices in `/licences.txt`; `make check-env` says which version is installed). The sandboxed nft scenarios need the
 kernel to load the `ct`/`fib`/`nat`/`limit` nft modules, and every VLAN scenario (sandbox and QEMU alike: the
 ISP and LAN sides tag with the host kernel's `8021q`) needs that module; a host that cannot load them (upgraded,
 not rebooted) makes them skip with a reason, `make check-env` says so, and CI loads the modules and sets
@@ -131,8 +134,18 @@ for status and leases: a lease that is listed in the lease table and keeps its j
 and when the LAN's server restarts; an hour of counters kept while nobody is subscribed; and the panel in Chromium
 (`web/panel/e2e/leases.spec.ts`), which waits 20 s after the router is up before it starts the browser, so that the
 chart has a past to draw, and goes from there to a device that joins, a reservation made from the Leases page and
-confirmed, and the mark where the WAN came back. Each of the five web
-scenarios names its own test or spec file (`lab.test`, `config.test`, `panel.spec`, `config.spec`, `leases.spec`),
+confirmed, and the mark where the WAN came back. Six more (M4 part 3b) are for the settings pages and a restart:
+the state naming the resolvers the forwarder is asking, through a typed one and the switch that leaves the WAN's out;
+four that ask for a restart over the API (`Ws::reboot`, `Api::grpc_reboot`), where the VM restarts itself (QEMU is not
+told `-no-reboot`, and the console is one capture across the restart: `openfeo-init: reboot requested by child` is
+the line that says the goodbyes are over), one keeping a lease changed a moment before, one ending the PPPoE session
+first (read in the concentrator's `pppd` log), one against a concentrator killed so that nothing answers
+(`Lab::kill_pppoe_server`), and one with a change left unconfirmed; and the panel in Chromium
+(`web/panel/e2e/settings.spec.ts`), which adds a port forward and a local name, changes the password to
+`lab-second-password` and restarts the router from the System page, after which the scenario asks the router what
+it ended up with under the new password. Each of the six web
+scenarios names its own test or spec file (`lab.test`, `config.test`, `panel.spec`, `config.spec`, `leases.spec`,
+`settings.spec`),
 since one process numbers its requests to the lab from 1. A lab verb may carry arguments: `lan-to <cidr> <gateway>`
 re-homes the LAN host as `rehome` does, for a test that follows a router it moved, and `join <hostname>` has a device
 take a lease on `lan0` under that name (the harness's own DHCP client, which puts no address on the interface, so the

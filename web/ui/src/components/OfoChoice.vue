@@ -2,7 +2,9 @@
 <!-- Copyright (C) 2026 Andrew Newton -->
 <script setup lang="ts">
 // A checkbox (its model is whether it is ticked) or a radio button (its model is the value of
-// whichever of its group is chosen).
+// whichever of its group is chosen). `bare` is a tick with no text beside it, where the row
+// and the column it stands in already say what it is (a grid): its label is then given to
+// assistive technology and not shown.
 const props = withDefaults(
   defineProps<{
     modelValue: boolean | string
@@ -12,8 +14,9 @@ const props = withDefaults(
     label: string
     hint?: string
     disabled?: boolean
+    bare?: boolean
   }>(),
-  { type: 'checkbox', disabled: false },
+  { type: 'checkbox', disabled: false, bare: false },
 )
 const emit = defineEmits<{ 'update:modelValue': [value: boolean | string] }>()
 
@@ -30,15 +33,16 @@ function changed(event: Event): void {
 </script>
 
 <template>
-  <label class="ofo-choice">
+  <label class="ofo-choice" :class="{ 'ofo-choice--bare': bare }">
     <input
       :type="type"
       :name="name"
       :value="value"
       :checked="type === 'radio' ? modelValue === value : modelValue === true"
       :disabled="disabled"
+      :aria-label="bare ? label : undefined"
       @change="changed"
     >
-    <span>{{ label }}<span v-if="hint" class="ofo-choice__hint">{{ hint }}</span></span>
+    <span v-if="!bare">{{ label }}<span v-if="hint" class="ofo-choice__hint">{{ hint }}</span></span>
   </label>
 </template>

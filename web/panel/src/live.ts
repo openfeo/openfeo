@@ -60,6 +60,13 @@ export interface LiveData {
   connection: Ref<Connection>
   /** When the connection was lost, while it is. */
   lostAt: Ref<Date | null>
+  /**
+   * When the router was asked to restart from this page, until it is heard of again: it goes
+   * away for a minute, and its going is not a connection lost by accident.
+   */
+  restarting: Ref<Date | null>
+  /** The router was asked to restart, and said it would. */
+  restart(): void
   /** The browser's clock, moving on each second while listening: what "today" is, and what a countdown ticks by. */
   now: Ref<Date>
   /**
@@ -88,6 +95,7 @@ export function useLive(router: PanelRouter): LiveData {
   const events = ref<Event[]>([])
   const connection = ref<Connection>(router.connection)
   const lostAt = ref<Date | null>(null)
+  const restarting = ref<Date | null>(null)
   const now = ref(new Date())
   /** The browser's clock when the state last arrived. */
   let stateAt = now.value.getTime()
@@ -245,6 +253,11 @@ export function useLive(router: PanelRouter): LiveData {
   function heard(now: Connection): void {
     connection.value = now
     if (now === 'open') {
+      if (lostAt.value !== null) {
+        // Back, with the session it had: the router did not restart after all, or is long back.
+        // (One that did restart knows no session, and the login screen follows instead.)
+        restarting.value = null
+      }
       lostAt.value = null
       // The router went on reading while the socket was away: what it kept fills the time.
       asked.clear()
@@ -273,6 +286,10 @@ export function useLive(router: PanelRouter): LiveData {
     events,
     connection,
     lostAt,
+    restarting,
+    restart: () => {
+      restarting.value = new Date()
+    },
     now,
     sinceBootMs,
     start: () => {

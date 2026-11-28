@@ -52,3 +52,7 @@ addresses:
   - interface: p0
     address: 203.0.113.100/24
     origin: ADDRESS_ORIGIN_DHCP
+dns:
+  resolvers:
+    - address: 203.0.113.1
+      wan: wan0

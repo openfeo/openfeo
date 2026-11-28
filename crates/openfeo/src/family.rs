@@ -8,14 +8,19 @@
 //! unchanged is left alone, one whose slice changed is stopped and started again, one no
 //! longer asked for is stopped. What a stopped instance had published leaves the World with
 //! it, and its replacement is started only once it is gone.
+//!
+//! A family can also be halted, for a restart of the router: every instance is stopped as any
+//! stop is, nothing is started after, and what they published stays in the World.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use openfeo_runtime::supervise::{BoxedTask, Stop, Stoppable, TaskError};
 use openfeo_runtime::world::WorldRx;
 use openfeo_runtime::{Publisher, Supervisor};
 use openfeo_world::World;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::debug;
 
 /// One family of per-WAN or per-LAN tasks.
@@ -42,12 +47,80 @@ pub trait Family: Send + Sync + 'static {
     fn withdraw(&self, key: &str, world: &mut World);
 }
 
+/// Stops a family for good, for a restart of the router (SPEC §6.3).
+#[derive(Debug, Clone)]
+pub struct Halt {
+    ask: mpsc::Sender<oneshot::Sender<()>>,
+}
+
+impl Halt {
+    /// Have the manager stop every instance, each as any stop is (its goodbye, `STOP_GRACE` at
+    /// most), start nothing after, and leave what they published in the World. Returns once
+    /// they have stopped or been dropped. A manager that is not running has nothing to stop.
+    pub async fn halt(&self) {
+        let (done, stopped) = oneshot::channel();
+        if self.ask.send(done).await.is_ok() {
+            // An error here is a manager that went away, and its instances with it.
+            let _ = stopped.await;
+        }
+    }
+}
+
+/// What a manager and the ones the supervisor starts after it share about a halt.
+struct Halting {
+    asks: Mutex<mpsc::Receiver<oneshot::Sender<()>>>,
+    /// Set by the first halt, and never cleared: a halted family stays halted.
+    halted: AtomicBool,
+}
+
+impl Halting {
+    /// The next halt asked for. Never, once nobody can ask.
+    async fn asked(&self) -> oneshot::Sender<()> {
+        match self.asks.lock().await.recv().await {
+            Some(done) => done,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+fn halting() -> (Halt, Arc<Halting>) {
+    // One halt is ever asked in earnest; a few more may wait their turn to be told so.
+    let (ask, asks) = mpsc::channel(4);
+    let halting = Halting {
+        asks: Mutex::new(asks),
+        halted: AtomicBool::new(false),
+    };
+    (Halt { ask }, Arc::new(halting))
+}
+
 /// Start `family`'s manager, a supervised task named `<PREFIX>-manager`.
 pub fn spawn<F: Family>(
     family: F,
     supervisor: &Supervisor,
     publisher: &Arc<Publisher>,
     world_rx: &WorldRx,
+) {
+    start(family, supervisor, publisher, world_rx, None);
+}
+
+/// As [`spawn`], and the family can be halted.
+pub fn spawn_haltable<F: Family>(
+    family: F,
+    supervisor: &Supervisor,
+    publisher: &Arc<Publisher>,
+    world_rx: &WorldRx,
+) -> Halt {
+    let (halt, halting) = halting();
+    start(family, supervisor, publisher, world_rx, Some(halting));
+    halt
+}
+
+fn start<F: Family>(
+    family: F,
+    supervisor: &Supervisor,
+    publisher: &Arc<Publisher>,
+    world_rx: &WorldRx,
+    halting: Option<Arc<Halting>>,
 ) {
     let family = Arc::new(family);
     let instances = supervisor.clone();
@@ -59,19 +132,27 @@ pub fn spawn<F: Family>(
             instances.clone(),
             publisher.clone(),
             world_rx.clone(),
+            halting.clone(),
         )
     });
 }
 
 /// The manager: on every World, stop the instances that are no longer wanted as they are, take
 /// their facts out, and then start what is wanted and not running. Dropping this future ends
-/// every instance.
+/// every instance. Halted, it stops them all, withdraws nothing, and starts nothing again.
 async fn manage<F: Family>(
     family: Arc<F>,
     supervisor: Supervisor,
     publisher: Arc<Publisher>,
     mut world_rx: WorldRx,
+    halting: Option<Arc<Halting>>,
 ) -> Result<(), TaskError> {
+    if let Some(halting) = &halting
+        && halting.halted.load(Ordering::SeqCst)
+    {
+        // Started again after a halt (the one before failed): there is nothing to manage.
+        return halted(halting).await;
+    }
     let mut running: BTreeMap<String, (F::Slice, Stoppable)> = BTreeMap::new();
     loop {
         let wanted = family.wanted(&world_rx.borrow_and_update());
@@ -110,17 +191,43 @@ async fn manage<F: Family>(
             };
             running.insert(key, (slice, task));
         }
-        world_rx
-            .changed()
-            .await
-            .map_err(|_| "world publisher gone")?;
+        let asked = async {
+            match &halting {
+                Some(halting) => halting.asked().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            changed = world_rx.changed() => changed.map_err(|_| "world publisher gone")?,
+            done = asked => {
+                let Some(halting) = &halting else {
+                    continue;
+                };
+                halting.halted.store(true, Ordering::SeqCst);
+                let stops: Vec<_> = std::mem::take(&mut running)
+                    .into_values()
+                    .map(|(_, task)| task.stop())
+                    .collect();
+                futures::future::join_all(stops).await;
+                debug!("{}: halted", F::PREFIX);
+                // Whoever asked may have stopped waiting; the family is halted all the same.
+                let _ = done.send(());
+                return halted(halting).await;
+            }
+        }
+    }
+}
+
+/// A halted manager: it answers whoever asks again, and does nothing else, for ever.
+async fn halted(halting: &Halting) -> Result<(), TaskError> {
+    loop {
+        let _ = halting.asked().await.send(());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use openfeo_config::{Config, PortMap, Wan};
@@ -388,11 +495,165 @@ mod tests {
             gone: gone.clone(),
         });
         let supervisor = Supervisor::new(HealthTracker::new());
-        let manager = tokio::spawn(manage(family, supervisor, publisher, world_rx));
+        let manager = tokio::spawn(manage(family, supervisor, publisher, world_rx, None));
         settle().await;
         assert!(!gone.load(Ordering::SeqCst));
         manager.abort();
         settle().await;
         assert!(gone.load(Ordering::SeqCst));
+    }
+
+    /// A manager that can be halted, over `wans`, with instances that take `slow` to stop.
+    fn haltable(wans: &[(&str, u32)], slow: Duration) -> (Rig, Halt) {
+        let (publisher, world_rx) = Publisher::new(World::new(config(wans), PortMap::default()));
+        let publisher = Arc::new(publisher);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let supervisor = Supervisor::new(HealthTracker::new());
+        let halt = spawn_haltable(
+            Fake {
+                log: log.clone(),
+                slow,
+                gone: Arc::new(AtomicBool::new(false)),
+            },
+            &supervisor,
+            &publisher,
+            &world_rx,
+        );
+        (Rig { publisher, log }, halt)
+    }
+
+    /// SPEC §6.3: for a restart, every instance is stopped as any stop is, and nothing is
+    /// started in its place, whatever the World goes on asking for.
+    #[tokio::test(start_paused = true)]
+    async fn a_halt_stops_every_instance_with_its_goodbye_and_starts_none() {
+        let (rig, halt) = haltable(&[("wan0", 10), ("wan1", 20)], Duration::from_secs(1));
+        settle().await;
+        halt.halt().await;
+        assert_eq!(
+            rig.log(),
+            [
+                "started wan0 10",
+                "started wan1 20",
+                "stopped wan0",
+                "stopped wan1"
+            ],
+            "both said goodbye before the halt returned"
+        );
+        // The World still wants them, and goes on changing: nothing is started.
+        rig.reconfigure(&[("wan0", 11), ("wan1", 20), ("wan2", 5)])
+            .await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(rig.log().len(), 4, "{:?}", rig.log());
+    }
+
+    /// What the instances published stays: a restart is not a change of the World, and taking
+    /// every lease out of it would be reported as every device leaving.
+    #[tokio::test(start_paused = true)]
+    async fn a_halt_withdraws_nothing() {
+        let (rig, halt) = haltable(&[("wan0", 10), ("wan1", 20)], Duration::ZERO);
+        settle().await;
+        halt.halt().await;
+        settle().await;
+        let world = rig.publisher.current();
+        assert!(
+            world.leases.contains_key("wan0") && world.leases.contains_key("wan1"),
+            "{:?}",
+            world.leases
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_instance_that_will_not_stop_is_dropped_at_the_limit() {
+        let (rig, halt) = haltable(&[("wan0", 10)], Duration::from_secs(3_600));
+        settle().await;
+        let halted = Arc::new(AtomicBool::new(false));
+        let done = halted.clone();
+        tokio::spawn(async move {
+            halt.halt().await;
+            done.store(true, Ordering::SeqCst);
+        });
+        tokio::time::sleep(Duration::from_millis(2_900)).await;
+        assert!(!halted.load(Ordering::SeqCst), "it is given its 3 s");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(halted.load(Ordering::SeqCst), "and no longer");
+        assert_eq!(rig.log(), ["started wan0 10"], "it never said goodbye");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_halt_reaches_only_its_own_family() {
+        // Two managers over one World: the one halted, the other not.
+        let (publisher, world_rx) =
+            Publisher::new(World::new(config(&[("wan0", 10)]), PortMap::default()));
+        let publisher = Arc::new(publisher);
+        let supervisor = Supervisor::new(HealthTracker::new());
+        let fake = |log: &Arc<Mutex<Vec<String>>>| Fake {
+            log: log.clone(),
+            slow: Duration::ZERO,
+            gone: Arc::new(AtomicBool::new(false)),
+        };
+        let (halted_log, other_log) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let halt = spawn_haltable(fake(&halted_log), &supervisor, &publisher, &world_rx);
+        spawn(fake(&other_log), &supervisor, &publisher, &world_rx);
+        settle().await;
+        halt.halt().await;
+        let wanted = Arc::new(config(&[("wan0", 10), ("wan1", 20)]));
+        publisher.update(|world| world.config = wanted);
+        settle().await;
+        assert_eq!(
+            *halted_log.lock().unwrap(),
+            ["started wan0 10", "stopped wan0"]
+        );
+        assert_eq!(
+            *other_log.lock().unwrap(),
+            ["started wan0 10", "started wan1 20"],
+            "the other family was not stopped and is still managed"
+        );
+    }
+
+    /// The supervisor starts a manager again when it fails. One that was halted stays halted.
+    #[tokio::test(start_paused = true)]
+    async fn a_manager_that_starts_again_after_a_halt_starts_nothing() {
+        let (publisher, world_rx) =
+            Publisher::new(World::new(config(&[("wan0", 10)]), PortMap::default()));
+        let publisher = Arc::new(publisher);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let family = Arc::new(Fake {
+            log: log.clone(),
+            slow: Duration::ZERO,
+            gone: Arc::new(AtomicBool::new(false)),
+        });
+        let supervisor = Supervisor::new(HealthTracker::new());
+        let (halt, halting) = halting();
+        let first = tokio::spawn(manage(
+            family.clone(),
+            supervisor.clone(),
+            publisher.clone(),
+            world_rx.clone(),
+            Some(halting.clone()),
+        ));
+        settle().await;
+        halt.halt().await;
+        first.abort();
+        settle().await;
+        let _second = tokio::spawn(manage(
+            family,
+            supervisor,
+            publisher,
+            world_rx,
+            Some(halting),
+        ));
+        settle().await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["started wan0 10", "stopped wan0"],
+            "nothing was started by the manager that came after"
+        );
+        // And a halt asked of it is answered: there is nothing to stop.
+        tokio::time::timeout(Duration::from_secs(1), halt.halt())
+            .await
+            .expect("a halted manager answers a second halt at once");
     }
 }

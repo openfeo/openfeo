@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | parts 1 and 2 of 5, and 3a, 2026-11-23 | #68, #81, #101, #103, #128; follow-ups #124, #129 |
+| M4 API and panel | parts 1 and 2 of 5, and 3a and 3b, 2026-11-24 | #68, #81, #101, #103, #128, #132; follow-ups #124, #129 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -345,6 +345,47 @@ file rewritten, and the scenario that steps the clock a year finds the lease sti
 few minutes old. And the Leases page said nothing when the router refused the draft, so Apply
 changes looked dead: it lists every refusal, and a new reservation leaves out a name another
 on its LAN already has. Slices 3b (the settings pages) and 3c (the views) follow.
+
+**2026-11-24, [#132](https://github.com/openfeo/openfeo/pull/132), part 3b: settings.** The
+second slice: the pages that edit what the config already has for the firewall, DNS and the
+router itself, and the two things done from the panel that are not config. On the router's side,
+`State` says which resolvers the forwarder is asking, in order, each with the WAN it was learned
+from or none when the owner typed it, taken from the function the forwarder is configured by.
+`SystemService` begins with `Reboot`: it needs a session, answers, and a second later the router
+stops what has a goodbye to say (every PPPoE session, ended as §7.2 asks, and every LAN's DHCPv4
+server, which writes its lease file), waits 3.5 s at most, and has PID 1 restart the machine; the
+DHCPv4 client is left alone, so the router comes back to the address it had, and a change of
+config that was waiting is not confirmed by it (SPEC §6.3 gains those sentences). A family
+manager learned to be halted for this: its instances are stopped as any stop is, nothing is
+started after, and nothing is withdrawn from the World. `/licences.txt` now covers the whole
+binary: the Rust crates' notices by `cargo about` (148 crates, mimalloc's among them, against
+the list `cargo deny` applies), the C libraries' from the pinned sources, with musl's kept beside
+them, then the npm packages' and the fonts' as before. The panel gains **Firewall** (a grid of which LAN may
+start connections to the internet and to each other LAN, port forwards and rules as tables
+edited in place, and whether the router answers ping), **DNS** (the owner's resolvers, whether
+the WAN's are used too, the resolvers in use now, local names, and under Advanced the names let
+through the rebinding guard) and, under a new Router group, **System** (hostname and domain,
+the time servers and whether the clock is set, the password, restarting, and the version,
+uptime, certificate fingerprint and notices). The password and a restart are calls of their
+own, outside the draft: what is typed for a password is kept nowhere, and Restart asks first
+and says what is lost. A LAN that a forward, a rule or another LAN's tick points into can now be
+removed once the draft has none of them, each named as a link to where it is removed; the apply
+dialog names every new setting as its page does, and says where the router will be found when a
+change renames it. Proven by 1124 unit tests on the Rust side and 607 on the web side, and by
+six new `m4` scenarios (44 in all): the resolvers in the state; a restart asked over the API
+that keeps a lease changed a moment before it, ends the PPPoE session first, does not wait for a
+concentrator that says nothing, and comes back on the confirmed config with a change left
+unconfirmed (three of the four fail with the goodbyes left out on purpose); and Playwright's
+Chromium adding a forward and a local name that a LAN host then looks up, changing the password,
+and restarting the router from the System page to end at the login screen. The whole-branch
+review found two things the tests had not asked, fixed in the same pull request. The notices
+were written only on a machine whose cargo cache already held every crate in the lockfile, so
+the image would not have built on a fresh one, CI's among them: every crate is now fetched
+first, the script was run against an empty cache before and after, and a crate whose licence
+cannot be read stops the build where it used to be left out. And the wait a wrong current
+password earns stopped being said once the password was retyped, while the button stayed held:
+it is said for as long as the button is. libnftnl's label is the one its sources carry,
+GPL-2.0-or-later. Slice 3c (the views: Routes, Ports, Logs) follows.
 
 ## Follow-ups
 

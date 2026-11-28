@@ -241,6 +241,44 @@ body {
   margin-top: var(--space-3);
 }
 
+/* A section whose table needs the page's whole width (a forward has six columns): its title
+   and its sentence stand above the table, not beside it. */
+.page__wide.ofo-formsec {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* A line about a table, beneath its Add button. */
+.page__note {
+  display: block;
+  margin: var(--space-3) 0 0;
+}
+
+/* The System page's About: a name beside each thing the router says of itself, the long
+   fingerprint breaking where it must. */
+.about {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-5);
+  margin: 0;
+}
+
+.about dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The Firewall page's grid: each tick stands under the name of its column, and what the
+   router refused about a row's ticks is said beneath the table. */
+.reach th:not(:first-child),
+.reach td:not(:first-child) {
+  text-align: center;
+}
+
+.reach__said {
+  margin-top: var(--space-2);
+}
+
+
 /* The dialog before an apply: wider than a plain question, for the list of changes. */
 .apply .ofo-dialog {
   width: min(560px, 100%);

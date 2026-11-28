@@ -16,7 +16,7 @@ import {
   type TabEntry,
 } from '@openfeo/ui'
 import { computed, inject, provide, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 
 import { CONFIG } from '../config'
 import { FIELDS, forgetFrom, listText, numberText, pageFields, parseList, toNumber, under } from '../fields'
@@ -87,7 +87,7 @@ const adrift = computed(() => {
   const draft = store.draft.value
   return draft === null ? [] : store.unfit.value.filter((unfit) => stillUnfit(draft, unfit))
 })
-/** Those that are settings of no LAN: on pages this panel does not have yet. */
+/** Those that are settings of no LAN: a forward's or a rule's on Firewall, a local name's on DNS. */
 const adriftElsewhere = computed(() => adrift.value.filter((unfit) => !unfit.path.startsWith('lans[')))
 /** What a field at `path` (or, for a list, beneath it) says when its address found no place. */
 function unfitAt(path: string): string | undefined {
@@ -225,7 +225,11 @@ function tick(port: string, ticked: boolean): void {
   // What the router refused at a port is kept by the port's place in the list, which is another list now.
   store.violations.value = store.violations.value.filter((violation) => !under(violation.path, `${at.value}.ports`))
 }
-const reach = computed(() => (lan.value === undefined || lan.value.reaches.length === 0 ? 'wan' : lan.value.reaches.join(', ')))
+/** What this LAN may start connections to, in words: an empty list is the internet alone. */
+const reach = computed(() => {
+  const may = lan.value === undefined || lan.value.reaches.length === 0 ? ['wan'] : lan.value.reaches.filter((name) => name !== 'none')
+  return may.length === 0 ? 'nothing' : may.map((name) => (name === 'wan' ? 'the internet' : name)).join(', ')
+})
 
 // ---- DHCP ----
 
@@ -316,7 +320,7 @@ function add(name: string): void {
   store.edit((draft) => draft.lans.push(newLan(name)))
   show(name)
 }
-/** What still points at this LAN: it cannot go until the pages that edit those are here. */
+/** What still points at this LAN: it cannot go until each is removed where it is edited, on Firewall. */
 const inTheWay = computed(() => (lan.value === undefined || store.draft.value === null ? [] : blockers(store.draft.value, lan.value)))
 function remove(): void {
   const gone = index.value
@@ -348,7 +352,10 @@ function remove(): void {
           <code class="ofo-mono">{{ unfit.path }}</code>: {{ unfit.value }}
         </li>
       </ul>
-      <p class="said__line">They are settings of pages this panel does not have yet. Choose a subnet they fit in, or change them in the config file first.</p>
+      <p class="said__line">
+        They are set on other pages: a forward or a rule on <RouterLink :to="PAGES.firewall">Firewall</RouterLink>, a local name on
+        <RouterLink :to="PAGES.dns">DNS</RouterLink>. Choose a subnet they fit in, or change them there first.
+      </p>
     </OfoBanner>
 
     <div v-if="store.draft.value === null" class="dash__waiting" aria-busy="true">
@@ -398,7 +405,7 @@ function remove(): void {
             />
             <span v-if="ports.length === 0" class="ofo-muted">No port is free.</span>
           </OfoChoiceGroup>
-          <p class="reach ofo-muted ofo-span-2 page__none">May reach: {{ reach }}. Changed on the Firewall page.</p>
+          <p class="reach ofo-muted ofo-span-2 page__none">May reach: {{ reach }}. Changed on the <RouterLink :to="PAGES.firewall">Firewall</RouterLink> page.</p>
         </OfoFormSection>
 
         <OfoFormSection title="DHCP" text="The addresses the router hands out on this LAN, and what it tells each device.">
@@ -592,7 +599,12 @@ function remove(): void {
 
         <div class="page__foot">
           <OfoButton size="sm" variant="ghost" :disabled="!editable || inTheWay.length > 0" @click="remove">Remove {{ lan.name }}</OfoButton>
-          <span v-if="editable && inTheWay.length > 0" class="ofo-muted page__why">Cannot be removed yet: {{ inTheWay.join('; ') }}.</span>
+          <span v-if="editable && inTheWay.length > 0" class="ofo-muted page__why">
+            Cannot be removed yet:
+            <template v-for="(each, n) in inTheWay" :key="each.text">
+              <RouterLink :to="PAGES.firewall">{{ each.text }}</RouterLink>{{ n === inTheWay.length - 1 ? '.' : '; ' }}
+            </template>
+          </span>
         </div>
       </div>
     </template>

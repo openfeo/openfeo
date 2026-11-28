@@ -110,8 +110,26 @@ impl Reply {
 }
 
 /// The API on loopback.
+/// A restarter that counts what it is asked, where a test has no router to restart.
+#[derive(Debug, Default)]
+pub(crate) struct Counted(std::sync::atomic::AtomicUsize);
+
+impl Counted {
+    /// How many restarts were asked.
+    pub(crate) fn asked(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::Restarter for Counted {
+    fn restart(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub(crate) struct TestApi {
     pub(crate) shared: Arc<Shared>,
+    restarter: Arc<Counted>,
     pub(crate) https: SocketAddr,
     pub(crate) http: SocketAddr,
     pub(crate) config_path: PathBuf,
@@ -161,6 +179,7 @@ pub(crate) async fn spawn_api_full(
         healthy: true,
         unhealthy: Vec::new(),
     });
+    let restarter = Arc::new(Counted::default());
     let server = Server::bind(ApiDeps {
         world,
         publisher,
@@ -179,6 +198,7 @@ pub(crate) async fn spawn_api_full(
         limits,
         extra_host: None,
         confirm_secs: crate::keeper::DEFAULT_WINDOW_SECS,
+        restarter: restarter.clone(),
     })
     .await
     .unwrap();
@@ -192,6 +212,7 @@ pub(crate) async fn spawn_api_full(
     });
     TestApi {
         shared,
+        restarter,
         https,
         http,
         config_path,
@@ -204,6 +225,11 @@ pub(crate) async fn spawn_api_full(
 
 impl TestApi {
     /// The API with the test password already set; the token of the client that set it.
+    /// How many restarts were asked of the router.
+    pub(crate) fn restarts(&self) -> usize {
+        self.restarter.asked()
+    }
+
     pub(crate) async fn with_password(password: &str) -> (TestApi, String) {
         let api = spawn_api(ConfigState::Loaded).await;
         let session = api

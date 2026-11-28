@@ -64,6 +64,7 @@ message Request {
     RevertConfigRequest revert_config = 8;
     GetLeasesRequest get_leases = 9;
     GetHistoryRequest get_history = 10;
+    RebootRequest reboot = 11;
   }
 }
 
@@ -80,6 +81,7 @@ message Response {
     RevertConfigResponse revert_config = 8;
     GetLeasesResponse get_leases = 9;
     GetHistoryResponse get_history = 10;
+    RebootResponse reboot = 11;
   }
 }
 
@@ -279,6 +281,19 @@ service ConfigService {
   rpc ApplyConfig(ApplyConfigRequest) returns (ApplyConfigResponse);
   rpc ConfirmConfig(ConfirmConfigRequest) returns (ConfirmConfigResponse);
   rpc RevertConfig(RevertConfigRequest) returns (RevertConfigResponse);
+}
+
+// ---- The router itself ----
+
+message RebootRequest {}
+
+message RebootResponse {}
+
+service SystemService {
+  // Restart the router. It answers at once and the restart begins about a second later: the
+  // PPPoE sessions are ended and the lease files written first (SPEC §6.3). Every session ends
+  // with it; a change of config that waits to be confirmed is not confirmed by it.
+  rpc Reboot(RebootRequest) returns (RebootResponse);
 }
 
 // ---- Plain HTTP, before login ----

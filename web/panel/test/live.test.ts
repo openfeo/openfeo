@@ -348,3 +348,20 @@ test('a browser clock set back does not take the uptime back', () => {
   expect(live.sinceBootMs.value).toBe(273_600_000)
   live.stop()
 })
+
+test('restarting is forgotten once the socket is open again after it was lost', () => {
+  const { router, live } = started()
+  expect(live.restarting.value).toBeNull()
+  live.restart()
+  expect(live.restarting.value?.getTime()).toBe(NOW.getTime())
+  // An open socket that was never lost says nothing of the restart: the router has a second
+  // before it goes.
+  router.setConnection('open')
+  expect(live.restarting.value).not.toBeNull()
+  router.setConnection('reconnecting')
+  expect(live.restarting.value).not.toBeNull()
+  // Back, with the session it had: the router did not restart after all, or is long back.
+  router.setConnection('open')
+  expect(live.restarting.value).toBeNull()
+  live.stop()
+})

@@ -67,6 +67,15 @@ test("the bar counts the draft's changes on a settings page and is not on the da
   await routes.push('/wan')
   await flushPromises()
   expect(bar(wrapper).text()).toContain('2 changes not applied yet')
+  await routes.push('/firewall')
+  await flushPromises()
+  expect(bar(wrapper).text()).toContain('2 changes not applied yet')
+  await routes.push('/dns')
+  await flushPromises()
+  expect(bar(wrapper).text()).toContain('2 changes not applied yet')
+  await routes.push('/system')
+  await flushPromises()
+  expect(bar(wrapper).text()).toContain('2 changes not applied yet')
   await routes.push('/')
   await flushPromises()
   expect(bar(wrapper).exists()).toBe(false)
@@ -180,6 +189,40 @@ test('a change that moves the caller warns, with the name and the new address', 
   expect(warning.text()).toContain('Renew your DHCP lease, or change your static address, then come back to https://openfeo.home.arpa or https://192.168.2.1.')
   expect(warning.findAll('code.ofo-mono').map((code) => code.text())).toEqual(['https://openfeo.home.arpa', 'https://192.168.2.1'])
   expect(dialog(wrapper).findAll('.apply__effects li').map((item) => item.text())).toEqual(['lan0 moves: its devices need new addresses.'])
+})
+
+test('a rename says where the router will be found', async () => {
+  const { wrapper, store } = await page('/system', routerConfig(), (fake) => {
+    fake.validation = {
+      violations: [],
+      effects: [{ $typeName: 'openfeo.v1.ConfigEffect', subject: 'edge.home.arpa', kind: ConfigEffectKind.ROUTER_RENAMED }],
+      caller: { $typeName: 'openfeo.v1.Caller', connectionDrops: false, lanChanges: false, lan: 'lan0', routerAfter: '192.168.1.1' },
+    }
+  })
+  store().edit((draft) => (draft.system!.hostname = 'edge'))
+  await flushPromises()
+  await review(wrapper)
+  const renamed = dialog(wrapper).find('.apply__renamed')
+  expect(renamed.classes()).toContain('ofo-banner--warn')
+  expect(renamed.find('.ofo-banner__title').text()).toBe('This renames the router')
+  expect(renamed.text()).toContain(
+    'It will answer at https://edge.home.arpa and no longer at https://openfeo.home.arpa, and its certificate is issued again, so the browser will ask about it once more. This page goes on working until it is closed or reloaded: confirm the change here, then open the new name. It is also at https://192.168.1.1.',
+  )
+  expect(renamed.findAll('code.ofo-mono').map((code) => code.text())).toEqual(['https://edge.home.arpa', 'https://openfeo.home.arpa', 'https://192.168.1.1'])
+  // With no address from the router, the name alone.
+  unmountAll()
+  const alone = await page('/system')
+  alone.store().edit((draft) => (draft.system!.domain = 'lan.example'))
+  await flushPromises()
+  await review(alone.wrapper)
+  expect(dialog(alone.wrapper).find('.apply__renamed').text()).not.toContain('It is also at')
+  expect(dialog(alone.wrapper).find('.apply__renamed').findAll('code.ofo-mono').map((code) => code.text())).toEqual(['https://openfeo.lan.example', 'https://openfeo.home.arpa'])
+})
+
+test('a change that renames nothing has no such block', async () => {
+  const { wrapper } = await changed()
+  await review(wrapper)
+  expect(dialog(wrapper).find('.apply__renamed').exists()).toBe(false)
 })
 
 test('a caller whose subnet changes under a connection that stays is warned in other words', async () => {

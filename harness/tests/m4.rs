@@ -183,6 +183,30 @@ const SCENARIOS: &[Scenario] = &[
         name: "the_panel_shows_the_hour_and_the_leases_in_a_browser",
         run: the_panel_shows_the_hour_and_the_leases_in_a_browser,
     },
+    Scenario {
+        name: "the_state_says_which_resolvers_are_in_use",
+        run: the_state_says_which_resolvers_are_in_use,
+    },
+    Scenario {
+        name: "a_restart_asked_over_the_api_stops_in_order_and_keeps_the_leases",
+        run: a_restart_asked_over_the_api_stops_in_order_and_keeps_the_leases,
+    },
+    Scenario {
+        name: "a_restart_ends_the_pppoe_session_first",
+        run: a_restart_ends_the_pppoe_session_first,
+    },
+    Scenario {
+        name: "a_restart_does_not_wait_for_a_concentrator_that_says_nothing",
+        run: a_restart_does_not_wait_for_a_concentrator_that_says_nothing,
+    },
+    Scenario {
+        name: "a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config",
+        run: a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config,
+    },
+    Scenario {
+        name: "the_panel_changes_the_settings_and_restarts_the_router",
+        run: the_panel_changes_the_settings_and_restarts_the_router,
+    },
 ];
 
 fn main() -> ExitCode {
@@ -314,10 +338,22 @@ fn the_panel_and_its_files_are_served(api: &Api) -> anyhow::Result<()> {
         notices.status,
         notices.header("content-type")
     );
-    for needed in ["SIL OPEN FONT LICENSE", "@bufbuild/protobuf", "vue "] {
+    // One file for the whole binary (SPEC §13): a Rust crate, the C libraries linked into it
+    // (libnftables and the libc among them), an npm package and the fonts.
+    for needed in [
+        "\nThe router: Rust crates\n",
+        "\ntokio ",
+        "\nThe router: C libraries\n",
+        "\nnftables ",
+        "\nmusl libc ",
+        "\nThe panel: npm packages\n",
+        "@bufbuild/protobuf",
+        "\nvue ",
+        "SIL OPEN FONT LICENSE",
+    ] {
         ensure!(
             notices.text().contains(needed),
-            "the notices do not mention {needed}"
+            "the notices do not have {needed:?}"
         );
     }
     Ok(())
@@ -2777,6 +2813,400 @@ fn the_panel_shows_the_hour_and_the_leases_in_a_browser(lab: &mut Lab) -> anyhow
     ensure!(
         reserved.contains(&("plug-kitchen", lease.address.as_str())),
         "the reservations are {reserved:?}, and the lease is {lease:?}"
+    );
+    Ok(())
+}
+
+/// The resolvers the state names, in order, each with the WAN it came from.
+fn resolvers_of(state: &openfeo_config::state::State) -> Vec<(String, String)> {
+    state
+        .dns
+        .iter()
+        .flat_map(|dns| &dns.resolvers)
+        .map(|resolver| (resolver.address.clone(), resolver.wan.clone()))
+        .collect()
+}
+
+/// SPEC §8.3 (M4 part 3b): the state says which resolvers the forwarder is asking, in the
+/// order it asks, and where each came from: the WAN's lease, the ones the owner typed, and
+/// the switch that leaves the WAN's out.
+fn the_state_says_which_resolvers_are_in_use(lab: &mut Lab) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    ws.subscribe("state", 0)?;
+    let learned = ("203.0.113.1".to_owned(), "wan0".to_owned());
+    let typed = ("198.51.100.53".to_owned(), String::new());
+    // The lab's Kea gives one resolver with the lease.
+    ws.state_where(SOON, |state| resolvers_of(state) == [learned.clone()])
+        .context("the lease's resolver is not in the state")?;
+    let view = ws.config()?;
+    let mut config = view.config.context("no config")?;
+    let mut dns = config.dns.take().unwrap_or_default();
+    dns.upstreams = vec![typed.0.clone()];
+    config.dns = Some(dns);
+    let tag = applied(&mut ws, &config, &view.tag, true, 0)?;
+    ws.state_where(SOON, |state| {
+        resolvers_of(state) == [typed.clone(), learned.clone()]
+    })
+    .context("a typed resolver is not first, with no WAN to its name")?;
+    if let Some(dns) = config.dns.as_mut() {
+        dns.use_wan_dns = Some(false);
+    }
+    applied(&mut ws, &config, &tag, true, 0)?;
+    ws.state_where(SOON, |state| resolvers_of(state) == [typed.clone()])
+        .context("with the switch off the WAN's resolver is still in use")?;
+    no_task_failed(lab)
+}
+
+/// The API logs who asked for a restart.
+const RESTART_ASKED: &str = r"openfeo: system: restart asked from 192\.168\.1\.";
+/// PID 1 was asked to restart by the router process: the goodbyes are over.
+const REBOOT_REQUESTED: &str = r"openfeo-init: reboot requested by child";
+
+/// Ask for a restart over the socket and take a refusal for a failure of the scenario.
+fn restart_asked(ws: &mut Ws) -> anyhow::Result<()> {
+    ws.reboot()?
+        .map_err(|error| anyhow::anyhow!("the restart was refused: {error:?}"))
+}
+
+/// SPEC §6.3 (M4 part 3b): a restart asked over the API needs a session; it stops the LAN's
+/// DHCPv4 server first, so that a lease changed a moment before is in the file, and leaves the
+/// WAN's DHCPv4 client alone, so that the router comes back to the address it had. The router
+/// comes back with a smaller uptime, the same config and nobody logged in.
+fn a_restart_asked_over_the_api_stops_in_order_and_keeps_the_leases(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let refused = api.grpc_reboot(None)?;
+    ensure!(
+        refused
+            .as_ref()
+            .is_err_and(|status| status.code() == tonic::Code::Unauthenticated),
+        "a restart with no session: {refused:?}"
+    );
+    ensure!(
+        lab.console()?.count(&re(RESTART_ASKED)) == 0,
+        "a stranger's restart was taken"
+    );
+    // One device, joining twice under two names within a moment: the second is a change to its
+    // lease that the server has not yet written to its file (it writes once in five seconds).
+    join(lab, "early")?;
+    join(lab, "late")?;
+    let mut ws = api.ws_with(&token)?;
+    let deadline = Instant::now() + SOON;
+    let lease = loop {
+        let table = ws.leases()?;
+        if let Some(lease) = table.leases.iter().find(|lease| lease.hostname == "late") {
+            break lease.clone();
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "the lease is not there: {table:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let before = ws.request_state()?;
+    let uptime = before
+        .system
+        .as_ref()
+        .map_or(0, |system| system.uptime_secs);
+    let wan_address = before.wans.first().map(|wan| wan.ipv4.clone());
+    let tag = ws.config()?.tag;
+    let listening = lab.console()?.count(&re(LISTENING));
+
+    let mut cur = Cursor::default();
+    restart_asked(&mut ws)?;
+    let console = lab.console()?;
+    console.wait_for(&mut cur, &re(RESTART_ASKED), SOON)?;
+    let asked = cur;
+    console
+        .wait_for(&mut cur, &re(LAN0_DHCP_STOPPED), SOON)
+        .context("the LAN's DHCP server was not stopped before the restart")?;
+    console
+        .wait_for(&mut cur, &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    wait_listening_again(lab, listening)?;
+    let console = lab.console()?;
+    ensure!(
+        console.count_since(&asked, &re(WAN0_DHCP_STOPPED)) == 0,
+        "the WAN's DHCP client was stopped for the restart: its lease is released"
+    );
+    console
+        .wait_for(&mut cur, &re(INIT_REBOOT), SOON)
+        .context("the router did not come back asking for the address it had")?;
+
+    ensure!(
+        api.get("/api/state", Some(&token))?.status == 401,
+        "a session outlived the restart"
+    );
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    // The state as it stands, and then every change, until the WAN has its address again.
+    ws.subscribe("state", 0)?;
+    let after = ws
+        .state_where(BOOT_TIMEOUT, |state| {
+            state.wans.first().map(|wan| wan.ipv4.clone()) == wan_address
+        })
+        .context("the WAN did not come back to the address it had")?;
+    let uptime_after = after
+        .system
+        .as_ref()
+        .map_or(u64::MAX, |system| system.uptime_secs);
+    ensure!(
+        uptime_after < uptime,
+        "the uptime did not start again: {uptime} s before, {uptime_after} s after"
+    );
+    ensure!(
+        ws.config()?.tag == tag,
+        "the config changed across the restart"
+    );
+    let table = ws.leases()?;
+    let kept = table
+        .leases
+        .iter()
+        .find(|kept| kept.mac == lease.mac)
+        .with_context(|| format!("the lease did not survive the restart: {table:?}"))?;
+    ensure!(
+        (
+            kept.hostname.as_str(),
+            kept.address.as_str(),
+            kept.joined_unix
+        ) == ("late", lease.address.as_str(), lease.joined_unix),
+        "the lease came back as {kept:?}, and was {lease:?}"
+    );
+    no_task_failed(lab)
+}
+
+/// SPEC §6.3, §7.2: before the router restarts, its PPPoE session is ended as the protocol
+/// asks, so the access concentrator knows at once and does not hold the account until its own
+/// echoes fail.
+fn a_restart_ends_the_pppoe_session_first(lab: &mut Lab) -> anyhow::Result<()> {
+    boot_pppoe(lab)?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let listening = lab.console()?.count(&re(LISTENING));
+    let mut cur = Cursor::default();
+    lab.console()?.wait_for(&mut cur, &re(PPPOE_UP), SOON)?;
+    restart_asked(&mut ws)?;
+    let console = lab.console()?;
+    console.wait_for(&mut cur, &re(RESTART_ASKED), SOON)?;
+    console
+        .wait_for(&mut cur, &re(PPPOE_STOPPED), SOON)
+        .context("the PPPoE session was not ended before the restart")?;
+    console
+        .wait_for(&mut cur, &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    // The concentrator's side: our Terminate-Request reached its pppd.
+    pppd_log_shows(lab, "LCP terminated by peer")?;
+    wait_listening_again(lab, listening)?;
+    lab.console()?
+        .wait_for(&mut cur, &re(PPPOE_UP), BOOT_TIMEOUT)
+        .context("no session after the restart")?;
+    no_task_failed(lab)
+}
+
+/// SPEC §6.3: the goodbyes get 3 s and the restart goes ahead without them. A concentrator
+/// that answers nothing costs those seconds and nothing else.
+fn a_restart_does_not_wait_for_a_concentrator_that_says_nothing(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    boot_pppoe(lab)?;
+    let api = api(lab)?;
+    let token = api.claim(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let listening = lab.console()?.count(&re(LISTENING));
+    // Killed, not stopped: nothing goes out, and the router's session still believes in it.
+    ensure!(lab.kill_pppoe_server(), "no access concentrator to kill");
+    let mut cur = Cursor::default();
+    restart_asked(&mut ws)?;
+    let answered = Instant::now();
+    let console = lab.console()?;
+    console.wait_for(&mut cur, &re(RESTART_ASKED), SOON)?;
+    console
+        .wait_for(
+            &mut cur,
+            &re(r"openfeo: task pppoe-wan0 did not stop in 3s; dropped"),
+            SOON,
+        )
+        .context("the session was not given up on")?;
+    console
+        .wait_for(&mut cur, &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    let took = answered.elapsed();
+    ensure!(
+        took <= Duration::from_secs(6),
+        "the restart waited {took:?} for a concentrator that was not there"
+    );
+    wait_listening_again(lab, listening)
+}
+
+/// SPEC §5.5, §6.3: a restart does not confirm a change that is waiting. The router comes back
+/// on the confirmed config, as after a power cut, and says the change was discarded.
+fn a_restart_asked_while_a_change_is_pending_comes_back_on_the_confirmed_config(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    let (api, token, _) = boot_claimed(lab)?;
+    let mut ws = api.ws_with(&token)?;
+    let view = ws.config()?;
+    let config = view.config.context("no config")?;
+    let ping = |config: &Config| {
+        config
+            .firewall
+            .as_ref()
+            .is_some_and(|firewall| firewall.wan_ping)
+    };
+    // A change that moves nothing, left unconfirmed.
+    let mut changed = config.clone();
+    changed
+        .firewall
+        .get_or_insert_with(Default::default)
+        .wan_ping = !ping(&config);
+    applied(&mut ws, &changed, &view.tag, false, 600)?;
+    let listening = lab.console()?.count(&re(LISTENING));
+    restart_asked(&mut ws)?;
+    lab.console()?
+        .wait_for(&mut Cursor::default(), &re(REBOOT_REQUESTED), SOON)
+        .context("PID 1 was not asked to restart")?;
+    wait_listening_again(lab, listening)?;
+    lab.console()?
+        .wait_for(&mut Cursor::default(), &re(DISCARDED), SOON)?;
+    let token = api.login(PASSWORD)?;
+    let mut ws = api.ws_with(&token)?;
+    let after = ws.config()?;
+    let running = after.config.context("no config")?;
+    ensure!(
+        after.tag == view.tag && ping(&running) == ping(&config),
+        "the router came back on the change it was never told to keep"
+    );
+    ws.subscribe("events", 16)?;
+    ws.event(SOON, "config.discarded")?;
+    no_task_failed(lab)
+}
+
+/// What the browser changes the lab's password to.
+const NEW_PASSWORD: &str = "lab-second-password";
+
+/// The settings pages (SPEC §8.4, §12; M4 part 3b) in Playwright's Chromium, inside the LAN
+/// namespace, against the booted router: a port forward is added on Firewall, applied and
+/// confirmed; a LAN that a forward points into cannot be removed until the forward is; a
+/// local name is added on DNS; the password is changed on System, the old one refused and
+/// the new one taken; and the router is restarted from there, the page waiting and ending at
+/// the login screen. Afterwards the router is asked what it ended up with: the forward and
+/// the name are in its config, a LAN host can look the name up, the new password logs in,
+/// and the console shows one restart that was asked for. Screenshots of the three pages and
+/// the restart's dialog join the others. Skipped as the other browser scenarios are.
+fn the_panel_changes_the_settings_and_restarts_the_router(lab: &mut Lab) -> anyhow::Result<()> {
+    const WINDOW: u32 = 40;
+    web::ready()?;
+    boot(lab, &format!("openfeo.confirm_secs={WINDOW}"))?;
+    let shots = std::env::var_os("OPENFEO_SHOTS")
+        .map_or_else(|| lab.run_dir.join("panel-shots"), std::path::PathBuf::from);
+    web::settle(&lab.lan0, "lan0")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut playwright = web::tool(&lab.lan0, "playwright")?;
+    playwright
+        .args([
+            "test",
+            "--config",
+            "panel/playwright.config.ts",
+            "settings.spec",
+        ])
+        .env("OPENFEO_PANEL_URL", format!("https://{HOST}"))
+        .env("OPENFEO_PANEL_RESOLVE", format!("{HOST} 192.168.1.1"))
+        .env("OPENFEO_E2E_OUT", lab.run_dir.join("e2e-settings"))
+        .env("OPENFEO_SHOTS", &shots)
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_NEW_PASSWORD", NEW_PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir());
+    ctl.serve_while(
+        playwright,
+        &lab.run_dir.join("playwright-settings.log"),
+        Duration::from_secs(480),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
+
+    // One restart, asked for through the API, with its goodbyes; and the machine came up twice.
+    let console = lab.console()?;
+    for (line, times) in [
+        (RESTART_ASKED, 1),
+        (REBOOT_REQUESTED, 1),
+        (LAN0_DHCP_STOPPED, 1),
+        (r"Linux version \S+-openfeo", 2),
+        (r"openfeo: config: confirmed", 2),
+    ] {
+        let found = console.count(&re(line));
+        ensure!(
+            found == times,
+            "{line} is on the console {found} times, not {times}"
+        );
+    }
+    no_task_failed(lab)?;
+    password_never_logged(lab)?;
+    ensure!(
+        lab.console()?.count(&re(NEW_PASSWORD)) == 0,
+        "the new password is on the console"
+    );
+
+    settings_ended_up(lab)
+}
+
+/// What the router ended up with after the settings run, asked with the password the browser
+/// gave it: the forward and the local name, nothing of what was added and removed in one
+/// draft, and the name answered to a device on the LAN.
+fn settings_ended_up(lab: &Lab) -> anyhow::Result<()> {
+    let api = api(lab)?;
+    let token = api.login(NEW_PASSWORD)?;
+    let config = api.ws_with(&token)?.config()?.config.context("no config")?;
+    let forwards: Vec<(&str, u32, &str, u32)> = config
+        .firewall
+        .iter()
+        .flat_map(|firewall| &firewall.port_forwards)
+        .map(|forward| {
+            (
+                forward.name.as_str(),
+                forward.port,
+                forward.to.as_str(),
+                forward.to_port,
+            )
+        })
+        .collect();
+    ensure!(
+        forwards.contains(&("e2e-ssh", 2022, "192.168.1.50", 22)),
+        "the forwards are {forwards:?}"
+    );
+    ensure!(
+        !forwards.iter().any(|forward| forward.0 == "iot-cam")
+            && config.lans.iter().all(|lan| lan.name != "iot"),
+        "what was added and removed in one draft is in the config"
+    );
+    let names: Vec<(&str, &str)> = config
+        .dns
+        .iter()
+        .flat_map(|dns| &dns.records)
+        .map(|record| (record.name.as_str(), record.address.as_str()))
+        .collect();
+    ensure!(
+        names == [("printer", "192.168.1.50")],
+        "the local names are {names:?}"
+    );
+    // And a device on the LAN finds the name, under the router's domain.
+    let answer = lanclient::dig(
+        &lab.lan0,
+        std::net::Ipv4Addr::new(192, 168, 1, 1).into(),
+        "printer.home.arpa",
+        "A",
+        &[],
+        Duration::from_secs(6),
+    )?;
+    ensure!(
+        answer.status == "NOERROR"
+            && answer
+                .answers
+                .iter()
+                .any(|(_, _, rtype, data)| rtype == "A" && data == "192.168.1.50"),
+        "printer.home.arpa: {answer:?}"
     );
     Ok(())
 }

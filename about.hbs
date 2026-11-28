@@ -1,0 +1,15 @@
+{{!-- SPDX-License-Identifier: GPL-2.0-or-later --}}
+{{!-- Copyright (C) 2026 Andrew Newton --}}
+{{!-- The Rust crates' notices as plain text, in the shape web/scripts/notices.mjs gives the
+     others in /licences.txt: under each licence text, the crates it is given for. --}}
+{{#each licenses}}
+==============================================================================
+{{#each used_by}}
+{{crate.name}} {{crate.version}}
+{{/each}}
+{{id}}
+==============================================================================
+
+{{{text}}}
+
+{{/each}}

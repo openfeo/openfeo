@@ -77,7 +77,7 @@ rustup toolchain install stable --profile minimal
 rustup target add --toolchain stable x86_64-unknown-linux-musl
 rustup component add --toolchain stable clippy rustfmt
 
-log "cargo-deny and buf (make lint)"
+log "cargo-deny and buf (make lint), cargo-about (make panel)"
 if ! cargo deny --version >/dev/null 2>&1; then
   # The release tag, from the redirect GitHub answers for /releases/latest; the prebuilt musl
   # tarball when that works, a source build otherwise.
@@ -87,6 +87,16 @@ if ! cargo deny --version >/dev/null 2>&1; then
     "https://github.com/EmbarkStudios/cargo-deny/releases/download/$tag/cargo-deny-$tag-x86_64-unknown-linux-musl.tar.gz" \
     | $SUDO tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/cargo-deny'; then
     cargo install cargo-deny --locked
+  fi
+fi
+# The cargo-about that writes the Rust crates' notices into /licences.txt (make panel). The
+# Makefile's CARGO_ABOUT_VERSION, which this runs too early to read: make panel refuses another.
+ABOUT=0.9.2
+if [ "$(cargo about --version 2>/dev/null | awk '{print $2}')" != "$ABOUT" ]; then
+  if ! curl -fsSL \
+    "https://github.com/EmbarkStudios/cargo-about/releases/download/$ABOUT/cargo-about-$ABOUT-x86_64-unknown-linux-musl.tar.gz" \
+    | $SUDO tar -xz -C /usr/local/bin --strip-components=1 --wildcards '*/cargo-about'; then
+    cargo install cargo-about --locked --version "$ABOUT"
   fi
 fi
 if ! command -v buf >/dev/null 2>&1; then
@@ -192,11 +202,12 @@ echo "modules loaded: ${loaded:-none (built in, or unavailable: check-env tells 
 version_of() {
   case "$1" in
     cargo-deny) cargo deny --version 2>&1 ;; # a cargo subcommand: found wherever cargo looks
+    cargo-about) cargo about --version 2>&1 ;;
     kea-dhcp4) kea-dhcp4 -v 2>&1 ;;
     *) "$1" --version 2>&1 ;;
   esac | head -n 1
 }
-for tool in rustc cargo cargo-deny buf node npm qemu-system-x86_64 kea-dhcp4 dnsmasq; do
+for tool in rustc cargo cargo-deny cargo-about buf node npm qemu-system-x86_64 kea-dhcp4 dnsmasq; do
   if version=$(version_of "$tool") && [ -n "$version" ]; then
     echo "$tool: $version"
   else
