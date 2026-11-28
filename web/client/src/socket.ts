@@ -3,7 +3,7 @@
 
 // The envelope over a WebSocket (SPEC §8.3). One socket for everything after login: the first
 // frame is `Auth` with the session's token, requests are numbered and answered under their
-// number, and pushes (state, counters, events) arrive under number 0. The router acknowledges
+// number, and pushes (state, leases, counters, events, lines of the log) arrive under number 0. The router acknowledges
 // `Auth`, `Subscribe` and `Unsubscribe` with an empty reply.
 
 import { create, fromBinary, toBinary, type MessageInitShape } from '@bufbuild/protobuf'
@@ -14,6 +14,7 @@ import {
   ClientMsgSchema,
   ErrorCode,
   ServerMsgSchema,
+  type LogBatch,
   type RequestSchema,
   type Response as Reply,
   type ServerMsg,
@@ -27,7 +28,7 @@ import type { TokenStore } from './token-store.js'
 export type Connection = 'idle' | 'connecting' | 'open' | 'reconnecting'
 /** Why a session ended: this client logged out, the router no longer knew it, or it was ended from elsewhere. */
 export type SessionEnd = 'logout' | 'lapsed' | 'revoked'
-export type Topic = 'state' | 'leases' | 'counters' | 'events'
+export type Topic = 'state' | 'leases' | 'counters' | 'events' | 'logs'
 
 export interface Subscription {
   /** Stop listening. The topic is unsubscribed when its last listener closes. */
@@ -46,6 +47,11 @@ interface Waiting {
 
 interface EventListener {
   onPush: (event: Event) => void
+  onLost: (() => void) | undefined
+}
+
+interface LogListener {
+  onPush: (batch: LogBatch) => void
   onLost: (() => void) | undefined
 }
 
@@ -110,9 +116,12 @@ export class Link {
   readonly #leases = new Set<(leases: Leases) => void>()
   readonly #counters = new Set<(counters: Counters) => void>()
   readonly #events = new Set<EventListener>()
+  readonly #logs = new Set<LogListener>()
   #backlog = 0
   /** Events were subscribed on an earlier socket: the next subscribe is a resumption. */
   #eventsBefore = false
+  /** The log was, likewise. */
+  #logsBefore = false
   /** How many times in a row a socket has been lost without one authenticating. */
   #attempt = 0
   #retry: unknown = undefined
@@ -193,6 +202,15 @@ export class Link {
     return this.#listen('events', this.#events, { onPush, onLost })
   }
 
+  /**
+   * Every line of the log written from now on, in batches. `onLost` when lines were skipped:
+   * the router says so when this reader fell behind, and a socket that was away missed what
+   * was written meanwhile.
+   */
+  subscribeLogs(onPush: (batch: LogBatch) => void, onLost: (() => void) | undefined): Subscription {
+    return this.#listen('logs', this.#logs, { onPush, onLost })
+  }
+
   /** Tell the router, then end the session here whether or not it heard. */
   async logout(): Promise<void> {
     if (this.#deps.store.get() === null) {
@@ -228,6 +246,9 @@ export class Link {
           if (topic === 'events') {
             this.#eventsBefore = false
           }
+          if (topic === 'logs') {
+            this.#logsBefore = false
+          }
           if (this.#authenticated) {
             this.#send(this.#nextId++, { case: 'unsubscribe', value: { topic } })
           }
@@ -250,6 +271,9 @@ export class Link {
     if (this.#events.size > 0) {
       topics.push('events')
     }
+    if (this.#logs.size > 0) {
+      topics.push('logs')
+    }
     return topics
   }
 
@@ -264,6 +288,14 @@ export class Link {
       if (resumed) {
         this.#lost()
       }
+    }
+    if (topic === 'logs') {
+      // The log is sent from the subscription on: what was written while the socket was away
+      // was not, and whoever follows it is told so.
+      if (this.#logsBefore) {
+        this.#logsLost()
+      }
+      this.#logsBefore = true
     }
   }
 
@@ -394,9 +426,26 @@ export class Link {
         [...this.#events].map((listener) => listener.onPush),
         body.value,
       )
+    } else if (body.case === 'logs') {
+      deliver(
+        [...this.#logs].map((listener) => listener.onPush),
+        body.value,
+      )
     } else if (body.case === 'error' && body.value.code === ErrorCode.DATA_LOSS) {
-      this.#lost()
+      // The router says which topic's pushes it dropped; one that says nothing means events.
+      if (body.value.topic === 'logs') {
+        this.#logsLost()
+      } else {
+        this.#lost()
+      }
     }
+  }
+
+  #logsLost(): void {
+    deliver(
+      [...this.#logs].flatMap((listener) => (listener.onLost === undefined ? [] : [() => listener.onLost?.()])),
+      undefined,
+    )
   }
 
   #lost(): void {
@@ -501,6 +550,8 @@ export class Link {
     this.#counters.clear()
     this.#events.clear()
     this.#eventsBefore = false
+    this.#logs.clear()
+    this.#logsBefore = false
   }
 
   /** The session is over: nothing is kept, nothing reconnects, and whoever listens is told why. */

@@ -192,6 +192,10 @@ const SCENARIOS: &[Scenario] = &[
         run: the_routes_dump_has_the_default_route_and_each_lans_subnet,
     },
     Scenario {
+        name: "the_javascript_client_reads_the_routes_and_the_log_from_the_lan",
+        run: the_javascript_client_reads_the_routes_and_the_log_from_the_lan,
+    },
+    Scenario {
         name: "the_log_is_read_by_level_and_text_and_followed",
         run: the_log_is_read_by_level_and_text_and_followed,
     },
@@ -3154,6 +3158,40 @@ fn no_line_in_the_log_holds_a_password_or_a_token(lab: &mut Lab) -> anyhow::Resu
         lab.console()?.count(&re(WRONG)) == 0,
         "the wrong password is on the console"
     );
+    no_task_failed(lab)?;
+    password_never_logged(lab)
+}
+
+/// `@openfeo/client`'s calls for the routes and the log (SPEC §8.3, M4 part 3c), run by Node
+/// inside the LAN namespace against the booted router (`web/client/itest/views.test.ts`): the
+/// dump with the default route and the LAN, the log read back by level, by text and by page,
+/// and a subscription to `logs` that is sent the line of a cut ISP, which the client's own
+/// rule then matches as the router's does. Skipped as the other client scenarios are.
+fn the_javascript_client_reads_the_routes_and_the_log_from_the_lan(
+    lab: &mut Lab,
+) -> anyhow::Result<()> {
+    web::node_ready()?;
+    boot(lab, "")?;
+    let ctl = web::LabCtl::new(&lab.run_dir)?;
+    let mut qmp = lab.qmp()?;
+    let mut vitest = web::tool(&lab.lan0, "vitest")?;
+    vitest
+        .args([
+            "run",
+            "--config",
+            "client/itest/vitest.config.ts",
+            "views.test",
+        ])
+        .env("OPENFEO_ROUTER", "https://192.168.1.1")
+        .env("OPENFEO_PASSWORD", PASSWORD)
+        .env("OPENFEO_LAB_CTL", ctl.dir())
+        .env("NODE_TLS_REJECT_UNAUTHORIZED", "0");
+    ctl.serve_while(
+        vitest,
+        &lab.run_dir.join("client-views-itest.log"),
+        Duration::from_secs(300),
+        |verb| lab_verb(lab, &mut qmp, verb),
+    )?;
     no_task_failed(lab)?;
     password_never_logged(lab)
 }

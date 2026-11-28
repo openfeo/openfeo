@@ -22,6 +22,7 @@ import {
   type GetStatusResponse,
   type Leases,
   type LinkHistory,
+  type LogBatch,
   type Reverted,
   type Session,
   type SessionEnd,
@@ -32,8 +33,14 @@ import {
 
 import type { PanelRouter } from '../src/session'
 
-type Listener = ((state: State) => void) | ((leases: Leases) => void) | ((counters: Counters) => void) | ((event: Event) => void)
-type Topic = 'state' | 'leases' | 'counters' | 'events'
+type Pushed = State | Leases | Counters | Event | LogBatch
+type Listener =
+  | ((state: State) => void)
+  | ((leases: Leases) => void)
+  | ((counters: Counters) => void)
+  | ((event: Event) => void)
+  | ((batch: LogBatch) => void)
+type Topic = 'state' | 'leases' | 'counters' | 'events' | 'logs'
 
 interface Listening {
   topic: Topic
@@ -236,6 +243,7 @@ export class FakeRouter implements PanelRouter {
   subscribe(topic: 'leases', onPush: (leases: Leases) => void): Subscription
   subscribe(topic: 'counters', onPush: (counters: Counters) => void): Subscription
   subscribe(topic: 'events', onPush: (event: Event) => void, options?: { backlog?: number; onLost?: () => void }): Subscription
+  subscribe(topic: 'logs', onPush: (batch: LogBatch) => void, options?: { onLost?: () => void }): Subscription
   subscribe(topic: Topic, onPush: Listener, options: { backlog?: number; onLost?: () => void } = {}): Subscription {
     // As the client does: with no session there is nothing to subscribe on, and it says so at once.
     if (!this.authenticated) {
@@ -271,15 +279,16 @@ export class FakeRouter implements PanelRouter {
   push(topic: 'leases', value: Leases): void
   push(topic: 'counters', value: Counters): void
   push(topic: 'events', value: Event): void
-  push(topic: Topic, value: State | Leases | Counters | Event): void {
+  push(topic: 'logs', value: LogBatch): void
+  push(topic: Topic, value: Pushed): void {
     for (const entry of this.open(topic)) {
-      ;(entry.onPush as (value: State | Leases | Counters | Event) => void)(value)
+      ;(entry.onPush as (value: Pushed) => void)(value)
     }
   }
 
-  /** The router says events were dropped. */
-  lose(): void {
-    for (const entry of this.open('events')) {
+  /** The router says events were dropped, or lines of the log. */
+  lose(topic: 'events' | 'logs' = 'events'): void {
+    for (const entry of this.open(topic)) {
       entry.onLost?.()
     }
   }
