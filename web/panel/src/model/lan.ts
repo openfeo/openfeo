@@ -146,39 +146,33 @@ function bounds(target: string): [number, number] | null {
   return address === null ? null : [address, address]
 }
 
-/** Something that points at a LAN: what it is, in words, and which part of the Firewall page holds it. */
-export interface Blocker {
-  text: string
-  kind: 'forward' | 'rule' | 'reach'
-}
-
 /**
- * What still points at a LAN, and so stands in the way of removing it. Each is removed where
- * it is edited, on the Firewall page: removing them with the LAN would delete firewall config
- * on the strength of a press elsewhere.
+ * What still points at a LAN, and so stands in the way of removing it, each in words. Each is
+ * removed where it is edited, on the Firewall page: removing them with the LAN would delete
+ * firewall config on the strength of a press elsewhere.
  */
-export function blockers(config: Config, lan: Lan): Blocker[] {
+export function blockers(config: Config, lan: Lan): string[] {
   const subnet = parseCidr4(lan.ipv4)
   const inside = (first: number, last: number) => subnet !== null && contains(subnet, first) && contains(subnet, last)
-  const found: Blocker[] = []
+  const found: string[] = []
   for (const forward of config.firewall?.portForwards ?? []) {
     const to = parse4(forward.to)
     if (to !== null && inside(to, to)) {
-      found.push({ text: `port forward ${forward.name} points into it`, kind: 'forward' })
+      found.push(`port forward ${forward.name} points into it`)
     }
   }
   for (const rule of config.firewall?.rules ?? []) {
     const covered = bounds(rule.to)
     if (covered !== null && inside(covered[0], covered[1])) {
-      found.push({ text: `rule ${rule.name} points into it`, kind: 'rule' })
+      found.push(`rule ${rule.name} points into it`)
     }
     if (rule.from === lan.name) {
-      found.push({ text: `rule ${rule.name} starts from it`, kind: 'rule' })
+      found.push(`rule ${rule.name} starts from it`)
     }
   }
   for (const other of config.lans) {
     if (other.name !== lan.name && other.reaches.includes(lan.name)) {
-      found.push({ text: `${other.name} may reach it`, kind: 'reach' })
+      found.push(`${other.name} may reach it`)
     }
   }
   return found

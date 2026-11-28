@@ -12,7 +12,7 @@ appends its entry here in the same PR (`CLAUDE.md`, Process).
 | M1 IPv4 router | done, 2026-10-31 | #1, #2, #3, #4, #6, #7; follow-up #8 |
 | M2 IPv6 | done, 2026-11-07 | #10, #22, #36; follow-up #20 |
 | M3 PPPoE | done, 2026-11-09 | #46, #47; follow-ups #58, #59, #67 |
-| M4 API and panel | parts 1 and 2 of 5, and 3a and 3b, 2026-11-24 | #68, #81, #101, #103, #128, #132; follow-ups #124, #129 |
+| M4 API and panel | parts 1 and 2 of 5, and 3a and 3b, 2026-11-24 | #68, #81, #101, #103, #128, #132; follow-ups #124, #129, #134 |
 | M5 to M7 | not started | |
 
 ## M0 Harness and skeleton
@@ -459,6 +459,21 @@ for what it holds; and `@openfeo/ui` no longer exports a function that only it u
 three, one needed nothing, and two are filed: the lease table is built on every change of the World
 for sockets that follow only the state (#130), and a new subscriber to the counters waits up to a
 second for its first sample (#131).
+
+**2026-11-28, [#134](https://github.com/openfeo/openfeo/pull/134), M4 part 3b minors.** Six of the
+seven minors that the review of #132 left. A restart asked while a family manager is busy stopping
+an instance for a change of config no longer finds that instance's replacement started (on a PPPoE
+WAN, a new discovery begun as the router goes, and less time for the session's goodbye): the
+manager takes a halt that is waiting before it starts anything, and one that the supervisor starts
+again with a halt already asked starts nothing either. On the System page, what the router said of
+a change of config that was waiting, when it refused a new password for it, goes once the change is
+settled and is not said twice beside the held button's own line. `make check-env` holds `cargo
+about` to the version `make panel` takes, and says which to install. The Firewall page writes
+whether the router answers ping through the model's own function, which nothing used; what stands
+in the way of removing a LAN is its words alone again, the part nothing read gone; and a test that
+could not fail on what its name claimed is named for what it shows. The seventh is filed: the Rust
+standard library is in the binary and its notices are not in `/licences.txt` (#133), to be settled
+with the notices of the image as a whole.
 
 ## Tooling and process
 

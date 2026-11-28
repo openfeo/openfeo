@@ -601,8 +601,8 @@ function remove(): void {
           <OfoButton size="sm" variant="ghost" :disabled="!editable || inTheWay.length > 0" @click="remove">Remove {{ lan.name }}</OfoButton>
           <span v-if="editable && inTheWay.length > 0" class="ofo-muted page__why">
             Cannot be removed yet:
-            <template v-for="(each, n) in inTheWay" :key="each.text">
-              <RouterLink :to="PAGES.firewall">{{ each.text }}</RouterLink>{{ n === inTheWay.length - 1 ? '.' : '; ' }}
+            <template v-for="(each, n) in inTheWay" :key="each">
+              <RouterLink :to="PAGES.firewall">{{ each }}</RouterLink>{{ n === inTheWay.length - 1 ? '.' : '; ' }}
             </template>
           </span>
         </div>

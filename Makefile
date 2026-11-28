@@ -50,7 +50,7 @@ run: kernel
 test-harness: kernel
 	OPENFEO_KERNEL=$(BUILD)/bzImage OPENFEO_SHOTS=$(BUILD)/panel-shots cargo test -p openfeo-harness --no-fail-fast --test netlink --test nft --test dhcp4 --test dhcp4_server --test dhcp6 --test dns --test sntp --test ndp --test pppoe --test m0 --test m1 --test m2 --test m2pd --test m3 --test m4 -- $(FILTER)
 check-env: kernel-headers nft-src
-	OPENFEO_KERNEL=$(BUILD)/bzImage cargo run -q -p openfeo-harness -- check
+	OPENFEO_KERNEL=$(BUILD)/bzImage OPENFEO_CARGO_ABOUT=$(CARGO_ABOUT_VERSION) cargo run -q -p openfeo-harness -- check
 ci: lint test kernel test-harness
 lint: kernel-headers nft-src web-lint
 	cargo fmt --all --check
