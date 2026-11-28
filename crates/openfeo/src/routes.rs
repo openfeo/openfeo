@@ -64,7 +64,9 @@ pub fn routes_of(cache: &Cache, wans: &[String]) -> Vec<Route> {
         .collect()
 }
 
-/// `main`, `local`, the name of the WAN whose own table it is, or the number.
+/// `main`, `local`, the name of the WAN whose own table it is, or the number. A WAN named as
+/// a table is said (`main`, `local`, a number) does not lend its name: the word would say two
+/// tables at once, and its own is then said by its number.
 fn table_name(table: u32, wans: &[String]) -> String {
     match table {
         TABLE_MAIN => "main".to_owned(),
@@ -73,7 +75,11 @@ fn table_name(table: u32, wans: &[String]) -> String {
             .iter()
             .enumerate()
             .find(|(index, _)| wan_table(*index) == other)
-            .map_or_else(|| other.to_string(), |(_, name)| name.clone()),
+            .map(|(_, name)| name)
+            .filter(|name| {
+                !matches!(name.as_str(), "main" | "local") && name.parse::<u32>().is_err()
+            })
+            .map_or_else(|| other.to_string(), Clone::clone),
     }
 }
 
@@ -174,6 +180,29 @@ mod tests {
         assert_eq!(in_table(101), "wan1");
         assert_eq!(in_table(102), "102", "no third WAN: the number");
         assert_eq!(in_table(53), "53");
+    }
+
+    /// A WAN may be named as a table is said (`main`, `local`, a number): its name would then
+    /// say two tables at once, so its own table is said by its number.
+    #[test]
+    fn a_wan_named_like_a_table_does_not_lend_its_name() {
+        let wans: Vec<String> = ["main", "local", "254", "fibre"].map(str::to_owned).into();
+        let in_table = |table: u32| {
+            let said = routes_of(
+                &cache([Kernel {
+                    table,
+                    ..default4()
+                }]),
+                &wans,
+            );
+            said[0].table.clone()
+        };
+        assert_eq!(in_table(100), "100");
+        assert_eq!(in_table(101), "101");
+        assert_eq!(in_table(102), "102");
+        assert_eq!(in_table(103), "fibre");
+        assert_eq!(in_table(254), "main");
+        assert_eq!(in_table(255), "local");
     }
 
     #[test]
